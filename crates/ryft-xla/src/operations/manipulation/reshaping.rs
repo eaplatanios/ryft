@@ -204,7 +204,7 @@ impl ReshapeOperationLoweringExtension for ReshapeOperation {
         let input = input_values[0];
         let result = if output_types[0].static_shape().is_none() {
             if input_type.shape() == output_types[0].shape() {
-                // The dynamic target is exactly the input shape, so the input already has the required result type.
+                // The dynamic target is exactly the input shape, so the input already has the required output type.
                 input
             } else {
                 // Core type inference admits a dynamic target only when it keeps the dynamic dimensions of the input in

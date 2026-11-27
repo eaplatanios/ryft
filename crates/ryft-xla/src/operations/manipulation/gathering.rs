@@ -294,14 +294,14 @@ mod tests {
     fn test_gather_operation_lower() {
         // Take whole rows of a [3, 2] matrix at the row indices in a [2, 1] index array. Offset axis 1 carries the
         // row with slice sizes [1, 2], and axis 0 is collapsed because the start indices select it. Output is [2, 2].
-        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         let mut builder = ProgramBuilder::new();
-        let operand = builder.add_input(operand_type);
+        let input = builder.add_input(input_type);
         let indices = builder.add_input(indices_type);
         let output = builder
-            .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![operand, indices], None)
+            .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![input, indices], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
@@ -332,11 +332,11 @@ mod tests {
             ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(query), Dimension::Static(1)]));
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         let mut builder = ProgramBuilder::new();
-        let operand = builder
+        let input = builder
             .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])));
         let indices = builder.add_input(indices_type);
         let output = builder
-            .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![operand, indices], None)
+            .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![input, indices], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
@@ -365,15 +365,15 @@ mod tests {
         // `Clip` is the default out-of-bounds behavior of StableHLO `gather`, so a gather in `Clip` mode lowers to the
         // bare `stablehlo.gather` without extra clamp operations, just like the in-bounds default, rather than
         // failing.
-        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2])
             .with_mode(GatherMode::Clip);
         let mut builder = ProgramBuilder::new();
-        let operand = builder.add_input(operand_type);
+        let input = builder.add_input(input_type);
         let indices = builder.add_input(indices_type);
         let output = builder
-            .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![operand, indices], None)
+            .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![input, indices], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(

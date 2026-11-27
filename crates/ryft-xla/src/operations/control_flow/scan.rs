@@ -15,8 +15,8 @@
 //! straight-line body copies only, and a scan with zero iterations lowers to its initial carries and empty accumulators.
 //! On every path, an entry guard first checks the input relationships that the actual input types leave unproven,
 //! including those with the runtime length of a scan of dynamic length. Every ordered effect class that the
-//! body uses is threaded through the loop state as one trailing token, the results are normalized to the refined output
-//! types of the scan, and results whose types place them over explicit mesh axes are constrained to that placement.
+//! body uses is threaded through the loop state as one trailing token, the outputs are normalized to the refined output
+//! types of the scan, and outputs whose types place them over explicit mesh axes are constrained to that placement.
 //! Reference state is discharged before lowering.
 
 use std::rc::Rc;
@@ -86,7 +86,7 @@ impl LowerableOperation for ScanOperation<Type> {
         //      trips run `unroll` body copies each, followed by its remaining iterations, as `ScanLoopInputs` emits
         //      them.
         //   4. The carries and the accumulators are normalized to the refined `output_types` of the scan, and each
-        //      result whose type places it over an explicit mesh axis is constrained to that placement.
+        //      output whose type places it over an explicit mesh axis is constrained to that placement.
         //
         // The program that attaches the scan validated its region and input counts, so a mismatch here is an internal
         // error, reported as the operation's own region contract and input count would report it.
@@ -698,7 +698,7 @@ mod tests {
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    /// Transposes a linear scan with an unsharded result declaration and checks the input cotangent on both devices.
+    /// Transposes a linear scan with an unsharded output declaration and checks the input cotangent on both devices.
     fn assert_transposed_scan_cotangent(
         session: &Session,
         mesh: &DeviceMesh,
@@ -709,7 +709,7 @@ mod tests {
         let input_types = program.input_types();
         let output_types = program.output_types();
         let [Type::Array(input_type)] = input_types.as_ref() else { panic!("expected one array input") };
-        let [Type::Array(output_type)] = output_types.as_ref() else { panic!("expected one array result") };
+        let [Type::Array(output_type)] = output_types.as_ref() else { panic!("expected one array output") };
         assert_eq!(output_type.sharding(), None);
         let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(transposed.input_types(), output_types);
@@ -786,7 +786,7 @@ mod tests {
     }
 
     /// Returns a scan of the given `length` over the `f64` body `(i, c, x) -> (2c + x, c)`, which appends each item `x`
-    /// to its carry as a binary digit and stacks the carry that it received, so that both of its results depend on the
+    /// to its carry as a binary digit and stacks the carry that it received, so that both of its outputs depend on the
     /// order in which its iterations visit the items. The scan takes its initial carry and its stacked items as inputs,
     /// followed by its runtime length when its length is dynamic.
     fn binary_digits_scan_program(length: Dimension, reverse: bool, unroll: usize) -> FlatProgram<Session> {
@@ -2436,7 +2436,7 @@ mod tests {
                 .unwrap()
                 .remove(0)
                 .outputs;
-            // A populated dynamic result is copied back as its compact logical elements.
+            // A populated dynamic output is copied back as its compact logical elements.
             let logical = |index: usize| {
                 let output = &outputs[index];
                 let bytes = output.copy_to_host(Some(Layout::dense_major_to_minor(2))).unwrap().r#await().unwrap();
@@ -2923,7 +2923,7 @@ mod tests {
     #[test]
     fn test_scan_operation_lower_constrains_explicit_output_shardings() {
         // The body negates each `f32[8]` row of an `f32[4, 8]` stack whose second axis is sharded over the explicit
-        // mesh axis `x`. The accumulator keeps the sharding of its slices, and the result of the scan is constrained to
+        // mesh axis `x`. The accumulator keeps the sharding of its slices, and the output of the scan is constrained to
         // the placement that its type states.
         let (client, mesh) = two_device_mesh(MeshAxisType::Explicit);
         let logical_mesh = mesh.logical_mesh().clone();
@@ -3030,13 +3030,13 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_operation_lower_constrains_results_of_mixed_explicit_and_auto_meshes() {
+    fn test_scan_operation_lower_constrains_outputs_of_mixed_explicit_and_auto_meshes() {
         // The mesh has the explicit axis `x` of size 1 and the `Auto` axis `y` of size 2. The body passes a replicated
         // carry through and negates each `f32[8]` row of an `f32[4, 8]` stack whose second axis is placed over `y` by
-        // the argument and result shardings of the module, so neither result places anything over the explicit axis
+        // the argument and result shardings of the module, so neither output places anything over the explicit axis
         // and their types record no placement over the auto axis. Their mesh has an explicit axis, though, so both
-        // results are still constrained to the placements that their types state, with the dimensions of the rank-2
-        // result left open over the auto axis.
+        // outputs are still constrained to the placements that their types state, with the dimensions of the rank-2
+        // output left open over the auto axis.
         let (client, _) = two_device_mesh(MeshAxisType::Auto);
         let logical_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap(),
@@ -4172,7 +4172,7 @@ mod tests {
     #[test]
     fn test_scan_operation_lower_frontend_execution_dynamic_count() {
         // The count value supplies the frontend's execution domain when there is no carry or stacked input. Its
-        // runtime extent controls the output allocation's logical shape, including the empty result.
+        // runtime extent controls the output allocation's logical shape, including the empty output.
         let count_type = DimensionType::new("iterations", DimensionBounds::non_negative(Some(5)).unwrap());
         let (_, program) = TracingContext::<Constant, Operation>::trace(
             |count| {

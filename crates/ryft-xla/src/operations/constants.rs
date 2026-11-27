@@ -130,7 +130,7 @@ pub(crate) fn dynamic_constructor_types(
     Ok((output_type.clone(), physical_type))
 }
 
-/// Refines one statically bounded constructor result from its compact first-class dimension operands.
+/// Refines one statically bounded constructor output from its compact first-class dimension inputs.
 pub(crate) fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
     mut result: ValueRef<'b, 'c, 't>,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -142,15 +142,15 @@ pub(crate) fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     result = refined_type.lower_layout_constraint(result, block, location)?;
     let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
-    // The dimension operands are compact (i.e., one per dynamic axis, in axis order), so advance the operand iterator
-    // only when a dynamic axis is encountered rather than indexing by the physical axis number.
-    let mut operands = input_values.iter();
+    // The dimension inputs are compact (i.e., one per dynamic axis, in axis order), so advance the input iterator only
+    // when a dynamic axis is encountered rather than indexing by the physical axis number.
+    let mut inputs = input_values.iter();
     for (axis, dimension) in output_type.shape().dimensions().iter().cloned().enumerate() {
         if !matches!(dimension, Dimension::Dynamic(_)) {
             continue;
         }
-        let operand = *operands.next().unwrap();
-        let extent = block.append_operation(stable_hlo::convert(operand, i32_scalar_type, location)?)?;
+        let input = *inputs.next().unwrap();
+        let extent = block.append_operation(stable_hlo::convert(input, i32_scalar_type, location)?)?;
         let extent = extent.result(0).unwrap().as_ref();
         let mut dimensions = refined_type.shape().dimensions().to_vec();
         dimensions[axis] = dimension;
@@ -537,7 +537,7 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
     Ok(vec![result])
 }
 
-/// Finishes a constructor whose result takes the type and the runtime shape of an exemplar. `result` must have the
+/// Finishes a constructor whose output takes the type and the runtime shape of an exemplar. `result` must have the
 /// [`physical_bound_type`] of `output_type`, because allocation uses the declared bounds. This function applies the
 /// declared memory placement and layout to that allocation, restores the logical size of every dynamic axis from
 /// `exemplar`, including zero extents, and constrains the result to the sharding that its type declares, if any.
@@ -564,7 +564,7 @@ fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
     Ok(vec![result])
 }
 
-/// Constrains the result of a nullary constructor (a zero, a one, or an iota) to the sharding that its type declares,
+/// Constrains the output of a nullary constructor (a zero, a one, or an iota) to the sharding that its type declares,
 /// if any, as the constructors with an exemplar do (refer to [`lower_like_constant`] and [`lower_exemplar_shape`]).
 /// Staging lowers a `zero_like` or an `iota_like` whose type is static to such a constructor, so without the
 /// constraint an explicitly sharded constant would rely on sharding propagation rather than keep the placement that its
@@ -585,12 +585,12 @@ fn lower_constructor_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     Ok(vec![result])
 }
 
-/// Selects the compact first-class dimension operands of a dynamic array constructor whose output axes remain
-/// dynamic. The constructor consumes one operand per dynamic axis of its declared payload type, but type inference
-/// refines every axis of a dimension identity to a static extent when one of its operands has that exact extent (e.g.,
-/// an eager dimension value). This function omits the operands of refined axes after validating them. It emits
-/// runtime assertions, through [`lower_output_extent_validation`], that every symbolic operand of a refined axis
-/// equals the refined extent.
+/// Selects the compact first-class dimension inputs of a dynamic array constructor whose output axes remain dynamic.
+/// The constructor consumes one input per dynamic axis of its declared payload type, but type inference refines every
+/// axis of a dimension identity to a static extent when one of its inputs has that exact extent (e.g., an eager
+/// dimension value). This function omits the inputs of refined axes after validating them. It emits runtime
+/// assertions, through [`lower_output_extent_validation`], that every symbolic input of a refined axis equals the
+/// refined extent.
 fn dynamic_constructor_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     name: &str,
     declared_type: &ArrayType,
@@ -641,7 +641,7 @@ fn dynamic_constructor_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         .collect())
 }
 
-/// Lowers one bounded dynamic integer-valued array constructor from its compact first-class dimension operands.
+/// Lowers one bounded dynamic integer-valued array constructor from its compact first-class dimension inputs.
 fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
     name: &str,
     integer_value: i64,
@@ -1183,7 +1183,7 @@ mod tests {
             let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).with_memory(memory);
 
             // The fill literal is uploaded to the requested memory, but XLA's CUDA compiler cannot take it from
-            // unpinned host memory as the argument of the program that broadcasts it.
+            // unpinned host memory as the input of the program that broadcasts it.
             if client.platform_name().unwrap().eq_ignore_ascii_case("cuda")
                 && memory == (Memory::Host { pinned: false })
             {
@@ -1623,7 +1623,7 @@ mod tests {
 
     #[test]
     fn test_lower_like_constant_executes_with_constructed_exemplar() {
-        // The exemplar's runtime extent comes from another dynamic constructor rather than from an entry argument.
+        // The exemplar's runtime extent comes from another dynamic constructor rather than from an entry input.
         // `zero_like(zero)` also equals the `zero` output, which XLA merges into one bounded dynamic buffer. Each
         // output must nevertheless report its own logical extent.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(5)).unwrap());
@@ -1815,7 +1815,7 @@ mod tests {
     #[test]
     fn test_lower_exemplar_shape_executes_dynamic_shape() {
         // One compiled program serves every runtime extent of the exemplar, including an empty one, and the
-        // exemplar's elements never reach the results.
+        // exemplar's elements never reach the outputs.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(5)).unwrap());
         let exemplar_type = ArrayType::new(DataType::F64, Shape::new(vec![rows.into(), Dimension::Static(2)]));
         let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
@@ -2026,7 +2026,7 @@ mod tests {
 
     #[test]
     fn test_lower_dynamic_constructor_distinct_symbolic_peers() {
-        // Distinct operands that share a symbolic identity are equal by construction because entry refinements
+        // Distinct inputs that share a symbolic identity are equal by construction because entry refinements
         // validate identities shared by boundary inputs. Both axes therefore stay dynamic without any assertion.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
@@ -2080,8 +2080,8 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_dynamic_constructor_shared_symbolic_operand() {
-        // Reusing one operand for every axis of a symbolic identity needs no assertion either.
+    fn test_lower_dynamic_constructor_shared_symbolic_input() {
+        // Reusing one input for every axis of a symbolic identity needs no assertion either.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
         let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
@@ -2128,7 +2128,7 @@ mod tests {
 
     #[test]
     fn test_lower_dynamic_constructor_exact_extents() {
-        // Exact operands refine every axis to their static extent and prove it, so they need no assertion and do not
+        // Exact inputs refine every axis to their static extent and prove it, so they need no assertion and do not
         // reach the lowered constructor.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.into()]));
@@ -2162,8 +2162,8 @@ mod tests {
 
     #[test]
     fn test_lower_dynamic_constructor_mixed_repeated_extents() {
-        // An exact operand makes both repeated axes static, but the symbolic peer must still equal that extent. The
-        // constructors share the mixed boundary and cover both operand orders.
+        // An exact input makes both repeated axes static, but the symbolic peer must still equal that extent. The
+        // constructors share the mixed boundary and cover both input orders.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![size.clone().into(), size.clone().into()]));
         let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
@@ -2246,8 +2246,8 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_dynamic_constructor_mixed_repeated_extents_shared_symbolic_operand() {
-        // A symbolic operand repeated across axes refined to the same extent needs only one assertion.
+    fn test_lower_dynamic_constructor_mixed_repeated_extents_shared_symbolic_input() {
+        // A symbolic input repeated across axes refined to the same extent needs only one assertion.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let output_type = ArrayType::new(
             DataType::F64,

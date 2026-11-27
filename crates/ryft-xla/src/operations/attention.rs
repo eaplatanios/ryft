@@ -282,7 +282,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 self.dropout(),
                 fused_attention_sliding_window_length(self),
             );
-            // The operand order matches the operand order of the boundary exactly, so the bias sits after the value and
+            // The operand order matches the input order of the boundary exactly, so the bias sits after the value and
             // the `i32[batch]` sequence lengths trail. The workspace result is declared at size zero, because the
             // compiler resizes it as needed, and the training form inserts the `f32[b, n, t]` log-sum-exp residual
             // before it.
@@ -499,7 +499,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
             let residual = block.append_operation(stable_hlo::transpose(residual_input, &[0, 2, 1], location)?)?;
             let residual = residual.result(0).unwrap().as_ref();
             // The kernel call order `(Q, K, V, residual, dO[, bias], O[, q_seqlen, kv_seqlen])` differs from the
-            // operand order of the boundary, and places the bias between the output cotangent and the forward output.
+            // input order of the boundary, and places the bias between the output cotangent and the forward output.
             let mut operands =
                 vec![physical_inputs[0], physical_inputs[1], physical_inputs[2], residual, physical_inputs[offset + 2]];
             let mut operand_layouts =
@@ -824,7 +824,7 @@ fn fused_attention_eligibility(
     Ok(FmhaEligibility::Eligible)
 }
 
-/// Canonical operand indices of one attention boundary.
+/// Canonical input indices of one attention boundary.
 fn attention_input_indices(input_structure: AttentionInputs<Placeholder>) -> AttentionInputs<usize> {
     AttentionInputs::from_parameters(input_structure, 0..input_structure.parameter_count()).unwrap()
 }
@@ -1332,8 +1332,8 @@ mod tests {
     #[test]
     fn test_select_attention_implementation_fused_unavailable() {
         // Requesting the fused kernels for calls that they cannot implement reports why instead of silently lowering
-        // the portable body (e.g., `f32` operands on CUDA, any operands without a CUDA target, a dropout state, an
-        // empty head dimension or key/value sequence, or a padded right local window).
+        // the portable body (e.g., `f32` inputs on CUDA, any inputs without a CUDA target, a dropout state, an empty
+        // head dimension or key/value sequence, or a padded right local window).
         let fused = AttentionConfiguration::new()
             .with_scale(0.125)
             .with_causal(true)
@@ -1737,8 +1737,8 @@ mod tests {
         assert!(module.contains("stablehlo.exponential"));
         assert!(!module.contains("__cudnn$fmha"));
 
-        // `f32` operands, unaligned head dimensions, and `f8` operands do not qualify for the fused kernels, so even
-        // CUDA targets lower the portable body, which converts narrow operands for its `f32` softmax.
+        // `f32` inputs, unaligned head dimensions, and `f8` inputs do not qualify for the fused kernels, so even CUDA
+        // targets lower the portable body, which converts narrow inputs for its `f32` softmax.
         for (data_type, head_dimension) in [(DataType::F32, 8), (DataType::BF16, 4), (DataType::F8E4M3FN, 8)] {
             let input_types = vec![attention_array_type(data_type, &[1, 4, 2, head_dimension]); 3];
             let program = forward_program(

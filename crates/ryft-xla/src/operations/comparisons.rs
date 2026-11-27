@@ -3,7 +3,7 @@ use ryft_core::{ArrayType, CompareOperation, DataType, ProgramError};
 use ryft_mlir::ValueRef;
 
 use crate::lowering::types::{ComparisonDirectionLoweringExtension, lower_signed_one_bit_to_mlir};
-use crate::operations::normalize_binary_elementwise_operands;
+use crate::operations::normalize_binary_elementwise_inputs;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
 
 impl LowerableOperation for CompareOperation<ArrayType> {
@@ -27,7 +27,7 @@ impl LowerableOperation for CompareOperation<ArrayType> {
         if operand_type.data_type() == DataType::I1 {
             operand_type = operand_type.with_data_type(DataType::I8);
         }
-        let [left, right] = normalize_binary_elementwise_operands(
+        let [left, right] = normalize_binary_elementwise_inputs(
             &inputs,
             &[operand_type],
             &mut lowerer.block(),
@@ -59,7 +59,7 @@ impl LowerableOperation for CompareOperation<Type> {
     }
 }
 
-/// Returns the promoted numeric operand descriptor for one comparison result descriptor.
+/// Returns the promoted numeric operand descriptor for one comparison output descriptor.
 fn comparison_operand_type(input_types: &[ArrayType], output_types: &[ArrayType]) -> Result<ArrayType, Error> {
     check_count!("input", input_types, 2, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_comparison_operand_type() {
-        // The operands compare at their promoted data type, with the shape of the result.
+        // The inputs compare at their promoted data type, with the shape of the output.
         assert_eq!(
             comparison_operand_type(
                 &[ArrayType::new_static(DataType::I8, [2]), ArrayType::new_static(DataType::I32, [2])],

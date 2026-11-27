@@ -6,7 +6,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::operations::{normalize_binary_elementwise_operands, normalize_elementwise_operand};
+use crate::operations::{normalize_binary_elementwise_inputs, normalize_elementwise_input};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for MaxOperation<ArrayType> {
@@ -18,7 +18,7 @@ impl LowerableOperation for MaxOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = input_types;
-        let [left, right] = normalize_binary_elementwise_operands(
+        let [left, right] = normalize_binary_elementwise_inputs(
             input_values,
             output_types,
             &mut lowerer.block(),
@@ -50,7 +50,7 @@ impl LowerableOperation for MinOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = input_types;
-        let [left, right] = normalize_binary_elementwise_operands(
+        let [left, right] = normalize_binary_elementwise_inputs(
             input_values,
             output_types,
             &mut lowerer.block(),
@@ -85,7 +85,7 @@ impl LowerableOperation for ClampOperation<ArrayType> {
         check_count!("input", input_values, 3, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let output_type = &output_types[0];
-        let input = normalize_elementwise_operand(
+        let input = normalize_elementwise_input(
             input_values[1],
             output_type,
             &mut lowerer.block(),
@@ -100,7 +100,7 @@ impl LowerableOperation for ClampOperation<ArrayType> {
             // lowerings below propagate the NaNs of the input and of both bounds, order the signed zeros, and order
             // complex values lexicographically like the reference backend.
             let [lower, upper] = [input_values[0], input_values[2]].map(|bound| {
-                normalize_elementwise_operand(
+                normalize_elementwise_input(
                     bound,
                     output_type,
                     &mut lowerer.block(),
@@ -130,7 +130,7 @@ impl LowerableOperation for ClampOperation<ArrayType> {
         for bound in &mut bounds {
             let is_scalar = bound.r#type()?.cast::<TensorTypeRef>().is_some_and(|r#type| r#type.rank() == 0);
             let bound_type = if is_scalar { ArrayType::scalar(output_type.data_type()) } else { output_type.clone() };
-            *bound = normalize_elementwise_operand(
+            *bound = normalize_elementwise_input(
                 *bound,
                 &bound_type,
                 &mut lowerer.block(),
@@ -364,9 +364,9 @@ mod tests {
 
     use super::*;
 
-    /// Uploads complex operands whose lexicographic order is decided by the real components, by the imaginary
+    /// Uploads complex inputs whose lexicographic order is decided by the real components, by the imaginary
     /// components, by signed zeros that compare equal, and by NaN payloads in either component.
-    fn complex_operands(session: &Session, mesh: &DeviceMesh) -> ([Complex<f32>; 5], [Complex<f32>; 5], Array, Array) {
+    fn complex_inputs(session: &Session, mesh: &DeviceMesh) -> ([Complex<f32>; 5], [Complex<f32>; 5], Array, Array) {
         let left = [
             Complex::new(1f32, 100.0),
             Complex::new(1.0, 2.0),
@@ -386,10 +386,10 @@ mod tests {
         (left, right, left_array, right_array)
     }
 
-    /// Uploads `f32` operands whose order is decided by their values, by signed zeros that compare equal in both
-    /// operand orders and with equal signs, by a NaN payload in the left operand, in the right operand, and in both,
-    /// and by equal infinities.
-    fn real_operands(session: &Session, mesh: &DeviceMesh) -> (Array, Array) {
+    /// Uploads `f32` inputs whose order is decided by their values, by signed zeros that compare equal in both input
+    /// orders and with equal signs, by a NaN payload in the left input, in the right input, and in both, and by equal
+    /// infinities.
+    fn real_inputs(session: &Session, mesh: &DeviceMesh) -> (Array, Array) {
         let left = [
             1f32,
             3.0,
@@ -433,7 +433,7 @@ mod tests {
         // Floating-point maxima order negative zero below positive zero in both operand orders, keep the sign of
         // equal zeros, and propagate a NaN of either operand with its payload, preferring the left one. Exact byte
         // comparisons check the signs of the zeros and the payloads.
-        let (left, right) = real_operands(&session, &mesh);
+        let (left, right) = real_inputs(&session, &mesh);
         assert_eq!(
             left.max(&right).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[
@@ -459,7 +459,7 @@ mod tests {
 
         // Complete operands compare lexicographically, and ties and unordered comparisons select the right operand.
         // Exact byte comparisons also check signed zeros and NaN payloads in both operand orders.
-        let (left, right, left_array, right_array) = complex_operands(&session, &mesh);
+        let (left, right, left_array, right_array) = complex_inputs(&session, &mesh);
         assert_eq!(
             left_array.max(&right_array).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[right[0], right[1], right[2], right[3], right[4]]),
@@ -500,7 +500,7 @@ mod tests {
 
         // Floating-point minima order negative zero below positive zero in both operand orders, keep the sign of
         // equal zeros, and propagate a NaN of either operand with its payload, preferring the left one.
-        let (left, right) = real_operands(&session, &mesh);
+        let (left, right) = real_inputs(&session, &mesh);
         assert_eq!(
             left.min(&right).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[
@@ -526,7 +526,7 @@ mod tests {
 
         // Complete operands compare lexicographically, and ties and unordered comparisons select the right operand.
         // Exact byte comparisons also check signed zeros and NaN payloads in both operand orders.
-        let (left, right, left_array, right_array) = complex_operands(&session, &mesh);
+        let (left, right, left_array, right_array) = complex_inputs(&session, &mesh);
         assert_eq!(
             left_array.min(&right_array).unwrap().copy_to_host_bytes().unwrap(),
             values_to_bytes(&[left[0], left[1], right[2], right[3], right[4]]),
@@ -640,10 +640,10 @@ mod tests {
             ArrayType::new_static(DataType::F32, [10]).with_sharding(sharding).unwrap()
         };
 
-        // Each device holds the operands of `real_operands`, in both orders, so that executions check the signed zeros
-        // and the NaN payloads of the extremum of every device against those of the same operation on values without
+        // Each device holds the inputs of `real_inputs`, in both orders, so that executions check the signed zeros and
+        // the NaN payloads of the extremum of every device against those of the same operation on values without
         // reduction state, at the top level of a compiled function, in the body of a `scan`, and in a called function.
-        let (left, right) = real_operands(&session, &single_device_mesh);
+        let (left, right) = real_inputs(&session, &single_device_mesh);
         let (left, right) = (left.copy_to_host_bytes().unwrap(), right.copy_to_host_bytes().unwrap());
         let contributions = [[left.clone(), right.clone()], [right, left]];
         let mut outcomes = Vec::new();
@@ -828,7 +828,7 @@ mod tests {
         );
         assert_eq!(zeros.clamp(&zero, &upper).unwrap().copy_to_host_bytes().unwrap(), values_to_bytes(&[0.5f32, 0.0]));
 
-        // Array bounds broadcast to the result.
+        // Array bounds broadcast to the output.
         let bounds =
             replicated_array(&session, &mesh, DataType::F32, &[4], values_to_bytes(&[0f32, 1.0, 2.0, 3.0]).as_slice());
         assert_eq!(

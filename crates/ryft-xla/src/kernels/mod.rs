@@ -172,7 +172,7 @@ pub const ROCM_KERNEL_CUSTOM_CALL_TARGET: &str = "ryft.kernel.rocm";
 ///
 /// [`CompiledKernel`] independently validates the logical signature, operation-local aliases, and effects, adds
 /// semantic and compiler identity, and discharges only the reference state that the definition proves local. A bridge
-/// cannot request external reference state slots or alter the kernel's logical inputs and results. An embedding
+/// cannot request external reference state slots or alter the kernel's logical inputs and outputs. An embedding
 /// implementing native checked assertions must return precisely [`EffectClass::OrderedAssertion`], preserving their
 /// token chain, because a pure call cannot discharge or silently discard an observable assertion.
 pub trait KernelOutputEmbedding<Output, Extension: Operation<Type = Type> = NoKernelExtension> {
@@ -256,7 +256,7 @@ where
             }
         }
         let mut custom_call = embedding.custom_call(kernel, output)?;
-        // An assertion is observable even when every array result is unused. A trusted embedding must implement
+        // An assertion is observable even when every array output is unused. A trusted embedding must implement
         // that exact effect with its native handler and preserve the canonical assertion token chain.
         if custom_call.effect_class() != required_effect {
             return Err(KernelEmbeddingError::UnsupportedEffect {
@@ -268,7 +268,7 @@ where
         let actual = custom_call.output_types().iter().cloned().map(Type::Array).collect::<Vec<_>>();
         if actual != expected {
             return Err(KernelEmbeddingError::Invalid {
-                message: "compiler output types differ from the logical kernel results".to_owned(),
+                message: "compiler output types differ from the logical kernel outputs".to_owned(),
             });
         }
         let aliases = custom_call
@@ -341,8 +341,8 @@ where
 
     /// Binds the selected call through ordinary staging or an existing compilation domain after checking the inputs
     /// against the kernel signature. The inputs may be placed, like those of the kernel call that this call replaces
-    /// (refer to [`KernelCallOperation`](ryft_kernels::KernelCallOperation)), and the results have the types that the
-    /// kernel call infers for them. External reference state arguments are absent, and all operands and outputs are
+    /// (refer to [`KernelCallOperation`](ryft_kernels::KernelCallOperation)), and the outputs have the types that the
+    /// kernel call infers for them. External reference state inputs are absent, and all inputs and outputs are
     /// ordinary array values.
     pub fn bind<C>(&self, context: &C, inputs: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
     where
@@ -357,17 +357,17 @@ where
 /// Returns the physical `custom_call` that a compiler embedding selected for the kernel call `operation`, declared for
 /// a call on inputs of `input_types`, which may be placed.
 ///
-/// The result of a read-write parameter is the storage of its input, and a custom call requires an aliased result to
-/// have exactly the type of the input that it aliases. A kernel call types that result accordingly, so the returned
-/// call declares every aliased result with the type of its input. Every other result keeps its physical declaration,
+/// The output of a read-write parameter is the storage of its input, and a custom call requires an aliased output to
+/// have exactly the type of the input that it aliases. A kernel call types that output accordingly, so the returned
+/// call declares every aliased output with the type of its input. Every other output keeps its physical declaration,
 /// from which a custom call infers the same type as the kernel call. The returned call is checked by inferring its
-/// results on `input_types` and comparing them with those of the kernel call, so a selected call always has the
-/// result types of the call that it replaces.
+/// outputs on `input_types` and comparing them with those of the kernel call, so a selected call always has the
+/// output types of the call that it replaces.
 ///
 /// # Errors
 ///
 /// Returns the [`TypeError`] of [`KernelCallOperation::output_types_for`](ryft_kernels::KernelCallOperation) for
-/// inputs that the kernel call rejects, and a [`TypeError`] when the custom call infers other result types than the
+/// inputs that the kernel call rejects, and a [`TypeError`] when the custom call infers other output types than the
 /// kernel call.
 pub(crate) fn placed_custom_call(
     operation: &ryft_kernels::KernelCallOperation,
@@ -412,7 +412,7 @@ pub(crate) fn placed_custom_call(
     };
     if Operation::infer_output_types(&placed, &array_types(input_types), &[])? != array_types(&logical) {
         return Err(TypeError::invalid(
-            "selected kernel custom call does not have the result types of the kernel call that it replaces",
+            "selected kernel custom call does not have the output types of the kernel call that it replaces",
         ));
     }
     Ok(placed)
@@ -983,7 +983,7 @@ pub(crate) mod tests {
         assert!(matches!(
             CompiledKernel::from_output(&verified, b"config", &(), &FixedEmbedding(changed_output)),
             Err(KernelEmbeddingError::Invalid { message })
-                if message == "compiler output types differ from the logical kernel results",
+                if message == "compiler output types differ from the logical kernel outputs",
         ));
         let empty_target = CustomCallOperation::new("", vec![scalar.clone()]).with_input_output_alias(0, 0).unwrap();
         assert!(matches!(
@@ -1040,7 +1040,7 @@ pub(crate) mod tests {
             ProgramError::Type(TypeError::invalid("`kernel_call` input types do not match its logical signature")),
         );
 
-        // A placed input binds too. The result aliases the input, so the custom call declares it with the type of the
+        // A placed input binds too. The output aliases the input, so the custom call declares it with the type of the
         // input, whether that is replicated on a mesh or a local shard that varies along a manual axis, and the
         // traced program is well typed only if the call accepts its own alias.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Manual).unwrap()]).unwrap();

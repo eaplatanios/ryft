@@ -9,8 +9,8 @@
 //! `stablehlo.while` condition region cannot thread, and for a bounded loop, whose condition must not run once the
 //! bound is reached. A threaded predicate is evaluated once before the loop and once after each body run, while the
 //! pure condition of an unbounded loop with a scalar predicate is evaluated in the condition region directly. An entry
-//! guard checks the input relationships that the actual input types leave unproven before the loop, the results are
-//! normalized to the refined output types of the loop, and results whose types place them over explicit mesh axes are
+//! guard checks the input relationships that the actual input types leave unproven before the loop, the outputs are
+//! normalized to the refined output types of the loop, and outputs whose types place them over explicit mesh axes are
 //! constrained to that placement. Reference state is discharged before lowering.
 
 use ryft_core::{
@@ -303,7 +303,7 @@ impl LowerableOperation for WhileOperation<Type> {
                     .map(|((candidate, carried), state_type)| {
                         // A first-class dimension carry is loop invariant under a batched predicate, which is the
                         // contract that `WhileType` documents, so masking it is the identity and the body's candidate
-                        // result is threaded on directly. This matches eager interpretation, whose `select` returns
+                        // output is threaded on directly. This matches eager interpretation, whose `select` returns
                         // equal dimension carries unchanged.
                         if matches!(state_type, Type::Dimension(_)) {
                             return Ok(candidate);
@@ -1338,7 +1338,7 @@ mod tests {
     fn test_while_operation_lower_batched_predicate_passes_loop_invariant_dimensions() {
         // A loop with a batched predicate may also carry a first-class dimension, which the relaxed `WhileType`
         // contract requires to be loop invariant. Masking a carry that is loop invariant is the identity, so the
-        // lowering threads the body's dimension result on directly. Only the array carry gets a `stablehlo.select`,
+        // lowering threads the body's dimension output on directly. Only the array carry gets a `stablehlo.select`,
         // while the condition region still `or`-reduces the batched predicate into the scalar continuation decision.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
@@ -1436,7 +1436,7 @@ mod tests {
     #[test]
     fn test_while_operation_lower_constrains_explicit_output_shardings() {
         // The body negates an `f32[8]` vector sharded over the explicit mesh axis `x` while it counts its iterations up
-        // to a replicated limit. Each result of the loop is constrained to the placement that its type states.
+        // to a replicated limit. Each output of the loop is constrained to the placement that its type states.
         let (client, mesh) = two_device_mesh(MeshAxisType::Explicit);
         let scalar_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let vector_sharding =

@@ -4,8 +4,8 @@
 //!
 //! [`ProgramLoweringExtension`] lowers a staged program over any [`LowerableOperationFamily`].
 //! [`ProgramLoweringExtension::to_rendered_mlir`] renders the module according to its [`ProgramLoweringOptions`]. The
-//! default options read the entry signature from the global input and output types of the program, pass the arrays
-//! that the program imports as hidden arguments that precede its inputs, and prune the program first. Other options
+//! default options read the entry signature from the global input and output types of the program, pass the arrays that
+//! the program imports as hidden inputs that precede its public inputs, and prune the program first. Other options
 //! replace those types, attach `sdy.sharding` attributes to the arguments and results of the entry function, or lower
 //! the program as it is.
 //! [`ProgramLoweringExtension::to_mlir`] returns the [`MlirProgram`], which pairs the module with what executing it
@@ -73,7 +73,7 @@ pub enum LoweringError {
     #[error("missing captured constant #{index} during XLA lowering")]
     MissingCapturedConstant { index: usize },
 
-    /// A session constant appears where no hidden argument of the entry function is reachable (e.g., inside a
+    /// A session constant appears where no hidden input of the entry function is reachable (e.g., inside a
     /// `shard_map` body or a shared private function).
     #[error("session constant `{constant}` cannot be referenced in this lowering scope")]
     UnreachableSessionConstant { constant: String },
@@ -179,15 +179,16 @@ pub(crate) mod reductions;
 pub(crate) mod regions;
 /// Lowering of logical meshes, shardings, and sharding constraints to Shardy.
 pub(crate) mod sharding;
-/// Logical and physical signatures of lowered XLA executables.
-pub(crate) mod signatures;
 /// Module-scoped lowering state shared across nested regions.
 pub(crate) mod states;
 /// Shared StableHLO type, constant, and dynamic-dimension lowering helpers.
 pub(crate) mod types;
 
 pub use admission::DataDependentPaddingDiscipline;
-pub use programs::{EntryShardingOverride, MlirProgram, ProgramLoweringExtension, ProgramLoweringOptions};
+pub use programs::{
+    EntryShardingOverride, InputDimension, MlirProgram, MlirProgramSignature, OutputDimension,
+    ProgramLoweringExtension, ProgramLoweringOptions,
+};
 pub use sharding::{
     LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension, UnreducedKindExtension,
 };
@@ -293,7 +294,7 @@ pub struct Lowerer<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type> = Operation
     /// Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
     nested_functions: Option<Rc<CallFunctionMap<O>>>,
 
-    /// Hidden capture arguments of the function currently being lowered, in capture-table order.
+    /// Hidden capture inputs of the function currently being lowered, in capture-table order.
     captured_values: Vec<ValueRef<'b, 'c, 't>>,
 
     /// Current per-class effect tokens of the lowering scope this lowerer emits into.
@@ -335,7 +336,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
         self
     }
 
-    /// Attaches the hidden capture arguments of the function currently being lowered.
+    /// Attaches the hidden capture inputs of the function currently being lowered.
     pub(crate) fn with_captured_values(mut self, captured_values: &[ValueRef<'b, 'c, 't>]) -> Self {
         self.captured_values = captured_values.to_vec();
         self
@@ -605,7 +606,7 @@ pub trait LowerableOperation: CoreOperation {
     /// Returns, for each input of `callee`, the callee of a `call` of this family whose first `capture_count`
     /// inputs are its lifted captures, whether it is a capture that the callee never reads when it is lowered for
     /// `target_platform`, or [`None`] when every input counts as read. The lowering of the call passes a value that
-    /// requires no buffer in place of such a capture, and the function that makes the call reads the operand only
+    /// requires no buffer in place of such a capture, and the function that makes the call reads the input only
     /// where the callee reads it. Only a family knows the regions of its callees, so this function is asked of the
     /// family. It returns [`None`] unless a family overrides it, and [`Operation`] answers from the regions that its
     /// lowering emits.
@@ -790,7 +791,7 @@ pub(crate) fn current_or_new_token<'b, 'c: 'b, 't: 'c>(
     Ok(created)
 }
 
-/// Value type that lowering can materialize as a StableHLO dense constant or bind to a captured argument (e.g., the
+/// Value type that lowering can materialize as a StableHLO dense constant or bind to a captured input (e.g., the
 /// values of [`ArrayOperation`](ryft_core::ArrayOperation) constants).
 pub(crate) trait MlirLowerableValue: 'static + Value<Type = ArrayType> {
     /// Builds a dense-elements attribute containing this value.
@@ -881,7 +882,7 @@ impl MlirLowerableValue for ArrayConstant {
 }
 
 // `ArrayType` is used as the value representation for abstract linear XLA programs. It can type program atoms, but it
-// is not a concrete literal, so lowering paths that need a real value must supply it through captured arguments instead
+// is not a concrete literal, so lowering paths that need a real value must supply it through captured inputs instead
 // of materializing it from type metadata.
 impl MlirLowerableValue for ArrayType {
     fn to_dense_elements_attribute<'c, 't>(
@@ -1553,8 +1554,8 @@ pub(crate) mod tests {
                     // Dimension outputs and the trailing hidden runtime extents are `i64` scalars.
                     return Ok(MixedValue::Dimension(values_from_bytes::<i64>(bytes.as_slice())[0]));
                 }
-                // A populated dynamic result is copied back as its compact logical elements, while an empty logical
-                // result may still carry its backing allocation and trailing size metadata, which are ignored.
+                // A populated dynamic output is copied back as its compact logical elements, while an empty logical
+                // output may still carry its backing allocation and trailing size metadata, which are ignored.
                 let logical = output.unpadded_dimensions()?.to_vec();
                 let element_count = logical.iter().product::<u64>() as usize;
                 if data_type == Some(DataType::I32) {
@@ -1632,7 +1633,7 @@ pub(crate) mod tests {
         )
     }
 
-    /// Builds a one-instruction program applying the given single-operand operation to an input of the given data
+    /// Builds a one-instruction program applying the given single-input operation to an input of the given data
     /// type and dimensions, and returns the result of lowering it to a rendered StableHLO module.
     pub(crate) fn lowered_unary_module(
         operation: ArrayOperation<ArrayConstant>,

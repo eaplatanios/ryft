@@ -12,7 +12,7 @@ impl LowerableOperation for TagOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (lowerer, input_types, output_types);
-        // `tag` only affects rematerialization policies, so by lowering time it is the identity and the operand is
+        // `tag` only affects rematerialization policies, so by lowering time it is the identity and the input is
         // forwarded without emitting any MLIR operation.
         if input_values.len() != 1 {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
@@ -34,8 +34,8 @@ mod tests {
 
     #[test]
     fn test_tag_operation_lower() {
-        // A tag is the identity by lowering time, so it forwards its operand without emitting anything, and it takes
-        // exactly one operand.
+        // A tag is the identity by lowering time, so it forwards its input without emitting anything, and it takes
+        // exactly one input.
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
         let scalar_type = ArrayType::scalar(DataType::F32);

@@ -25,10 +25,10 @@ pub trait ComparisonDirectionLoweringExtension {
 
     /// Lowers one comparison of two values in this direction to a single `stablehlo.compare`. This serves
     /// [`CompareOperation`](ryft_core::CompareOperation) lowerings, scalar dimension comparisons, and the comparisons
-    /// inside of combiner and comparator bodies. Both operands must already share one tensor type, because this
-    /// function neither promotes nor broadcasts them, and the result has their shape with a Boolean element type. The
-    /// comparison type (i.e., `FLOAT`, `SIGNED`, or `UNSIGNED`) follows the element type of the left-hand side input,
-    /// as [`stable_hlo::ComparisonType::for_type`] describes.
+    /// inside of combiner and comparator bodies. Both inputs must already share one tensor type, because this function
+    /// neither promotes nor broadcasts them, and the output has their shape with a Boolean element type. The comparison
+    /// type (i.e., `FLOAT`, `SIGNED`, or `UNSIGNED`) follows the element type of the left-hand side input, as
+    /// [`stable_hlo::ComparisonType::for_type`] describes.
     fn lower_comparison<'b, 'c: 'b, 't: 'c>(
         self,
         left: ValueRef<'b, 'c, 't>,
@@ -64,14 +64,14 @@ impl ComparisonDirectionLoweringExtension for ComparisonDirection {
     }
 }
 
-/// Validates that a program compiled for `target_platform` can take its arguments from `memory` and return its
-/// results in it.
+/// Validates that a program compiled for `target_platform` can take its inputs from `memory` and return its outputs
+/// in it.
 ///
 /// XLA's CUDA compiler does not place values in unpinned host memory, although its plugin can hold buffers there. It
-/// reads an argument that is declared in that memory from device memory, and it returns a result that is declared in
-/// that memory in device memory or, after a transfer, in pinned host memory. A program with such a boundary would
-/// therefore reject its actual arguments and mislabel its results, so it is rejected here instead. Values inside a
-/// program are not affected, because the compiler treats pinned and unpinned host memory alike there.
+/// reads an input that is declared in that memory from device memory, and it returns an output that is declared in that
+/// memory in device memory or, after a transfer, in pinned host memory. A program with such a boundary would therefore
+/// reject its actual inputs and mislabel its outputs, so it is rejected here instead. Values inside a program are not
+/// affected, because the compiler treats pinned and unpinned host memory alike there.
 ///
 /// # Errors
 ///
@@ -113,8 +113,8 @@ pub trait MemoryLoweringExtension {
     /// validation retain the distinction at runtime boundaries. A plugin must expose the requested memory kind for
     /// native allocation.
     ///
-    /// Placement does not affect the MLIR tensor type, so the result type is the operand's type unchanged. Identity
-    /// transfers (i.e., transfers whose destination equals the operand's current space) still lower to the annotation,
+    /// Placement does not affect the MLIR tensor type, so the output type is the input's type unchanged. Identity
+    /// transfers (i.e., transfers whose destination equals the input's current space) still lower to the annotation,
     /// because placement round trips are meaningful to `HostOffloader` and must not be optimized away here.
     fn lower_transfer<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
         self,
@@ -403,7 +403,7 @@ impl DimensionValueLoweringExtension for DimensionValue {
 
 impl Constant {
     /// Lowers this traced constant atom to a StableHLO value and returns it. A captured constant forwards the hidden
-    /// capture argument that carries its runtime value, and a session constant forwards the hidden entry argument that
+    /// capture input that carries its runtime value, and a session constant forwards the hidden entry input that
     /// `lowering_state` assigns to it, while an immediate dimension extent is materialized in place. The latter is
     /// exactly what makes extents usable inside a `shard_map` manual region, where no capture table is reachable.
     pub(crate) fn lower<'b, 'c: 'b, 't: 'c, B, L>(
@@ -1422,7 +1422,7 @@ mod tests {
 
     #[test]
     fn test_constant_lower() {
-        // A captured constant forwards its capture argument, while dimension extents and Boolean predicates are
+        // A captured constant forwards its capture input, while dimension extents and Boolean predicates are
         // materialized in place.
         let context = MlirContext::new();
         let location = context.unknown_location();

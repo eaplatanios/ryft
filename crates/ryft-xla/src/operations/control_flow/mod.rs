@@ -260,12 +260,12 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     Ok(value)
 }
 
-/// Converts the lowered values of the results of one control flow instruction from the `region_output_types` that its
+/// Converts the lowered values of the outputs of one control flow instruction from the `region_output_types` that its
 /// lowering produced them at to the instruction's `output_types`, which refine them as
 /// `refine_control_flow_output_types` in `ryft-core` computes them. This is the inverse of
-/// [`lower_refined_region_input`]. Refinements only replace dynamic dimensions with static extents, so a result is
+/// [`lower_refined_region_input`]. Refinements only replace dynamic dimensions with static extents, so an output is
 /// exposed as its full physical buffer, sliced to the static extent of every refined axis, and then given back the
-/// runtime size of every axis that stays dynamic with `stablehlo.set_dimension_size`. Results whose types the
+/// runtime size of every axis that stays dynamic with `stablehlo.set_dimension_size`. Outputs whose types the
 /// instruction does not refine are returned unchanged.
 pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
     values: Vec<ValueRef<'b, 'c, 't>>,
@@ -344,7 +344,7 @@ pub(crate) trait ControlFlowRegionLoweringExtension<O: LowerableOperationFamily>
     ///
     /// `entry_effect_tokens` are the active tokens of each effect class in the enclosing scope, which the region
     /// references through StableHLO's implicit region capture. This is the same mechanism that feeds `input_values`
-    /// into `stablehlo.if` branches. Ordinary results are converted to `output_types` before the region returns one
+    /// into `stablehlo.if` branches. Ordinary outputs are converted to `output_types` before the region returns one
     /// trailing token for each class in `threaded_effects`, in canonical effect order. A branch that is pure for one of
     /// those classes returns that class's incoming token unchanged. `threaded_effects` must cover every ordered class
     /// whose token the lowering of this program advances, as [`lowered_effect_classes`] computes them. The region
@@ -396,8 +396,8 @@ impl<O: LowerableOperationFamily> ControlFlowRegionLoweringExtension<O> for Flat
                 &mut region_effect_tokens,
             )?;
             validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, threaded_effects)?;
-            // Normalize ordinary results before appending tokens so both conditional branches return the instruction's
-            // common refined shapes even when their declared dynamic and static result types differ.
+            // Normalize ordinary outputs before appending tokens so both conditional branches return the instruction's
+            // common refined shapes even when their declared dynamic and static output types differ.
             outputs = lower_refined_region_outputs(
                 outputs,
                 &self.output_types(),
@@ -491,10 +491,10 @@ pub(crate) fn threaded_effect_token_values<'b, 'c: 'b, 't: 'c>(
 
 /// Constrains each of the lowered `outputs` of a control flow operation whose array type in `output_types` carries a
 /// sharding over a mesh with at least one `Explicit` axis to that sharding with `sdy.sharding_constraint`, and returns
-/// the constrained values. This includes results that such a sharding replicates or shards only over the `Auto` axes of
-/// that mesh. Nothing inside a region needs to pin the placement of a result over a mesh with explicit axes (e.g., a
-/// region may return a replicated constant), so propagation could otherwise assign the result a placement other than
-/// the one that its type states. Results without a sharding, results whose mesh has no explicit axis (e.g., only `Auto`
+/// the constrained values. This includes outputs that such a sharding replicates or shards only over the `Auto` axes of
+/// that mesh. Nothing inside a region needs to pin the placement of an output over a mesh with explicit axes (e.g., a
+/// region may return a replicated constant), so propagation could otherwise assign the output a placement other than
+/// the one that its type states. Outputs without a sharding, outputs whose mesh has no explicit axis (e.g., only `Auto`
 /// or `Manual` axes), references, and first-class dimensions remain unconstrained. Mesh axes in `bound_manual_axes`,
 /// which enclosing manual regions bind, are excluded from the constraints that [`ShardingExtension::lower_sharding_constraint`]
 /// emits.
@@ -810,8 +810,8 @@ mod tests {
 
     #[test]
     fn test_lower_refined_region_outputs() {
-        // A result of the bounded dynamic region output type `f64[rows]` that the instruction refines to `f64[3]` is
-        // sliced to the static extent, while a result whose type the instruction does not refine is returned
+        // An output of the bounded dynamic region output type `f64[rows]` that the instruction refines to `f64[3]` is
+        // sliced to the static extent, while an output whose type the instruction does not refine is returned
         // unchanged.
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();

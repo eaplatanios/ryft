@@ -384,7 +384,7 @@ impl LowerableOperation for DynamicSliceOperation<Type> {
 /// Physical lowering plan for one axis of a first-class dynamic shape slice.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct DynamicSliceAxisPlan {
-    /// Maximum logical output size admitted by the size operand's type.
+    /// Maximum logical output size admitted by the size input's type.
     size: usize,
 
     /// Maximum physical input span needed to realize [`Self::size`] elements at the static stride.
@@ -807,8 +807,8 @@ mod tests {
             "#},
         );
 
-        // Static `sizes` make the result exact even when an operand axis is dynamic, so neither a first-class result
-        // extent nor a dynamic slice size operand is needed.
+        // Static `sizes` make the output exact even when an input axis is dynamic, so neither a first-class output
+        // extent nor a dynamic slice size input is needed.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(3)]));
@@ -1222,10 +1222,10 @@ mod tests {
     #[test]
     fn test_dynamic_update_slice_operation_lower_partial_pullbacks() {
         // The transpose of `DynamicUpdateSliceOperation` stages only the contributions whose accumulators are needed.
-        // With only the operand cotangent requested, it stages one `dynamic_update_slice` of the cotangent with a zero
+        // With only the input cotangent requested, it stages one `dynamic_update_slice` of the cotangent with a zero
         // update and no `dynamic_slice`, and with only the update cotangent requested, it stages one `dynamic_slice`
         // of the cotangent and no zero. The shared symbolic manipulation harness always differentiates with respect
-        // to every array input, so this runs both pruned pullbacks on the test execution client at symbolic operand
+        // to every array input, so this runs both pruned pullbacks on the test execution client at symbolic input
         // extents, with an in-bounds start and a start that clamps to the last rows.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
@@ -1338,7 +1338,7 @@ mod tests {
         // transposed call. Its forward region runs the transpose rule, while its transpose region carries the
         // original forward for re-transposition. Pinning both regions checks which contributions were pruned.
 
-        // With only the operand cotangent requested, the update accumulator is unneeded, so the transpose zeroes the
+        // With only the input cotangent requested, the update accumulator is unneeded, so the transpose zeroes the
         // updated window of the cotangent without slicing it.
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
         let pullback = linearization.pullback().unwrap().into_program();
@@ -1387,9 +1387,9 @@ mod tests {
             ],
         );
 
-        // With only the update cotangent requested, the operand accumulator is unneeded, so the transpose slices the
-        // updated window out of the cotangent without materializing a zero update. The retained operand extent and the
-        // zero operand tangent belong to the original forward region, which materializes the missing operand tangent.
+        // With only the update cotangent requested, the input accumulator is unneeded, so the transpose slices the
+        // updated window out of the cotangent without materializing a zero update. The retained input extent and the
+        // zero input tangent belong to the original forward region, which materializes the missing input tangent.
         let linearization = program.linearize_with_respect_to(&[1]).unwrap();
         let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
@@ -1692,7 +1692,7 @@ mod tests {
     fn test_dynamic_slice_operation_lower_pullback_with_runtime_size() {
         // The size comes from device data and changes without recompilation. Seed the pullback with the sliced
         // values so this fixture tests both the strided forward slice and its adjoint, which scatters individual
-        // points, including an empty result.
+        // points, including an empty output.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
@@ -1731,9 +1731,9 @@ mod tests {
         let context = TracingContext::<Constant, Operation>::new();
         let inputs = vec![context.input(input_type.clone().into()), context.input(size_type.clone().into())];
         let mut outputs = linearization.primal().interpret_in_context(&context, inputs).unwrap();
-        let mut arguments = vec![outputs[0].clone()];
-        arguments.extend(outputs.split_off(1));
-        outputs.extend(pullback.interpret_in_context(&context, arguments).unwrap());
+        let mut pullback_inputs = vec![outputs[0].clone()];
+        pullback_inputs.extend(outputs.split_off(1));
+        outputs.extend(pullback.interpret_in_context(&context, pullback_inputs).unwrap());
         let combined = context
             .builder()
             .borrow()
@@ -1815,13 +1815,13 @@ mod tests {
             context.input(scalar_type.clone().into()),
         ];
         let mut outputs = linearization.primal().interpret_in_context(&context, inputs).unwrap();
-        let mut arguments = vec![outputs[0].clone()];
-        arguments.extend(outputs.split_off(1));
+        let mut pullback_inputs = vec![outputs[0].clone()];
+        pullback_inputs.extend(outputs.split_off(1));
         // Replaying arithmetic dimensions creates fresh identities. Instantiate this standalone pullback's
         // formal dimension identities for the replayed residual signature before importing its operations.
-        let input_types = arguments.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let input_types = pullback_inputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
         let pullback = pullback.with_instantiated_type_identities(&input_types).unwrap();
-        outputs.extend(pullback.interpret_in_context(&context, arguments).unwrap());
+        outputs.extend(pullback.interpret_in_context(&context, pullback_inputs).unwrap());
         let combined = context
             .builder()
             .borrow()
@@ -1884,23 +1884,23 @@ mod tests {
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
         let value_type = replicated_scalar_type(&mesh, DataType::F32);
         let input_extent = DimensionVariable::new("input_extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let result_extent = DimensionVariable::new("result_extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let output_extent = DimensionVariable::new("output_extent", DimensionBounds::new(0, Some(5)).unwrap());
 
-        // The result extent is independent of the input extent at the type level. Lowering uses their finite physical
-        // bounds for one specialization and preserves the eager `result_extent <= input_extent` contract with an
+        // The output extent is independent of the input extent at the type level. Lowering uses their finite physical
+        // bounds for one specialization and preserves the eager `output_extent <= input_extent` contract with an
         // ordered runtime assertion.
         let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let input_size = builder.add_input(size_type.clone().into());
-        let result_size = builder.add_input(size_type.clone().into());
+        let output_size = builder.add_input(size_type.clone().into());
         let value = builder.add_input(value_type.clone().into());
         let input_dimension = builder
             .add_instruction(DimensionFromScalarOperation::new(input_extent.into()), Vec::new(), vec![input_size], None)
             .unwrap()[0];
-        let result_dimension = builder
+        let output_dimension = builder
             .add_instruction(
-                DimensionFromScalarOperation::new(result_extent.into()),
+                DimensionFromScalarOperation::new(output_extent.into()),
                 Vec::new(),
-                vec![result_size],
+                vec![output_size],
                 None,
             )
             .unwrap()[0];
@@ -1912,7 +1912,7 @@ mod tests {
             .add_instruction(
                 DynamicSliceOperation::<Type>::from_rank(1),
                 Vec::new(),
-                vec![input, start, result_dimension],
+                vec![input, start, output_dimension],
                 None,
             )
             .unwrap()[0];
@@ -1930,10 +1930,10 @@ mod tests {
         let scalar = |r#type: ArrayType, bytes: &[u8]| {
             Array::from_host_buffer(&session, r#type, mesh.clone(), None, bytes).unwrap()
         };
-        let inputs = |input_size: i64, result_size: i64| {
+        let inputs = |input_size: i64, output_size: i64| {
             vec![
                 scalar(size_type.clone(), input_size.to_ne_bytes().as_slice()),
-                scalar(size_type.clone(), result_size.to_ne_bytes().as_slice()),
+                scalar(size_type.clone(), output_size.to_ne_bytes().as_slice()),
                 scalar(value_type.clone(), 7.0f32.to_ne_bytes().as_slice()),
             ]
         };

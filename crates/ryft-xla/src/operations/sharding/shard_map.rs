@@ -3440,9 +3440,9 @@ pub(crate) mod tests {
                 let context = inputs[0].context().clone();
                 let mut primals = primal.interpret_in_context(&context, inputs[..2].to_vec())?;
                 let output = primals.remove(0);
-                let mut operands = vec![inputs[3].clone(), inputs[2].clone()];
-                operands.extend(primals);
-                let mut cotangents = pullback.interpret_in_context(&context, operands)?;
+                let mut pullback_inputs = vec![inputs[3].clone(), inputs[2].clone()];
+                pullback_inputs.extend(primals);
+                let mut cotangents = pullback.interpret_in_context(&context, pullback_inputs)?;
                 Ok(vec![output, cotangents.remove(1)])
             },
             input_types,
@@ -5940,8 +5940,8 @@ pub(crate) mod tests {
     fn test_shard_map_compilation_replicates_unplaced_outputs_on_cpu() {
         // An inputless map reads the coordinate of every device along `x` and tiles it along `x`. Broadcasting its
         // output to a type without a sharding leaves the program output without a placement, which execution treats as
-        // replicated, so lowering must annotate the result as replicated as well. Otherwise, the compiler keeps the
-        // result tiled like the output of the map, and every device returns one element instead of both. The first
+        // replicated, so lowering must annotate the output as replicated as well. Otherwise, the compiler keeps the
+        // output tiled like the output of the map, and every device returns one element instead of both. The first
         // output has no placement and the second one is replicated explicitly.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();

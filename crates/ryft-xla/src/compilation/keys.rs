@@ -19,7 +19,7 @@ use ryft_pjrt::protos::{AutoTuneReferenceKey, AutoTuneResultKey, CompilationOpti
 use serde::Serialize;
 
 use crate::compilation::CompilationError;
-use crate::compilation::domains::{apply_input_shardings, argument_type};
+use crate::compilation::domains::{apply_input_shardings, relocated_input_type};
 use crate::compilation::options::{InputBoundBucketing, Options};
 use crate::compilation::persistence::{
     PersistentArraySignature, PersistentBoundaryDimension, PersistentCanonicalArraySignature, PersistentDeviceMesh,
@@ -115,11 +115,7 @@ impl LoweredProgram {
             effect_abi_version: 1,
             donation_flags: self.donation_flags(),
             capture_count: self.capture_count() as u64,
-            expected_argument_shardings: self
-                .expected_argument_shardings()
-                .iter()
-                .map(PersistentSharding::from)
-                .collect(),
+            expected_input_shardings: self.expected_input_shardings().iter().map(PersistentSharding::from).collect(),
             output_shardings: self.output_shardings().iter().map(PersistentSharding::from).collect(),
             committed_outputs: self.committed_outputs(),
             mesh: PersistentDeviceMesh::from(self.mesh()),
@@ -307,7 +303,7 @@ impl<'o> std::borrow::Borrow<dyn EagerDispatchKeyView + 'o> for EagerDispatchKey
     }
 }
 
-/// Borrowed [`EagerDispatchKey`] over the arguments of one eager application, used to look up cache hits without
+/// Borrowed [`EagerDispatchKey`] over the inputs of one eager application, used to look up cache hits without
 /// building an owned key.
 pub(crate) struct EagerDispatchQuery<'o> {
     /// Applied operation.
@@ -324,7 +320,7 @@ pub(crate) struct EagerDispatchQuery<'o> {
 }
 
 impl<'o> EagerDispatchQuery<'o> {
-    /// Creates a query that borrows the arguments of one eager operation application.
+    /// Creates a query that borrows the inputs of one eager operation application.
     pub(crate) fn new(
         operation: &'o Operation,
         regions: &'o [RegionKey<Constant, Operation>],
@@ -374,7 +370,7 @@ pub(super) fn dispatch_signature(
             // Available runtime values inform the staged types. The enclosing call determines actual placement.
             for (input_type, input) in &mut inputs {
                 if let (Type::Array(array_type), Some(Value::Array(array))) = (&*input_type, *input)
-                    && let Some(relocated_type) = argument_type(array, array_type)
+                    && let Some(relocated_type) = relocated_input_type(array, array_type)
                 {
                     *input_type = Type::Array(relocated_type);
                 }
@@ -385,12 +381,12 @@ pub(super) fn dispatch_signature(
         DispatchInputs::Values(inputs) => inputs,
     };
 
-    // A relocatable argument is specialized for the same type as in a staged call. The executable signature for
-    // other arguments records runtime placements that name auto mesh axes, which the input types omit.
+    // A relocatable input is specialized for the same type as in a staged call. The executable signature for
+    // other inputs records runtime placements that name auto mesh axes, which the input types omit.
     let mut placements = None::<Vec<Option<Sharding>>>;
     for (index, (input_type, input)) in inputs.iter_mut().enumerate() {
         let placement = match (*input, &*input_type) {
-            (Value::Array(array), Type::Array(array_type)) => match argument_type(array, array_type) {
+            (Value::Array(array), Type::Array(array_type)) => match relocated_input_type(array, array_type) {
                 Some(relocated_type) => {
                     *input_type = Type::Array(relocated_type);
                     None
@@ -489,7 +485,7 @@ struct PersistentKey<'o> {
     /// Logical array types with shared dynamic dimension variables.
     signature: PersistentCanonicalArraySignature,
 
-    /// Physical executable argument position for each logical input, or `None` for erased arrays.
+    /// Physical input position for each logical input, or `None` for erased arrays.
     input_mapping: Vec<Option<u64>>,
 
     /// Whether each logical input is erased because the executable never reads it, or empty when every input is read,
@@ -498,16 +494,16 @@ struct PersistentKey<'o> {
     #[serde(skip_serializing_if = "<[bool]>::is_empty")]
     unread_inputs: &'o [bool],
 
-    /// Physical executable result position for each logical output, or `None` for erased arrays.
+    /// Physical output position for each logical output, or `None` for erased arrays.
     output_mapping: Vec<Option<u64>>,
 
-    /// Physical extent arguments for bounded dynamic input dimensions.
+    /// Physical extent inputs for bounded dynamic input dimensions.
     input_dimensions: Vec<PersistentBoundaryDimension>,
 
-    /// Physical extent results for bounded dynamic output dimensions.
+    /// Physical extent outputs for bounded dynamic output dimensions.
     output_dimensions: Vec<PersistentBoundaryDimension>,
 
-    /// Number of leading logical outputs in the public result.
+    /// Number of leading logical outputs in the public outputs.
     output_count: u64,
 
     /// External reference binding recipes without live reference handles.
@@ -537,15 +533,15 @@ struct PersistentKey<'o> {
     /// Number of leading logical inputs supplied by captures.
     capture_count: u64,
 
-    /// Shardings of all physical executable arguments in argument order.
-    expected_argument_shardings: Vec<PersistentSharding>,
+    /// Shardings of all physical inputs in physical input order.
+    expected_input_shardings: Vec<PersistentSharding>,
 
     /// Runtime placements of all logical outputs, including the auto mesh axes that output types never record.
     output_shardings: Vec<PersistentSharding>,
 
     /// Whether executions commit each logical output whatever the commitment of their inputs, which lowerings of the
     /// same module can differ in (e.g., the identity and a placement onto the memory that a device array is already
-    /// in, which lowers to nothing but commits the result).
+    /// in, which lowers to nothing but commits the output).
     committed_outputs: &'o [bool],
 
     /// Concrete compilation and execution mesh.
@@ -835,15 +831,15 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_signature_relocates_uncommitted_arguments() {
+    fn test_dispatch_signature_relocates_uncommitted_inputs() {
         // A `jit` dispatcher and a function compiled ahead of time for the type that the dispatcher specializes for
-        // agree, at a direct execution and at an eager call, for every argument and every mesh of the function, which
-        // is named, so an eager call runs on it as an execution does. An uncommitted argument that records nothing
+        // agree, at a direct execution and at an eager call, for every input and every mesh of the function, which
+        // is named, so an eager call runs on it as an execution does. An uncommitted input that records nothing
         // beyond replication moves there (the function compiled ahead of time is compiled for its type without a
-        // sharding). A committed anonymous argument is admitted on the same device. The mesh of the function still
+        // sharding). A committed anonymous input is admitted on the same device. The mesh of the function still
         // rejects incompatible devices and a split over another logical mesh. Each observation includes the runtime
-        // sharding of the result, because an eager call and an
-        // execution of one dispatcher must view an uncommitted argument alike (refer to `argument_type`): before, an
+        // sharding of the output, because an eager call and an
+        // execution of one dispatcher must view an uncommitted input alike (refer to `relocated_input_type`): before, an
         // eager call specialized for its type on the canonical mesh of its device, so it rejected a placement onto a
         // bare device that every other entry point accepted.
         let client = cpu_client(2);
@@ -872,7 +868,7 @@ mod tests {
             let array = Array::from_host_buffer(&session, vector_type.clone(), mesh, Some(sharding), bytes.clone());
             array.unwrap().with_committed(committed)
         };
-        let arguments = [
+        let inputs = [
             ("uncommitted", uncommitted.clone()),
             ("committed here", uncommitted.to_placement(&session, devices[0]).unwrap()),
             ("committed elsewhere", uncommitted.to_placement(&session, devices[1]).unwrap()),
@@ -902,15 +898,14 @@ mod tests {
         let mut rejected_rows = Vec::new();
         for (mesh_name, mesh) in &meshes {
             let dispatcher = jit::<_, (), ArrayType, ArrayType>(|(), x| Ok(x), &session, mesh.clone());
-            for (argument_name, argument) in &arguments {
-                let aot_type =
-                    if argument.is_committed() { argument.r#type().into_owned() } else { vector_type.clone() };
-                let execution = observe(dispatcher.execute((), argument.clone()));
-                let call = observe(dispatcher.call((), argument.clone()).map_err(Error::from));
+            for (input_name, input) in &inputs {
+                let aot_type = if input.is_committed() { input.r#type().into_owned() } else { vector_type.clone() };
+                let execution = observe(dispatcher.execute((), input.clone()));
+                let call = observe(dispatcher.call((), input.clone()).map_err(Error::from));
                 match compile::<_, ArrayType, ArrayType>(|x| x, aot_type, &session, mesh.clone()) {
                     Ok(compiled) => {
-                        let aot_execution = observe(compiled.executable().execute(&session, argument.clone()));
-                        let aot_call = observe(compiled.call(argument.clone()).map_err(Error::from));
+                        let aot_execution = observe(compiled.executable().execute(&session, input.clone()));
+                        let aot_call = observe(compiled.call(input.clone()).map_err(Error::from));
                         // A dispatcher keeps the placement of a committed split along an auto axis, which a function
                         // compiled for its type replicates (refer to the register entry "A call of a `jit` dispatcher
                         // keeps its inputs where they are"), so the runtime shardings are compared below instead.
@@ -920,32 +915,32 @@ mod tests {
                         assert_eq!(
                             (placed(&execution), placed(&call)),
                             (placed(&aot_execution), placed(&aot_call)),
-                            "{mesh_name}, {argument_name}",
+                            "{mesh_name}, {input_name}",
                         );
                     }
-                    // The mesh of the function rejects the type of a committed argument or of a split over another
+                    // The mesh of the function rejects the type of a committed input or of a split over another
                     // logical mesh, ahead of time and at a direct execution of the dispatcher alike, and an eager call
                     // of the dispatcher rejects it too, because it runs on that mesh, with the error of its devices or
                     // of its sharding, which the dispatcher keeps (refer to the register entry "A call of a `jit`
                     // dispatcher keeps its inputs where they are").
                     Err(error) => {
-                        assert_eq!(execution, Err(error.to_string()), "{mesh_name}, {argument_name}");
+                        assert_eq!(execution, Err(error.to_string()), "{mesh_name}, {input_name}");
                     }
                 }
                 if call.is_err() {
-                    rejected_rows.push((*mesh_name, *argument_name, call.clone()));
-                } else if argument.is_committed() && argument.mesh().logical_mesh() == &LogicalMesh::single_device() {
+                    rejected_rows.push((*mesh_name, *input_name, call.clone()));
+                } else if input.is_committed() && input.mesh().logical_mesh() == &LogicalMesh::single_device() {
                     committed_rows.push((*mesh_name, execution.clone(), call.clone()));
                 }
-                if !argument.is_committed() {
-                    uncommitted_rows.push((*mesh_name, *argument_name, execution, call));
-                } else if *argument_name == "split along an auto axis of one device" {
+                if !input.is_committed() {
+                    uncommitted_rows.push((*mesh_name, *input_name, execution, call));
+                } else if *input_name == "split along an auto axis of one device" {
                     split_rows.push((*mesh_name, execution, call));
                 }
             }
         }
 
-        // A placement of an uncommitted argument onto the bare device of a mesh of one device commits the result there,
+        // A placement of an uncommitted input onto the bare device of a mesh of one device commits the output there,
         // at every entry point alike.
         let mut placement_rows = Vec::new();
         for (mesh_name, mesh) in &meshes[..2] {
@@ -980,8 +975,8 @@ mod tests {
         let placed = |device: usize| Ok((vec![device], true, values.clone(), "{mesh<['q'=1:explicit]>, [{}]}".into()));
         assert_eq!(placement_rows, vec![("named here", placed(0)), ("named elsewhere", placed(1))]);
 
-        // An execution and an eager call place an uncommitted argument on the named mesh of the function and commit the
-        // result there, as JAX does under `set_mesh`. A split of an uncommitted argument along an auto axis is
+        // An execution and an eager call place an uncommitted input on the named mesh of the function and commit the
+        // output there, as JAX does under `set_mesh`. A split of an uncommitted input along an auto axis is
         // relocatable, so neither keeps it, whereas both keep the split of a committed one.
         let on = |devices: Vec<usize>, committed: bool, sharding: &str| {
             Ok::<_, String>((devices, committed, values.clone(), sharding.to_string()))
@@ -1015,7 +1010,7 @@ mod tests {
         assert_eq!(split_rows.last(), Some(&("one device", kept_split.clone(), kept_split)));
         let committed_to = |actual: &str, required: &str| {
             Err::<(Vec<usize>, bool, Vec<f32>, String), _>(format!(
-                "public argument #0 is committed to devices {actual}, but the executable requires {required}"
+                "public input #0 is committed to devices {actual}, but the executable requires {required}"
             ))
         };
         let sharded_as = |actual: &str, required: &str| {
@@ -1048,13 +1043,13 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_signature_relocates_uncommitted_arguments_under_transforms() {
+    fn test_dispatch_signature_relocates_uncommitted_inputs_under_transforms() {
         // A call of a `jit` dispatcher under JVP, batching, or partial evaluation with a known input sees the runtime
         // value that the transform wraps (i.e., the primal of a dual, the packed value of a batch, or a known value,
-        // refer to `ImportingContext::as_source_value`), so it specializes an uncommitted argument for its type without
+        // refer to `ImportingContext::as_source_value`), so it specializes an uncommitted input for its type without
         // a sharding and places it on the named mesh of one device, as `.call` does. Before, each of these specialized
-        // for the canonical upload mesh and rejected the argument with a mesh mismatch, both on the device where the
-        // argument lives and on another one.
+        // for the canonical upload mesh and rejected the input with a mesh mismatch, both on the device where the
+        // input lives and on another one.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let values = vec![1f32, 2f32];
@@ -1150,7 +1145,7 @@ mod tests {
         let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
         let session = Session::builder().client(client).build().unwrap();
         let values = [1.0f32, 2.0];
-        // The declaration names a sharding that the concrete input satisfies. A relocatable argument loses that
+        // The declaration names a sharding that the concrete input satisfies. A relocatable input loses that
         // sharding when staged, so validating the normalized type would reject this valid input.
         let array = f32_vector(&session, &mesh, &values).with_committed(false);
         let declared = array.r#type().into_owned();
@@ -1262,7 +1257,7 @@ mod tests {
         let memory_placement = |x: CompileTracer| x.place(&Memory::Device, None).unwrap();
 
         // A placement that only names the memory where a device array already is lowers to nothing, so the function
-        // that requests it lowers to the module of the identity, but it commits every result of that function.
+        // that requests it lowers to the module of the identity, but it commits every output of that function.
         let session = Session::builder().client(client).build().unwrap();
         let lower = |function: fn(CompileTracer) -> CompileTracer| {
             let staged =
@@ -1277,7 +1272,7 @@ mod tests {
         assert_eq!((placed.committed_outputs(), identity.committed_outputs()), (&[true][..], &[false][..]));
         assert!(session.compilation_key(&placed).unwrap() != session.compilation_key(&identity).unwrap());
 
-        // An eager call therefore commits the results of each function as its direct execution does, whichever of the
+        // An eager call therefore commits the outputs of each function as its direct execution does, whichever of the
         // two functions the compilation cache of the session sees first.
         for placed_first in [false, true] {
             let session = Session::builder().client(client).build().unwrap();

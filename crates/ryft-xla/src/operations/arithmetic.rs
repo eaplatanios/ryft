@@ -7,7 +7,7 @@ use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, TensorTypeRef, Type as MlirType, Value as MlirValue, ValueRef};
 
 use crate::lowering::types::{ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_signed_one_bit_to_mlir};
-use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_operands};
+use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_inputs};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 impl LowerableOperation for AddOperation<ArrayType> {
@@ -82,7 +82,7 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
                     carrier_data_type.lower_constant_elements_attribute(scalar_type, value, lowerer.context())?;
                 let constant = lowerer.block().append_operation(stable_hlo::constant(elements, lowerer.location())?)?;
                 // Broadcasting against a normalized input retains its runtime extents for bounded dynamic arrays.
-                Ok(normalize_binary_elementwise_operands(
+                Ok(normalize_binary_elementwise_inputs(
                     &[constant.result(0).unwrap().as_ref(), left],
                     std::slice::from_ref(&carrier_type),
                     &mut lowerer.block(),
@@ -213,7 +213,7 @@ impl LowerableOperation for PowOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = input_types;
-        let [left, right] = normalize_binary_elementwise_operands(
+        let [left, right] = normalize_binary_elementwise_inputs(
             input_values,
             output_types,
             &mut lowerer.block(),
@@ -290,7 +290,7 @@ fn normalize_arithmetic_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         DataType::U1 => output_types[0].clone().with_data_type(DataType::U8),
         _ => output_types[0].clone(),
     };
-    normalize_binary_elementwise_operands(
+    normalize_binary_elementwise_inputs(
         &inputs,
         &[output_type],
         &mut lowerer.block(),
@@ -315,7 +315,7 @@ fn lower_arithmetic_output<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     let data_type = if output_type.data_type() == DataType::I1 { DataType::I8 } else { DataType::U8 };
     let one = data_type.lower_constant_elements_attribute(scalar_type, 1, lowerer.context())?;
     let one = lowerer.block().append_operation(stable_hlo::constant(one, lowerer.location())?)?;
-    let one = normalize_binary_elementwise_operands(
+    let one = normalize_binary_elementwise_inputs(
         &[one.result(0).unwrap().as_ref(), output],
         &[output_type.clone().with_data_type(data_type)],
         &mut lowerer.block(),

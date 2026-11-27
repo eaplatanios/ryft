@@ -5,7 +5,7 @@
 //! to. This has three consequences:
 //!
 //!   - **Eager Functions from Dimensions to Arrays:** Functions that turn first-class dimensions into arrays (e.g.,
-//!     comparing two dimensions or [`DimensionToScalar`](ryft_core::DimensionToScalar)) materialize their results in
+//!     comparing two dimensions or [`DimensionToScalar`](ryft_core::DimensionToScalar)) materialize their outputs in
 //!     the session of their inputs, so they execute eagerly outside any explicit context.
 //!   - **Rich Dispatch:** [`Value`] dispatches and executes through its [`Session`], so its capabilities come from
 //!     the blanket implementations in `ryft-core` that bind operations, exactly like those of the staged values of a
@@ -34,7 +34,7 @@ use ryft_core::{
 };
 use ryft_macros::Parameter;
 
-use crate::compilation::domains::argument_type;
+use crate::compilation::domains::relocated_input_type;
 use crate::{Array, RetainedArray, Session};
 
 /// Type of an XLA [`Value`], which is the [`ArrayIrType`] of `ryft-core` used as it is. XLA defines its own values,
@@ -43,13 +43,13 @@ use crate::{Array, RetainedArray, Session};
 /// [`ArrayIrType`] everywhere, including in patterns and in the paths of its variants (e.g., [`Type::Array`]).
 pub type Type = ArrayIrType;
 
-/// First-class runtime dimension bound to the [`Session`] session in which array results derived from it are
+/// First-class runtime dimension bound to the [`Session`] session in which array outputs derived from it are
 /// materialized. This is the dimension member of [`Value`] and its projection onto [`DimensionType`]. A [`Dimension`]
 /// is a runtime _value_ that holds a checked [`DimensionValue`]. It is not a [`ryft_core::Dimension`], which is a
 /// static or symbolic extent inside an [`ArrayType`]. Dimension arithmetic remains host integer work. It dispatches
 /// through this dimension's [`Session`], whose eager binding evaluates dimension operations on the host without
 /// compiling programs. Only functions that produce arrays (e.g., comparisons and
-/// [`DimensionToScalar`](ryft_core::DimensionToScalar)) upload their results, which are placed according to the mesh
+/// [`DimensionToScalar`](ryft_core::DimensionToScalar)) upload their outputs, which are placed according to the mesh
 /// of the session. [`Value`] documents this placement policy. Two dimensions are equal when their [`DimensionValue`]s
 /// are equal, regardless of their sessions.
 #[derive(Clone, Parameter)]
@@ -57,12 +57,12 @@ pub struct Dimension {
     /// Checked host-side dimension.
     value: DimensionValue,
 
-    /// [`Session`] in which array results computed from this dimension are materialized.
+    /// [`Session`] in which array outputs computed from this dimension are materialized.
     session: Session,
 }
 
 impl Dimension {
-    /// Creates a new [`Dimension`] that materializes array results derived from `value` in `session`.
+    /// Creates a new [`Dimension`] that materializes array outputs derived from `value` in `session`.
     #[inline]
     pub fn new(value: DimensionValue, session: Session) -> Self {
         Self { value, session }
@@ -74,7 +74,7 @@ impl Dimension {
         &self.value
     }
 
-    /// Returns the [`Session`] in which array results computed from this dimension are materialized.
+    /// Returns the [`Session`] in which array outputs computed from this dimension are materialized.
     #[inline]
     pub fn session(&self) -> &Session {
         &self.session
@@ -128,7 +128,7 @@ impl Typed for Dimension {
 impl CoreValue for Dimension {
     // Like `Array`, a dimension dispatches and executes through the rich `Session` that it carries, projected onto
     // the dimension member family. That session evaluates dimension operations on the host and materializes array
-    // results (e.g., `dimension_to_scalar`) in its session.
+    // outputs (e.g., `dimension_to_scalar`) in its session.
 
     type Dispatch = ValueDomainDispatch;
     type Domain = ProjectedContext<Session, DimensionType>;
@@ -386,10 +386,10 @@ impl CoreValue for Value {
     #[inline]
     fn relocatable_type(&self) -> Option<Self::Type> {
         // An uncommitted array whose type records nothing beyond replication enters a transform without a sharding,
-        // which is the type for which a `jit` dispatcher specializes such an argument, so that a call moves it onto
-        // the devices where it runs under a transform as it does outside of one.
+        // which is the type for which a `jit` dispatcher specializes such an input, so that a call moves it onto the
+        // devices where it runs under a transform as it does outside of one.
         match self {
-            Self::Array(array) => argument_type(array, &array.r#type()).map(Type::Array),
+            Self::Array(array) => relocated_input_type(array, &array.r#type()).map(Type::Array),
             Self::Dimension(_) | Self::Reference(_) => None,
         }
     }
@@ -709,7 +709,7 @@ impl std::ops::BitXor for Value {
 ///   - **Immediate First-Class Dimensions:** A [`DimensionValue`] is a checked host integer, so embedding it costs
 ///     nothing and it lowers to a scalar `stablehlo.constant`. Unlike a capture reference, it also stays usable inside
 ///     a nested region, most importantly a `shard_map` manual computation, which owns no capture table of its own. That
-///     is what lets shape arithmetic, such as the explicit result extents of the collectives, be staged against a
+///     is what lets shape arithmetic, such as the explicit output extents of the collectives, be staged against a
 ///     manual region's shard-local values.
 ///   - **Immediate Boolean Predicates:** A predicate that is already known on the host while tracing (i.e., the result
 ///     of comparing two first-class dimensions with known extents) is stored in the program itself, so that it stays
@@ -720,7 +720,7 @@ impl std::ops::BitXor for Value {
 ///     so every other array constant is a capture or a session array.
 ///   - **Session Arrays:** A [`RetainedArray`] is a handle to an array that is retained for a trace whose capture table
 ///     cannot hold runtime arrays (e.g., the body of a rematerialized function or of a composite). Lowering turns it
-///     into a hidden executable argument, as it does for a capture.
+///     into a hidden executable input, as it does for a capture.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum Constant {
     /// Reference to a value held in the surrounding compiled function's capture table.
@@ -1248,7 +1248,7 @@ mod tests {
 
     #[test]
     fn test_dimension_compare() {
-        // The predicate is decided on the host, so only the Boolean result is uploaded and no program is compiled.
+        // The predicate is decided on the host, so only the Boolean output is uploaded and no program is compiled.
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let two = Dimension::new(DimensionValue::constant(2).unwrap(), session.clone());
@@ -1474,7 +1474,7 @@ mod tests {
     #[test]
     fn test_value_domain_compares_dimensions() {
         // Comparing first-class dimensions executes eagerly outside any context, without compiling a program, and
-        // materializes the Boolean result in the session of the inputs.
+        // materializes the Boolean output in the session of the inputs.
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let mesh = mesh_on(client, 0);
@@ -1576,7 +1576,7 @@ mod tests {
             Some(&ReferenceError::Frozen),
         );
 
-        // Reference operands of array operations are rejected by the array projection of the array IR capabilities.
+        // Reference inputs of array operations are rejected by the array projection of the array IR capabilities.
         let reference = vector(&[1.0, 2.0]).reference_new().unwrap();
         assert_eq!(
             reference.add(&vector(&[1.0, 2.0])),
@@ -1613,7 +1613,7 @@ mod tests {
         let message = "assertion failed: predicate must hold";
 
         // Inline execution can report the failure from the call. An asynchronous submission reports it at the
-        // effect barrier because the assertion has no result array carrying its completion.
+        // effect barrier because the assertion has no output array carrying its completion.
         match falsity.assert("predicate must hold", &[]) {
             Err(error) => assert_eq!(error, ProgramError::InvalidArgument { message: message.to_string() }),
             Ok(()) => assert!(matches!(

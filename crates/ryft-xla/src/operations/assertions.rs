@@ -73,10 +73,10 @@ const ASSERT_LABEL_COUNT_ATTRIBUTE: &str = "label_count";
 /// Formatting kind used for explicit dimension bounds.
 pub(crate) const ASSERT_BOUNDS_KIND: &str = "bounds";
 
-/// Formatting kind used for a dynamic concatenation result extent check.
+/// Formatting kind used for a dynamic concatenation output extent check.
 pub(crate) const ASSERT_CONCATENATE_KIND: &str = "concatenate";
 
-/// Formatting kind used for a padding result extent check.
+/// Formatting kind used for a padding output extent check.
 pub(crate) const ASSERT_PAD_KIND: &str = "pad";
 
 /// Formatting kind used for a reshape element count check.
@@ -183,10 +183,10 @@ pub(crate) fn lower_deliberately_false_assertion_predicate<'b, 'c: 'b, 't: 'c>(
     ComparisonDirection::LessThan.lower_comparison(value, zero, block, location)
 }
 
-/// Validates the extent operands of a complete output signature against the static extents to which type inference
-/// refined their declared dynamic axes. An exact operand of a shared dimension identity refines every occurrence of
-/// that identity, so a symbolic operand of another occurrence must equal the refined extent at runtime. This emits one
-/// assertion per distinct pair of operand value and expected extent, and none for operands whose exact extent already
+/// Validates the extent inputs of a complete output signature against the static extents to which type inference
+/// refined their declared dynamic axes. An exact input of a shared dimension identity refines every occurrence of that
+/// identity, so a symbolic input of another occurrence must equal the refined extent at runtime. This emits one
+/// assertion per distinct pair of input value and expected extent, and none for inputs whose exact extent already
 /// proves it. Axes that remain dynamic need no check, because distinct values that share a symbolic identity are equal
 /// by construction. Each internal identity has a single defining value (i.e., the type identity signature of a
 /// [`Region`](ryft_core::Region) rejects a second definition) and entry refinements validate identities shared by
@@ -196,8 +196,8 @@ pub(crate) fn lower_deliberately_false_assertion_predicate<'b, 'c: 'b, 't: 'c>(
 /// # Parameters
 ///
 ///   - `name`: Name of the operation that owns the assertions, reported in their diagnostics.
-///   - `declared_types`: Declared output types, which consume one extent operand per dynamic axis, in axis order.
-///   - `input_values`: Compact extent operands of the declared dynamic axes.
+///   - `declared_types`: Declared output types, which consume one extent input per dynamic axis, in axis order.
+///   - `input_values`: Compact extent inputs of the declared dynamic axes.
 ///   - `input_types`: Dimension types of `input_values`.
 ///   - `output_types`: Refined output types, which must have the ranks of `declared_types`.
 #[allow(clippy::too_many_arguments)]
@@ -247,16 +247,16 @@ pub(crate) fn lower_output_extent_validation<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Returns `true` if lowering an operation whose complete output signature declares `declared_types` emits runtime
-/// assertions that validate its extent operands, as [`lower_output_extent_validation`] does. Such assertions are
-/// effects that lowering synthesizes, because the operation itself declares none, so the enclosing scopes must thread
-/// their tokens, as [`lowered_effect_classes`](crate::operations::control_flow::lowered_effect_classes) reports. An
-/// instruction with fewer inputs than the declared dynamic axes does not size them with extent operands (e.g., a
+/// assertions that validate its extent inputs, as [`lower_output_extent_validation`] does. Such assertions are effects
+/// that lowering synthesizes, because the operation itself declares none, so the enclosing scopes must thread their
+/// tokens, as [`lowered_effect_classes`](crate::operations::control_flow::lowered_effect_classes) reports. An
+/// instruction with fewer inputs than the declared dynamic axes does not size them with extent inputs (e.g., a
 /// homogeneous array constructor), so lowering validates nothing for it.
 ///
 /// # Parameters
 ///
-///   - `declared_types`: Declared output types, which consume one extent operand per dynamic axis, in axis order.
-///   - `input_types`: Types of all instruction inputs, which end with the extent operands of the declared dynamic axes.
+///   - `declared_types`: Declared output types, which consume one extent input per dynamic axis, in axis order.
+///   - `input_types`: Types of all instruction inputs, which end with the extent inputs of the declared dynamic axes.
 ///   - `output_types`: Refined output types, which correspond to `declared_types`.
 pub(crate) fn validates_output_extents(
     declared_types: &[ArrayType],
@@ -817,10 +817,10 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
     )
 }
 
-/// Returns the checks that [`lower_output_extent_validation`] emits before deduplicating them by operand value. Each
-/// check covers one extent operand of a declared dynamic axis whose refined output extent its own type does not prove,
-/// and consists of its index among the `input_types` of the extent operands, the declared identity of its axis, and
-/// the refined extent.
+/// Returns the checks that [`lower_output_extent_validation`] emits before deduplicating them by input value. Each
+/// check covers one extent input of a declared dynamic axis whose refined output extent its own type does not prove,
+/// and consists of its index among the `input_types` of the extent inputs, the declared identity of its axis, and the
+/// refined extent.
 fn output_extent_checks<'o>(
     declared_types: &'o [ArrayType],
     input_types: &[Type],
@@ -1424,7 +1424,7 @@ fn validate_arithmetic(kind: &str, left_name: &str, left: i64, right_name: &str,
     })
 }
 
-/// Validates one padding result extent using wide signed arithmetic before narrowing to a native size carrier.
+/// Validates one padding output extent using wide signed arithmetic before narrowing to a native size carrier.
 fn validate_pad(axis: usize, input: i64, output: i64, low: i64, high: i64, interior: usize) -> Result<(), String> {
     if input < 0 || output < 0 {
         return Err(format!("`pad` dimensions must be nonnegative on axis {axis}"));
@@ -1663,16 +1663,16 @@ mod tests {
         let refined = vec![Type::from(ArrayType::new_static(DataType::F32, [3]))];
         let unrefined = vec![Type::from(declared_types[0].clone())];
 
-        // A symbolic extent operand of an axis that type inference refined to a static extent needs a runtime check,
-        // also when other instruction inputs precede the extent operands.
+        // A symbolic extent input of an axis that type inference refined to a static extent needs a runtime check, also
+        // when other instruction inputs precede the extent inputs.
         assert!(validates_output_extents(&declared_types, std::slice::from_ref(&symbolic), &refined).unwrap());
         assert!(validates_output_extents(&declared_types, &[refined[0].clone(), symbolic.clone()], &refined).unwrap());
 
-        // An exact extent operand already proves the refined extent, and axes that remain dynamic need no check.
+        // An exact extent input already proves the refined extent, and axes that remain dynamic need no check.
         assert!(!validates_output_extents(&declared_types, &[exact], &refined).unwrap());
         assert!(!validates_output_extents(&declared_types, &[symbolic], &unrefined).unwrap());
 
-        // An instruction without extent operands does not size its dynamic axes with them.
+        // An instruction without extent inputs does not size its dynamic axes with them.
         assert!(!validates_output_extents(&declared_types, &[], &refined).unwrap());
     }
 
@@ -1960,7 +1960,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
             // Exercise the public specialization and reference discharge boundaries before differentiating and
-            // lowering. These read-only external bindings become the two explicit initial state array arguments.
+            // lowering. These read-only external bindings become the two explicit initial state array inputs.
             let context = TracingContext::<Constant, Operation>::new();
             let inputs = source.input_types().into_owned().into_iter().map(PartialValue::Unknown).collect::<Vec<_>>();
             let evaluation = source.partially_evaluate_in_context(&context, &inputs).unwrap();
@@ -2491,7 +2491,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        // Only assertions create a local chain. Ordered I/O is seeded from the hidden executable argument.
+        // Only assertions create a local chain. Ordered I/O is seeded from the hidden physical input.
         assert!(lowered.signature().has_ordered_io());
         assert!(lowered.signature().requires_assertion_handler());
         assert_eq!(lowered.stable_hlo().matches("stablehlo.after_all").count(), 1, "{}", lowered.stable_hlo());

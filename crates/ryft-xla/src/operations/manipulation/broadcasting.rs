@@ -34,7 +34,7 @@ impl LowerableOperation for BroadcastOperation {
         check_count!("output", output_types, 1, ProgramError);
         let output_type = &output_types[0];
         let input = input_values[0];
-        // A static result can refine exact symbolic input axes. Expose their proved physical sizes so that XLA does not
+        // A static output can refine exact symbolic input axes. Expose their proved physical sizes so that XLA does not
         // retain a dynamic unit axis that would prevent a subsequent singleton expansion.
         let input = if output_type.static_shape().is_some() {
             input_types[0].lower_physical_storage(input, block, context, location)?
@@ -48,7 +48,7 @@ impl LowerableOperation for BroadcastOperation {
                     reason: "dynamic broadcast with explicit output layout needs finite allocation bounds".to_owned(),
                 }));
             }
-            // Every dynamic result axis is a passthrough of a mapped input axis, so obtain its runtime extent there.
+            // Every dynamic output axis is a passthrough of a mapped input axis, so obtain its runtime extent there.
             let extents = output_type
                 .shape()
                 .dimensions()
@@ -197,7 +197,7 @@ impl LowerableOperation for DynamicBroadcastOperation {
         };
         let output_type = <&ArrayType>::try_from(output_type)?;
         let result = if output_type.static_shape().is_some() {
-            // Exact symbolic axes have no inactive storage, and must lose their dynamic bit before a static result
+            // Exact symbolic axes have no inactive storage, and must lose their dynamic bit before a static output
             // is consumed as singleton broadcast storage by a later operation.
             let input = input_type.lower_physical_storage(*input, block, context, location)?;
             let output_tensor_type = output_type.lower(context, location)?;
@@ -211,7 +211,7 @@ impl LowerableOperation for DynamicBroadcastOperation {
             output_type.lower_layout_constraint(result, block, location)?
         } else if physical_bound_type(input_type).is_ok() && physical_bound_type(output_type).is_ok() {
             // Finite bounded inputs can be materialized at their physical shape, broadcast statically, and then
-            // refined from the explicit result extents. This avoids `dynamic_broadcast_in_dim`, which the XLA
+            // refined from the explicit output extents. This avoids `dynamic_broadcast_in_dim`, which the XLA
             // importer cannot legalize when an intermediate shape includes a computed dynamic ratio.
             let dynamic_extents = output_type
                 .shape()
@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_operation_lower_dynamic_result_type() {
+    fn test_broadcast_operation_lower_dynamic_output_type() {
         // Homogeneous broadcast admits a dynamic output extent that is identity-equal to the mapped input extent,
         // which is exactly the payload that program batching stages for a dynamic per-item dimension. Lowering keeps
         // that extent dynamic in the result tensor type and supplies no extent operand, so `stablehlo.broadcast_in_dim`
@@ -601,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_broadcast_operation_lower_output_layout() {
-        // Both static and bounded dynamic outputs constrain the physical result allocation.
+        // Both static and bounded dynamic outputs constrain the physical output allocation.
         for (dimension, expected) in [
             (
                 Dimension::Static(4),
@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn test_broadcast_operation_lower_batches_values_with_pending_reductions() {
-        // Every observable fact of an array, so that a batched result can be compared with the stacked results of the
+        // Every observable fact of an array, so that a batched output can be compared with the stacked outputs of the
         // unbatched function applied to every batch item.
         #[derive(Clone, Debug, PartialEq)]
         struct Observed {
@@ -1186,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_operation_lower_converted_operand() {
+    fn test_broadcast_operation_lower_converted_input() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let engine = Session::builder().client(client).build().unwrap();
@@ -1308,7 +1308,7 @@ mod tests {
     #[test]
     fn test_broadcast_like_operation_lower_executes_dynamic_shape() {
         // One compiled program serves every runtime extent of the exemplar, including an empty one, and the
-        // exemplar's elements never reach the results.
+        // exemplar's elements never reach the outputs.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(5)).unwrap());
         let exemplar_type = ArrayType::new(DataType::F64, Shape::new(vec![rows.clone().into(), Dimension::Static(2)]));
         let column_type = ArrayType::new(DataType::F64, Shape::new(vec![rows.into(), Dimension::Static(1)]));
@@ -1525,7 +1525,7 @@ mod tests {
             assert_eq!(values_from_bytes::<i64>(outputs[3].as_slice()), vec![i64::from(extent)]);
             assert_eq!(execution.outputs[0].unpadded_dimensions().unwrap(), &[2, extent as u64]);
             assert_eq!(execution.outputs[1].unpadded_dimensions().unwrap(), &[2, extent as u64]);
-            // Verify active payloads, because an empty logical result need not have an empty backing allocation.
+            // Verify active payloads, because an empty logical output need not have an empty backing allocation.
             if extent == 2 {
                 assert_eq!(
                     values_from_bytes::<i64>(outputs[0].as_slice()),
@@ -1572,7 +1572,7 @@ mod tests {
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "non-row-major bounded-dynamic output layout `tiled{0,1}`",
         ));
-        // An unspecified executable result layout still permits the internal constraint.
+        // An unspecified executable output layout still permits the internal constraint.
         let module = program
             .to_rendered_mlir(
                 "main",
@@ -1656,7 +1656,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        // An unspecified executable result layout defers the layout check to the operation lowering.
+        // An unspecified executable output layout defers the layout check to the operation lowering.
         assert!(matches!(
             program.to_rendered_mlir(
                 "main",

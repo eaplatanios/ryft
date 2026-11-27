@@ -57,7 +57,7 @@ trait CumulativeKindLoweringExtension {
     /// matches both the forward and the reverse padding, as observed in the optimized HLO of a CUDA compilation.
     ///
     /// On GPU targets (i.e., when `target_platform` is `"cuda"` or `"rocm"`), a forward [`CumulativeKind::Sum`] over a
-    /// statically shaped real numeric operand lowers to a
+    /// statically shaped real numeric input lowers to a
     /// [`chlo.scan`](https://openxla.org/stablehlo/generated/chlo#chloscan_chloscanop) instead, which is what JAX's
     /// `_cumred_gpu_lowering` emits. The scan carries one running sum per row of the unscanned axes, seeded with the
     /// sum identity, and its body adds each slice to that carry. Reverse, Boolean, and complex sums keep the window
@@ -134,7 +134,7 @@ impl CumulativeKindLoweringExtension for CumulativeKind {
                     .as_ref(),
             };
 
-            // The body receives one slice of the operand and the carry, and returns their sum both as the output slice
+            // The body receives one slice of the input and the carry, and returns their sum both as the output slice
             // and as the next carry.
             let mut body_region = context.region();
             let mut body_block = body_region
@@ -514,7 +514,7 @@ mod tests {
         );
 
         // An empty scanned axis accumulates nothing and would give `reduce_window` a degenerate window with zero
-        // extent, so the lowering forwards the operand instead of emitting any operation.
+        // extent, so the lowering forwards the input instead of emitting any operation.
         assert_eq!(
             lowered_unary_module(
                 ArrayOperation::Cumulative(CumulativeOperation::new(0, CumulativeKind::Sum)),
@@ -551,7 +551,7 @@ mod tests {
             .unwrap()
         };
 
-        // The compiled `reduce_window` scan reproduces the exact prefix sums of the operand, and its reverse
+        // The compiled `reduce_window` scan reproduces the exact prefix sums of the input, and its reverse
         // direction the exact suffix sums.
         let forward: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.cumulative_sum(0).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
@@ -748,7 +748,7 @@ mod tests {
         assert_close(&read_first_shard::<f32>(client, &output), &[1000.0 + 4.0f32.ln()]);
 
         // The reverse prefix scan folds the pairwise stable `log_add_exp` over each suffix, so position `i` of an
-        // operand of zeros holds `log(4 - i)` and the final position holds `log(1) = 0`.
+        // input of zeros holds `log(4 - i)` and the final position holds `log(1) = 0`.
         let scanned: CompiledFunction<ArrayType, ArrayType> =
             compile(|x| x.reverse_cumulative_log_sum_exp(0).unwrap(), input_type.clone(), &engine, mesh.clone())
                 .unwrap();
@@ -897,8 +897,8 @@ mod tests {
         assert_eq!(read(increasing.cumulative_product(0).unwrap()), vec![0.5, 0.625, 1.25, 4.6875]);
         assert_eq!(read(increasing.reverse_cumulative_product(0).unwrap()), vec![4.6875, 9.375, 7.5, 3.75]);
 
-        // A running maximum of an increasing operand distinguishes a prefix from a global maximum, and the extrema of
-        // the alternating operand distinguish them from a pass-through operand in both directions.
+        // A running maximum of an increasing input distinguishes a prefix from a global maximum, and the extrema of the
+        // alternating input distinguish them from a pass-through input in both directions.
         assert_eq!(read(increasing.cumulative_max(0).unwrap()), vec![0.5, 1.25, 2.0, 3.75]);
         assert_eq!(read(alternating.reverse_cumulative_max(0).unwrap()), vec![4.0, 2.5, 2.5, 2.5]);
         assert_eq!(read(alternating.cumulative_min(0).unwrap()), vec![4.0, 0.25, -1.5, -1.5]);

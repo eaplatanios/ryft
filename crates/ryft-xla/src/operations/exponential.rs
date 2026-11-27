@@ -14,7 +14,7 @@ use crate::lowering::types::{
 };
 use crate::operations::complex::lower_select_principal_phase_to_mlir;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
-use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_operands};
+use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_inputs};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ExpOperation<ArrayType> {
@@ -119,7 +119,7 @@ impl LowerableOperation for LogAddExpOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = input_types;
-        let [left, right] = normalize_binary_elementwise_operands(
+        let [left, right] = normalize_binary_elementwise_inputs(
             input_values,
             output_types,
             &mut lowerer.block(),
@@ -746,7 +746,7 @@ mod tests {
 
     use super::*;
 
-    /// Lowers one unary operation while retaining its bounded dynamic input and result shape.
+    /// Lowers one unary operation while retaining its bounded dynamic input and output shape.
     fn lowered_dynamic_unary_module(operation: ArrayOperation<ArrayConstant>, data_type: DataType) -> String {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayType::new(data_type, Shape::new(vec![dynamic_dimension("size", Some(5))])));

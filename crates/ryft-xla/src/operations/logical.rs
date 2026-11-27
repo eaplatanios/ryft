@@ -2,7 +2,7 @@ use ryft_core::{AndOperation, ArrayType, NotOperation, OrOperation, XorOperation
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::operations::normalize_binary_elementwise_operands;
+use crate::operations::normalize_binary_elementwise_inputs;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for NotOperation<ArrayType> {
@@ -28,7 +28,7 @@ impl LowerableOperation for AndOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = input_types;
-        let [left, right] = normalize_binary_elementwise_operands(
+        let [left, right] = normalize_binary_elementwise_inputs(
             input_values,
             output_types,
             &mut lowerer.block(),
@@ -49,7 +49,7 @@ impl LowerableOperation for OrOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = input_types;
-        let [left, right] = normalize_binary_elementwise_operands(
+        let [left, right] = normalize_binary_elementwise_inputs(
             input_values,
             output_types,
             &mut lowerer.block(),
@@ -70,7 +70,7 @@ impl LowerableOperation for XorOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = input_types;
-        let [left, right] = normalize_binary_elementwise_operands(
+        let [left, right] = normalize_binary_elementwise_inputs(
             input_values,
             output_types,
             &mut lowerer.block(),

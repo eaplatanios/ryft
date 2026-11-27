@@ -38,7 +38,7 @@ pub(super) struct RaggedCase {
     /// Logical participant count, which the single-GPU suite requires to be one.
     participants: usize,
 
-    /// Physical operand shape, including a leading mapped dimension for batching.
+    /// Physical input shape, including a leading mapped dimension for batching.
     local_shape: Vec<usize>,
 
     /// Physical seeded output shape.
@@ -47,16 +47,16 @@ pub(super) struct RaggedCase {
     /// Runtime metadata element type.
     metadata_type: String,
 
-    /// Starting operand row for each transfer.
+    /// Starting input row for each transfer.
     input_offsets: Vec<u64>,
 
-    /// Number of operand rows sent in each transfer.
+    /// Number of input rows sent in each transfer.
     send_sizes: Vec<u64>,
 
-    /// Starting result row for each transfer.
+    /// Starting output row for each transfer.
     output_offsets: Vec<u64>,
 
-    /// Number of result rows received in each transfer.
+    /// Number of output rows received in each transfer.
     receive_sizes: Vec<u64>,
 
     /// Direct execution or a transform staged inside the manual mesh.
@@ -249,7 +249,7 @@ impl RaggedCase {
         }
     }
 
-    /// Stages a transform while retaining all four metadata arrays as runtime arguments.
+    /// Stages a transform while retaining all four metadata arrays as runtime inputs.
     #[cfg(any(test, feature = "cuda-13"))]
     fn transformed(&self, inputs: Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError> {
         match self.transform.as_str() {

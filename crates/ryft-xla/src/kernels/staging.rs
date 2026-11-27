@@ -652,8 +652,8 @@ fn unbound_batch_placement<V: Value<Type = Type>>(
 /// `shard_map` over the mesh axes of the batch with the local batch size.
 ///
 /// The parameter types of a kernel are physical, so the body applies the kernel that is batched over the local batch
-/// extent to the local shards as they are. Its results vary along the manual axes like its inputs, and the output
-/// shardings of the map place the batch axis of every result on those axes. The results are typed over `mesh`, which
+/// extent to the local shards as they are. Its outputs vary along the manual axes like its inputs, and the output
+/// shardings of the map place the batch axis of every output on those axes. The outputs are typed over `mesh`, which
 /// types the axes either as manual or, for a caller in JAX's explicit sharding mode, as explicit (refer to
 /// [`ShardMapBoundary::caller_mesh`]).
 ///
@@ -735,7 +735,7 @@ where
         };
         batch_axes.push(axis);
         if parameter.access() != KernelParameterAccess::ReadOnly {
-            // Every writable parameter is mapped, and only the batch axis of its result is placed on the mesh.
+            // Every writable parameter is mapped, and only the batch axis of its output is placed on the mesh.
             let axis =
                 axis.ok_or_else(|| unsupported("writable kernel parameters require a mapped batch axis".to_owned()))?;
             let mut dimensions = vec![ShardingDimension::Replicated; parameter.r#type().rank() + 1];
@@ -865,7 +865,7 @@ where
 }
 
 /// Stages a native kernel primal with an explicit canonical JVP region. The JVP receives primal inputs followed by
-/// active tangents and returns primal results followed by their tangents, as checked by a [`CompositeOperation`]
+/// active tangents and returns primal outputs followed by their tangents, as checked by a [`CompositeOperation`]
 /// with a JVP rule region. The supplied rule owns derivative semantics, and the mutable kernel body is never
 /// implicitly differentiated. The primal applies the kernel to inputs of the types of `inputs`, which may be placed
 /// (refer to [`KernelCallOperation`]), so the rule region must be staged for those types.
@@ -933,7 +933,7 @@ where
 /// Uses an explicitly supplied pure equivalent program for differentiation while ordinary execution retains the native
 /// kernel primal. This is an AD contract, not recovery from compiler errors, so the caller guarantees equivalence for
 /// every admitted input. Complete input and output types must agree with the declared signature, and for placed inputs
-/// the fallback is staged again over their types and must give the results of the call. The fallback cannot contain
+/// the fallback is staged again over their types and must give the outputs of the call. The fallback cannot contain
 /// references or effects, and the native call cannot have observable effects beyond its confined local reference state,
 /// which [`KernelDefinition::effects`] summarizes together with the assertions of its mappings and scalar prefetch
 /// conversions. State that the body declares explicitly (e.g., through an external call) is observable and is rejected,
@@ -959,7 +959,7 @@ where
     }
 
     // The fallback is declared over the physical signature. For placed inputs it is staged again over their types, so
-    // that it and its derivative rule have the interface of this call, and it must then give the results the types
+    // that it and its derivative rule have the interface of this call, and it must then give the outputs the types
     // that the kernel call gives them.
     let actual_types = input_types(inputs);
     let restaged;
@@ -1441,8 +1441,8 @@ pub(crate) fn select_kernels(
                         validate_kernel_sharding(&input_types, bound_axes)?;
 
                         // The compiler sees the physical kernel. The custom call that replaces the kernel call is
-                        // declared for the placement of the values that the call receives and must give its results
-                        // the types that the kernel call gave them, since the instruction keeps its result atoms.
+                        // declared for the placement of the values that the call receives and must give its outputs
+                        // the types that the kernel call gave them, since the instruction keeps its output atoms.
                         let compiled = binding.compile(&definition, &facts)?;
                         let atom_type = |atom: &AtomId| region.atoms()[atom.index()].r#type().into_owned();
                         let compiled = placed_custom_call(
@@ -2041,7 +2041,7 @@ pub(crate) mod tests {
             }
         }
 
-        // A call that copies the element of its `i32[4]` data input at the prefetched start into its `i32[1]` result,
+        // A call that copies the element of its `i32[4]` data input at the prefetched start into its `i32[1]` output,
         // whose logical inputs are therefore `[i32[4], i32[]]`.
         let data_type = ArrayType::new_static(DataType::I32, vec![4]);
         let prefetch_type = ArrayType::scalar(DataType::I32);
@@ -2255,7 +2255,7 @@ pub(crate) mod tests {
 
     /// Batches `definition`, whose only input is an `f32[3]` item, along axis 1 of a packed `f32[3, 4]` input with
     /// `sharding` in a fresh trace whose enclosing manual regions bind `bound_axes`. Returns the staged program
-    /// together with the batch axis of every result, or the batching error.
+    /// together with the batch axis of every output, or the batching error.
     fn batch_sharded(
         definition: &KernelDefinition,
         sharding: Sharding,
@@ -2277,7 +2277,7 @@ pub(crate) mod tests {
     }
 
     /// Batches `definition` along axis 1 of one input of type `packed` in a fresh trace whose enclosing manual regions
-    /// bind `bound_axes`. Returns the staged program together with the batch axis of every result, or the batching
+    /// bind `bound_axes`. Returns the staged program together with the batch axis of every output, or the batching
     /// error.
     fn batch_packed(
         definition: &KernelDefinition,
@@ -2345,8 +2345,8 @@ pub(crate) mod tests {
             assert_eq!(axes, vec![Some(if in_place { 1 } else { 0 })]);
             program
         };
-        // A caller that types `x` as explicit receives results typed over its own mesh. The body applies the physical
-        // kernel to the local shard, and the write-only result gains the batch as its leading dimension, which the
+        // A caller that types `x` as explicit receives outputs typed over its own mesh. The body applies the physical
+        // kernel to the local shard, and the write-only output gains the batch as its leading dimension, which the
         // output sharding of the map places like the batch axis of the input.
         assert_eq!(
             stage(MeshAxisType::Explicit, false).to_string(),
@@ -2440,7 +2440,7 @@ pub(crate) mod tests {
         );
 
         // The local shards vary only along the axis that the map binds, so the compiler binding selects the kernel
-        // inside the map, and the custom call types its result like the kernel call did.
+        // inside the map, and the custom call types its output like the kernel call did.
         let binding = binding(1);
         assert_eq!(
             select_kernels(&manual, Some(&binding), facts).unwrap().unwrap().to_string(),
@@ -2795,7 +2795,7 @@ pub(crate) mod tests {
         .unwrap();
         let (_, program) = TracingContext::<Constant, Operation>::trace(
             |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
-                // The complete kernel result is deliberately unused by its enclosing computation.
+                // The complete kernel output is deliberately unused by its enclosing computation.
                 stage_kernel(inputs[0].context(), &definition, &inputs)?;
                 Ok(Vec::<Tracer<TracingContext<Constant, Operation>>>::new())
             },
@@ -2837,7 +2837,7 @@ pub(crate) mod tests {
         let definition = crate::kernels::tests::mapping_assertion_definition();
         let (_, program) = TracingContext::<Constant, Operation>::trace(
             |inputs: Vec<Tracer<TracingContext<Constant, Operation>>>| {
-                // The complete kernel result is deliberately unused by its enclosing computation.
+                // The complete kernel output is deliberately unused by its enclosing computation.
                 stage_kernel(inputs[0].context(), &definition, &inputs)?;
                 Ok(Vec::<Tracer<TracingContext<Constant, Operation>>>::new())
             },
@@ -3144,7 +3144,7 @@ pub(crate) mod tests {
     #[test]
     fn test_stage_kernel_with_fallback_placed_inputs() {
         // The input is replicated on a mesh. Ordinary staging accepts it, and so does the fallback staging, which
-        // stages the fallback and its derivative rule for the placed type. The result has the type of the input.
+        // stages the fallback and its derivative rule for the placed type. The output has the type of the input.
         let definition = differentiable_definition();
         let scalar = definition.operation().input_types()[0].clone();
         let mut builder = ProgramBuilder::<Constant, Operation>::new();

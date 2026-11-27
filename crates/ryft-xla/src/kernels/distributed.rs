@@ -205,9 +205,9 @@ impl DistributedKernelOptions {
 
 /// Functional distributed execution through explicit host transfers, with one ordered call at a time.
 ///
-/// Every participant constructs coordinators and calls them in the same order. For argument `i`, `sources[i]` selects
-/// the process supplying that argument's value, and all processes supply their complete local input vector. Source rows
-/// may differ, supporting local data parallel calls, rings, and broadcasts without an additional transfer graph. Every
+/// Every participant constructs coordinators and calls them in the same order. For input `i`, `sources[i]` selects the
+/// process supplying that input's value, and all processes supply their complete local input vector. Source rows may
+/// differ, supporting local data parallel calls, rings, and broadcasts without an additional transfer graph. Every
 /// participant uses the same semantic kernel and compiler configuration. Its actual local topology is independently
 /// validated and included in the collectively acknowledged preflight manifest.
 ///
@@ -219,7 +219,7 @@ impl DistributedKernelOptions {
 ///
 /// Outputs remain private until every participant advertises a successful native fence. This proves completion, not
 /// atomic delivery to every host, because a network failure after readiness may prevent one process from receiving a
-/// result already visible elsewhere. Cancellation cannot revoke a returned immutable output or abort submitted device
+/// output already visible elsewhere. Cancellation cannot revoke a returned immutable output or abort submitted device
 /// work. The runtime, the loaded kernel, and their existing client and session resources must outlive this coordinator.
 pub struct DistributedKernel<'o> {
     /// Existing loaded kernel, whose client and session lifetime is retained by the caller.
@@ -231,7 +231,7 @@ pub struct DistributedKernel<'o> {
     /// Checked next round within this reserved coordinator.
     round: u64,
 
-    /// Canonical logical byte counts for each argument.
+    /// Canonical logical byte counts for each input.
     sizes: Vec<usize>,
 
     /// Previous pending call, whose completion later setup cannot overtake.
@@ -470,7 +470,7 @@ impl<'o> DistributedKernel<'o> {
                 &KernelTransfer { size: bytes.len(), checksum: Sha256::digest(&bytes).into() },
             )?;
         }
-        let mut arguments = Vec::with_capacity(types.len());
+        let mut kernel_inputs = Vec::with_capacity(types.len());
         for (index, (&process, r#type)) in sources.iter().zip(types).enumerate() {
             let manifest: KernelTransfer = serde_json::from_slice(&self.coordination.wait(
                 round,
@@ -497,10 +497,10 @@ impl<'o> DistributedKernel<'o> {
             }
             let value = Array::from_host_buffer(session, r#type.clone(), mesh.clone(), None, bytes)?;
             value.block_until_ready()?;
-            arguments.push(value);
+            kernel_inputs.push(value);
         }
         self.coordination.validate_progress(cancelled, deadline)?;
-        Ok(self.kernel.call(arguments)?)
+        Ok(self.kernel.call(kernel_inputs)?)
     }
 }
 
@@ -630,7 +630,7 @@ struct KernelPreflight {
     /// Canonical logical byte counts in input order.
     sizes: Vec<usize>,
 
-    /// Source process that owns each local argument index.
+    /// Source process that owns each local input index.
     sources: Vec<usize>,
 
     /// Exact bounded transport and deadline policy.
@@ -787,7 +787,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Downloads one completed scalar result for independent host assertions.
+    /// Downloads one completed scalar output for independent host assertions.
     fn scalar(array: &Array) -> i32 {
         array.block_until_ready().unwrap();
         let bytes = array

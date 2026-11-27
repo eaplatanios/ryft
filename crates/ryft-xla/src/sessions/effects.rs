@@ -497,12 +497,12 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let input = f64_vector(&session, &mesh, &[3.0]);
         let mut builder = ProgramBuilder::<Constant, Operation>::new();
-        let argument = builder.add_input(input.r#type().into_owned().into());
+        let program_input = builder.add_input(input.r#type().into_owned().into());
         builder
             .add_instruction(
                 PrintOperation::<ArrayType>::new("unordered").with_effect_class(EffectClass::UnorderedIo),
                 Vec::new(),
-                vec![argument],
+                vec![program_input],
                 None,
             )
             .unwrap();

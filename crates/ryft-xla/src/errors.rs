@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_program_error_from_backend_errors() {
-        let compilation = CompilationError::ShardingCountMismatch { kind: "argument", expected: 2, actual: 1 };
+        let compilation = CompilationError::ShardingCountMismatch { kind: "input", expected: 2, actual: 1 };
         let error = ProgramError::from(Error::from(compilation.clone()));
         assert_eq!(error.downcast_custom::<CompilationError>(), Some(&compilation));
         assert_eq!(error, ProgramError::from(Error::from(compilation)));
@@ -530,10 +530,10 @@ mod tests {
         ));
 
         let compilation =
-            Error::from(CompilationError::ShardingCountMismatch { kind: "argument", expected: 2, actual: 1 });
+            Error::from(CompilationError::ShardingCountMismatch { kind: "input", expected: 2, actual: 1 });
         assert!(matches!(
             compilation,
-            Error::Compilation(CompilationError::ShardingCountMismatch { kind: "argument", expected: 2, actual: 1 }),
+            Error::Compilation(CompilationError::ShardingCountMismatch { kind: "input", expected: 2, actual: 1 }),
         ));
 
         let execution = Error::from(ExecutionError::DonationFlagCountMismatch { expected_count: 2, actual_count: 1 });

@@ -5,8 +5,8 @@
 //! `stablehlo.if` regions that take no arguments and capture the lowered branch inputs implicitly. Each branch input is
 //! converted from its actual type to the shared declared type of its branch input, and an entry guard checks the input
 //! relationships that the actual input types leave unproven before either branch runs. Every ordered effect class that
-//! either branch uses is threaded through both branches as one trailing token result, so both branches return the same
-//! result types, and both branches normalize their results to the refined output types of the condition. Results whose
+//! either branch uses is threaded through both branches as one trailing token output, so both branches return the same
+//! output types, and both branches normalize their outputs to the refined output types of the condition. Outputs whose
 //! types place them over explicit mesh axes are constrained to that placement.
 
 use ryft_core::{ArrayType, ConditionOperation, Operation, ProgramError, TypedProgram};
@@ -55,8 +55,8 @@ impl LowerableOperation for ConditionOperation<Type> {
         //   1. Each branch input is converted from its actual type to the shared declared type of its branch input.
         //   2. An entry guard checks the input relationships that the actual input types leave unproven, before the
         //      branch tokens are captured, so that the effects of either branch are ordered after the check.
-        //   3. Each branch is lowered with the entry tokens of the threaded effect classes and normalizes its results
-        //      to the condition's refined `output_types`, so both branches return identical result types.
+        //   3. Each branch is lowered with the entry tokens of the threaded effect classes and normalizes its outputs
+        //      to the condition's refined `output_types`, so both branches return identical output types.
         //   4. The trailing token results of the `stablehlo.if` become the current tokens of the enclosing scope, and
         //      each result whose type places it over an explicit mesh axis is constrained to that placement.
         //
@@ -106,7 +106,7 @@ impl LowerableOperation for ConditionOperation<Type> {
             entry_effect_tokens.set(effect, token);
         }
         // The declared branch outputs may differ (e.g., `f64[extent]` and `f64[3]`) while agreeing after input
-        // refinement, so each branch normalizes its results to the condition's output types.
+        // refinement, so each branch normalizes its outputs to the condition's output types.
         let [true_branch_region, false_branch_region] = [true_branch, false_branch].map(|branch| {
             branch.lower_control_flow_region(
                 &branch_inputs,
@@ -915,7 +915,7 @@ mod tests {
     fn test_condition_operation_lower_converts_a_refined_static_branch_input_to_its_bounded_branch_input_type() {
         // A branch input only needs to refine its branch input type, so a static `f64[3]` input feeds a branch input
         // with the bounded dynamic type `f64[rows]`. The output takes the static extent that the inputs establish for
-        // `rows`, so the bounded branch result is sliced back to `f64[3]`. The taken branch computes `a + b`.
+        // `rows`, so the bounded branch output is sliced back to `f64[3]`. The taken branch computes `a + b`.
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let branch_input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let branch = |add: bool| {
@@ -1083,9 +1083,9 @@ mod tests {
 
     #[test]
     fn test_condition_operation_lower_execution_bounded_dynamic_and_zero_space_outputs() {
-        // Both branches return a bounded dynamic `f64[extent]` and an empty `f64[0]`. The dynamic result keeps its
+        // Both branches return a bounded dynamic `f64[extent]` and an empty `f64[0]`. The dynamic output keeps its
         // runtime extent at every extent that its bound admits, including zero and the largest one, and the empty
-        // result stays empty whichever branch runs.
+        // output stays empty whichever branch runs.
         let extent_type = DimensionType::new("extent", DimensionBounds::non_negative(Some(9)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let empty_type = ArrayType::new_static(DataType::F64, [0]);
@@ -1210,9 +1210,9 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_operation_lower_execution_returns_equal_bounded_dynamic_results() {
-        // Each branch returns one bounded dynamic value twice, and the program returns both condition results. Each
-        // result must keep its own runtime extent at the executable boundary.
+    fn test_condition_operation_lower_execution_returns_equal_bounded_dynamic_outputs() {
+        // Each branch returns one bounded dynamic value twice, and the program returns both condition outputs. Each
+        // output must keep its own runtime extent at the executable boundary.
         let extent_type = DimensionType::new("extent", DimensionBounds::non_negative(Some(9)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
         let branch = |negate: bool| {
@@ -1785,7 +1785,7 @@ mod tests {
             );
         }
 
-        // A mapped predicate selects a branch per batch item, so both branches run on every item and their results are
+        // A mapped predicate selects a branch per batch item, so both branches run on every item and their outputs are
         // selected per item.
         let (batched, output_axes) = program
             .batched_with_threaded_extent(
@@ -1830,7 +1830,7 @@ mod tests {
     #[test]
     fn test_condition_operation_lower_execution_batched_under_eager_parent() {
         // Batching over eager array IR values binds the batched condition through eager dispatch, which compiles it as
-        // a standalone program whose results must all be arrays. Neither predicate kind may therefore return the batch
+        // a standalone program whose outputs must all be arrays. Neither predicate kind may therefore return the batch
         // extent that array IR batching threads through the batched branches.
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);

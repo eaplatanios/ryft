@@ -44,7 +44,7 @@ pub(crate) fn trace_scaled_dot_composition(
 /// the `__op$block_scaled_dot` custom call, as [`block_scaled_dot_custom_call_permutations`] decides, and needs no
 /// composition. XLA's CUDA block scaled dot replacement cannot propagate dynamic dimension annotations through its
 /// fused HLO, so eligible CUDA calls use the bounded static carriers while the caller masks physical suffix elements
-/// and restores the logical result dimensions. Other calls retain the logical boundary consumed by the portable
+/// and restores the logical output dimensions. Other calls retain the logical boundary consumed by the portable
 /// decomposition.
 pub(crate) fn scaled_dot_composition_types(
     operation: &ScaledDotOperation,
@@ -552,7 +552,7 @@ mod tests {
     use super::*;
 
     /// Builds the NVFP4 scaled dot program shared by the platform-gated lowering fixtures below, with
-    /// `f4e2m1fn [2, 16]` operands and `f8e4m3fn [2, 1]` scales over blocks of 16.
+    /// `f4e2m1fn [2, 16]` inputs and `f8e4m3fn [2, 1]` scales over blocks of 16.
     fn scaled_dot_fixture_program() -> (FlatProgram<Session>, Vec<ArrayType>, Vec<ArrayType>) {
         let element_type =
             ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(16)]));
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn test_scaled_dot_operation_lower_matches_reference_backend() {
-        // NVFP4 operands (`f4e2m1fn [2, 16]` elements with one `f8e4m3fn` scale per block of 16) produce the same
+        // NVFP4 inputs (`f4e2m1fn [2, 16]` elements with one `f8e4m3fn` scale per block of 16) produce the same
         // `f32` product on both backends. Every element, scale, product, and sum is exact, so the comparison is exact
         // whether XLA runs the portable decomposition of the `xla.scaled_dot` composite or a native kernel.
         let client = execution_client();

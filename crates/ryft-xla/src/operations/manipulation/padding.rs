@@ -123,7 +123,7 @@ impl<T: CoreType> PadOperationLoweringExtension for PadOperation<T> {
         check_count!("output", output_types, 1, ProgramError);
         let rank = input_types[0].rank();
         if let Some(extents) = output_extents {
-            // The explicit result extents are operands of the instruction.
+            // The explicit output extents are inputs of the instruction.
             check_count!("input", extents, rank, ProgramError);
         }
         if self.interior_padding().len() != rank {
@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pad_operation_rejects_implicit_dynamic_result_extent() {
+    fn test_pad_operation_rejects_implicit_dynamic_output_extent() {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("input", Some(5))]));
         let padding_value_type = ArrayType::scalar(DataType::F32);
         let mut builder = ProgramBuilder::new();
@@ -573,7 +573,7 @@ mod tests {
         let client = execution_client();
         crate::operations::assertions::ensure_assertion_handler_registered(client).unwrap();
         // Exact bits survive interior insertion, cropping by negative edges, empty inputs, and changes to allocation
-        // bounds. Static result refinements still check the actual runtime input extent.
+        // bounds. Static output refinements still check the actual runtime input extent.
         for data_type in [DataType::I64, DataType::C64] {
             let element = if data_type == DataType::I64 { "i64" } else { "complex<f32>" };
             let input = if data_type == DataType::I64 {
@@ -738,7 +738,7 @@ mod tests {
                             )
                             .and_then(|execution| execution.block_until_ready());
                         if actual_size != size {
-                            // The assertion recomputes the result extent from the actual input extent in wide
+                            // The assertion recomputes the output extent from the actual input extent in wide
                             // arithmetic and rejects it when it differs from the requested extent or leaves the native
                             // `i32` range.
                             let actual_size = i128::from(actual_size);

@@ -31,7 +31,7 @@ use crate::compilation::CompilationError;
 use crate::compilation::keys::COMPILER_IDENTITY;
 use crate::compilation::programs::{CompiledProgram, OutputDeviceAssignment};
 use crate::execution::{ExecutionPlan, flatten_device_assignment};
-use crate::lowering::signatures::ExecutableSignature;
+use crate::lowering::programs::MlirProgramSignature;
 use crate::{Error, RuntimeRequirement, Session, normalize_runtime_requirements};
 
 // TODO(eaplatanios): Review this module.
@@ -56,7 +56,7 @@ pub(super) struct PersistentReferenceState {
     /// Redundant flat position retained solely for corruption detection.
     logical_input_index: u64,
 
-    /// Hidden logical result containing the final state, or `None` for a read-only reference.
+    /// Hidden logical output containing the final state, or `None` for a read-only reference.
     logical_output_index: Option<u64>,
 }
 
@@ -146,13 +146,13 @@ pub(super) struct PersistentBoundaryDimension {
     /// Axis within the logical array.
     axis: u64,
 
-    /// Hidden physical argument or result index carrying the runtime extent.
+    /// Hidden physical input or output index carrying the runtime extent.
     physical_index: u64,
 }
 
 impl PersistentBoundaryDimension {
     /// Encodes the hidden extent slots of the bounded dynamic inputs of one executable signature.
-    pub(super) fn from_input_dimensions(signature: &ExecutableSignature) -> Vec<Self> {
+    pub(super) fn from_input_dimensions(signature: &MlirProgramSignature) -> Vec<Self> {
         signature
             .input_dimensions()
             .iter()
@@ -165,7 +165,7 @@ impl PersistentBoundaryDimension {
     }
 
     /// Encodes the hidden extent slots of the bounded dynamic outputs of one executable signature.
-    pub(super) fn from_output_dimensions(signature: &ExecutableSignature) -> Vec<Self> {
+    pub(super) fn from_output_dimensions(signature: &MlirProgramSignature) -> Vec<Self> {
         signature
             .output_dimensions()
             .iter()
@@ -517,11 +517,7 @@ impl CompiledProgram {
             effect_abi_version: 1,
             donation_flags: self.donation_flags().to_vec(),
             capture_count: self.capture_count() as u64,
-            expected_argument_shardings: self
-                .expected_argument_shardings()
-                .iter()
-                .map(PersistentSharding::from)
-                .collect(),
+            expected_input_shardings: self.expected_input_shardings().iter().map(PersistentSharding::from).collect(),
             output_shardings: self.output_shardings().iter().map(PersistentSharding::from).collect(),
             committed_outputs: self.committed_outputs().to_vec(),
             output_device_assignment: self.output_device_assignment(),
@@ -739,7 +735,7 @@ impl Session {
             }
         }
         // The inputs that the executable never reads are recorded as they were lowered (refer to
-        // `ExecutableSignature::with_unread_inputs`), never inferred from the mapping, which cannot tell such an input
+        // `MlirProgramSignature::with_unread_inputs`), never inferred from the mapping, which cannot tell such an input
         // from a read one without a buffer. An unread input has a static shape and backs no reference state, and the
         // signature that is rebuilt with them is then compared in full below. A record of no unread input is omitted,
         // so that the metadata of an executable without one is what it was before unread inputs were recorded.
@@ -754,7 +750,7 @@ impl Session {
                 reason: "unread input metadata does not match the logical inputs".into(),
             }));
         }
-        let signature = ExecutableSignature::new(input_types.as_slice(), output_types.as_slice())
+        let signature = MlirProgramSignature::new(input_types.as_slice(), output_types.as_slice())
             .with_unread_inputs(&unread_inputs)
             .with_effects(
                 metadata.ordered_io,
@@ -781,17 +777,17 @@ impl Session {
                 reason: "input or output sharding mesh does not match executable mesh".into(),
             }));
         }
-        let expected_argument_shardings = metadata
-            .expected_argument_shardings
+        let expected_input_shardings = metadata
+            .expected_input_shardings
             .into_iter()
             .map(Sharding::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        if expected_argument_shardings
+        if expected_input_shardings
             .iter()
             .any(|sharding| !sharding.mesh().has_same_topology(mesh.logical_mesh()))
         {
             return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
-                reason: "argument sharding mesh does not match executable mesh".into(),
+                reason: "input sharding mesh does not match executable mesh".into(),
             }));
         }
         let output_shardings =
@@ -814,9 +810,9 @@ impl Session {
             }));
         }
         let physical_input_count = signature.array_input_count();
-        if expected_argument_shardings.len() != physical_input_count {
+        if expected_input_shardings.len() != physical_input_count {
             return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
-                reason: "expected argument shardings do not match the physical input count".into(),
+                reason: "expected input shardings do not match the physical input count".into(),
             }));
         }
         for (state, &expected_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
@@ -826,11 +822,11 @@ impl Session {
                 })
             })?;
             let input_type = &input_types[expected_input_index];
-            let expected_sharding = &expected_argument_shardings[physical_input];
+            let expected_sharding = &expected_input_shardings[physical_input];
             if input_type.static_shape().is_none() && !expected_sharding.is_replicated() {
                 return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
                     reason: format!(
-                        "bounded-dynamic reference-state input {expected_input_index} expected argument sharding \
+                        "bounded-dynamic reference-state input {expected_input_index} expected input sharding \
                          is not replicated",
                     ),
                 }));
@@ -841,7 +837,7 @@ impl Session {
                 return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
                     reason: format!(
                         "reference-state input {expected_input_index} logical sharding does not match its expected \
-                         argument sharding",
+                         input sharding",
                     ),
                 }));
             }
@@ -938,7 +934,7 @@ impl Session {
             metadata.requires_assertion_handler,
             donation_flags.into(),
             capture_count,
-            expected_argument_shardings.into(),
+            expected_input_shardings.into(),
             output_shardings.into(),
             metadata.committed_outputs.into(),
             metadata.output_device_assignment,
@@ -971,7 +967,7 @@ struct PersistentExecutableMetadata {
     /// Logical array types with shared dynamic dimension variables.
     signature: PersistentArraySignature,
 
-    /// Physical executable argument position for each logical input, or `None` for erased arrays.
+    /// Physical input position for each logical input, or `None` for erased arrays.
     input_mapping: Vec<Option<u64>>,
 
     /// Whether each logical input is erased because the executable never reads it, or empty when every input is read,
@@ -979,16 +975,16 @@ struct PersistentExecutableMetadata {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     unread_inputs: Vec<bool>,
 
-    /// Physical executable result position for each logical output, or `None` for erased arrays.
+    /// Physical output position for each logical output, or `None` for erased arrays.
     output_mapping: Vec<Option<u64>>,
 
-    /// Physical extent arguments for bounded dynamic input dimensions.
+    /// Physical extent inputs for bounded dynamic input dimensions.
     input_dimensions: Vec<PersistentBoundaryDimension>,
 
-    /// Physical extent results for bounded dynamic output dimensions.
+    /// Physical extent outputs for bounded dynamic output dimensions.
     output_dimensions: Vec<PersistentBoundaryDimension>,
 
-    /// Number of leading logical outputs in the public result.
+    /// Number of leading logical outputs in the public outputs.
     output_count: u64,
 
     /// External reference binding recipes without live reference handles.
@@ -1018,8 +1014,8 @@ struct PersistentExecutableMetadata {
     /// Number of leading logical inputs supplied by captures.
     capture_count: u64,
 
-    /// Shardings of all physical executable arguments in argument order.
-    expected_argument_shardings: Vec<PersistentSharding>,
+    /// Shardings of all physical inputs in physical input order.
+    expected_input_shardings: Vec<PersistentSharding>,
 
     /// Runtime placements of all logical outputs, including the auto mesh axes that output types never record.
     output_shardings: Vec<PersistentSharding>,
@@ -1713,7 +1709,7 @@ mod tests {
         assert_eq!(restored.runtime_requirements(), compiled.compiled_program().runtime_requirements());
         assert_eq!(restored.donation_flags(), compiled.compiled_program().donation_flags());
         assert_eq!(restored.capture_count(), compiled.compiled_program().capture_count());
-        assert_eq!(restored.expected_argument_shardings(), compiled.compiled_program().expected_argument_shardings());
+        assert_eq!(restored.expected_input_shardings(), compiled.compiled_program().expected_input_shardings());
         assert_eq!(restored.mesh(), compiled.compiled_program().mesh());
 
         // Reload validates the live facts before handing any native executable bytes to PJRT.
@@ -1977,7 +1973,7 @@ mod tests {
     #[test]
     fn test_compiled_program_serialize_round_trips_calls_of_functions_that_name_devices() {
         // A caller of a function that places its value on the second device runs that call there and commits its
-        // result, as a direct execution of the function does, also after the program of the caller is serialized and
+        // output, as a direct execution of the function does, also after the program of the caller is serialized and
         // deserialized on its own.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -2099,16 +2095,16 @@ mod tests {
                 if reason == "reference-state metadata has an invalid output count",
         ));
 
-        // Dropping one expected argument sharding leaves the persisted list shorter than the physical boundary, so
+        // Dropping one expected input sharding leaves the persisted list shorter than the physical boundary, so
         // no reference state input could be checked against its own expected sharding.
         let mut truncated_expected_shardings = decode_envelope(&bytes).0;
-        assert_eq!(truncated_expected_shardings.expected_argument_shardings.len(), 2);
-        truncated_expected_shardings.expected_argument_shardings.pop();
+        assert_eq!(truncated_expected_shardings.expected_input_shardings.len(), 2);
+        truncated_expected_shardings.expected_input_shardings.pop();
         let corrupted = corrupt(truncated_expected_shardings);
         assert!(matches!(
             session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
-                if reason == "expected argument shardings do not match the physical input count",
+                if reason == "expected input shardings do not match the physical input count",
         ));
 
         let mut reordered = decode_envelope(&bytes).0;
@@ -2130,12 +2126,12 @@ mod tests {
         ));
 
         let mut mismatched_expected_sharding = decode_envelope(&bytes).0;
-        mismatched_expected_sharding.expected_argument_shardings[0].unreduced_axes.push("x".to_string());
+        mismatched_expected_sharding.expected_input_shardings[0].unreduced_axes.push("x".to_string());
         let corrupted = corrupt(mismatched_expected_sharding);
         assert!(matches!(
             session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
-                if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
+                if reason == "reference-state input 0 logical sharding does not match its expected input sharding",
         ));
 
         let mut mismatched_input = decode_envelope(&bytes).0;
@@ -2156,7 +2152,7 @@ mod tests {
         assert!(matches!(
             session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
-                if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
+                if reason == "reference-state input 0 logical sharding does not match its expected input sharding",
         ));
 
         let mut mismatched_output = decode_envelope(&bytes).0;
@@ -2328,7 +2324,7 @@ mod tests {
         let compiled = session.compile_program(&lowered).unwrap();
         assert_eq!(compiled.input_types(), &[state_type.clone(), state_type.clone()]);
         assert_eq!(compiled.all_output_types(), &[state_type.clone(), state_type.clone()]);
-        assert_eq!(compiled.expected_argument_shardings(), &[state_sharding.clone(), state_sharding]);
+        assert_eq!(compiled.expected_input_shardings(), &[state_sharding.clone(), state_sharding]);
         assert_eq!(compiled.mesh(), &mesh);
         assert_eq!(
             compiled.reference_states(),
@@ -2340,7 +2336,7 @@ mod tests {
                 assert_eq!(restored.input_types(), compiled.input_types());
                 assert_eq!(restored.all_output_types(), compiled.all_output_types());
                 assert_eq!(restored.reference_states(), compiled.reference_states());
-                assert_eq!(restored.expected_argument_shardings(), compiled.expected_argument_shardings());
+                assert_eq!(restored.expected_input_shardings(), compiled.expected_input_shardings());
                 assert_eq!(restored.mesh(), compiled.mesh());
             }
             None => {
@@ -2420,9 +2416,9 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let input = f64_vector(&session, &mesh, &[3.0]);
         let mut builder = ProgramBuilder::<Constant, Operation>::new();
-        let argument = builder.add_input(input.r#type().into_owned().into());
+        let input_atom = builder.add_input(input.r#type().into_owned().into());
         builder
-            .add_instruction(PrintOperation::<ArrayType>::new("ordered"), Vec::new(), vec![argument], None)
+            .add_instruction(PrintOperation::<ArrayType>::new("ordered"), Vec::new(), vec![input_atom], None)
             .unwrap();
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         let lowered = session.lower_program(&program, 0, &Options::new(mesh)).unwrap();
@@ -2519,7 +2515,7 @@ mod tests {
             effect_abi_version: 1,
             donation_flags: Vec::new(),
             capture_count: 0,
-            expected_argument_shardings: Vec::new(),
+            expected_input_shardings: Vec::new(),
             output_shardings: Vec::new(),
             committed_outputs: Vec::new(),
             output_device_assignment: OutputDeviceAssignment::Fixed,

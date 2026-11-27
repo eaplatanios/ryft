@@ -321,10 +321,10 @@ pub(crate) struct NamedCompositionKey {
     /// Semantic identity of the composition, whose name also names the emitted private function.
     composite: CompositeKey,
 
-    /// Logical operand types of the composition boundary.
+    /// Logical input types of the composition boundary.
     input_types: Vec<ArrayType>,
 
-    /// Logical result types of the composition boundary.
+    /// Logical output types of the composition boundary.
     output_types: Vec<ArrayType>,
 }
 
@@ -407,86 +407,87 @@ impl NamedCompositionFunctionMap {
         self.order.push(key);
         Ok(())
     }
-}
 
-/// Collects every named semantic composition required by `program` and traces each distinct typed decomposition once.
-/// Only the regions that lowering emits for `target_platform` contribute (refer to [`omits_regions`]), so neither a
-/// composite call that a backend implementation replaces on that target nor the body of a scan that admits no
-/// iteration contributes compositions.
-pub(crate) fn collect_named_composition_functions<Input, Output, O: LowerableOperationFamily>(
-    program: &Program<Constant, O, Input, Output>,
-    target_platform: Option<&str>,
-) -> Result<NamedCompositionFunctionMap, Error>
-where
-    Input: Parameterized<Constant>,
-    Output: Parameterized<Constant>,
-{
-    /// Registers the compositions of `region` and of the computation regions that its instructions attach, visiting
-    /// each region at most once.
-    fn walk<O: LowerableOperationFamily>(
-        region: RegionRef<'_, Constant, O>,
-        map: &mut NamedCompositionFunctionMap,
-        visited: &mut HashSet<RegionId>,
+    /// Returns the map of every named semantic composition required by `program`, tracing each distinct typed
+    /// decomposition once.
+    /// Only the regions that lowering emits for `target_platform` contribute (refer to [`omits_regions`]), so neither a
+    /// composite call that a backend implementation replaces on that target nor the body of a scan that admits no
+    /// iteration contributes compositions.
+    pub(crate) fn for_program<Input, Output, O: LowerableOperationFamily>(
+        program: &Program<Constant, O, Input, Output>,
         target_platform: Option<&str>,
-    ) -> Result<(), Error> {
-        if !visited.insert(region.id()) {
-            return Ok(());
-        }
-        for instruction in region.instructions() {
-            let operation = instruction.operation();
-            if omits_regions(region, instruction, target_platform) {
-                continue;
+    ) -> Result<Self, Error>
+    where
+        Input: Parameterized<Constant>,
+        Output: Parameterized<Constant>,
+    {
+        /// Registers the compositions of `region` and of the computation regions that its instructions attach, visiting
+        /// each region at most once.
+        fn walk<O: LowerableOperationFamily>(
+            region: RegionRef<'_, Constant, O>,
+            map: &mut NamedCompositionFunctionMap,
+            visited: &mut HashSet<RegionId>,
+            target_platform: Option<&str>,
+        ) -> Result<(), Error> {
+            if !visited.insert(region.id()) {
+                return Ok(());
             }
-            for (index, nested) in instruction.regions().iter().enumerate() {
-                if operation.region_role(index) == Some(RegionRole::Computation) {
-                    walk(RegionRef::new(region.arena(), *nested)?, map, visited, target_platform)?;
+            for instruction in region.instructions() {
+                let operation = instruction.operation();
+                if omits_regions(region, instruction, target_platform) {
+                    continue;
+                }
+                for (index, nested) in instruction.regions().iter().enumerate() {
+                    if operation.region_role(index) == Some(RegionRole::Computation) {
+                        walk(RegionRef::new(region.arena(), *nested)?, map, visited, target_platform)?;
+                    }
+                }
+                // Payloads are recognized through their projections, so any family that embeds them gets their
+                // compositions.
+                let scaled_dot = operation.projected_payload::<ScaledDotOperation>();
+                let Some(operation) = scaled_dot else {
+                    continue;
+                };
+                let input_types = instruction
+                    .inputs()
+                    .iter()
+                    .map(|input| {
+                        let r#type = region.atoms()[input.index()].r#type();
+                        <&ArrayType>::try_from(r#type.as_ref()).cloned().map_err(ProgramError::from)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let output_types = instruction
+                    .outputs()
+                    .iter()
+                    .map(|output| {
+                        let r#type = region.atoms()[output.index()].r#type();
+                        <&ArrayType>::try_from(r#type.as_ref()).cloned().map_err(ProgramError::from)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                // Calls that lower to the block-scaled-dot custom call need no composition.
+                if let Some((composition_input_types, composition_output_types)) = scaled_dot_composition_types(
+                    operation,
+                    input_types.as_slice(),
+                    output_types.as_slice(),
+                    target_platform,
+                )? {
+                    map.register(
+                        scaled_dot_composition_key(
+                            operation,
+                            composition_input_types.as_slice(),
+                            composition_output_types.as_slice(),
+                        )?,
+                        || trace_scaled_dot_composition(operation, composition_input_types.as_slice()),
+                    )?;
                 }
             }
-            // Payloads are recognized through their projections, so any family that embeds them gets their
-            // compositions.
-            let scaled_dot = operation.projected_payload::<ScaledDotOperation>();
-            let Some(operation) = scaled_dot else {
-                continue;
-            };
-            let input_types = instruction
-                .inputs()
-                .iter()
-                .map(|input| {
-                    let r#type = region.atoms()[input.index()].r#type();
-                    <&ArrayType>::try_from(r#type.as_ref()).cloned().map_err(ProgramError::from)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let output_types = instruction
-                .outputs()
-                .iter()
-                .map(|output| {
-                    let r#type = region.atoms()[output.index()].r#type();
-                    <&ArrayType>::try_from(r#type.as_ref()).cloned().map_err(ProgramError::from)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            // Calls that lower to the block-scaled-dot custom call need no composition.
-            if let Some((composition_input_types, composition_output_types)) = scaled_dot_composition_types(
-                operation,
-                input_types.as_slice(),
-                output_types.as_slice(),
-                target_platform,
-            )? {
-                map.register(
-                    scaled_dot_composition_key(
-                        operation,
-                        composition_input_types.as_slice(),
-                        composition_output_types.as_slice(),
-                    )?,
-                    || trace_scaled_dot_composition(operation, composition_input_types.as_slice()),
-                )?;
-            }
+            Ok(())
         }
-        Ok(())
-    }
 
-    let mut map = NamedCompositionFunctionMap::default();
-    walk(program.entry_region_ref(), &mut map, &mut HashSet::new(), target_platform)?;
-    Ok(map)
+        let mut map = Self::default();
+        walk(program.entry_region_ref(), &mut map, &mut HashSet::new(), target_platform)?;
+        Ok(map)
+    }
 }
 
 /// Emits the private decomposition function of one named composition into `module_block`.
@@ -1446,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_named_composition_functions_skips_the_bodies_of_scans_without_iterations() {
+    fn test_named_composition_function_map_for_program_skips_the_bodies_of_scans_without_iterations() {
         // A scaled dot in the body of a scan needs its composition when the length of the scan admits an iteration,
         // and not on any target when its length is zero, because lowering then emits nothing of its body (refer to
         // `omits_regions`).
@@ -1473,7 +1474,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 5], vec![Placeholder; 5])
                 .unwrap();
-            let map = collect_named_composition_functions(&program, None).unwrap();
+            let map = NamedCompositionFunctionMap::for_program(&program, None).unwrap();
             map.order().iter().map(|key| map.functions()[key].symbol().to_string()).collect::<Vec<_>>()
         };
         assert_eq!(symbols(0), Vec::<String>::new());

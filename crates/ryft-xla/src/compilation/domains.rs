@@ -1,8 +1,8 @@
 //! Compilation lifecycle of the XLA [`Session`], which implements [`CompilationDomain`] and [`CompilationCacheDomain`].
 //!
 //! `Session::lower_staged_program` validates the boundary of a staged program against the sharding overrides of its
-//! [`Options`]. `Session::lower_program` then selects kernels, discharges references, places every executable argument
-//! and result, and emits the StableHLO module together with its invocation contract. `Session::compile_program`
+//! [`Options`]. `Session::lower_program` then selects kernels, discharges references, places every physical input
+//! and output, and emits the StableHLO module together with its invocation contract. `Session::compile_program`
 //! compiles that module through the PJRT client of the session and derives the reusable execution plan.
 //! [`with_input_shardings`] applies input sharding overrides to input types before staging.
 
@@ -33,14 +33,14 @@ use crate::compilation::programs::{
 use crate::execution::{ExecutionPlan, validate_capture_reduction};
 use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::emissions::{
-    collect_session_constants, emitted_capture_reads, emitted_regions, omits_regions, unread_entry_arguments,
+    collect_session_constants, emitted_capture_reads, emitted_regions, omits_regions, unread_entry_inputs,
 };
 use crate::lowering::modules::{contains_unresolved_references, contains_unresolved_state, value_shardings};
+use crate::lowering::programs::MlirProgramSignature;
 use crate::lowering::programs::{
     OutputShardingSource, ProgramLoweringAnalysisExtension, ProgramLoweringExtension, ProgramLoweringOptions,
     entry_output_shardings, entry_outputs_with_compiler_chosen_placement,
 };
-use crate::lowering::signatures::ExecutableSignature;
 use crate::{
     Array, Constant, Error, ExecutionError, LoweringError, OpShardingExtension, Operation, RetainedArray, Session,
     Type, Value,
@@ -85,9 +85,9 @@ impl CompilationDomain for Session {
     // it (e.g., a replicated output override over auto mesh axes stages nothing, and a callee that a caller on other
     // devices inlines no longer shows where it was compiled to run). The function names its devices exactly when it
     // requests a placement that names devices (refer to `requests_placement`), which a request that only moves a value
-    // to another memory does not. Otherwise public arguments or the enclosing caller
+    // to another memory does not. Otherwise public inputs or the enclosing caller
     // select the devices, even for a function with committed captures. A dispatcher without input overrides also
-    // keeps each argument's sharding over auto mesh axes, because it specializes on the placement of runtime inputs
+    // keeps each input's sharding over auto mesh axes, because it specializes on the placement of runtime inputs
     // (refer to `dispatch_signature`). Every call also records the mesh of its function, named or not, which only an
     // application of the call by a session reads, to run there (refer to `CallOperation::with_function_mesh`), and
     // which a call nested in a compiled caller never reads. Core constructs the call operation once for each staged
@@ -115,13 +115,13 @@ impl CompilationDomain for Session {
         self.lower_staged_program(staged)
     }
 
-    // A cached executable contains no capture buffers. Materialize this lowering's hidden arguments on every
+    // A cached executable contains no capture buffers. Materialize this lowering's hidden inputs on every
     // compile request, including cache hits.
     fn compile(&self, program: &LoweredProgram) -> Result<(Arc<CompiledProgram>, Vec<Value>), Self::Error> {
         let session_arrays = program
             .session_constants()
             .iter()
-            .map(|binding| Ok(Value::Array(binding.argument().to_array(self)?)))
+            .map(|binding| Ok(Value::Array(binding.input().to_array(self)?)))
             .collect::<Result<Vec<_>, Error>>()?;
         let compiled = self.compilation_cache().compile(self, program)?;
 
@@ -163,7 +163,7 @@ impl Session {
         // constant of another client fails (refer to `placed_constant`), because every execution would reject it.
         // Staging already pruned the captures that the function does not use, which are therefore never checked. A
         // capture that only regions which lowering omits read (e.g., the body of a scan that admits no iteration) is
-        // not checked either, because the executable never reads it, and lowering erases its argument through the same
+        // not checked either, because the executable never reads it, and lowering erases its input through the same
         // decision (refer to `emitted_capture_reads`).
         let target_platform = Some(self.target()?.platform_name());
         let entry = staged.source_program().program().entry_region_ref();
@@ -199,7 +199,7 @@ impl Session {
             options
         };
         let lowered_program = self.lower_function_program(program, capture_count, options, true)?;
-        // A compiled function accepts exactly the arguments that its declared input types describe, so the public input
+        // A compiled function accepts exactly the inputs that its declared input types describe, so the public input
         // types of its executable are those types, which lowering never changes.
         let lowered_input_types = lowered_program.input_types();
         let lowered_public_input_types =
@@ -230,7 +230,7 @@ impl Session {
     /// process a device that it cannot address, is rejected first, as a direct placement and a placement of a capture
     /// reject it (refer to `validate_mesh_devices`), before anything is lowered, compiled, or looked up in a
     /// compilation cache, so that every process rejects it alike. The program is lowered as the program of an eager
-    /// application, whose mesh is where its operands are, so the mesh does not commit its outputs for being named
+    /// application, whose mesh is where its inputs are, so the mesh does not commit its outputs for being named
     /// (refer to [`commits_public_outputs`] and `lower_function_program`).
     pub(crate) fn lower_program(
         &self,
@@ -254,7 +254,8 @@ impl Session {
         LoweredProgram::new(lowering, self.target()?)
     }
 
-    /// Prepares the executable or remote result metadata for an eager application, deriving both from the same lowering.
+    /// Prepares the executable or remote output metadata for an eager application, deriving both from the same
+    /// lowering.
     pub(crate) fn prepare_eager_program(
         &self,
         program: &FlatProgram<Session>,
@@ -264,7 +265,7 @@ impl Session {
         let lowering = self.lower_program_invocation(program, 0, options, false)?;
         let target = self.target()?;
 
-        // Record the first application slot of each hidden argument's source constant.
+        // Record the first application slot of each hidden input's source constant.
         let mut slots = HashMap::with_capacity(session_constants.len());
         for (slot, constant) in session_constants.iter().enumerate() {
             slots.entry(constant).or_insert(slot);
@@ -483,13 +484,13 @@ impl Session {
                 },
             }));
         }
-        // Assign hidden argument slots from the original constants in the program that lowering emits for the target.
+        // Assign hidden input slots from the original constants in the program that lowering emits for the target.
         // Each constant supplies its declared type, and its placed array supplies buffers and runtime sharding.
         let session_constants = collect_session_constants(program, target_platform)
             .into_iter()
             .map(|source| {
-                let argument = placed_constant(self, &source, options.mesh())?.unwrap_or_else(|| source.clone());
-                Ok::<_, Error>(SessionConstantBinding::new(source, argument))
+                let input = placed_constant(self, &source, options.mesh())?.unwrap_or_else(|| source.clone());
+                Ok::<_, Error>(SessionConstantBinding::new(source, input))
             })
             .collect::<Result<Vec<_>, _>>()?;
         effective_capture_types.extend(session_constants.iter().map(|binding| binding.source().r#type().into_owned()));
@@ -571,15 +572,15 @@ impl Session {
         let program_output_types = program.output_types();
         let mut public_output_types = program_output_types[..output_count].to_vec();
         apply_signature_shardings(public_output_types.iter_mut(), options.output_shardings(), "output")?;
-        // Executable arguments are placed as their runtime arrays are, or as an input override requests, including
-        // over the auto mesh axes that their types never record. A runtime placement drops a pending reduction over
-        // those axes, which no value of the program can carry, whereas an input override, which states the placement
-        // with which the argument arrives, keeps it (refer to `receivable_argument_sharding`). An argument that the
-        // executable never reads has no executable argument (refer to `unread_entry_arguments`), so its placement is
-        // neither resolved nor validated, whatever its runtime array is (e.g., split unevenly, or of another client), and
-        // it is annotated replicated, which no physical argument carries.
+        // Physical inputs are placed as their runtime arrays are, or as an input override requests, including over the
+        // auto mesh axes that their types never record. A runtime placement drops a pending reduction over those axes,
+        // which no value of the program can carry, whereas an input override, which states the placement with which
+        // the input arrives, keeps it (refer to `receivable_input_sharding`). An input that the executable never reads
+        // has no physical input (refer to `unread_entry_inputs`), so its placement is neither resolved nor validated,
+        // whatever its runtime array is (e.g., split unevenly, or of another client), and it is annotated replicated,
+        // which no physical input carries.
         let source_capture_count = lowered_capture_count - session_constants.len();
-        let unread_arguments = unread_entry_arguments(
+        let unread_logical_inputs = unread_entry_inputs(
             program,
             &effective_input_types,
             lowered_capture_count,
@@ -588,11 +589,11 @@ impl Session {
             &reference_state_input_indices,
             target_platform,
         );
-        let logical_argument_shardings = effective_input_types
+        let logical_input_shardings = effective_input_types
             .iter()
             .enumerate()
             .map(|(index, array_type)| {
-                if unread_arguments[index] {
+                if unread_logical_inputs[index] {
                     return Ok(Sharding::replicated(options.mesh().logical_mesh().clone(), array_type.rank()));
                 }
                 let placement = if index < source_capture_count {
@@ -600,14 +601,14 @@ impl Session {
                 } else if index < lowered_capture_count {
                     let constant_index = index - source_capture_count;
                     let binding = &session_constants[constant_index];
-                    let argument = binding.argument();
-                    argument.validate_client(self.client())?;
-                    admit_capture(argument.sharding(), index, lowered_capture_count)?;
+                    let input = binding.input();
+                    input.validate_client(self.client())?;
+                    admit_capture(input.sharding(), index, lowered_capture_count)?;
                     let description = format!("retained array #{constant_index}");
                     Some(capture_sharding(
                         &description,
                         &binding.source().r#type(),
-                        argument.sharding(),
+                        input.sharding(),
                         options.mesh().logical_mesh(),
                     )?)
                 } else {
@@ -618,15 +619,14 @@ impl Session {
                     options.input_placements().and_then(|placements| placements.get(index).cloned().flatten())
                 };
                 match placement {
-                    Some(placement) => receivable_argument_sharding(placement),
+                    Some(placement) => receivable_input_sharding(placement),
                     None => Ok(CallOperation::declared_input_sharding(array_type, options.mesh().logical_mesh())),
                 }
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        // The executable expects the buffers of every argument to be split evenly (refer to `validate_even_sharding`),
-        // so an argument that a placement splits unevenly is rejected here rather than when execution launches.
-        for (index, (array_type, sharding)) in effective_input_types.iter().zip(&logical_argument_shardings).enumerate()
-        {
+        // The executable expects the buffers of every input to be split evenly (refer to `validate_even_sharding`),
+        // so an input that a placement splits unevenly is rejected here rather than when execution launches.
+        for (index, (array_type, sharding)) in effective_input_types.iter().zip(&logical_input_shardings).enumerate() {
             let (kind, index) = if index < source_capture_count {
                 ("capture", index)
             } else if index < lowered_capture_count {
@@ -636,11 +636,11 @@ impl Session {
             };
             validate_even_sharding(kind, index, array_type, sharding)?;
         }
-        // An argument is annotated as its runtime array stores it, which replicates the dimensions that its placement
+        // An input is annotated as its runtime array stores it, which replicates the dimensions that its placement
         // leaves unconstrained, as the StableHLO export of traced programs annotates it (refer to
         // `Sharding::with_unconstrained_dimensions_replicated`). Execution still expects the placement
         // itself, which describes the same buffers.
-        let argument_annotations = logical_argument_shardings
+        let input_annotations = logical_input_shardings
             .iter()
             .map(Sharding::with_unconstrained_dimensions_replicated)
             .collect::<Vec<_>>();
@@ -654,7 +654,7 @@ impl Session {
                         ),
                     }));
                 }
-                if !logical_argument_shardings[logical_input_index].is_replicated() {
+                if !logical_input_shardings[logical_input_index].is_replicated() {
                     return Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi {
                         reason: format!(
                             "bounded-dynamic external state input {logical_input_index} must use replicated sharding",
@@ -679,34 +679,34 @@ impl Session {
             .map_err(ProgramError::from)?;
         // A public output that a `place` in the entry region or in the callee of a `call` produces, directly or through
         // operations that return its value and placement unchanged, has the placement of its target, which states the
-        // placement along every mesh axis, and one that returns an argument in the same way is placed where that
-        // argument enters the executable (refer to `ProgramLoweringAnalysisExtension::output_sharding_sources`). Its
-        // type drops the auto mesh axes of that placement, and its result has no physical buffer whose placement the
+        // placement along every mesh axis, and one that returns an input in the same way is placed where that
+        // input enters the executable (refer to `ProgramLoweringAnalysisExtension::output_sharding_sources`). Its
+        // type drops the auto mesh axes of that placement, and its output has no physical buffer whose placement the
         // compiler could report when it has the zero data type, so the placement is carried to the boundary instead.
         // Outputs follow the output override first, then the placement from the program, both including over auto mesh
         // axes, and otherwise their types. The StableHLO export of traced programs follows the same rule (refer to
-        // `entry_output_shardings`). The arguments of the program are its captures and its public inputs, between which
+        // `entry_output_shardings`). The inputs of the program are its captures and its public inputs, between which
         // the executable receives the arrays of session constants.
         let constant_shardings = session_constants
             .iter()
-            .map(|binding| (binding.source(), binding.argument().sharding()))
+            .map(|binding| (binding.source(), binding.input().sharding()))
             .collect::<HashMap<_, _>>();
         let sharding_sources =
             program.output_sharding_sources(output_count, |constant| constant_shardings[constant].clone());
-        let program_argument_shardings = logical_argument_shardings[..source_capture_count]
+        let program_input_shardings = logical_input_shardings[..source_capture_count]
             .iter()
-            .chain(&logical_argument_shardings[lowered_capture_count..])
+            .chain(&logical_input_shardings[lowered_capture_count..])
             .cloned()
             .map(Some)
             .collect::<Vec<_>>();
-        // An output without a placement is replicated. These are the result annotations that lowering emits, and a
-        // result is never left without one, which would let the compiler place it differently (e.g., as the output of a
+        // An output without a placement is replicated. These are the output annotations that lowering emits, and an
+        // output is never left without one, which would let the compiler place it differently (e.g., as the output of a
         // `shard_map` that it is derived from) than execution expects.
         let mut output_annotations = entry_output_shardings(
             &output_types,
             options.output_shardings(),
             &sharding_sources,
-            &program_argument_shardings,
+            &program_input_shardings,
         )?
         .into_iter()
         .zip(&output_types)
@@ -729,12 +729,12 @@ impl Session {
             .enumerate()
             .map(|(index, (annotation, array_type))| {
                 // An anonymous singleton can omit a requested unconstrained sharding from its array type.
-                // Keep the unclosed placement of an explicit request or of an argument that the output forwards.
+                // Keep the unclosed placement of an explicit request or of an input that the output forwards.
                 let requested = options.output_shardings().map(|shardings| &shardings[index]).or_else(|| {
                     match &sharding_sources[index] {
                         Some(OutputShardingSource::Determined(sharding)) => Some(sharding),
                         Some(OutputShardingSource::Input(index)) => {
-                            program_argument_shardings.get(*index).and_then(Option::as_ref)
+                            program_input_shardings.get(*index).and_then(Option::as_ref)
                         }
                         None => None,
                     }
@@ -747,8 +747,8 @@ impl Session {
         for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
             if state.is_mutated() {
                 output_types.push(effective_input_types[logical_input_index].clone());
-                output_annotations.push(argument_annotations[logical_input_index].clone());
-                output_shardings.push(logical_argument_shardings[logical_input_index].clone());
+                output_annotations.push(input_annotations[logical_input_index].clone());
+                output_shardings.push(logical_input_shardings[logical_input_index].clone());
             }
         }
         // Every public output of a function that requests a placement explicitly anywhere is committed to its devices
@@ -762,9 +762,9 @@ impl Session {
         // whereas a function that is compiled for a single device leaves its outputs to the other rules. Every public
         // output of a function compiled for a named mesh (`function`) is committed too, as JAX commits every result of
         // a `jit` function under `set_mesh` (refer to `commits_public_outputs`). Other outputs are committed when a
-        // public argument of an execution is. The arrays that a function captures never commit its outputs, committed
+        // public input of an execution is. The arrays that a function captures never commit its outputs, committed
         // or not, as JAX returns `jit(lambda x: x + c)(x)` uncommitted for an uncommitted `x` whatever the commitment
-        // of `c`. Eager operations and compiled reshards set the commitment of their results themselves, so these flags
+        // of `c`. Eager operations and compiled reshards set the commitment of their outputs themselves, so these flags
         // do not reach them.
         let commits_public_outputs = commits_public_outputs(
             options.mesh(),
@@ -782,12 +782,12 @@ impl Session {
         } else {
             OutputDeviceAssignment::FromCaller
         };
-        // The effective placements of the arguments and results (i.e., their annotations) are checked rather than their
+        // The effective placements of the inputs and outputs (i.e., their annotations) are checked rather than their
         // types, which do not record placements along auto mesh axes (e.g., an output override that splits an output
         // along an auto axis), so that no replica returns a full buffer where the runtime placement describes a part.
         if !use_shardy_partitioner
             && options.mesh().devices().len() > 1
-            && argument_annotations.iter().chain(&output_annotations).any(|sharding| !sharding.is_replicated())
+            && input_annotations.iter().chain(&output_annotations).any(|sharding| !sharding.is_replicated())
         {
             return Err(Error::Compilation(CompilationError::InvalidOptions {
                 reason: "bounded-dynamic multi-device programs currently require fully replicated shardings \
@@ -804,7 +804,7 @@ impl Session {
         resolve_shardy_debug_options(self.client(), &mut compilation_options);
         // Shardy currently rejects bounded dynamic tensors. Fully replicated dynamic programs need no partitioning,
         // so lower them without Shardy metadata and execute one replica per mesh device instead.
-        let lowered_argument_shardings = use_shardy_partitioner.then_some(argument_annotations.as_slice());
+        let lowered_input_shardings = use_shardy_partitioner.then_some(input_annotations.as_slice());
         let lowered_output_shardings = use_shardy_partitioner.then_some(output_annotations.as_slice());
         // Public outputs without an override leave their placement over auto mesh axes to the compiler, like JAX
         // outputs without `out_shardings`, and compilation reads that placement back from the executable. The StableHLO
@@ -821,13 +821,13 @@ impl Session {
             .map(|index| use_shardy_partitioner && index < output_count && public_open_outputs[index])
             .collect::<Vec<_>>();
         // The program is already pruned, and its boundary is the one that this function resolved above.
-        let argument_count = effective_capture_types.len() + effective_public_input_types.parameter_count();
+        let input_count = effective_capture_types.len() + effective_public_input_types.parameter_count();
         let lowering_options = ProgramLoweringOptions::new()
             .without_pruning()
             .with_capture_types(effective_capture_types.clone())
             .with_input_types(&effective_public_input_types)
             .with_output_types(&output_types)
-            .with_exact_input_shardings(value_shardings(lowered_argument_shardings, argument_count))
+            .with_exact_input_shardings(value_shardings(lowered_input_shardings, input_count))
             .with_exact_output_shardings(value_shardings(lowered_output_shardings, output_types.parameter_count()))
             .with_open_outputs(open_outputs.clone())
             .with_target_platform(target_platform)
@@ -858,7 +858,7 @@ impl Session {
                 *donation = false;
             }
         }
-        let expected_argument_shardings = signature.physical_input_shardings(logical_argument_shardings.as_slice());
+        let expected_input_shardings = signature.physical_input_shardings(logical_input_shardings.as_slice());
         let embeds_kernels = emitted_regions(program.entry_region_ref(), target_platform).any(|region| {
             region.instructions().iter().any(|instruction| match instruction.operation() {
                 Operation::CustomCall(operation) | Operation::Array(ArrayOperation::CustomCall(operation)) => {
@@ -882,7 +882,7 @@ impl Session {
             donation_flags.into(),
             lowered_capture_count,
             session_constants.into(),
-            expected_argument_shardings.into(),
+            expected_input_shardings.into(),
             output_shardings.into(),
             open_outputs.into(),
             committed_outputs.into(),
@@ -981,19 +981,19 @@ impl CompilationCacheDomain for Session {
     }
 }
 
-/// Returns `sharding`, the placement of an argument of an executable that comes from a runtime array or a capture
-/// rather than from an input sharding override, without its unreduced axes that are auto mesh axes. Types do not record
-/// a pending reduction over auto mesh axes (refer to [`ArrayType::with_sharding`]), so neither the argument nor a value
-/// that the program computes from it can carry one, and Shardy rejects a program that drops it without a reshard (e.g.,
-/// an eager `sin` of such an argument, which eager dispatch places as its runtime array is). The executable therefore
-/// receives such an argument reduced, and argument preparation rejects an argument whose runtime sharding still has the
+/// Returns `sharding`, the placement of a physical input that comes from a runtime array or a capture rather than from
+/// an input sharding override, without its unreduced axes that are auto mesh axes. Types do not record a pending
+/// reduction over auto mesh axes (refer to [`ArrayType::with_sharding`]), so neither the input nor a value that the
+/// program computes from it can carry one, and Shardy rejects a program that drops it without a reshard (e.g., an
+/// eager `sin` of such an input, which eager dispatch places as its runtime array is). The executable therefore
+/// receives such an input reduced, and input preparation rejects an input whose runtime sharding still has the
 /// reduction pending (refer to `validate_input_reduction`), for compiled functions, `jit` dispatchers, and eager
-/// operations alike. An input sharding override states the placement with which its argument arrives, which the
+/// operations alike. An input sharding override states the placement with which its input arrives, which the
 /// boundary of the executable keeps, so that a program can complete the reduction (e.g., the reshard that
 /// [`Array::to_placement`](crate::Array::to_placement) compiles from an override with a pending reduction to one
 /// without it), and it is never passed here. A sharding without unreduced axes, which is the common case, is returned
 /// as it is.
-fn receivable_argument_sharding(sharding: Sharding) -> Result<Sharding, Error> {
+fn receivable_input_sharding(sharding: Sharding) -> Result<Sharding, Error> {
     if sharding.unreduced_axes().is_empty() {
         return Ok(sharding);
     }
@@ -1002,37 +1002,37 @@ fn receivable_argument_sharding(sharding: Sharding) -> Result<Sharding, Error> {
 
 /// Admits `sharding`, the placement of the runtime array of an array that a function captures (i.e., an explicit
 /// capture or the array of a session constant), as the input at `index` of its executable, whose first `capture_count`
-/// inputs are captures. This is the rule by which an execution admits an argument (refer to
+/// inputs are captures. This is the rule by which an execution admits an input (refer to
 /// `validate_capture_reduction`), applied to every capture that a function uses before it is placed on the mesh of the
 /// function, whatever the mesh of the function, so that a capture with a pending reduction over auto mesh axes is
-/// rejected with the error with which an execution rejects such an argument, rather than reduced by the placement that
+/// rejected with the error with which an execution rejects such an input, rather than reduced by the placement that
 /// moves it onto another topology.
 ///
 /// # Errors
 ///
 /// Returns [`ExecutionError::UnreducedAutoAxisCapture`] for such a capture.
 pub(crate) fn admit_capture(sharding: &Sharding, index: usize, capture_count: usize) -> Result<(), Error> {
-    let expected = receivable_argument_sharding(sharding.clone())?;
+    let expected = receivable_input_sharding(sharding.clone())?;
     validate_capture_reduction(sharding, &expected, index, capture_count).map_err(Error::Execution)
 }
 
 /// Returns the sharding with which the executable of a function compiled for `mesh` receives an array that the function
 /// captures, an explicit capture or an array that its program imports (i.e., a session constant) alike, whose type is
 /// `array_type` and whose runtime array is placed as `sharding`. A capture never decides where the function runs, and
-/// the executable receives it on `mesh` as it receives a public argument. A capture over a logical mesh of the topology
+/// the executable receives it on `mesh` as it receives a public input. A capture over a logical mesh of the topology
 /// of `mesh` is received as it is placed, including over the auto mesh axes that its type does not record, so that an
 /// execution only moves it onto the devices of `mesh` and never copies a capture that is already placed there. A
 /// capture over a logical mesh of another topology is received replicated over `mesh` when its runtime array stores
 /// what its type records as replicated, which includes a capture that is split along auto mesh axes only, which types
 /// never record, and the dimensions that its type leaves unconstrained, which a runtime array stores replicated (refer
 /// to `with_unconstrained_dimensions_replicated`). This is how JAX runs a `jit` function on the devices of its
-/// arguments whatever the devices of the arrays that it closes over. `description` names the capture in the error
+/// inputs whatever the devices of the arrays that it closes over. `description` names the capture in the error
 /// (e.g., "capture #0").
 ///
 /// Only the captures that survive the pruning of the staged program are resolved, so that a capture that the
 /// function does not use places nothing and fails nothing. A capture over a logical mesh of another topology that the
 /// function receives replicated is traced with the type that [`captured_type`] gives it. For a session constant,
-/// lowering binds its hidden argument to the placed array before resolving that argument's sharding.
+/// lowering binds its hidden input to the placed array before resolving that input's sharding.
 ///
 /// # Errors
 ///
@@ -1066,7 +1066,7 @@ pub(crate) fn capture_sharding(
 /// capture follows the call of the function. A type without sharding, including that of a capture on the anonymous mesh
 /// of one device, stays unsharded. When its type records only replication (refer to
 /// `Sharding::with_unconstrained_dimensions_replicated`), the function receives it without sharding,
-/// as it receives a public argument whose type declares none. The types of the values that it computes from the capture
+/// as it receives a public input whose type declares none. The types of the values that it computes from the capture
 /// then name no mesh of the capture. A call of a function that names no devices therefore runs where its caller runs
 /// whatever the devices of its captures, as JAX computes `jit(lambda x: x + c)` on the devices of `x` whether `c` is
 /// uncommitted or committed elsewhere. A capture whose type records more (i.e., a split, a pending reduction, or manual
@@ -1074,9 +1074,9 @@ pub(crate) fn capture_sharding(
 /// can receive it on the mesh of its options (refer to [`capture_sharding`]). This is the single rule for the type of a
 /// captured array inside a compiled function, which every route by which an array enters the trace of a compiled
 /// function shares (refer to `Session::capture_constant` and [`imported_constant`]). Lowering binds a session constant
-/// to its placed argument (refer to [`placed_constant`]). An uncommitted public argument follows the call as a capture
-/// does, so a `jit` dispatcher specializes for such an argument with the type that this function returns as well (refer
-/// to [`argument_type`]).
+/// to its placed input (refer to [`placed_constant`]). An uncommitted public input follows the call as a capture
+/// does, so a `jit` dispatcher specializes for such an input with the type that this function returns as well (refer
+/// to [`relocated_input_type`]).
 pub(crate) fn captured_type(array_type: &ArrayType) -> Option<ArrayType> {
     let stored = array_type.sharding().map(Sharding::with_unconstrained_dimensions_replicated);
     if !stored.as_ref().is_none_or(Sharding::is_replicated) {
@@ -1085,22 +1085,22 @@ pub(crate) fn captured_type(array_type: &ArrayType) -> Option<ArrayType> {
     array_type.clone().with_sharding(None).ok()
 }
 
-/// Returns the type for which a `jit` dispatcher specializes its function for `array`, an argument of one of its
+/// Returns the type for which a `jit` dispatcher specializes its function for `array`, an input of one of its
 /// executions or eager calls whose effective type is `array_type` (i.e., the type of `array` or the staged type that
 /// the dispatcher declares for it), when `array` is relocatable, and [`None`] when it is not, in which case the
-/// dispatcher specializes for `array_type` and the placement of `array`. An uncommitted argument whose type records
+/// dispatcher specializes for `array_type` and the placement of `array`. An uncommitted input whose type records
 /// nothing beyond replication (e.g., an upload without a destination, which lives on the canonical mesh of its device)
 /// is relocatable: an execution moves it onto the devices of the function, as it moves an
-/// uncommitted argument of a function compiled for a type without a sharding. The function is therefore specialized
+/// uncommitted input of a function compiled for a type without a sharding. The function is therefore specialized
 /// for its type without a sharding, by the rule that types a capture (refer to [`captured_type`]), rather than for the
-/// logical mesh where it happens to live, which another mesh of the same devices would reject. A committed argument and
+/// logical mesh where it happens to live, which another mesh of the same devices would reject. A committed input and
 /// one whose type records more keep their types, so the mesh of a function still rejects them when their logical
 /// meshes differ. The dispatch signature uses this rule for both executions and eager calls, so they trace the function
-/// alike. The rule also determines which arguments an eager call of a dispatcher
-/// leaves only an argument that is not relocatable where it is (refer to `CallEagerExtension::eager_input_placement`).
-/// A relocatable argument has no placement over auto mesh axes for the function to specialize on (e.g., an uncommitted
+/// alike. The rule also determines which inputs an eager call of a dispatcher
+/// leaves only an input that is not relocatable where it is (refer to `CallEagerExtension::eager_input_placement`).
+/// A relocatable input has no placement over auto mesh axes for the function to specialize on (e.g., an uncommitted
 /// split along an auto axis of one device), because an execution moves it.
-pub(crate) fn argument_type(array: &Array, array_type: &ArrayType) -> Option<ArrayType> {
+pub(crate) fn relocated_input_type(array: &Array, array_type: &ArrayType) -> Option<ArrayType> {
     if array.is_committed() { None } else { captured_type(array_type) }
 }
 
@@ -1182,7 +1182,7 @@ pub(crate) fn placed_constant(
         .is_none_or(|sharding| sharding.mesh().has_same_topology(mesh.logical_mesh()));
     // A capture that the function cannot admit (refer to `admit_capture`) is left as it is, so that its admission
     // rejects it rather than a placement that completes its pending reduction.
-    let pending_auto_reduction = receivable_argument_sharding(constant.sharding().clone())? != *constant.sharding();
+    let pending_auto_reduction = receivable_input_sharding(constant.sharding().clone())? != *constant.sharding();
     if !follows_mesh || pending_auto_reduction {
         return Ok(None);
     }
@@ -1351,16 +1351,16 @@ pub(crate) fn jit_compilation_options(
 }
 
 /// Returns whether every execution of a program on `mesh` commits its public outputs whatever the commitment of its
-/// arguments, where `requests_placement` says whether the program requests a placement explicitly anywhere, including
+/// inputs, where `requests_placement` says whether the program requests a placement explicitly anywhere, including
 /// one that only moves a value to another memory (refer to `requests_placement`), and `function_mesh` says whether
 /// `mesh` is the mesh that the function of the program was compiled for and runs on, rather than the devices of the
-/// arguments of an eager application or of an eager operation. This is the case when the program requests a placement,
+/// inputs of an eager application or of an eager operation. This is the case when the program requests a placement,
 /// as JAX commits every result of a `jit` function with any explicit sharding, when it runs on more than one device, as
 /// JAX commits every result of a computation on more than one device, and when it runs on the named mesh of its
 /// function (refer to [`LogicalMesh::is_named`]), as JAX commits every result of a `jit` function under
-/// `set_mesh`, on one device too. A result of a function on a named mesh of one device is therefore committed to that
+/// `set_mesh`, on one device too. An output of a function on a named mesh of one device is therefore committed to that
 /// mesh, so combining it with a value committed to other devices is an error, as under `set_mesh`. On an anonymous
-/// mesh, results are committed only by the other rules or by a committed public argument.
+/// mesh, outputs are committed only by the other rules or by a committed public input.
 ///
 /// This is the one owner of the rule. Compiled functions record it (refer to [`CompiledProgram::committed_outputs`]),
 /// so that `.executable().execute` commits by it, and the placement decision of an eager application of a call reads it
@@ -1541,13 +1541,13 @@ fn runtime_output_sharding(annotation: &Sharding, declaration: Option<&Sharding>
     Ok(annotation.with_dimensions(dimensions)?)
 }
 
-/// Validates that `sharding`, the placement of the argument or result `index` of kind `kind` (e.g., `"input"`) of an
+/// Validates that `sharding`, the placement of the input or output `index` of kind `kind` (e.g., `"input"`) of an
 /// executable, splits every static extent of `array_type` evenly. The SPMD partitioner splits a dimension into shards
 /// of one size and pads the last ones, so an uneven split (e.g., five elements over two devices) makes the executable
 /// expect or return buffers other than the exact shards (i.e., `[3]` and `[2]`) that the runtime placement describes,
 /// which launching the executable or reconstructing its outputs would reject. A dimension is split into as many shards
 /// as the product of the sizes of the mesh axes that it is sharded along. Dynamic extents are not checked here, and
-/// neither are values that the executable does not materialize (refer to [`ExecutableSignature::materializes`]),
+/// neither are values that the executable does not materialize (refer to [`MlirProgramSignature::materializes`]),
 /// because they have no buffers that the executable could expect or return (e.g., a `Zero[5]` split into shards of
 /// lengths 3 and 2).
 ///
@@ -1560,7 +1560,7 @@ fn validate_even_sharding(
     array_type: &ArrayType,
     sharding: &Sharding,
 ) -> Result<(), Error> {
-    if !ExecutableSignature::materializes(array_type) {
+    if !MlirProgramSignature::materializes(array_type) {
         return Ok(());
     }
     for (dimension, (extent, sharding_dimension)) in
@@ -1585,7 +1585,7 @@ fn validate_even_sharding(
 
 /// Returns whether every array type that occurs in a region that lowering emits for `target_platform` (refer to
 /// [`emitted_regions`]) of `program` has a static shape. The walk covers the entry region and its executed nested
-/// regions, and therefore every region boundary, constant, and instruction result that lowering emits. Regions that
+/// regions, and therefore every region boundary, constant, and instruction output that lowering emits. Regions that
 /// lowering never reaches (e.g., the rule regions of composites, the transpose region of a `linear_call`, or a body that
 /// a backend implementation of a named composite replaces for the target) are skipped, so that they cannot change how
 /// the rest of the program is compiled. First-class atoms of dimension type are ignored because they lower to ordinary
@@ -1928,7 +1928,7 @@ mod tests {
 
     #[test]
     fn test_compile_statefully_with_captures_commits_outputs_for_boundary_shardings() {
-        // A nullary function that returns an uncommitted capture on a mesh of one device leaves its result uncommitted
+        // A nullary function that returns an uncommitted capture on a mesh of one device leaves its output uncommitted
         // when it states no placement at its boundary, also when its options hold an empty list of input overrides,
         // which states nothing, and commits it when an output override states a placement.
         let client = cpu_client(1);
@@ -1946,11 +1946,11 @@ mod tests {
                 options,
             )
             .unwrap();
-            let Value::Array(result) = function.execute_statefully_and_wait(&session, ()).unwrap() else {
+            let Value::Array(output) = function.execute_statefully_and_wait(&session, ()).unwrap() else {
                 unreachable!("the function returns an array")
             };
-            assert_eq!(result.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![3.0]);
-            result.is_committed()
+            assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![3.0]);
+            output.is_committed()
         };
         assert_eq!(
             [
@@ -2423,9 +2423,9 @@ mod tests {
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![placed, placed], None).unwrap()[0];
         let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
-        // The output type inherits the unconstrained dimension of the `place` target, but the output is not the result
-        // of that `place`. Its annotation closes that dimension like the target of a `place` that produces an output,
-        // so that the compiler returns the buffers that the runtime placement of the output describes.
+        // The output type inherits the unconstrained dimension of the `place` target, but that `place` does not produce
+        // the output. Its annotation closes that dimension like the target of a `place` that produces an output, so
+        // that the compiler returns the buffers that the runtime placement of the output describes.
         let options = Options::new(mesh.clone()).with_input_shardings(vec![input_sharding.clone()]);
         let lowered = session.lower_program(&program, 0, &options).unwrap();
         assert_eq!(
@@ -2462,7 +2462,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_lower_program_closes_unconstrained_argument_shardings() {
+    fn test_session_lower_program_closes_unconstrained_input_shardings() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
         let logical_mesh = LogicalMesh::new(vec![
@@ -2490,10 +2490,10 @@ mod tests {
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![placed, placed], None).unwrap()[0];
         let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
-        // An array placed with an unconstrained dimension stores that dimension replicated, so the argument that it
-        // enters as is annotated with that dimension closed, whether its placement is an input override or the observed
-        // placement of the runtime array. Otherwise, the compiler could shard that dimension and expect smaller buffers
-        // than the array supplies.
+        // An array placed with an unconstrained dimension stores that dimension replicated, so the physical input that
+        // it enters as is annotated with that dimension closed, whether its placement is an input override or the
+        // observed placement of the runtime array. Otherwise, the compiler could shard that dimension and expect
+        // smaller buffers than the array supplies.
         let values = (0..16).collect::<Vec<i32>>();
         for options in [
             Options::new(mesh.clone()).with_input_shardings(vec![input_sharding.clone()]),
@@ -2553,7 +2553,7 @@ mod tests {
         let target = Placement::new(mesh.clone(), unconstrained.clone()).unwrap();
         let options = || Options::new(mesh.clone());
 
-        // Both an output that forwards an argument and one produced by an explicit placement retain the requested
+        // Both an output that forwards an input and one produced by an explicit placement retain the requested
         // metadata. The anonymous type omits its sharding, and every executable buffer holds the full extent.
         let identity = crate::compile_with_options::<_, ArrayType, ArrayType>(
             |x: CompileTracer| x,
@@ -2597,7 +2597,7 @@ mod tests {
             builder.add_instruction(PlaceOperation::new(None, None), Vec::new(), vec![input], None).unwrap()[0];
         let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
-        // A `place` without a target returns its input where it is. A result of the zero data type has no buffer whose
+        // A `place` without a target returns its input where it is. An output of the zero data type has no buffer whose
         // placement the compiler could report, so it takes the placement that the input enters with.
         let options = Options::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]);
         let lowered = session.lower_program(&program, 0, &options).unwrap();
@@ -2652,9 +2652,9 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![placed, forwarded], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
-        // A `call` whose callee places its result or returns one of its inputs places its own result as the callee
-        // does. A result of the zero data type has no buffer whose placement the compiler could report, so it takes
-        // its placement from the `place` in the callee or from the argument that the call forwards.
+        // A `call` whose callee places its output or returns one of its inputs places its own output as the callee
+        // does. An output of the zero data type has no buffer whose placement the compiler could report, so it takes
+        // its placement from the `place` in the callee or from the input that the call forwards.
         let options = Options::new(mesh.clone()).with_input_shardings(vec![replicated.clone(), sharded.clone()]);
         let lowered = session.lower_program(&program, 0, &options).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
@@ -2691,9 +2691,9 @@ mod tests {
             .unwrap()[0];
         let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
-        // A device target completes the pending reduction of its input along `x`, which has one device, so its result
-        // is placed and annotated as its type states rather than as the argument that it is computed from, and `exp`
-        // applies to that result.
+        // A device target completes the pending reduction of its input along `x`, which has one device, so its output
+        // is placed and annotated as its type states rather than as the input that it is computed from, and `exp`
+        // applies to that output.
         let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(
             lowered.stable_hlo(),
@@ -2744,11 +2744,11 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![returned, called], Vec::new(), vec![Placeholder; 2])
             .unwrap();
 
-        // A retained array of the zero data type has no buffer whose placement the compiler could report, so a result
+        // A retained array of the zero data type has no buffer whose placement the compiler could report, so an output
         // that returns it, directly or from the callee of a `call`, takes the placement of the retained array.
         let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
-        // The executable receives the retained array as its hidden session constant argument.
+        // The executable receives the retained array as its hidden session constant input.
         let outputs = session.execute_program(&compiled, vec![array]).unwrap();
         let output_type = zero_type.with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1)).unwrap();
         assert_eq!(outputs[0].r#type().as_ref(), &output_type);
@@ -2766,13 +2766,13 @@ mod tests {
         outputs[0].block_until_ready().unwrap();
         outputs[1].block_until_ready().unwrap();
 
-        // Retargeting the same program to a singleton mesh places both results as the bound hidden argument.
+        // Retargeting the same program to a singleton mesh places both outputs as the bound hidden input.
         let singleton = DeviceMesh::new(LogicalMesh::single_device(), vec![mesh.devices()[0]]).unwrap();
         let replicated = Sharding::replicated(singleton.logical_mesh().clone(), 1);
         let lowered = session.lower_program(&program, 0, &Options::new(singleton)).unwrap();
-        let [binding] = lowered.session_constants() else { panic!("expected one hidden argument") };
+        let [binding] = lowered.session_constants() else { panic!("expected one hidden input") };
         assert_eq!(binding.source().sharding(), &sharded);
-        assert_eq!(binding.argument().sharding(), &replicated);
+        assert_eq!(binding.input().sharding(), &replicated);
         assert_eq!(lowered.output_shardings(), &[replicated.clone(), replicated]);
     }
 
@@ -2791,11 +2791,11 @@ mod tests {
             builder.build(vec![first, second], Vec::new(), vec![Placeholder; 2]).unwrap();
 
         let lowered = session.lower_program(&program, 0, &Options::new(array.mesh().clone())).unwrap();
-        let [first, second] = lowered.session_constants() else { panic!("expected two hidden arguments") };
+        let [first, second] = lowered.session_constants() else { panic!("expected two hidden inputs") };
         assert_eq!(first.source(), &uncommitted);
         assert_eq!(second.source(), &committed);
-        // Both arguments share the same committed placement, but their source identities have separate slots.
-        assert_eq!(first.argument(), second.argument());
+        // Both inputs share the same committed placement, but their source identities have separate slots.
+        assert_eq!(first.input(), second.input());
         let (_, captures) = CompilationDomain::compile(&session, &lowered).unwrap();
         let [Value::Array(first), Value::Array(second)] = captures.as_slice() else {
             panic!("expected two executable captures")
@@ -3153,9 +3153,9 @@ mod tests {
             )
         };
 
-        // The SPMD partitioner has no uneven splits, so an executable whose argument splits five elements over two
-        // devices would expect buffers other than the `[3]` and `[2]` shards of its runtime array. Compilation rejects
-        // such a placement, whether an input override requests it or a resident array has it.
+        // The SPMD partitioner has no uneven splits, so an executable whose physical input splits five elements over
+        // two devices would expect buffers other than the `[3]` and `[2]` shards of its runtime array. Compilation
+        // rejects such a placement, whether an input override requests it or a resident array has it.
         let input_options = Options::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]);
         assert!(matches!(
             compile(5, input_options.clone()),
@@ -3666,7 +3666,7 @@ mod tests {
             (array.mesh().devices().to_vec(), array.is_committed(), values)
         };
 
-        // Returns the eager result and the compiled result of a placement of `input` without a target and with
+        // Returns the eager output and the compiled output of a placement of `input` without a target and with
         // `source`, compiled for the mesh of `input`.
         let options = |source: &PlacementRequest| PlacementOptions::default().with_source(source.clone());
         let place = |input: &Array, source: &PlacementRequest| {
@@ -3789,10 +3789,10 @@ mod tests {
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let predicate_type = replicated_scalar_type(&mesh, DataType::Boolean);
 
-        // A `place` that no result uses is not part of the program that lowering emits, as JAX removes a dead
-        // `device_put` before it looks at shardings, whether a branch drops its result or the condition returns it as
+        // A `place` whose output nothing uses is not part of the program that lowering emits, as JAX removes a dead
+        // `device_put` before it looks at shardings, whether a branch drops its output or the condition returns it as
         // an output that the program does not use. It neither fails the validation of placements onto another device
-        // nor commits the results, and the program agrees with the analysis of its placement requests.
+        // nor commits the outputs, and the program agrees with the analysis of its placement requests.
         for returns_placement in [false, true] {
             let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone().into());
@@ -4674,11 +4674,11 @@ mod tests {
 
     #[test]
     fn test_session_lower_program_keeps_pending_reductions_of_input_overrides() {
-        // An input sharding override states the placement with which its argument arrives, a pending sum over an auto
+        // An input sharding override states the placement with which its input arrives, a pending sum over an auto
         // axis included, so the boundary of the executable keeps it and the program can complete it (e.g., the reshard
         // that `Array::to_placement` compiles from such a source onto a sharding without unreduced axes). A runtime
         // placement with the same pending sum is dropped instead, because no value of the program can carry it, and
-        // argument preparation then rejects an argument with that sum pending.
+        // input preparation then rejects an input with that sum pending.
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
         let session = Session::builder().client(client).build().unwrap();
@@ -4750,10 +4750,10 @@ mod tests {
         let program =
             builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
 
-        // The hidden argument uses the retained runtime sharding without creating another logical array.
+        // The hidden input uses the retained runtime sharding without creating another logical array.
         let statistics = session.array_statistics();
         let lowered = session.lower_program(&program, 0, &Options::new(mesh)).unwrap();
-        assert_eq!(lowered.expected_argument_shardings(), &[sharding]);
+        assert_eq!(lowered.expected_input_shardings(), &[sharding]);
         assert_eq!(session.array_statistics(), statistics);
 
         let foreign_client = other_cpu_client(2);
@@ -5576,7 +5576,7 @@ mod tests {
                 true,
                 false,
                 vec![3.0],
-                Err("public argument #0 is committed to devices [0, 1], but the executable requires [0]".to_string()),
+                Err("public input #0 is committed to devices [0, 1], but the executable requires [0]".to_string()),
                 Err("the cross-host transfers extension is not provided by the PJRT plugin".to_string()),
             ),
         );
@@ -5760,14 +5760,15 @@ mod tests {
     #[test]
     fn test_session_lower_staged_program_skips_captures_that_only_omitted_regions_read() {
         // A split capture that only the body of a scan imports is checked when the scan admits an iteration, and not
-        // when its length is zero, because lowering then emits nothing of that body and the executable has no argument
-        // for the capture (refer to `emitted_capture_reads`). This holds for a populated capture of another client,
-        // whose admission rejects it, and for a capture of this client without buffers, which only an execution
-        // rejects. At length zero both compile and run through the executable. It holds alike for a capture of another
-        // client of the zero data type, which has no buffer either, and for a capture of this client that is split
-        // unevenly, which the executable could not receive. Every entry point agrees: an execution, a call, the
-        // interpretation rule of a call, an execution of a persisted copy, and an execution of a caller that is compiled
-        // around a call, which passes the capture on to the callee and so reads it only where the callee reads it.
+        // when its length is zero, because lowering then emits nothing of that body and the executable has no physical
+        // input for the capture (refer to `emitted_capture_reads`). This holds for a populated capture of another
+        // client, whose admission rejects it, and for a capture of this client without buffers, which only an
+        // execution rejects. At length zero both compile and run through the executable. It holds alike for a capture
+        // of another client of the zero data type, which has no buffer either, and for a capture of this client that
+        // is split unevenly, which the executable could not receive. Every entry point agrees: an execution, a call,
+        // the interpretation rule of a call, an execution of a persisted copy, and an execution of a caller that is
+        // compiled around a call, which passes the capture on to the callee and so reads it only where the callee
+        // reads it.
         let session = Session::builder().client(cpu_client(2)).build().unwrap();
         let foreign_session = Session::builder().client(other_cpu_client(2)).build().unwrap();
         let mesh = two_device_mesh(session.client(), MeshAxisType::Explicit);
@@ -5931,7 +5932,7 @@ mod tests {
         // A capture of another client of the zero data type and a capture of this client that is split unevenly are
         // rejected like the captures above when the function reads them, and require nothing when it does not. The
         // signature records which captures are unread rather than leaving execution to infer it from a missing buffer,
-        // which a capture of the zero data type never has (refer to `ExecutableSignature::is_unread_input`), and a
+        // which a capture of the zero data type never has (refer to `MlirProgramSignature::is_unread_input`), and a
         // capture is placed only once it is known to be read.
         let zero_message = format!(
             "session constant `{}` retains an array of a different PJRT client than the client of this session",
@@ -5953,7 +5954,7 @@ mod tests {
             assert_eq!(persisted(capture, 0), *nothing);
         }
         // A caller that passes a capture on to a call whose callee never reads it reads it neither, so its executable
-        // has no argument for it and places nothing, and it agrees with the function at every length.
+        // has no physical input for it and places nothing, and it agrees with the function at every length.
         for (capture, nothing) in unread.into_iter().chain([(&reversed, &nothing)]) {
             assert_eq!(caller(capture, 0), *nothing);
         }
@@ -5963,7 +5964,7 @@ mod tests {
         assert_eq!(caller(&reversed, 1), read);
 
         // A function that also calls a function whose own capture is numbered zero as well reads its own capture zero
-        // only where its own regions read it, and the capture of its callee only through the operand of the call
+        // only where its own regions read it, and the capture of its callee only through the input of the call
         // (refer to `emitted_regions_entering_calls`). So a capture of another client that only a scan without
         // iterations reads stays unread when the callee reads its own capture zero, and a capture that the function
         // reads stays required when the callee never reads its own capture zero, at every entry point. Before, the
@@ -6206,9 +6207,9 @@ mod tests {
 
     #[test]
     fn test_placed_constant_preserves_capture_completion_with_shared_buffers() {
-        // Two captures share the buffer of one array but complete with different fences (e.g., a result that aliases an
-        // existing array, refer to `Array::with_execution_fence`). Placing either one reuses the placed buffer of the
-        // other while each placement observes the fence of its own capture.
+        // Two captures share the buffer of one array but complete with different fences (e.g., an output that aliases
+        // an existing array, refer to `Array::with_execution_fence`). Placing either one reuses the placed buffer of
+        // the other while each placement observes the fence of its own capture.
         let client = cpu_client(3);
         let session = Session::builder().client(client).build().unwrap();
         let devices = client.addressable_devices().unwrap();
@@ -6271,14 +6272,14 @@ mod tests {
             let lowered = session.lower_program(&program, 0, &Options::new(target)).unwrap();
             assert_eq!(lowered.session_constants().len(), captures.len());
             let (program, captures) = CompilationDomain::compile(&session, &lowered).unwrap();
-            let arguments = captures
+            let inputs = captures
                 .into_iter()
                 .map(|value| {
                     let Value::Array(array) = value else { panic!("expected an executable capture") };
                     array
                 })
                 .collect();
-            session.execute_program(&program, arguments).and_then(|arrays| {
+            session.execute_program(&program, inputs).and_then(|arrays| {
                 arrays
                     .into_iter()
                     .map(|array| array.copy_to_host()?.elements::<f32>().map_err(Error::from))
@@ -6326,7 +6327,7 @@ mod tests {
         // every process rejects it alike, also for a function without captures. A session that declares that device
         // passes this check, and a CPU client, which lists only its own devices, then cannot assign the program to that
         // device. Before, it compiled, and an execution either failed for a missing shard or returned a
-        // result on the misattributed mesh, and a device that the session does not know compiled as well.
+        // output on the misattributed mesh, and a device that the session does not know compiled as well.
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let local = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();

@@ -46,7 +46,7 @@ pub(super) struct DistributedCollectiveCase {
     /// Global participant count.
     participants: usize,
 
-    /// Physical operand buffer shape on each rank.
+    /// Physical input buffer shape on each rank.
     local_shape: Vec<usize>,
 
     /// Physical output buffer shape on each rank.
@@ -56,7 +56,7 @@ pub(super) struct DistributedCollectiveCase {
     #[serde(default)]
     metadata_type: Option<String>,
 
-    /// Sender-owned operand row offsets, indexed by rank then destination.
+    /// Sender-owned input row offsets, indexed by rank then destination.
     #[serde(default)]
     input_offsets: Vec<Vec<u64>>,
 

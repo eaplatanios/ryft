@@ -280,7 +280,7 @@ fn collapse_singleton_axis<'b, 'c: 'b, 't: 'c>(
     Ok(reshape.result(0).unwrap().as_ref())
 }
 
-/// Applies one axis-ordered explicit dimension operand per result axis to one native collective result.
+/// Applies one axis-ordered explicit dimension input per output axis to one native collective result.
 fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
     mut result: ValueRef<'b, 'c, 't>,
     extents: &[ValueRef<'b, 'c, 't>],

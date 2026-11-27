@@ -1170,7 +1170,7 @@ mod tests {
     /// Compiles `module` with one SPMD partition per CPU device, executes it once with one `f64` input buffer of
     /// `dimensions` per device holding that device's entry of `shards`, and returns every device's single `f64` output
     /// as its elements in logical row-major order together with its physical layout.
-    #[allow(deprecated)] // Inspect the physical result layout, independently of the declared array type.
+    #[allow(deprecated)] // Inspect the physical output layout, independently of the declared array type.
     fn execute_sharded_module(
         module: &str,
         shards: &[Vec<f64>],
@@ -1954,7 +1954,7 @@ mod tests {
         };
         let client = execution_client();
         // Exercise repeated calls, selected and unselected branches, zero-trip loops, a rolled scan and a fully
-        // unrolled scan. The checked cast's unused result must never make its precondition disappear.
+        // unrolled scan. The checked cast's unused output must never make its precondition disappear.
         for wrapper in 0..5 {
             for entered in [false, true] {
                 if wrapper == 0 && !entered {
@@ -3300,7 +3300,7 @@ mod tests {
         // Layouts are only observable where a value crosses a boundary (i.e., executable inputs and outputs, and custom
         // call inputs and outputs). The custom call explicitly requests the column-major layout to observe this
         // storage. XLA rejects bounded dynamic custom call operands and bounded dynamic executable outputs whose layout
-        // is not row-major, so only a static result of such a cast can be observed, and its consumer still receives
+        // is not row-major, so only a static output of such a cast can be observed, and its consumer still receives
         // the declared column-major storage.
         // The copying handler reads and writes its buffers through host pointers, so this test always runs on the CPU
         // client rather than on the configured execution platform, whose buffers may live in device memory.
@@ -3394,7 +3394,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)] // Inspect physical result storage independently of the lowered IR.
+    #[allow(deprecated)] // Inspect physical output storage independently of the lowered IR.
     fn test_cast_operation_lower_layouts_in_shard_map() {
         let mesh = test_manual_mesh("x", 1);
         let sharding = Sharding::replicated(mesh.clone(), 2);
@@ -3537,8 +3537,8 @@ mod tests {
             assert_eq!(read_first_shard::<f64>(client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
         }
 
-        // A tuple mixes an erased zero, a constrained result and an unconstrained result. The dynamic case also
-        // appends hidden extent results. Check the actual buffers rather than trusting their reconstructed types.
+        // A tuple mixes an erased zero, a constrained output and an unconstrained output. The dynamic case also
+        // appends hidden extent outputs. Check the actual buffers rather than trusting their reconstructed types.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
         let zero_type = ArrayType::new_static(DataType::Zero, [2, 3]);
         let zero = Array::from_host_buffer(&session, zero_type.clone(), mesh.clone(), None, []).unwrap();
@@ -3585,7 +3585,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)] // Verify actual result storage alongside the hidden extent and effect-token ABI.
+    #[allow(deprecated)] // Verify actual output storage alongside the hidden extent and effect-token ABI.
     fn test_cast_operation_lower_preserves_dynamic_row_major_layout_with_ordered_io() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
@@ -3959,7 +3959,7 @@ mod tests {
     #[test]
     fn test_cast_operation_lower_preserved_placement_executes() {
         // Carrying the auto and explicit placement forward emits no constraint, so every device keeps its own shard
-        // and only the physical layout of the result changes. Types record no placement over the auto axis `a`, so the
+        // and only the physical layout of the output changes. Types record no placement over the auto axis `a`, so the
         // placement over it is only an argument and result sharding of the lowered module.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),

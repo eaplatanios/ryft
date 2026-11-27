@@ -624,7 +624,7 @@ impl RuntimeRegistry {
         Ok(resources)
     }
 
-    /// Retains invocation resources after a successful submission. Call this before reconstructing results so that the
+    /// Retains invocation resources after a successful submission. Call this before reconstructing outputs so that the
     /// resources outlive native execution even if reconstruction fails. [`ExecutionResources::into_parts`] supplies
     /// [`Some`] when the invocation has resources or an execution context. The context can borrow from an extension
     /// instance, so it needs tracking even without additional resources. [`None`] skips tracking. When given [`Some`],

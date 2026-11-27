@@ -16,7 +16,7 @@ impl LowerableOperation for StopGradientOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (lowerer, input_types, output_types);
-        // `stop_gradient` only affects differentiation, so by lowering time it is the identity and every operand is
+        // `stop_gradient` only affects differentiation, so by lowering time it is the identity and every input is
         // forwarded without emitting any MLIR operation, which matches JAX's lowering.
         Ok(input_values.to_vec())
     }
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn test_stop_gradient_operation_lower() {
-        // A gradient barrier is the identity by lowering time, so it forwards every operand without emitting anything.
+        // A gradient barrier is the identity by lowering time, so it forwards every input without emitting anything.
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
         let scalar_type = ArrayType::scalar(DataType::F32);
@@ -194,7 +194,7 @@ mod tests {
             assert!((got - expected).abs() < 1e-5, "got {got}, expected ~{expected}");
         }
 
-        // Lowering preserves every result of one variadic barrier without materializing an MLIR operation.
+        // Lowering preserves every output of one variadic barrier without materializing an MLIR operation.
         let variadic: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             |(first, second)| {
                 let context = first.domain();

@@ -166,7 +166,7 @@ const ELEMENTWISE_OPERATIONS: &[&str] = &[
 /// auto mesh axes, which no type records, or [`None`] when `value` is not the result of such a constraint or the
 /// constraint partitions a dimension along a part of an axis. An empty dimension is replicated when it is closed and
 /// unconstrained when it is open. This is what the program states about the placement of a value along auto mesh axes
-/// (e.g., the constraint that [`ShardingReductionExtension::lower_pending_reduction_constraint`] emits for an argument
+/// (e.g., the constraint that [`ShardingReductionExtension::lower_pending_reduction_constraint`] emits for an input
 /// that enters with a pending reduction, or for the result of an earlier instruction), so it is read from the program
 /// rather than reconstructed.
 fn constrained_dimensions(value: ValueRef<'_, '_, '_>) -> Result<Option<Rc<[ShardingDimension]>>, Error> {
@@ -340,14 +340,14 @@ impl ShardingReductionExtension for Sharding {
     }
 }
 
-/// Validates `declared`, a sharding that the lowering declares on a value of `data_type` (i.e., a result sharding of
-/// the entry function, the sharding of a `constrain_sharding`, or the boundary sharding of an operand or a result of a
+/// Validates `declared`, a sharding that the lowering declares on a value of `data_type` (i.e., an output sharding of
+/// the entry function, the sharding of a `constrain_sharding`, or the boundary sharding of an input or an output of a
 /// `call`), against `carried`, the sharding that the type of that value records, if any. XLA exports a sharding
 /// that adds unreduced axes to a value as the introduction of a pending reduction, which it implements (by filling the
 /// other devices with an identity) only for [`UnreducedKind::Sum`] and otherwise aborts the process. A declared pending
 /// maximum or minimum must therefore be one that the value already carries, which is the case exactly when its type
 /// records it over the same axes with the same kind. A type never records reduction state over auto mesh axes (and the
-/// lowering completes such a state where an argument enters), so a pending maximum or minimum over an auto axis is
+/// lowering completes such a state where an input enters), so a pending maximum or minimum over an auto axis is
 /// always rejected. A pending sum that the sharding introduces, and a pending reduction that the value carries and the
 /// sharding drops, are changes that a collective makes, which must be one that the collective makes for `data_type`
 /// (refer to [`validate_pending_reduction_change`]). `operation` names the construct in the error, and the axes that an
@@ -410,7 +410,7 @@ pub(crate) fn validate_declared_pending_reduction(
 /// [`partial_completion_rejection`], which the device placements of [`crate::arrays::transfers`] read as well. Those
 /// placements take a host round trip where the rule rejects the transition, while a compiled program has no exact
 /// alternative, so it is rejected before anything is compiled. Every site where the lowering completes a pending
-/// reduction (i.e., an entry argument with an input sharding override, and the user-stated shardings of
+/// reduction (i.e., an entry input with an input sharding override, and the user-stated shardings of
 /// [`validate_declared_pending_reduction`]) checks its transition here, and not only each completed axis in isolation.
 ///
 /// # Errors
@@ -1035,7 +1035,7 @@ mod tests {
         assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![12.0, 24.0, 36.0, 48.0]);
 
         // The split of the sum of an input split along `d` and one replicated along it is the split of the first,
-        // whichever of the two is the left operand, so neither order gathers anything.
+        // whichever of the two is the left input, so neither order gathers anything.
         let replicated_buffers = client
             .addressable_devices()
             .unwrap()
@@ -1081,7 +1081,7 @@ mod tests {
         }
 
         // An axis splits at most one dimension of a value, so the sum of a matrix split into rows along `d` and one
-        // split into columns along `d` keeps the split along `d` of neither, whichever is the left operand, where both
+        // split into columns along `d` keeps the split along `d` of neither, whichever is the left input, where both
         // orders failed with "mesh axis name `d` appears more than once".
         let matrix_type = test_matrix_type(4, 4)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2).with_unreduced_axes(["m"]).unwrap())
@@ -1129,7 +1129,7 @@ mod tests {
                 .into_iter()
                 .filter(|opcode| optimized.bytes().windows(opcode.len()).any(|window| window == opcode.as_bytes()))
                 .collect::<Vec<_>>();
-            // Both operands are gathered along `d` before the sum, and the result is then sliced to its rows.
+            // Both inputs are gathered along `d` before the sum, and the output is then sliced to its rows.
             assert_eq!(collectives, ["all-gather"]);
             let function: CompiledFunction<(ArrayType, ArrayType), ArrayType> =
                 compile_with_options(body, input_types, &session, options).unwrap();
@@ -1146,7 +1146,7 @@ mod tests {
         // A value with a pending sum along the explicit axis `m`, split along `d` or replicated, flows through every
         // construct that can carry it, on a mesh whose axis `d` is explicit, on one whose axis `d` is auto, and on one
         // whose axes are both auto (where the input override states the pending sum, which lowering completes where
-        // the argument enters). Device `(d, m)` holds the contribution `(m + 1) * [1, 2, 3, 4]` (of the half that `d`
+        // the input enters). Device `(d, m)` holds the contribution `(m + 1) * [1, 2, 3, 4]` (of the half that `d`
         // selects, for a split value), so the value is `3 * [1, 2, 3, 4]`, and each construct multiplies it by a known
         // factor. Each cell is the right value or an error of the lowering that names the construct, never a wrong
         // value or a module that Shardy rejects.
@@ -1403,7 +1403,7 @@ mod tests {
         // A `while`, a `condition`, and a `scan` cannot carry such a value on the mixed mesh, whose auto axis no type
         // records (refer to `validate_pending_reductions_across_regions`), so they are rejected with the ways forward,
         // where they returned double the value of a split value and Shardy rejected a replicated one. The gathers on the
-        // mixed mesh replicate the split result that leaves the function, and the all-reduces on the auto mesh complete
+        // mixed mesh replicate the split output that leaves the function, and the all-reduces on the auto mesh complete
         // the pending sum where the input enters.
         let mut expected = Vec::new();
         let constructs = [
@@ -1614,9 +1614,9 @@ mod tests {
     #[test]
     fn test_validate_declared_pending_reduction() {
         // XLA aborts the process when it exports a sharding that introduces a pending maximum or minimum (it can only
-        // introduce a pending sum), so lowering rejects such a result sharding or `constrain_sharding` before anything
+        // introduce a pending sum), so lowering rejects such an output sharding or `constrain_sharding` before anything
         // is compiled. A value carries a pending reduction only where its type records it, which it never does over an
-        // auto axis (an argument that enters with one is reduced where it enters). Lowering alone is checked here, so
+        // auto axis (an input that enters with one is reduced where it enters). Lowering alone is checked here, so
         // that a missing rejection cannot abort the test process.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -1722,7 +1722,7 @@ mod tests {
              state over auto mesh axes, so a pending `max` reduction over them is never carried)",
         );
 
-        // A pending sum that a sharding introduces, and a pending reduction that an argument whose type does not record
+        // A pending sum that a sharding introduces, and a pending reduction that an input whose type does not record
         // it brings into the program and that the program completes where it enters, are changes that a collective
         // makes, which must be one that the collective makes for the data type of the value (refer to
         // `collective_reduction`). One data type of every class of that classification, over the axis `x` of size two:
@@ -1933,7 +1933,7 @@ mod tests {
         // to `partial_completion_rejection`, which the placement planner reads as well), because the partial sums are
         // rounded to the data type before the remaining reduction. On a 2x2 mesh, an identity whose input override is
         // pending along the explicit axis `x` and the auto axis `y` and whose output override is pending along `x`
-        // completes the sum along `y` where the argument enters and keeps it along `x`. For the `f8e4m3fn`
+        // completes the sum along `y` where the input enters and keeps it along `x`. For the `f8e4m3fn`
         // contributions `448`, `448`, `-448`, and `-448`, which sum to zero, that program returned NaN before this
         // check. A completion along both axes at once (both auto) is lowered.
         let client = cpu_client(4);

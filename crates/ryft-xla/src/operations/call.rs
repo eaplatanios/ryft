@@ -5,24 +5,24 @@
 //! application by a session reads the mesh of its function (refer to [`CallOperation::function_mesh`]) and that a
 //! nested call follows its caller. Each entry point of this crate honors the boundary of a call as follows:
 //!
-//!   - Lowering constrains the operands and the results that have overrides where the call executes, as an execution
-//!     of the function annotates its arguments and results, and mesh discovery declares the mesh of these constraints
-//!     (refer to `collect_nested_sharding_mesh`). Compiling a caller for other devices than those of a call that names
-//!     devices, or for the replicas of a bounded dynamic program while an override splits a value, fails with an exact
-//!     error (refer to `validate_placements`), as JAX rejects a nested `jit` with an incompatible device assignment.
-//!     Lowering emits each callee inline or, when it occurs more than once, as a call of one shared private
-//!     `func.func` (refer to `collect_call_functions`).
+//!   - Lowering constrains the inputs and the outputs that have overrides where the call executes, as an execution of
+//!     the function annotates its inputs and outputs, and mesh discovery declares the mesh of these constraints (refer
+//!     to `ProgramLoweringAnalysisExtension::nested_sharding_mesh`). Compiling a caller for other devices than those of
+//!     a call that names devices, or for the replicas of a bounded dynamic program while an override splits a value,
+//!     fails with an exact error (refer to `validate_placements`), as JAX rejects a nested `jit` with an incompatible
+//!     device assignment. Lowering emits each callee inline or, when it occurs more than once, as a call of one shared
+//!     private `func.func` (refer to `collect_call_functions`).
 //!   - Eager dispatch and eager interpretation take one placement decision for each application (refer to
-//!     `CallEagerExtension::eager_decision`), which admits the arguments as an execution does (their client, their
+//!     `CallEagerExtension::eager_decision`), which admits the inputs as an execution does (their client, their
 //!     committed devices, and their reduction state), selects the devices of the call, moves captures and uncommitted
-//!     arguments to them, applies the input and output sharding overrides, and states whether the arguments commit the
-//!     results and whether this process alone chose their devices. Every other input is placed as the executable of
-//!     the callee places it (refer to [`CallOperation::boundary_input_sharding`]), which is as the callee input type
-//!     records for a function compiled for its input types (replicated for a type without a sharding), and as the
-//!     input is for a call of a `jit` dispatcher, whose executables are specialized for the placements of their inputs.
-//!   - A call commits its results when it names devices, when its callee requests any placement (including one that
-//!     only moves a value to another memory), runs on multiple devices, has a committed public input, or is applied
-//!     by a session on the named mesh of its function (refer to `commits_public_outputs`).
+//!     inputs to them, applies the input and output sharding overrides, and states whether the inputs commit the
+//!     outputs and whether this process alone chose their devices. Every other input is placed as the executable of the
+//!     callee places it (refer to [`CallOperation::boundary_input_sharding`]), which is as the callee input type
+//!     records for a function compiled for its input types (replicated for a type without a sharding), and as the input
+//!     is for a call of a `jit` dispatcher, whose executables are specialized for the placements of their inputs.
+//!   - A call commits its outputs when it names devices, when its callee requests any placement (including one that
+//!     only moves a value to another memory), runs on multiple devices, has a committed public input, or is applied by
+//!     a session on the named mesh of its function (refer to `commits_public_outputs`).
 
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
@@ -42,7 +42,7 @@ use ryft_mlir::{
     Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
 
-use crate::compilation::domains::{argument_type, commits_public_outputs};
+use crate::compilation::domains::{relocated_input_type, commits_public_outputs};
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::EffectTokens;
 use crate::lowering::emissions::{omits_regions, partition_session_constants, unread_call_captures};
@@ -395,40 +395,39 @@ pub(crate) fn lower_shared_function_call<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Placement decision of one eager application of a call (i.e., an eager call of a compiled function, which
-/// `Session::bind` applies), which [`CallEagerExtension::eager_decision`] makes once from the call, its callee, and
-/// the actual arguments. It states the facts that the types of the arguments omit, and the application consumes it
-/// instead of deriving any of them again, so that it agrees with an execution of the callee. Partial evaluation, which
-/// sees types only, forwards an input through a call only where this decision returns it unchanged whatever the
-/// arguments are.
+/// `Session::bind` applies), which [`CallEagerExtension::eager_decision`] makes once from the call, its callee, and the
+/// actual inputs. It states the facts that the types of the inputs omit, and the application consumes it instead of
+/// deriving any of them again, so that it agrees with an execution of the callee. Partial evaluation, which sees types
+/// only, forwards an input through a call only where this decision returns it unchanged whatever the inputs are.
 pub(crate) struct EagerCallDecision<'o> {
-    /// Arguments as the application receives them, which are admitted (i.e., they belong to the client of the session,
-    /// their committed public arguments agree on their devices, and none carries a pending reduction that its boundary
+    /// Inputs as the application receives them, which are admitted (i.e., they belong to the client of the session,
+    /// their committed public inputs agree on their devices, and none carries a pending reduction that its boundary
     /// cannot receive) and placed on [`Self::mesh`] as an execution of the callee places them.
     inputs: Cow<'o, [Value]>,
 
-    /// Devices on which the application runs, borrowed from the argument that selected them when one did. An eager
-    /// call compiles its callee for these devices.
+    /// Devices on which the application runs, borrowed from the input that selected them when one did. An eager call
+    /// compiles its callee for these devices.
     mesh: Cow<'o, DeviceMesh>,
 
-    /// Whether every result of the application is committed, which is when a public argument is committed or when the
-    /// callee commits its public outputs on [`Self::mesh`] (i.e., when the call requests a placement, runs on more
-    /// than one device, or runs on the named mesh of its function, refer to [`commits_public_outputs`]), as the
-    /// executable of the callee commits them.
+    /// Whether every output of the application is committed, which is when a public input is committed or when the
+    /// callee commits its public outputs on [`Self::mesh`] (i.e., when the call requests a placement, runs on more than
+    /// one device, or runs on the named mesh of its function, refer to [`commits_public_outputs`]), as the executable
+    /// of the callee commits them.
     committed: bool,
 
     /// Whether this process alone chose [`Self::mesh`] (refer to `Session::assigns_placement_locally`), which every
-    /// result of the application states (refer to [`Array::is_locally_assigned`]).
+    /// output of the application states (refer to [`Array::is_locally_assigned`]).
     locally_assigned: bool,
 
-    /// For each argument, whether it is a capture that an executable of the callee has no argument for (refer to
+    /// For each input, whether it is a capture that an executable of the callee has no physical input for (refer to
     /// `unread_lifted_captures`), or [`None`] when the callee has no such capture. The application neither admits,
-    /// moves, nor requires the buffers of such a capture, as an execution of the callee does not, so
-    /// [`Self::inputs`] holds it as it arrived.
+    /// moves, nor requires the buffers of such a capture, as an execution of the callee does not, so [`Self::inputs`]
+    /// holds it as it arrived.
     unread_captures: Option<Arc<[bool]>>,
 }
 
 impl<'o> EagerCallDecision<'o> {
-    /// Returns the arguments as the application receives them (refer to [`EagerCallDecision`]).
+    /// Returns the inputs as the application receives them (refer to [`EagerCallDecision`]).
     #[inline]
     pub(crate) fn inputs(&self) -> &[Value] {
         &self.inputs
@@ -440,7 +439,7 @@ impl<'o> EagerCallDecision<'o> {
         &self.mesh
     }
 
-    /// Returns whether every result of the application is committed.
+    /// Returns whether every output of the application is committed.
     #[inline]
     pub(crate) fn committed(&self) -> bool {
         self.committed
@@ -452,7 +451,7 @@ impl<'o> EagerCallDecision<'o> {
         self.locally_assigned
     }
 
-    /// Returns, for each argument, whether it is a capture that an executable of the callee has no argument for, or
+    /// Returns, for each input, whether it is a capture that an executable of the callee has no physical input for, or
     /// [`None`] when the callee has no such capture (refer to [`EagerCallDecision`]).
     #[inline]
     pub(crate) fn unread_captures(&self) -> Option<&[bool]> {
@@ -460,8 +459,8 @@ impl<'o> EagerCallDecision<'o> {
     }
 }
 
-/// Returns the array of argument `index` of an eager application of a call, or [`None`] when the argument is not an
-/// array or is a capture that `unread_captures` flags (refer to [`EagerCallDecision::unread_captures`]), of which the
+/// Returns the array of input `index` of an eager application of a call, or [`None`] when the input is not an array or
+/// is a capture that `unread_captures` flags (refer to [`EagerCallDecision::unread_captures`]), of which the
 /// application requires nothing.
 fn read_array<'v>(unread_captures: Option<&[bool]>, index: usize, input: &'v Value) -> Option<&'v Array> {
     match input {
@@ -473,54 +472,53 @@ fn read_array<'v>(unread_captures: Option<&[bool]>, index: usize, input: &'v Val
 /// Eager application of a [`CallOperation`] by a [`Session`], which `Session::bind` applies to every call that a
 /// session binds, and which the interpretation of a call on a session reaches through the bind channel of its driver.
 /// The application takes one placement decision (refer to [`Self::eager_decision`]) and executes the compiled callee
-/// with the arguments as that decision places them, so that an eager call agrees with an execution of the function
-/// that it calls. Refer to the documentation of this module for how the application honors the boundary of a call.
+/// with the inputs as that decision places them, so that an eager call agrees with an execution of the function that it
+/// calls. Refer to the documentation of this module for how the application honors the boundary of a call.
 pub(crate) trait CallEagerExtension {
     /// Returns the placement decision of an eager application of this call of `callee` on `inputs`, executed by
     /// `session` (refer to [`EagerCallDecision`]). This is the one place that decides where an eager call runs, which
-    /// arguments it admits, where they move, whether its results are committed, and whether its devices were chosen by
+    /// inputs it admits, where they move, whether its outputs are committed, and whether its devices were chosen by
     /// this process alone.
     ///
-    ///   - Every argument, captures included, must belong to the client of `session`, which an execution requires too
+    ///   - Every input, captures included, must belong to the client of `session`, which an execution requires too
     ///     (refer to `validate_input_clients`).
-    ///   - A call whose callee names devices runs on them. Its committed public arguments must already be on them, and
+    ///   - A call whose callee names devices runs on them. Its committed public inputs must already be on them, and
     ///     every input is placed there as its effective boundary sharding requests (refer to
     ///     [`CallOperation::boundary_input_sharding`]), or keeps its sharding when the mesh topologies agree and is
     ///     replicated otherwise. Its devices are named for every process, so they are not locally assigned.
     ///   - A call runs on the mesh of its function (refer to [`CallOperation::with_function_mesh`]) in the same way
     ///     when that mesh is named (refer to [`LogicalMesh::is_named`](ryft_core::LogicalMesh::is_named)), as JAX runs
-    ///     a `jit` function under `set_mesh`, and commits its results. On the anonymous mesh of one device, it does so
-    ///     only when no public argument is committed, as JAX runs a `jit` function under `default_device`, with
-    ///     uncommitted results, and a committed public argument decides as below. This decision is taken only for the
-    ///     call that the session applies. A call nested in its callee, or in a region of another eager operation (e.g.,
+    ///     a `jit` function under `set_mesh`, and commits its outputs. On the anonymous mesh of one device, it does so
+    ///     only when no public input is committed, as JAX runs a `jit` function under `default_device`, with
+    ///     uncommitted outputs, and a committed public input decides as below. This decision is taken only for the call
+    ///     that the session applies. A call nested in its callee, or in a region of another eager operation (e.g.,
     ///     `condition`), is compiled into the computation of that call or operation and runs where it runs, as a nested
     ///     call runs where its compiled caller runs.
-    ///   - Any other call runs where its public arguments are, as JAX runs a `jit` function without shardings.
-    ///     Committed public arguments must agree on their devices, as JAX rejects a `jit` call whose committed
-    ///     arguments are on different devices ("Received incompatible devices for jitted computation"), and they
-    ///     select the devices.
-    ///     Without one, uncommitted public arguments on the same devices keep them, and otherwise the session default
-    ///     supplies them, which, for a call without public array arguments, is where the session places a value
-    ///     without array inputs over the logical mesh of the outputs of the callee (refer to
-    ///     `Session::device_mesh_for`), as for any other eager operation without array inputs. The lifted captures
-    ///     move there, as closed-over constants do in JAX (refer to `capture_inputs`), and so do the uncommitted public
-    ///     arguments that live elsewhere, through the one rule by which uncommitted operands follow committed ones
-    ///     (refer to `Session::place_uncommitted_inputs`). Each input with an effective boundary sharding is then
-    ///     placed as it requests, as is an argument on one device whose callee input declares another logical mesh of
-    ///     one device (refer to [`CallOperation::eager_boundary_input_sharding`]).
+    ///   - Any other call runs where its public inputs are, as JAX runs a `jit` function without shardings. Committed
+    ///     public inputs must agree on their devices, as JAX rejects a `jit` call whose committed arguments are on
+    ///     different devices ("Received incompatible devices for jitted computation"), and they select the devices.
+    ///     Without one, uncommitted public inputs on the same devices keep them, and otherwise the session default
+    ///     supplies them, which, for a call without public array inputs, is where the session places a value without
+    ///     array inputs over the logical mesh of the outputs of the callee (refer to `Session::device_mesh_for`), as
+    ///     for any other eager operation without array inputs. The lifted captures move there, as closed-over constants
+    ///     do in JAX (refer to `capture_inputs`), and so do the uncommitted public inputs that live elsewhere, through
+    ///     the one rule by which uncommitted inputs follow committed ones (refer to
+    ///     `Session::place_uncommitted_inputs`). Each input with an effective boundary sharding is then placed as it
+    ///     requests, as is an input on one device whose callee input declares another logical mesh of one device (refer
+    ///     to [`CallOperation::eager_boundary_input_sharding`]).
     ///
-    /// The arguments are admitted before anything moves, and whether or not anything moves: an argument that carries a
+    /// The inputs are admitted before anything moves, and whether or not anything moves: an input that carries a
     /// pending reduction that the executable of the callee cannot receive is rejected wherever it is (refer to
     /// `validate_input_reduction`), because a reshard never completes a pending reduction, so an eager call rejects
-    /// what an execution rejects, whatever placement the decision chooses. The results are committed when a public
-    /// argument is committed or when the callee commits its public outputs on the selected devices (refer to
+    /// what an execution rejects, whatever placement the decision chooses. The outputs are committed when a public
+    /// input is committed or when the callee commits its public outputs on the selected devices (refer to
     /// [`CallOperation::has_placement_requests`] and [`commits_public_outputs`]), which includes every application that
-    /// runs on the named mesh of its function, as JAX commits every result of a `jit` function under `set_mesh`, and
-    /// excludes an application that runs where its arguments are, whatever logical mesh they record.
+    /// runs on the named mesh of its function, as JAX commits every output of a `jit` function under `set_mesh`, and
+    /// excludes an application that runs where its inputs are, whatever logical mesh they record.
     ///
     /// # Errors
     ///
-    /// Returns the error of admitting an argument, of selecting the default devices, or of moving an input.
+    /// Returns the error of admitting an input, of selecting the default devices, or of moving an input.
     fn eager_decision<'o>(
         &self,
         session: &Session,
@@ -534,8 +532,8 @@ pub(crate) trait CallEagerExtension {
     /// transform created (refer to [`CallOperation::derived_input_shardings`]) or that keeps its input placements
     /// (refer to [`CallOperation::with_kept_input_placements`]), it is the runtime sharding of `array`, because such a
     /// call leaves that input where it is and its executable must not move it to the placement that its traced input
-    /// type would give it. A call of a `jit` dispatcher keeps no relocatable argument where it is (refer to
-    /// `argument_type`), because the executions of the dispatcher do not specialize on its placement either. It is
+    /// type would give it. A call of a `jit` dispatcher keeps no relocatable input where it is (refer to
+    /// `relocated_input_type`), because the executions of the dispatcher do not specialize on its placement either. It is
     /// [`None`] for any other input, whose placement the executable chooses by its own rule.
     fn eager_input_placement(&self, index: usize, array: &Array, declared: &Type) -> Option<Sharding>;
 }
@@ -553,9 +551,9 @@ impl CallEagerExtension for CallOperation<Type> {
                 Value::Dimension(_) | Value::Reference(_) => None,
             }
         }
-        // A capture that the executable of the callee has no argument for is neither admitted, moved, nor required to
-        // hold buffers here, as an execution of the callee requires nothing of it. A callee without captures pays one
-        // comparison, and one with captures a look-up.
+        // A capture that the executable of the callee has no physical input for is neither admitted, moved, nor
+        // required to hold buffers here, as an execution of the callee requires nothing of it. A callee without
+        // captures pays one comparison, and one with captures a look-up.
         let target_platform = session.target()?.platform_name();
         let callee_requests = || RegionPlacementRequests::for_lowering(callee, Some(target_platform));
         let unread_captures = match self.capture_count() {
@@ -567,11 +565,11 @@ impl CallEagerExtension for CallOperation<Type> {
         validate_input_clients(session, read_arrays, self.capture_count())?;
         let interface = callee.interface();
         let declared = interface.input_types();
-        // Admission is decided here, once, from the arguments as they arrive and before any of them moves, whether or
-        // not the application moves it, so that an eager call, which runs a program of its own rather than the
-        // executable of the callee, still rejects what that executable rejects. A pending reduction that a type records
-        // is judged by the type rule of the call first, as when the call is staged, and the common case of arguments
-        // without one costs one branch for each argument.
+        // Admission is decided here, once, from the inputs as they arrive and before any of them moves, whether or not
+        // the application moves it, so that an eager call, which runs a program of its own rather than the executable
+        // of the callee, still rejects what that executable rejects. A pending reduction that a type records is judged
+        // by the type rule of the call first, as when the call is staged, and the common case of inputs without one
+        // costs one branch for each input.
         let pending = |(index, input): (usize, &Value)| {
             read_array(unread, index, input).is_some_and(|array| !array.sharding().unreduced_axes().is_empty())
         };
@@ -585,8 +583,8 @@ impl CallEagerExtension for CallOperation<Type> {
             }
         }
         let public_arrays = inputs.iter().skip(self.capture_count()).filter_map(array);
-        // The mesh commits the results for being named only when the application runs on it because the function was
-        // compiled for it, and not when it is where the arguments of the application are (refer to
+        // The mesh commits the outputs for being named only when the application runs on it because the function was
+        // compiled for it, and not when it is where the inputs of the application are (refer to
         // `commits_public_outputs`).
         let committed = |mesh: &DeviceMesh, function_mesh: bool| {
             public_arrays.clone().any(Array::is_committed)
@@ -634,14 +632,14 @@ impl CallEagerExtension for CallOperation<Type> {
             });
         }
 
-        let mut committed_arguments =
+        let mut committed_inputs =
             inputs.iter().skip(self.capture_count()).enumerate().filter_map(|(index, input)| match input {
                 Value::Array(array) if array.is_committed() => Some((index, array)),
                 _ => None,
             });
-        let first_committed = committed_arguments.next();
+        let first_committed = committed_inputs.next();
         if let Some((first_index, first)) = first_committed {
-            for (index, array) in committed_arguments {
+            for (index, array) in committed_inputs {
                 if array.mesh().devices() != first.mesh().devices() {
                     // Each device is rendered by its `Display` implementation, which names its process when it is not
                     // process zero.
@@ -651,8 +649,8 @@ impl CallEagerExtension for CallOperation<Type> {
                     };
                     return Err(ProgramError::InvalidArgument {
                         message: format!(
-                            "public argument #{index} is committed to devices {}, but public argument \
-                             #{first_index} is committed to devices {}",
+                            "public input #{index} is committed to devices {}, but public input #{first_index} \
+                             is committed to devices {}",
                             devices(array),
                             devices(first),
                         ),
@@ -679,11 +677,11 @@ impl CallEagerExtension for CallOperation<Type> {
         };
         let mut prepared = capture_inputs(self, session, inputs, unread, &mesh)?;
 
-        // Uncommitted public arguments that live elsewhere follow the committed ones, or move to the default devices,
-        // exactly as the operands of any other eager operation do, so that every input of the callee is on the devices
+        // Uncommitted public inputs that live elsewhere follow the committed ones, or move to the default devices,
+        // exactly as the inputs of any other eager operation do, so that every input of the callee is on the devices
         // where it runs, including an input that the callee returns as it is. Arrays produced by the same program, or
-        // cloned from one array, share their mesh allocation, so the common case of arguments on one mesh only compares
-        // pointers, as the operands of other eager operations do (refer to `Session::place_uncommitted_inputs`).
+        // cloned from one array, share their mesh allocation, so the common case of inputs on one mesh only compares
+        // pointers, as the inputs of other eager operations do (refer to `Session::place_uncommitted_inputs`).
         let shares_mesh = |mesh: &DeviceMesh, other: &DeviceMesh| std::ptr::eq(mesh, other) || mesh == other;
         let read_arrays = || prepared.iter().enumerate().filter_map(|(index, input)| read_array(unread, index, input));
         let mut prepared_arrays = read_arrays();
@@ -733,26 +731,25 @@ impl CallEagerExtension for CallOperation<Type> {
         if let Some(sharding) = self.boundary_input_sharding(index, &array.r#type(), declared) {
             return Some(sharding.into_owned());
         }
-        let keeps_placement = self.keeps_input_placements() && argument_type(array, &array.r#type()).is_none();
+        let keeps_placement = self.keeps_input_placements() && relocated_input_type(array, &array.r#type()).is_none();
         (self.derived_input_shardings().is_some() || keeps_placement).then(|| array.sharding().clone())
     }
 }
 
-/// Validates that `array`, the argument at `index` of an eager application of `call` for a callee input of type
+/// Validates that `array`, the input at `index` of an eager application of `call` for a callee input of type
 /// `declared`, carries no pending reduction that the executable of the callee cannot receive, by the rule with which an
-/// execution admits its arguments (refer to [`validate_input_reduction`]). That executable receives the argument at its
-/// eager placement (refer to [`CallEagerExtension::eager_input_placement`]), or else as `declared` places it (refer to
-/// [`CallOperation::declared_input_sharding`]). An input override of the callee is the argument sharding of that
+/// execution admits its inputs (refer to [`validate_input_reduction`]). That executable receives the input at its eager
+/// placement (refer to [`CallEagerExtension::eager_input_placement`]), or else as `declared` places it (refer to
+/// [`CallOperation::declared_input_sharding`]). An input override of the callee is the input sharding of that
 /// executable as stated, including a pending reduction over auto mesh axes that it states, which the executable
-/// completes where the argument enters, as a direct execution of the callee does. Any other placement is received
-/// without the pending reductions over auto mesh axes, which no type records (refer to
-/// [`Sharding::without_auto_axes`]), so such an argument is rejected. An argument without a pending reduction, which is
-/// the common case, costs one branch.
+/// completes where the input enters, as a direct execution of the callee does. Any other placement is received without
+/// the pending reductions over auto mesh axes, which no type records (refer to [`Sharding::without_auto_axes`]), so
+/// such an input is rejected. An input without a pending reduction, which is the common case, costs one branch.
 ///
 /// # Errors
 ///
-/// Returns [`ExecutionError::UnreducedAutoAxisArgument`] or [`ExecutionError::UnreducedAutoAxisCapture`] for such
-/// an argument.
+/// Returns [`ExecutionError::UnreducedAutoAxisInput`] or [`ExecutionError::UnreducedAutoAxisCapture`] for such an
+/// input.
 fn validate_input_admission(
     call: &CallOperation<Type>,
     index: usize,
@@ -771,10 +768,10 @@ fn validate_input_admission(
     validate_input_reduction(array, &expected, index, call.capture_count())
 }
 
-/// Places an input of `call` on the boundary's devices after all committed public arguments have passed the device
-/// check, as its effective boundary sharding requests (refer to [`CallOperation::boundary_input_sharding`]). An
-/// input without one keeps its sharding when the mesh topologies agree and is replicated when they differ. The input
-/// keeps its commitment.
+/// Places an input of `call` on the boundary's devices after all committed public inputs have passed the device check,
+/// as its effective boundary sharding requests (refer to [`CallOperation::boundary_input_sharding`]). An input without
+/// one keeps its sharding when the mesh topologies agree and is replicated when they differ. The input keeps its
+/// commitment.
 ///
 /// # Errors
 ///
@@ -839,9 +836,9 @@ fn capture_inputs<'o>(
         };
         prepared.to_mut()[index] = Value::Array(capture.with_committed(false));
     }
-    // Eager dispatch compiles the callee on the logical mesh of its first array operand, which is a capture here. A
-    // replicated public argument on the devices of the captures is given that logical mesh too, which moves no
-    // data, so that the array operands of the call name the logical mesh on which its callee runs.
+    // Eager dispatch compiles the callee on the logical mesh of its first array input, which is a capture here. A
+    // replicated public input on the devices of the captures is given that logical mesh too, which moves no data, so
+    // that the array inputs of the call name the logical mesh on which its callee runs.
     let callee_mesh = prepared[..call.capture_count()]
         .iter()
         .enumerate()
@@ -869,7 +866,7 @@ fn capture_inputs<'o>(
 // evaluation with an eager known side, or the body of a composite whose inputs refine its traced types) binds each of
 // its instructions, nested calls included, through `Context::bind`. This rule only runs when a caller applies the
 // operation directly, and it hands the call to the bind channel of the driver, so that it runs exactly as a call that
-// the session binds itself (i.e., with the same placement decision, compiled program, and results). The callee is
+// the session binds itself (i.e., with the same placement decision, compiled program, and outputs). The callee is
 // copied into an owned program for that bind, because the driver only lends a view of it.
 impl InterpretableOperation<Session> for CallOperation<Type> {
     fn interpret<D: InterpretationDriver<Session>>(
@@ -886,13 +883,13 @@ impl InterpretableOperation<Session> for CallOperation<Type> {
 // A call of a compiled function places the values that cross the boundary of its callee as the effective boundary
 // shardings of that boundary request (i.e., its sharding overrides, refer to `CallOperation::with_boundary`, and the
 // placements of the inputs without one, refer to `CallOperation::boundary_input_sharding`), as an execution of the
-// function places its arguments and results. The overrides are applied at the call site, as constraints on the operands
-// and on the results of the call, rather than as annotations of the callee, because the callee may be inlined or shared
+// function places its inputs and outputs. The overrides are applied at the call site, as constraints on the inputs and
+// on the outputs of the call, rather than as annotations of the callee, because the callee may be inlined or shared
 // with calls that carry other overrides. Each constraint is the sharding with which the function annotates its own
-// boundary (refer to `Sharding::with_unconstrained_dimensions_replicated`), and it is closed over auto
-// mesh axes, so that a replicated override stops the compiler from splitting the value, like the replicated result of
-// an execution. An effective input sharding without an override that the operand type already has is not constrained
-// again, unless the mesh has auto axes, along which the operand type cannot show where the operand is (refer to
+// boundary (refer to `Sharding::with_unconstrained_dimensions_replicated`), and it is closed over auto mesh axes, so
+// that a replicated override stops the compiler from splitting the value, like the replicated output of an execution.
+// An effective input sharding without an override that the input type already has is not constrained again, unless the
+// mesh has auto axes, along which the input type cannot show where the input is (refer to
 // `CallOperation::boundary_input_sharding_constraint`).
 impl LowerableOperation for CallOperation<Type> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -905,8 +902,8 @@ impl LowerableOperation for CallOperation<Type> {
         self.validate_region_count(lowerer.regions().len())?;
         // A capture that the callee never reads requires nothing of the caller (refer to `unread_call_captures`), so
         // the call receives a value that requires no buffer in its place, as the entry function binds an argument that
-        // it never reads, and neither places nor constrains it. The caller reads the operand by the same decision
-        // (refer to `emitted_capture_reads` and `partition_session_constants`).
+        // it never reads, and neither places nor constrains it. The caller reads the input by the same decision (refer
+        // to `emitted_capture_reads` and `partition_session_constants`).
         let unread = match self.capture_count() {
             0 => None,
             capture_count => unread_call_captures(
@@ -928,10 +925,10 @@ impl LowerableOperation for CallOperation<Type> {
                 }
                 let callee = lowerer.regions()[0].entry_region_ref();
                 let declared = &callee.interface().input_types()[index];
-                // The callee receives the operand as its entry function holds an argument that arrives at the boundary
+                // The callee receives the input as its entry function holds an argument that arrives at the boundary
                 // sharding, with the reduction state over auto mesh axes that an override may state completed (refer to
-                // `Sharding::without_auto_reduction_axes`). An operand is a value of the caller, which never carries
-                // such a state, because the entry of the outermost program completes it or admission rejects it, so the
+                // `Sharding::without_auto_reduction_axes`). An input is a value of the caller, which never carries such
+                // a state, because the entry of the outermost program completes it or admission rejects it, so the
                 // constraint neither introduces nor completes a reduction over auto mesh axes, of any kind. Only the
                 // outputs of a call can still introduce one (refer to `lower_boundary_constraint`).
                 let Some(sharding) =
@@ -948,12 +945,12 @@ impl LowerableOperation for CallOperation<Type> {
                 lowerer.split_effect_tokens();
             let [callee] = regions else { unreachable!("validated call region count") };
 
-            // An operand whose type refines the callee input type (e.g., with a static extent for a bounded dynamic
-            // one) enters the callee at the type of the callee input, and a result leaves it at the refined type of the
+            // An input whose type refines the callee input type (e.g., with a static extent for a bounded dynamic one)
+            // enters the callee at the type of the callee input, and an output leaves it at the refined type of the
             // call (refer to `CallOperation::validate_input_types`). Neither conversion checks anything, because the
-            // call has accepted its operands and the callee computes its results from them. Only shapes are converted.
-            // A difference in sharding alone (i.e., in placement, or in manual variation that a call in a `shard_map`
-            // body passes on to its results) lowers to nothing, because the call accepts only operands whose values the
+            // call has accepted its inputs and the callee computes its outputs from them. Only shapes are converted. A
+            // difference in sharding alone (i.e., in placement, or in manual variation that a call in a `shard_map`
+            // body passes on to its outputs) lowers to nothing, because the call accepts only inputs whose values the
             // callee input types describe.
             let callee_input_types = callee.input_types();
             let input_values = input_values
@@ -1305,7 +1302,7 @@ trait CallProgramLoweringExtension<O: LowerableOperationFamily> {
     /// Lowers one `call` to either a `func.call` of a shared private function (when its callee was deduplicated) or
     /// an inlined copy of the callee body (otherwise).
     ///
-    /// `input_values` are the lowered call operands in callee-input order. `capture_count` is the operation payload's
+    /// `input_values` are the lowered call inputs in callee-input order. `capture_count` is the operation payload's
     /// exact leading lifted-capture prefix length. Deriving it from capture-constant indices instead would conflate the
     /// independent capture namespaces of nested calls inside the callee arena. `caller_captured_values` are the
     /// captured values of the calling scope, whose session-constant suffix the inlined callee inherits (refer to
@@ -1344,7 +1341,7 @@ impl<O: LowerableOperationFamily> CallProgramLoweringExtension<O> for FlatProgra
         if let Some(map) = nested_functions
             && let Some(function) = map.get(self)
         {
-            // The `call` operation's type inference already pins its operands to the callee input types, so a
+            // The `call` operation's type inference already pins its inputs to the callee input types, so a
             // matching arity is the only guard needed before emitting the symbol call. Anything else inlines.
             if input_values.len() == function.input_types.len() {
                 return lower_shared_function_call(
@@ -1378,7 +1375,7 @@ impl<O: LowerableOperationFamily> CallProgramLoweringExtension<O> for FlatProgra
     }
 }
 
-/// Constrains `value`, an operand or a result of type `r#type` of a `call`, to `sharding`, the effective boundary
+/// Constrains `value`, an input or an output of type `r#type` of a `call`, to `sharding`, the effective boundary
 /// sharding of the corresponding position of the boundary of its callee (i.e., its override, or the declared sharding
 /// of an input without one, refer to [`CallOperation::boundary_input_sharding`]), and returns the constrained value.
 /// The constraint is the sharding with which the called function annotates that position of its own boundary (refer to
@@ -1545,7 +1542,7 @@ mod tests {
         Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
     }
 
-    /// Lowers an outer program that calls each of `callees` through one `call` and sums the results, returning
+    /// Lowers an outer program that calls each of `callees` through one `call` and sums the outputs, returning
     /// the module text. Each callee is `f(x) = x + x`, and the outer function is `g(x) = sum_i callee_i(x)`.
     fn lower_call_sum_module(callees: Vec<Arc<FlatProgram<Session>>>) -> String {
         let array_type = test_vector_type(4);
@@ -2264,8 +2261,8 @@ mod tests {
                     .call(input(&replicated.clone().with_unreduced_axes(["x"]).unwrap()))
                     .unwrap_err()
                     .to_string(),
-                "public argument #0 is unreduced along the mesh axes [\"x\"], which the executable cannot receive \
-                 because a staged type does not record a pending reduction over auto mesh axes; reduce the argument \
+                "public input #0 is unreduced along the mesh axes [\"x\"], which the executable cannot receive \
+                 because a staged type does not record a pending reduction over auto mesh axes; reduce the input \
                  (e.g., with `Array::to_placement` onto a sharding without unreduced axes), or place it over explicit \
                  mesh axes, before passing it to a compiled function or an eager operation",
             );
@@ -2274,8 +2271,8 @@ mod tests {
     }
 
     #[test]
-    fn test_call_operation_eager_decision_gives_arguments_the_declared_logical_mesh() {
-        // A compiled identity declares its input replicated over the mesh `q`. An argument replicated over another
+    fn test_call_operation_eager_decision_gives_inputs_the_declared_logical_mesh() {
+        // A compiled identity declares its input replicated over the mesh `q`. An input replicated over another
         // logical mesh of the same devices (e.g., `p`, or the default mesh of an upload) only needs the logical mesh of
         // the declared input, which a direct execution and a call both give it, on one device as on two.
         let session = Session::builder().client(cpu_client(2)).build().unwrap();
@@ -2325,7 +2322,7 @@ mod tests {
     }
 
     #[test]
-    fn test_call_operation_eager_decision_without_array_arguments() {
+    fn test_call_operation_eager_decision_without_array_inputs() {
         let session = Session::builder().client(cpu_client(2)).build().unwrap();
         let devices = session.addressable_devices().unwrap();
         let observe = |outputs: Result<Vec<Value>, ProgramError>| {
@@ -2340,8 +2337,8 @@ mod tests {
         // A call of a callee without inputs that names no devices runs where the session places a value without array
         // inputs over the logical mesh of its outputs (refer to `Session::device_mesh_for`), which is the first device
         // of the client for a named mesh of one device and the first two devices for a mesh of two devices, and the
-        // results are committed exactly when they live on more than one device. An eager call and the interpretation
-        // rule of the call run it on the same devices and give its results the same facts.
+        // outputs are committed exactly when they live on more than one device. An eager call and the interpretation
+        // rule of the call run it on the same devices and give its outputs the same facts.
         for (axis, size) in [("a", 1), ("x", 2)] {
             let logical_mesh =
                 LogicalMesh::new(vec![MeshAxis::new(axis, size, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -2368,8 +2365,8 @@ mod tests {
 
     #[test]
     fn test_call_operation_eager_decision_runs_known_calls_on_the_function_mesh() {
-        // A call of a function compiled for a named mesh of the second device runs there and commits its result when
-        // an uncommitted argument on the first device is applied directly, when partial evaluation applies the call on
+        // A call of a function compiled for a named mesh of the second device runs there and commits its output when
+        // an uncommitted input on the first device is applied directly, when partial evaluation applies the call on
         // the eager known side (with and without a residual policy), and when it applies the known call of a split.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -2380,23 +2377,23 @@ mod tests {
         )
         .unwrap();
         let scalar_type = ArrayType::scalar(DataType::F32).replicated(&mesh).unwrap();
-        let argument = Array::from_host_buffer(&session, scalar_type.clone(), None, None, 4f32.to_ne_bytes()).unwrap();
-        assert!(!argument.is_committed());
-        assert_ne!(argument.mesh().devices(), mesh.devices());
+        let input = Array::from_host_buffer(&session, scalar_type.clone(), None, None, 4f32.to_ne_bytes()).unwrap();
+        assert!(!input.is_committed());
+        assert_ne!(input.mesh().devices(), mesh.devices());
 
         let function: CompiledFunction<ArrayType, ArrayType> =
             compile(|input: CompileTracer| input, scalar_type.clone(), &session, mesh.clone()).unwrap();
         let observe =
             |output: &Array| (output.mesh().devices().to_vec(), output.is_committed(), read_sharded_f32_array(output));
         let expected = (mesh.devices().to_vec(), true, vec![4.0]);
-        assert_eq!(observe(&function.call(argument.clone()).unwrap()), expected);
+        assert_eq!(observe(&function.call(input.clone()).unwrap()), expected);
 
         let policy = ResidualPolicyReference::new(NothingSavable);
         let context = PartialEvaluationContext::new(session.clone());
         for context in [context.clone(), context.with_residual_policy(&policy)] {
             let input = ValueProjection::<ArrayType>::into_projected(PartialTracer::new(
                 context.clone(),
-                PartialEvaluationValue::known(Value::Array(argument.clone())),
+                PartialEvaluationValue::known(Value::Array(input.clone())),
             ))
             .unwrap();
             let output = function.call_in_context(&context, input).unwrap().into_value().into_value().unwrap();
@@ -2416,7 +2413,7 @@ mod tests {
         let context = PartialEvaluationContext::new(session);
         let partial =
             |value| ValueProjection::<ArrayType>::into_projected(PartialTracer::new(context.clone(), value)).unwrap();
-        let known = partial(PartialEvaluationValue::known(Value::Array(argument)));
+        let known = partial(PartialEvaluationValue::known(Value::Array(input)));
         let unknown = partial(context.unknown_input(scalar_type.into(), 1));
         let (known, unknown) = split.call_in_context(&context, (known, unknown)).unwrap();
         let known = known.into_value().into_value().unwrap();
@@ -2507,7 +2504,7 @@ mod tests {
         };
 
         // Without boundary shardings, the identity callee returns its input replicated, as an execution of a function
-        // compiled for that input type places its argument, while a call of a `jit` dispatcher returns its input where
+        // compiled for that input type places its input, while a call of a `jit` dispatcher returns its input where
         // it is, as the executables of the dispatcher do.
         let output = interpret(CallOperation::new(0));
         assert_eq!(output.sharding(), &replicated);
@@ -2518,8 +2515,8 @@ mod tests {
         assert_eq!(shapes(&output), vec!["[2]", "[2]"]);
         assert_eq!(values(&output), vec![vec![1, 2], vec![3, 4]]);
 
-        // A replicated output override places the result of the callee, and a replicated input override places the
-        // input that the callee returns, as executions of the called function place their results and arguments.
+        // A replicated output override places the output of the callee, and a replicated input override places the
+        // input that the callee returns, as executions of the called function place their outputs and inputs.
         for call in [
             CallOperation::new(0).with_boundary(Some(&mesh), Vec::new(), vec![Some(replicated.clone())]),
             CallOperation::new(0).with_boundary(Some(&mesh), vec![Some(replicated.clone())], Vec::new()),
@@ -2532,7 +2529,7 @@ mod tests {
         }
 
         // A call whose boundary is on another single device moves an uncommitted input there, as an execution of its
-        // callee moves its argument, and commits the result, as that execution does, although the input already has
+        // callee moves its input, and commits the output, as that execution does, although the input already has
         // the sharding that the override requests.
         let second_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -2572,7 +2569,7 @@ mod tests {
     }
 
     #[test]
-    fn test_call_operation_interpret_receives_arguments_and_returns_results_as_an_execution() {
+    fn test_call_operation_interpret_receives_inputs_and_returns_outputs_as_an_execution() {
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
         let session = Session::builder().client(client).build().unwrap();
@@ -2591,12 +2588,12 @@ mod tests {
             Ok((array.addressable_shards().count(), array.layout().cloned(), values_from_bytes::<f32>(&values)))
         };
 
-        // An identity whose input override is the sharding of its argument is applied directly, through a call, and
-        // through the interpretation rule of its call in a caller, to an argument that holds the buffers of only some
-        // of its local devices. The rule supplies a missing buffer from a local replica of the same contribution,
-        // rejects an argument with a contribution that no local replica holds with the error of the execution, and
-        // returns a result without the layout of its argument, which the declaration of the result omits, as an
-        // execution of the callee does.
+        // An identity whose input override is the sharding of its input is applied directly, through a call, and
+        // through the interpretation rule of its call in a caller, to an input that holds the buffers of only some of
+        // its local devices. The rule supplies a missing buffer from a local replica of the same contribution, rejects
+        // an input with a contribution that no local replica holds with the error of the execution, and returns an
+        // output without the layout of its input, which the declaration of the output omits, as an execution of the
+        // callee does.
         for sharding in [&replicated, &split] {
             let options = Options::new(mesh.clone()).with_input_shardings(vec![sharding.clone()]);
             let callee: CompiledFunction<ArrayType, ArrayType> =
@@ -2614,17 +2611,17 @@ mod tests {
             let nested = Arc::new(region.with_id(call.regions()[0]).unwrap().to_program());
             let regions = AttachedRegions::Callees(std::slice::from_ref(&nested));
             for layout in [None, Some(column_major.clone())] {
-                let argument_type = matrix_type.clone().with_layout(layout.clone());
-                let argument = Array::from_host_buffer(
+                let input_type = matrix_type.clone().with_layout(layout.clone());
+                let input = Array::from_host_buffer(
                     &session,
-                    argument_type.clone(),
+                    input_type.clone(),
                     mesh.clone(),
                     Some(sharding.clone()),
                     values_to_bytes(&values),
                 )
                 .unwrap();
                 for buffer_count in [2, 1, 0] {
-                    let buffers = argument
+                    let buffers = input
                         .addressable_shards()
                         .take(buffer_count)
                         .map(|shard| {
@@ -2634,7 +2631,7 @@ mod tests {
                         .collect();
                     let partial = Array::from_addressable_buffers(
                         &session,
-                        argument_type.clone(),
+                        input_type.clone(),
                         mesh.clone(),
                         Some(sharding.clone()),
                         buffers,
@@ -2670,7 +2667,7 @@ mod tests {
     #[test]
     fn test_call_operation_interpret_binds_the_captures_that_nested_regions_read() {
         // The body of a scan in the callee of a call reads a capture of the callee through a capture constant (refer to
-        // `emitted_capture_reads`), which the lowering of the whole callee binds to the argument that the call receives
+        // `emitted_capture_reads`), which the lowering of the whole callee binds to the input that the call receives
         // for the capture. The interpretation rule of the call returns what `.call` and an execution of the callee
         // return, on the same devices and with the same commitment, also for a capture that lives on another mesh of
         // the same devices in the opposite order.
@@ -2884,12 +2881,12 @@ mod tests {
     }
 
     #[test]
-    fn test_call_operation_interpret_fails_every_result_of_a_call_with_a_failed_argument() {
-        // A compiled identity of two arguments receives a failed first argument and a healthy second one. Every result
-        // of an execution carries the completion of the whole execution, so reading the healthy second result fails
-        // with the failure of the first argument on direct execution, on `.call`, and through the interpretation rule
-        // of a call of the function. The first argument is either of the zero data type, without buffers, with a failed
-        // producer, or an ordinary `f32` produced by an execution whose input upload failed.
+    fn test_call_operation_interpret_fails_every_output_of_a_call_with_a_failed_input() {
+        // A compiled identity of two inputs receives a failed first input and a healthy second one. Every output of an
+        // execution carries the completion of the whole execution, so reading the healthy second output fails with the
+        // failure of the first input on direct execution, on `.call`, and through the interpretation rule of a call of
+        // the function. The first input is either of the zero data type, without buffers, with a failed producer, or an
+        // ordinary `f32` produced by an execution whose input upload failed.
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
@@ -2928,10 +2925,10 @@ mod tests {
             let identity = |inputs: (CompileTracer, CompileTracer)| inputs;
             let function: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
                 compile(identity, types.clone(), &session, mesh.clone()).unwrap();
-            let arguments = (failed.clone(), scalar.clone());
-            let executed = function.executable().execute(&session, arguments.clone());
-            let executed = observe(executed.map(|(_, result)| result).map_err(|error| error.to_string()));
-            let called = observe(function.call(arguments).map(|(_, result)| result).map_err(|error| error.to_string()));
+            let inputs = (failed.clone(), scalar.clone());
+            let executed = function.executable().execute(&session, inputs.clone());
+            let executed = observe(executed.map(|(_, output)| output).map_err(|error| error.to_string()));
+            let called = observe(function.call(inputs).map(|(_, output)| output).map_err(|error| error.to_string()));
             let caller: StagedFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
                 stage(|inputs| function.call(inputs).unwrap(), types, Options::new(mesh.clone())).unwrap();
             let program = caller.source_program().to_program_with_lifted_captures().unwrap();
@@ -2948,7 +2945,7 @@ mod tests {
                 .interpret(&session, &EagerInterpretationDriver::new(&regions), &inputs)
                 .map_err(|error| error.to_string())
                 .map(|mut outputs| match outputs.remove(1) {
-                    Value::Array(result) => result,
+                    Value::Array(output) => output,
                     _ => panic!("expected an array"),
                 });
             observations.push((executed, called, observe(interpreted)));
@@ -3017,9 +3014,9 @@ mod tests {
         );
 
         // A callee that only moves its input to another memory names no devices, so its call runs where its public
-        // argument is and commits both results, because the callee requests a placement. The interpreted call fills the
-        // value there too, rather than on the default device of the session, and commits both results whatever the
-        // commitment of the argument, as an execution of the callee on those devices does.
+        // input is and commits both outputs, because the callee requests a placement. The interpreted call fills the
+        // value there too, rather than on the default device of the session, and commits both outputs whatever the
+        // commitment of the input, as an execution of the callee on those devices does.
         let first_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let first_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![first_device]).unwrap();
         let memory: CompiledFunction<ArrayType, (ArrayType, ArrayType)> = compile(
@@ -3049,7 +3046,7 @@ mod tests {
             assert_eq!(placements, vec![(vec![device], true); 2]);
         }
 
-        // A call of a callee that names no devices rejects committed arguments on different devices from one another
+        // A call of a callee that names no devices rejects committed inputs on different devices from one another
         // before it runs its callee, as JAX rejects such a `jit` call ("Received incompatible devices for jitted
         // computation").
         let pair: CompiledFunction<(ArrayType, ArrayType), (ArrayType, ArrayType)> =
@@ -3085,8 +3082,8 @@ mod tests {
             ProgramError::InvalidArgument {
                 message: Error::from(ProgramError::InvalidArgument {
                     message: format!(
-                        "public argument #1 is committed to devices [{}], but public argument #0 is committed to \
-                         devices [{}]",
+                        "public input #1 is committed to devices [{}], but public input #0 is committed to devices \
+                         [{}]",
                         second_device.id(),
                         first_mesh.devices()[0].id(),
                     ),
@@ -3130,9 +3127,9 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        // Each operand and result of a call that its callee boundary overrides is constrained to the override where
-        // the call executes, closed over auto mesh axes and with unconstrained dimensions replicated, as an execution
-        // of the called function annotates its own boundary. An operand without an input override is constrained to
+        // Each input and output of a call that its callee boundary overrides is constrained to the override where the
+        // call executes, closed over auto mesh axes and with unconstrained dimensions replicated, as an execution of
+        // the called function annotates its own boundary. An input without an input override is constrained to
         // the replicated sharding that the callee declares for it, because its type cannot show its placement along
         // the auto axis (refer to `CallOperation::boundary_input_sharding`). The shared callee itself carries no
         // override.
@@ -3221,10 +3218,10 @@ mod tests {
     fn test_call_operation_lower_places_cotangents_at_the_cotangent_shardings_of_overrides() {
         // A function that moves its scalar input to device memory and returns it, compiled with an inferred boundary,
         // has the same derivatives when that boundary is stated as an input override, an output override, or both,
-        // for every reduction state of its argument. A tangent has the sharding of its primal, while the cotangent of a
+        // for every reduction state of its input. A tangent has the sharding of its primal, while the cotangent of a
         // value with a pending sum has a completed one and the reverse (refer to `Sharding::cotangent`), so the
         // transposed call places each cotangent that crosses the boundary at the cotangent sharding of the override of
-        // its primal, and keeps each known primal value at the override itself. The inferred boundary of an argument is
+        // its primal, and keeps each known primal value at the override itself. The inferred boundary of an input is
         // the sharding of its type, which records reduction state over explicit axes only, so over auto axes only the
         // runtime shardings and values that the session-level derivative paths return show it.
         let client = cpu_client(2);
@@ -3327,12 +3324,12 @@ mod tests {
     #[test]
     fn test_call_operation_lower_rejects_boundaries_that_introduce_pending_extrema() {
         // XLA aborts the process when it exports a sharding that introduces a pending maximum or minimum, so the
-        // boundary of a nested call rejects one that its result does not carry, as the result shardings of an entry
-        // function do. The caller uses the result of the call, so the override does not reach its own result shardings.
-        // An input override introduces nothing: the callee holds its argument as it has entered, with the pending
+        // boundary of a nested call rejects one that its output does not carry, as the result shardings of an entry
+        // function do. The caller uses the output of the call, so the override does not reach its own result shardings.
+        // An input override introduces nothing: the callee holds its input as it has entered, with the pending
         // reduction over auto mesh axes that the override states completed (refer to
-        // `Sharding::without_auto_reduction_axes`), and the operand of the call is a completed value of the caller, so
-        // the call lowers and constrains the operand replicated. Lowering alone is checked here, so that a missing
+        // `Sharding::without_auto_reduction_axes`), and the input of the call is a completed value of the caller, so
+        // the call lowers and constrains the input replicated. Lowering alone is checked here, so that a missing
         // rejection cannot abort the test process.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -3398,8 +3395,8 @@ mod tests {
             }
         }
 
-        // A boundary that keeps the pending maximum that its operand and its result carry over an explicit mesh axis
-        // introduces nothing (the caller returns the result as it is, because `add` takes no pending maximum).
+        // A boundary that keeps the pending maximum that its input and its output carry over an explicit mesh axis
+        // introduces nothing (the caller returns the output as it is, because `add` takes no pending maximum).
         let mesh = two_device_mesh(client, MeshAxisType::Explicit);
         let maximum = pending(&mesh, UnreducedKind::Max);
         let typed = vector_type.clone().with_sharding(maximum.clone()).unwrap();

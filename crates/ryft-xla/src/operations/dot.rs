@@ -457,7 +457,7 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
     Ok((group_starts, group_ends))
 }
 
-/// Expands one grouped dot operand into a dense group axis whose elements outside each group are masked to zero. Group
+/// Expands one grouped dot input into a dense group axis whose elements outside each group are masked to zero. Group
 /// intervals are accumulated in `u64` and capped at the physical ragged extent so metadata arithmetic and iota indices
 /// cannot wrap. The intermediate order keeps the `group_sizes` prefix axes first so every broadcast dimension is
 /// monotonic, and a final transpose, when necessary, produces `[group, original axes...]` for the dense dot.
@@ -571,7 +571,7 @@ fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
     }
 }
 
-/// Emits one ordinary dense dot after the grouped operands have been expanded.
+/// Emits one ordinary dense dot after the grouped inputs have been expanded.
 fn lower_dense_ragged_dot<'b, 'c: 'b, 't: 'c>(
     left: ValueRef<'b, 'c, 't>,
     right: ValueRef<'b, 'c, 't>,
@@ -785,11 +785,11 @@ mod tests {
         // A dot with an accumulation type lowers to a `stablehlo.dot_general` whose result type is the accumulation
         // type, as XLA's `preferred_element_type` contract requires, with the operands kept at their narrow element
         // type.
-        let operand_type =
+        let input_type =
             ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
-        let left = builder.add_input(operand_type.clone());
-        let right = builder.add_input(operand_type.clone());
+        let left = builder.add_input(input_type.clone());
+        let right = builder.add_input(input_type.clone());
         let operation = DotOperation::new(DotDimensionNumbers::matmul()).with_accumulation_type(DataType::F32);
         let output = builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap()[0];
         let program = builder
@@ -844,19 +844,19 @@ mod tests {
 
     #[test]
     fn test_dot_operation_lower_with_accumulation_type_matches_reference_backend() {
-        // The operands stay `f8e4m3fn` on device and the contraction accumulates at `f32`. Every value is exactly
+        // The inputs stay `f8e4m3fn` on device and the contraction accumulates at `f32`. Every value is exactly
         // representable in `f8e4m3fn` and every product and sum is exact in `f32`, so both backends are exact.
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
-        let operand_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
+        let input_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
         let reference_left = CoreArray::from_elements(
-            operand_type.clone(),
+            input_type.clone(),
             &[0.5f64, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
         )
         .unwrap();
         let reference_right = CoreArray::from_elements(
-            operand_type,
+            input_type,
             &[1f64, 0.5, 0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
         )
         .unwrap();

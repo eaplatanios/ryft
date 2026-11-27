@@ -726,7 +726,7 @@ mod tests {
     fn test_print_operation_lower() {
         // In a flat program with two prints, the token chain is created lazily by one zero-operand
         // `stablehlo.after_all` at the first print, the second print consumes the first print's token result, and
-        // each print's data flow output is its forwarded operand. The final add therefore reads `%arg0` and `%0`
+        // each print's data flow output is its forwarded input. The final add therefore reads `%arg0` and `%0`
         // rather than custom call results.
         let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
@@ -886,11 +886,10 @@ mod tests {
         .unwrap();
         let (output, lines) = with_captured_prints(|| compiled.executable().execute(&engine, source).unwrap());
 
-        // Both prints fire in program order, and the printed values are the forwarded operands.
+        // Both prints fire in program order, and the printed values are the forwarded inputs.
         assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string(), "doubled: [3.0, 5.0]".to_string()]);
 
-        // The compiled function still computes its data flow output, because each print is the identity on its
-        // operand.
+        // The compiled function still computes its data flow output, because each print is the identity on its input.
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let output_bytes = output
             .device_shard(device_id)

@@ -270,9 +270,8 @@ impl LowerableOperation for DimensionPowOperation {
 
 /// Lowering of the arithmetic of a [`DimensionOperation`].
 trait DimensionOperationLoweringExtension {
-    /// Lowers one first-class dimension arithmetic operation on scalar `i64` extents. Arithmetic that the operand
-    /// bounds do not prove safe keeps the checked eager semantics through a runtime assertion on the ordered assertion
-    /// chain.
+    /// Lowers one first-class dimension arithmetic operation on scalar `i64` extents. Arithmetic that the input bounds
+    /// do not prove safe keeps the checked eager semantics through a runtime assertion on the ordered assertion chain.
     fn lower_arithmetic<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
@@ -328,7 +327,7 @@ impl DimensionOperationLoweringExtension for DimensionOperation<DimensionValue> 
         }
         // A runtime assertion and the arithmetic operation do not have a StableHLO data dependency.
         // Select a valid divisor for the data operation so speculative or reordered execution cannot
-        // evaluate division by zero before the host callback reports the original operands.
+        // evaluate division by zero before the host callback reports the original inputs.
         let safe_right = if requires_runtime_assertion
             && matches!(self, DimensionOperation::Div(_) | DimensionOperation::Rem(_))
         {
@@ -363,8 +362,8 @@ impl DimensionOperationLoweringExtension for DimensionOperation<DimensionValue> 
         };
         // Because of the same missing data dependency, an unproven subtraction can hand a negative extent to consumers
         // such as `set_dimension_size`, and an unproven addition, multiplication, or power can hand them a wrapped
-        // negative, failing inside XLA before the host callback reports the original operands. Clamping the unproven
-        // data path to zero keeps it well defined, so that the assertion owns the diagnostic.
+        // negative, failing inside XLA before the host callback reports the original inputs. Clamping the unproven data
+        // path to zero keeps it well defined, so that the assertion owns the diagnostic.
         let result = if requires_runtime_assertion
             && matches!(
                 self,
@@ -663,7 +662,7 @@ mod tests {
         // An unproven subtraction keeps its diagnostic assertions, which are two gateway checks and one arithmetic
         // check. Because the assertion custom call has no StableHLO data dependency on the subtraction, the data path
         // is clamped to zero so that downstream extent consumers cannot fail inside XLA before the host callback
-        // reports the original operands.
+        // reports the original inputs.
         let unproven = build(DimensionBounds::new(1, Some(9)).unwrap(), DimensionBounds::new(1, Some(9)).unwrap());
         assert_eq!(
             unproven,
@@ -870,9 +869,9 @@ mod tests {
         let left_type = DimensionType::new("left", bounds);
         let right_type = DimensionType::new("right", bounds);
         let check = |operation: DimensionOperation<DimensionValue>,
-                     valid_operands: (i64, i64),
+                     valid_inputs: (i64, i64),
                      expected_output: i64,
-                     invalid_operands: (i64, i64),
+                     invalid_inputs: (i64, i64),
                      expected_error: &str| {
             let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let left_input = builder.add_input(input_type.clone().into());
@@ -914,10 +913,10 @@ mod tests {
             };
 
             let output =
-                session.execute_program(&compiled, vec![input(valid_operands.0), input(valid_operands.1)]).unwrap();
+                session.execute_program(&compiled, vec![input(valid_inputs.0), input(valid_inputs.1)]).unwrap();
             assert_eq!(read_first_shard::<i64>(client, &output[0]), vec![expected_output]);
             let error = session
-                .execute_program(&compiled, vec![input(invalid_operands.0), input(invalid_operands.1)])
+                .execute_program(&compiled, vec![input(invalid_inputs.0), input(invalid_inputs.1)])
                 .unwrap_err();
             assert_eq!(error.to_string(), expected_error);
         };

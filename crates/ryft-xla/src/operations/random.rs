@@ -44,7 +44,7 @@ impl LowerableOperation for RngBitGeneratorOperation<Type> {
         let block = &mut lowerer.block();
         // Type inference refines the declared dynamic output axes whose extents are exact (e.g., those of eager
         // dimension values) to static axes, so only the refined bits type decides whether the generator can be
-        // lowered. Their extent operands can be omitted after validating symbolic operands against the refined extents.
+        // lowered. Their extent inputs can be omitted after validating symbolic inputs against the refined extents.
         let [_, bits_type] = output_types else {
             return Err(ProgramError::InvalidOutputCount { expected: 2, actual: output_types.len() }.into());
         };
@@ -218,7 +218,7 @@ trait RandomAlgorithmLoweringExtension {
     /// Lowers one random bit generation with this algorithm to a `stablehlo.rng_bit_generator` that produces bits of
     /// type `bits_type`, mapping the algorithm to the corresponding StableHLO algorithm attribute. The two results are
     /// the advanced generator state and the bits. The bits type is the instruction's output type, which may be refined,
-    /// rather than the operation's declared one, whose dynamic axes exact extent operands may have refined to static
+    /// rather than the operation's declared one, whose dynamic axes exact extent inputs may have refined to static
     /// axes. The bits stay in the memory where they are generated, which suits callers that consume them inside their
     /// own lowering.
     fn lower_unplaced_bit_generator<'b, 'c: 'b, 't: 'c>(
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn test_rng_bit_generator_operation_lower_with_exact_output_extent() {
         // An exact extent refines the declared dynamic bits axis to a static one, so the generator lowers at that
-        // static shape and its redundant extent operand does not reach `stablehlo.rng_bit_generator`.
+        // static shape and its redundant extent input does not reach `stablehlo.rng_bit_generator`.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let state_type = RandomAlgorithm::ThreeFry.state_type();
@@ -418,8 +418,8 @@ mod tests {
 
     #[test]
     fn test_rng_bit_generator_operation_lower_mixed_repeated_extents() {
-        // An exact operand makes both repeated bits axes static, but the symbolic peer must still equal that extent.
-        // The two generators cover both operand orders and consume the same state, so they produce the same bits.
+        // An exact input makes both repeated bits axes static, but the symbolic peer must still equal that extent.
+        // The two generators cover both input orders and consume the same state, so they produce the same bits.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
         let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![size.clone().into(), size.clone().into()]));
         let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_rng_bit_generator_operation_lower_rejects_missing_input_types() {
-        // Input types are validated before they are split into the state type and the extent operand types.
+        // Input types are validated before they are split into the state type and the extent input types.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let operation = RngBitGeneratorOperation::<Type>::new(
             RandomAlgorithm::ThreeFry,

@@ -33,7 +33,7 @@ use ryft_pjrt::{
 use crate::arrays::metadata::ArrayOutputPlan;
 use crate::compilation::programs::OutputDeviceAssignment;
 use crate::devices::MemoryExtension;
-use crate::lowering::signatures::ExecutableSignature;
+use crate::lowering::programs::MlirProgramSignature;
 use crate::sessions::effects::ensure_effect_dispatch_is_allowed;
 use crate::types::DataTypeExtension;
 use crate::{
@@ -55,23 +55,23 @@ pub enum ExecutionError {
     #[error("got {actual_count} donation flag(s), but expected {expected_count}")]
     DonationFlagCountMismatch { expected_count: usize, actual_count: usize },
 
-    /// A public argument is committed to a physical device assignment incompatible with the executable.
-    #[error("public argument #{index} is committed to devices {actual:?}, but the executable requires {expected:?}")]
+    /// A public input is committed to a physical device assignment incompatible with the executable.
+    #[error("public input #{index} is committed to devices {actual:?}, but the executable requires {expected:?}")]
     CommittedInputDeviceMismatch { index: usize, actual: Vec<DeviceId>, expected: Vec<DeviceId> },
 
-    #[error("public argument #{index} belongs to a different PJRT client than the execution")]
-    ArgumentClientMismatch { index: usize },
+    #[error("public input #{index} belongs to a different PJRT client than the execution")]
+    InputClientMismatch { index: usize },
 
     #[error("captured array #{index} belongs to a different PJRT client than the execution")]
     CaptureClientMismatch { index: usize },
 
     #[error(
-        "public argument #{index} is unreduced along the mesh axes {axes:?}, which the executable cannot receive \
-         because a staged type does not record a pending reduction over auto mesh axes; reduce the argument (e.g., \
+        "public input #{index} is unreduced along the mesh axes {axes:?}, which the executable cannot receive \
+         because a staged type does not record a pending reduction over auto mesh axes; reduce the input (e.g., \
          with `Array::to_placement` onto a sharding without unreduced axes), or place it over explicit mesh axes, \
          before passing it to a compiled function or an eager operation"
     )]
-    UnreducedAutoAxisArgument { index: usize, axes: Vec<String> },
+    UnreducedAutoAxisInput { index: usize, axes: Vec<String> },
 
     #[error(
         "captured array #{index} is unreduced along the mesh axes {axes:?}, which the executable cannot receive \
@@ -180,7 +180,7 @@ pub(super) struct ExecutionPlan {
     zero_space_inputs: bool,
 
     /// Placement of every logical output, present when every output has a static type, every output without a
-    /// physical result has the zero data type, the program runs on a single device or declares a sharding without
+    /// physical output has the zero data type, the program runs on a single device or declares a sharding without
     /// `Unconstrained` dimensions for every output, which XLA must then honor, and the executable reports the memory
     /// of every output, which [`Self::new`] compares with the declared one. The outputs of such programs are built
     /// directly from the returned buffers.
@@ -195,7 +195,7 @@ impl ExecutionPlan {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
         output_shardings: &[Sharding],
-        signature: &ExecutableSignature,
+        signature: &MlirProgramSignature,
         donation_flags: &[bool],
         capture_count: usize,
         mesh: &DeviceMesh,
@@ -420,7 +420,7 @@ impl ExecutionArguments {
             .collect::<Vec<Vec<ExecutionInput<'static>>>>();
         for (array_index, (array, &requested)) in arrays.into_iter().zip(donation_flags).enumerate() {
             if client.is_some_and(|client| !std::ptr::eq(array.client(), client)) {
-                return Err(Error::Execution(ExecutionError::ArgumentClientMismatch { index: array_index }));
+                return Err(Error::Execution(ExecutionError::InputClientMismatch { index: array_index }));
             }
             if array.shards().iter().filter(|shard| shard.buffer().is_some()).count() != addressable_device_ids.len()
                 && let Some(device_id) = array
@@ -617,7 +617,7 @@ impl Session {
         Ok(execution.into_output())
     }
 
-    /// Validates the program and prepares its runtime resources before argument materialization and effect reservation.
+    /// Validates the program and prepares its runtime resources before input materialization and effect reservation.
     fn prepare_execution_resources(&self, program: &CompiledProgram) -> Result<ExecutionResources, Error> {
         ensure_effect_dispatch_is_allowed()?;
         self.validate_program_owner(program)?;
@@ -640,8 +640,8 @@ impl Session {
                 actual: inputs.len(),
             }));
         }
-        // An input that the executable never reads has no executable argument, and the signature records it as unread
-        // (refer to `unread_entry_arguments`), so it is neither checked, nor required to hold buffers, nor waited for,
+        // An input that the executable never reads has no physical input, and the signature records it as unread
+        // (refer to `unread_entry_inputs`), so it is neither checked, nor required to hold buffers, nor waited for,
         // whatever its data type. An erased input of the zero data type that the executable reads is not unread, and
         // its producer is still observed below.
         let is_unread = |index: usize| program.signature().is_unread_input(index);
@@ -649,8 +649,8 @@ impl Session {
         // owns the program (refer to `Self::validate_program_owner`).
         let checked = inputs.iter().enumerate().map(|(index, input)| (!is_unread(index)).then_some(input));
         validate_input_clients(self, checked, program.capture_count())?;
-        // Outputs are committed when a public argument is (refer to `Self::reconstruct_compiled_outputs`), which is
-        // decided here, once, for every execution path. An argument that the executable never reads (i.e., a capture
+        // Outputs are committed when a public input is (refer to `Self::reconstruct_compiled_outputs`), which is
+        // decided here, once, for every execution path. An input that the executable never reads (i.e., a capture
         // that the program of an eager call passes on to a callee that never reads it, refer to
         // `Options::with_unread_inputs`) commits nothing.
         let public_inputs = || {
@@ -706,7 +706,7 @@ impl Session {
             (input_refinements, Some(actual_input_types))
         };
 
-        // Validate the logical public arguments before padding, erasing, donating, or moving any buffers.
+        // Validate the logical public inputs before padding, erasing, donating, or moving any buffers.
         // Captures, including hidden session constants, are placed on the executable's mesh.
         for (index, input) in inputs.iter().skip(program.capture_count()).enumerate() {
             if !is_unread(program.capture_count() + index) {
@@ -715,8 +715,8 @@ impl Session {
         }
 
         // The runtime sharding of an input records a pending reduction over auto mesh axes, which its type omits, so
-        // validation against the declared type cannot see it. Every execution path prepares its arguments here. Every
-        // logical input is admitted, also one that has no executable argument (i.e., a static input of the zero data
+        // validation against the declared type cannot see it. Every execution path prepares its inputs here. Every
+        // logical input is admitted, also one that has no physical input (i.e., a static input of the zero data
         // type, which is erased below), because the admission concerns the logical value and not its buffers, and an
         // eager call admits the same input alike (refer to `CallEagerExtension::eager_decision`). The executable
         // receives such an input as its declared type states. A capture that the executable never reads is not
@@ -724,7 +724,7 @@ impl Session {
         for (index, (input, physical_index)) in inputs.iter().zip(program.signature().input_mapping()).enumerate() {
             match physical_index {
                 Some(physical_index) => {
-                    let expected = &program.expected_argument_shardings()[*physical_index];
+                    let expected = &program.expected_input_shardings()[*physical_index];
                     validate_input_reduction(input, expected, index, program.capture_count())?;
                 }
                 None if input.sharding().unreduced_axes().is_empty() || is_unread(index) => {}
@@ -758,21 +758,21 @@ impl Session {
                 Some(actual_input_types) => actual_input_types,
                 None => inputs.iter().map(|input| input.r#type().into_owned()).collect(),
             };
-            // Place every argument on the sharding with which the executable receives it before padding it, as an
-            // eager call does (refer to `CallEagerExtension::eager_decision`), because padding an input that arrives
-            // split unevenly would compile that uneven split. Arguments of the zero data type carry no payload to pad,
-            // and `Self::materialize_zero_space_carriers` builds their carriers on the receiving placement. Placing
-            // first would also introduce a pending reduction that the receiving sharding has and an argument below its
-            // bound does not, which padding then refuses (refer to the register entry "A bounded-dynamic input sharding
-            // does not introduce a pending reduction below the bound"). Such an argument is rejected here, from global
-            // facts alone, so every process rejects it alike, before any argument is placed.
+            // Place every input on the sharding with which the executable receives it before padding it, as an eager
+            // call does (refer to `CallEagerExtension::eager_decision`), because padding an input that arrives split
+            // unevenly would compile that uneven split. Inputs of the zero data type carry no payload to pad, and
+            // `Self::materialize_zero_space_carriers` builds their carriers on the receiving placement. Placing first
+            // would also introduce a pending reduction that the receiving sharding has and an input below its bound
+            // does not, which padding then refuses (refer to the register entry "A bounded-dynamic input sharding does
+            // not introduce a pending reduction below the bound"). Such an input is rejected here, from global facts
+            // alone, so every process rejects it alike, before any input is placed.
             for (logical_input_index, (input, physical_index)) in
                 inputs.iter().zip(program.signature().input_mapping()).enumerate()
             {
                 let Some(physical_index) = physical_index else {
                     continue;
                 };
-                let expected = &program.expected_argument_shardings()[*physical_index];
+                let expected = &program.expected_input_shardings()[*physical_index];
                 let actual_shape = actual_input_types[logical_input_index].static_shape();
                 let bound_shape = plan.physical_input_types[*physical_index].static_shape();
                 if let (Some(actual_shape), Some(bound_shape)) = (actual_shape, bound_shape)
@@ -801,7 +801,7 @@ impl Session {
                 .map(|(input, physical_index)| match physical_index {
                     Some(physical_index) if !input.data_type().is_zero() => self.reshard_input_if_needed(
                         program.mesh(),
-                        &program.expected_argument_shardings()[*physical_index],
+                        &program.expected_input_shardings()[*physical_index],
                         input,
                     ),
                     _ => Ok(input),
@@ -820,14 +820,13 @@ impl Session {
         } else {
             inputs
         };
-        let mut inputs =
-            self.reshard_inputs_if_needed(program.mesh(), program.expected_argument_shardings(), inputs)?;
+        let mut inputs = self.reshard_inputs_if_needed(program.mesh(), program.expected_input_shardings(), inputs)?;
         // A logical input without a layout constraint admits any physical representation. Match the compiled
         // signature before handing buffers to PJRT, which otherwise reads their storage in its expected order. A
         // declared layout that differs from the expected one always needs a conversion, and an input without a
         // declared layout needs one only when the buffer of one of its shards has another layout, which requires
         // observing the buffers. Either way the shards are converted on their own (refer to
-        // `Self::convert_argument_storage`), because the argument was admitted above and keeps every logical fact.
+        // `Self::convert_input_storage`), because the input was admitted above and keeps every logical fact.
         for (input, physical_type) in inputs.iter_mut().zip(&plan.physical_input_types) {
             if input.data_type().is_zero() {
                 continue;
@@ -853,7 +852,7 @@ impl Session {
                 }
             };
             if needs_conversion {
-                *input = self.convert_argument_storage(input.clone(), expected)?;
+                *input = self.convert_input_storage(input.clone(), expected)?;
             }
         }
         let donation_flags = if donation_overrides.is_empty() {
@@ -983,7 +982,7 @@ impl Session {
                     }
                 };
                 let physical_input_index = program.signature().input_mapping()[logical_input_index].unwrap();
-                let expected_sharding = &program.expected_argument_shardings()[physical_input_index];
+                let expected_sharding = &program.expected_input_shardings()[physical_input_index];
                 let declared_type = &program.input_types()[logical_input_index];
                 let effective_type = if declared_type.sharding().is_some() {
                     declared_type.clone()
@@ -1312,7 +1311,7 @@ impl Session {
         }
     }
 
-    /// Submits at the common physical boundary and transposes array results, retaining hidden effect tokens in the
+    /// Submits at the common physical boundary and transposes array outputs, retaining hidden effect tokens in the
     /// active scope. No scope lock is held across PJRT, which may execute callbacks inline on this thread.
     ///
     /// # Parameters
@@ -1332,7 +1331,7 @@ impl Session {
     ///   - `resources`: Prepared invocation resources. This function takes them at the PJRT handoff so the caller
     ///     can release any reference guards before dropping the resources after an earlier failure.
     ///   - `after_submission`: Callback that runs synchronously on this thread, exactly once, with the fence of the
-    ///     whole execution right after PJRT accepts the submission and before the results are checked. It does not
+    ///     whole execution right after PJRT accepts the submission and before the outputs are checked. It does not
     ///     run when submission fails.
     fn execute_pjrt_buffers(
         &self,
@@ -1477,22 +1476,22 @@ impl Session {
         Ok(Execution::new(per_output_buffers, joined_fence.unwrap_or(fence)))
     }
 
-    /// Returns `argument`, an argument of an execution that its executable has admitted, with every addressable shard
-    /// stored in `layout`, and with the type, the placement (including the splits along auto mesh axes and the
-    /// contributions along unreduced axes, which its type may not record), the commitment, and the [locally assigned
-    /// devices](Array::is_locally_assigned) of `argument`. This is the one storage conversion of argument preparation.
-    /// It converts each mismatching shard on the device of that shard, or through host memory in the background, and
+    /// Returns `input`, an input of an execution that its executable has admitted, with every addressable shard stored
+    /// in `layout`, and with the type, the placement (including the splits along auto mesh axes and the contributions
+    /// along unreduced axes, which its type may not record), the commitment, and the [locally assigned
+    /// devices](Array::is_locally_assigned) of `input`. This is the one storage conversion of input preparation. It
+    /// converts each mismatching shard on the device of that shard, or through host memory in the background, and
     /// keeps the others, so that preparation never waits for the producer of a shard, and the result joins the
-    /// execution fence of `argument` with the completion of every conversion. It never goes through an operation with
-    /// an admission of its own (e.g., a whole-array cast through `Session::bind`), which could reject or alter what the
+    /// execution fence of `input` with the completion of every conversion. It never goes through an operation with an
+    /// admission of its own (e.g., a whole-array cast through `Session::bind`), which could reject or alter what the
     /// admission of the executable accepted (e.g., a pending sum over an auto mesh axis that an input sharding override
-    /// states), because a conversion of storage changes none of the logical facts of the argument.
-    fn convert_argument_storage(&self, argument: Array, layout: &Layout) -> Result<Array, Error> {
-        let (committed, locally_assigned) = (argument.is_committed(), argument.is_locally_assigned());
+    /// states), because a conversion of storage changes none of the logical facts of the input.
+    fn convert_input_storage(&self, input: Array, layout: &Layout) -> Result<Array, Error> {
+        let (committed, locally_assigned) = (input.is_committed(), input.is_locally_assigned());
         // A placement onto the mesh and the sharding of an array only places its storage (refer to
         // `Array::place_within_client`), so it consults neither the reduction state nor the variation of the array.
-        let target = Placement::new(argument.mesh().clone(), argument.sharding().clone())?.with_layout(layout.clone());
-        Ok(argument
+        let target = Placement::new(input.mesh().clone(), input.sharding().clone())?.with_layout(layout.clone());
+        Ok(input
             .place_within_client(self, &target, false)?
             .with_committed(committed)
             .with_locally_assigned(locally_assigned))
@@ -1552,7 +1551,7 @@ impl Session {
 
     /// Pads bounded-dynamic inputs to static executable storage and appends their logical extents. An executable
     /// compiled for bounded dynamic shapes takes every such input with its static bound shape, followed by a scalar
-    /// argument for each logical extent, and this function produces those physical inputs in that order. Each extent
+    /// input for each logical extent, and this function produces those physical inputs in that order. Each extent
     /// scalar is uploaded replicated over `mesh`, on which the executable receives it, and not on the devices of its
     /// input. An input of the zero data type is not placed before this point, and its devices may be ones that each
     /// process chose on its own, which an explicit upload would then name as if every process knew them.
@@ -1579,7 +1578,7 @@ impl Session {
     fn materialize_bounded_dynamic_inputs(
         &self,
         mesh: &DeviceMesh,
-        signature: &ExecutableSignature,
+        signature: &MlirProgramSignature,
         declared_types: &[ArrayType],
         actual_types: &[ArrayType],
         inputs: Vec<Array>,
@@ -1626,7 +1625,7 @@ impl Session {
             }
             // Padding is an eager operation that would admit the input again and combine its pending reduction with
             // that of the padding value, so an input with a pending reduction must arrive at its bound (refer to the
-            // register entry "A bounded-dynamic argument with a pending reduction arrives at its bound"). The rule
+            // register entry "A bounded-dynamic input with a pending reduction arrives at its bound"). The rule
             // reads only global facts of the input, so every process rejects it alike, before it is padded.
             if !input.sharding().unreduced_axes().is_empty() {
                 return Err(ProgramError::InvalidArgument {
@@ -1916,12 +1915,12 @@ pub(crate) fn validate_input_clients<'a>(
     let foreign = |input: Option<&Array>| input.is_some_and(|input| !std::ptr::eq(input.client(), session.client()));
     match inputs.into_iter().position(foreign) {
         Some(index) if index < capture_count => Err(ExecutionError::CaptureClientMismatch { index }),
-        Some(index) => Err(ExecutionError::ArgumentClientMismatch { index: index - capture_count }),
+        Some(index) => Err(ExecutionError::InputClientMismatch { index: index - capture_count }),
         None => Ok(()),
     }
 }
 
-/// Checks the commitment of a public argument against the physical devices of a fixed call boundary.
+/// Checks the commitment of a public input against the physical devices of a fixed call boundary.
 /// The order identifies the device assigned to each partition. Logical mesh names and shardings can differ.
 pub(crate) fn validate_committed_input_devices(
     input: &Array,
@@ -1939,12 +1938,12 @@ pub(crate) fn validate_committed_input_devices(
 }
 
 /// Validates that `input`, the input at `index` of an execution whose first `capture_count` inputs are captures, can
-/// enter the executable at the `expected` sharding of its argument. A reshard moves shards but never completes a
+/// enter the executable at the `expected` sharding of its physical input. A reshard moves shards but never completes a
 /// pending reduction, so the unreduced axes of the runtime sharding of `input` and their kind must be those of
-/// `expected`. Types record a pending reduction over explicit and manual mesh axes, and argument validation compares
+/// `expected`. Types record a pending reduction over explicit and manual mesh axes, and input validation compares
 /// it (refer to [`validate_input_type`]). They omit one over auto mesh axes (refer to [`ArrayType::with_sharding`]),
 /// so an executable that was compiled for the type of such an input expects it reduced, and nothing could carry the
-/// reduction across its boundary. Such an input is rejected with [`ExecutionError::UnreducedAutoAxisArgument`] or
+/// reduction across its boundary. Such an input is rejected with [`ExecutionError::UnreducedAutoAxisInput`] or
 /// [`ExecutionError::UnreducedAutoAxisCapture`] instead. An input without a pending reduction, which is the common
 /// case, costs one branch. Compilation applies the same rule to every array that a function captures, through
 /// [`validate_capture_reduction`].
@@ -1960,11 +1959,11 @@ pub(crate) fn validate_input_reduction(
 /// Validates that an array that a function captures (i.e., an explicit capture or the array of a session constant),
 /// whose runtime array is placed as `sharding`, can enter the executable of that function as its input at `index`,
 /// whose first `capture_count` inputs are captures, by the rule of [`validate_input_reduction`]. The executable
-/// receives a capture as it receives an argument without an input sharding override, which drops a pending reduction
-/// over auto mesh axes (refer to `receivable_argument_sharding` in `crate::compilation::domains`), so such a capture is
+/// receives a capture as it receives a public input without an input sharding override, which drops a pending reduction
+/// over auto mesh axes (refer to `receivable_input_sharding` in `crate::compilation::domains`), so such a capture is
 /// rejected with [`ExecutionError::UnreducedAutoAxisCapture`], whatever the mesh of the function. Compilation applies
 /// it before it places a capture on the mesh of the function, because that placement would otherwise complete the
-/// reduction silently, as an execution never does for an argument.
+/// reduction silently, as an execution never does for a public input.
 pub(crate) fn validate_capture_reduction(
     sharding: &Sharding,
     expected: &Sharding,
@@ -1993,14 +1992,14 @@ fn validate_reduction(
     Err(if index < capture_count {
         ExecutionError::UnreducedAutoAxisCapture { index, axes }
     } else {
-        ExecutionError::UnreducedAutoAxisArgument { index: index - capture_count, axes }
+        ExecutionError::UnreducedAutoAxisInput { index: index - capture_count, axes }
     })
 }
 
 /// Validates runtime refinement of a declared logical input type, excluding the placement that a sharding describes,
-/// because an execution reshards its arguments as its executable expects. A reshard cannot change a pending reduction
+/// because an execution reshards its inputs as its executable expects. A reshard cannot change a pending reduction
 /// (i.e., the unreduced axes of a sharding and their kind), so the two types must agree on it. This is the rule by
-/// which an executable accepts its arguments. The type rule of a `call` accepts the inputs of a call by a stricter
+/// which an executable accepts its inputs. The type rule of a `call` accepts the inputs of a call by a stricter
 /// rule, because a call does not reshard its inputs (refer to `CallOperation::validate_input_types`).
 pub(crate) fn validate_input_type(declared: &ArrayType, actual: &ArrayType) -> Result<(), Error> {
     // Calls of a specialization ordinarily pass inputs of exactly its declared types, which refine them trivially.
@@ -2063,16 +2062,16 @@ impl ReferenceCompletionBackend for ReferenceCompletion {
 /// Assignment of a prepared invocation's output devices.
 #[derive(Copy, Clone)]
 struct OutputAssignment {
-    /// Whether a public argument is committed, which commits every output of the execution.
+    /// Whether a public input is committed, which commits every output of the execution.
     committed: bool,
 
     /// Whether this process chose the devices of this invocation independently.
     locally_assigned: bool,
 }
 
-/// Fully materialized physical arguments and logical refinements prepared before PJRT submission.
+/// Fully materialized physical inputs and logical refinements prepared before PJRT submission.
 struct PreparedExecution {
-    /// Fully materialized physical arrays in executable argument order.
+    /// Fully materialized physical arrays in physical input order.
     inputs: Vec<Array>,
 
     /// Addressable devices in executable order.
@@ -2084,7 +2083,7 @@ struct PreparedExecution {
     /// Runtime refinements established from the unmaterialized logical inputs.
     input_refinements: <ArrayType as CoreType>::Refinements,
 
-    /// Physical result count expected from every addressable device.
+    /// Physical output count expected from every addressable device.
     physical_output_count: usize,
 
     /// Placement derived from logical inputs before preparing their buffers.
@@ -2093,8 +2092,8 @@ struct PreparedExecution {
 
 impl PreparedExecution {
     /// Consumes the materialized arrays into PJRT arguments grouped by device, and returns them together with the
-    /// execution fences of those arrays (i.e., of the public arguments and the captures) that are pending or failed,
-    /// the input refinements, and the physical result count.
+    /// execution fences of those arrays (i.e., of the public inputs and the captures) that are pending or failed, the
+    /// input refinements, and the physical output count.
     ///
     /// An execution fence of an input can carry the failure of work that no buffer of the input depends on (e.g., of a
     /// storage conversion or of an effect of its producer), which PJRT therefore cannot order the execution after, so
@@ -2188,7 +2187,7 @@ mod tests {
     /// Deterministic failure point of stateful execution, used by regression tests of its transaction protocol.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub(super) enum StatefulFailureInjection {
-        /// Fails immediately before PJRT submission, after argument preparation but before publication.
+        /// Fails immediately before PJRT submission, after input preparation but before publication.
         BeforeSubmission,
 
         /// Fails after mutable inputs cross the execution handoff boundary.
@@ -2450,7 +2449,7 @@ mod tests {
              `device`",
         );
 
-        // Overrides that agree with the declared memories are accepted, and the result occupies the declared memory.
+        // Overrides that agree with the declared memories are accepted, and the output occupies the declared memory.
         let compiled = compile(&host_type, &host_shape, &host_shape).unwrap();
         let values = [1f64, 2.];
         let input = Array::from_host_buffer(&session, host_type.clone(), mesh, None, values_to_bytes(&values)).unwrap();
@@ -2945,7 +2944,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_execute_compiled_async_prepares_runtime_before_arguments() {
+    fn test_session_execute_compiled_async_prepares_runtime_before_inputs() {
         /// Print runtime that initializes successfully but rejects invocation preparation.
         struct RejectingPrintRuntime;
 
@@ -2991,7 +2990,7 @@ mod tests {
         let extensions = RuntimeExtensions::new().with_replaced_provider(Arc::new(RejectingPrintRuntime)).unwrap();
         let session = Session::builder().client(client).runtime_extensions(extensions).build().unwrap();
 
-        // The missing input makes the error distinguish preparation from argument validation.
+        // The missing input makes the error distinguish preparation from input validation.
         assert!(matches!(
             session.execute_compiled_async(&compiled, vec![]),
             Err(Error::Runtime(RuntimeError::InvalidConfiguration { identifier, reason }))
@@ -3004,7 +3003,7 @@ mod tests {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let wide_mesh = two_device_mesh(client, MeshAxisType::Auto);
-        // Every result of a function compiled for a named mesh is committed, so the function is compiled for the
+        // Every output of a function compiled for a named mesh is committed, so the function is compiled for the
         // anonymous mesh of one device, where the commitment of its inputs decides.
         let second_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![wide_mesh.devices()[1]]).unwrap();
         let scalar_type = replicated_scalar_type(&second_mesh, DataType::F32);
@@ -3138,7 +3137,7 @@ mod tests {
     #[test]
     fn test_session_execute_compiled_async_commits_outputs_of_nested_boundary_shardings() {
         // The function runs on the anonymous mesh of one device, where only explicit placement requests commit its
-        // outputs (every result of a function compiled for a named mesh is committed).
+        // outputs (every output of a function compiled for a named mesh is committed).
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
@@ -3228,7 +3227,7 @@ mod tests {
         };
 
         // A function on uncommitted inputs that requests no placement commits every output when it is compiled for
-        // more than one device, as JAX commits every result of a computation over more than one device, and it keeps
+        // more than one device, as JAX commits every output of a computation over more than one device, and it keeps
         // the rule for the commitment of its inputs when it is compiled for the anonymous mesh of a single device. On a
         // named mesh of a single device, it commits every public output, as JAX does under `set_mesh`.
         assert_eq!(execute(&wide_mesh), (true, true));
@@ -3313,7 +3312,7 @@ mod tests {
             session.compilation_key(donated_lowered.lowered_program()).unwrap(),
         );
 
-        // Boolean values retain physical `i1` arguments and results while the identity over the zero data type has an
+        // Boolean values retain physical `i1` inputs and outputs while the identity over the zero data type has an
         // empty physical signature. Their retained logical metadata also keeps their compilation identities distinct.
         let boolean_type = input_type.clone().with_data_type(DataType::Boolean);
         let boolean_staged: StagedFunction<Session, Type, Type> =
@@ -3559,10 +3558,10 @@ mod tests {
             .unwrap();
         let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5)).unwrap());
 
-        // XLA merges bounded dynamic results that it proves equal and, on CPU, fills the duplicate result with a plain
+        // XLA merges bounded dynamic outputs that it proves equal and, on CPU, fills the duplicate output with a plain
         // copy that leaves its runtime size trailer at zero, while CUDA preserves the trailer. The program returns the
-        // same prefix slice twice and then an equal slice built separately, which covers duplicate entry results and
-        // results merged by XLA's CSE.
+        // same prefix slice twice and then an equal slice built separately, which covers duplicate entry outputs and
+        // outputs merged by XLA's CSE.
         let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let mask = builder.add_input(mask_type.into());
         let values = builder.add_input(values_type.into());
@@ -3629,9 +3628,9 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let input = f32_vector(&session, &mesh, &[2.0, 5.0]);
         let mut builder = ProgramBuilder::<Constant, Operation>::new();
-        let argument = builder.add_input(input.r#type().into_owned().into());
+        let program_input = builder.add_input(input.r#type().into_owned().into());
         let source = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![argument], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![program_input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let lowered = session.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
         let program = session.compile_program(&lowered).unwrap();
@@ -3727,21 +3726,21 @@ mod tests {
         assert_eq!(foreign_mesh, mesh);
         let local = f32_scalar(&session, &mesh, 1.0);
         let foreign = f32_scalar(&other_session, &foreign_mesh, 2.0);
-        let argument_error = ExecutionError::ArgumentClientMismatch { index: 0 };
+        let input_error = ExecutionError::InputClientMismatch { index: 0 };
         let capture_error = ExecutionError::CaptureClientMismatch { index: 0 };
 
-        // A program with one capture and one public argument, which both enter it as hidden and public arguments.
+        // A program with one capture and one public input, which enter it as hidden and public inputs.
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
         let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let capture = builder.add_input(scalar_type.clone().into());
-        let argument = builder.add_input(scalar_type.clone().into());
+        let input = builder.add_input(scalar_type.clone().into());
         let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![capture, argument], vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![capture, input], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let lowered = session.lower_program(&program, 1, &Options::new(mesh.clone())).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
         for (inputs, expected) in [
-            (vec![local.clone(), foreign.clone()], &argument_error),
+            (vec![local.clone(), foreign.clone()], &input_error),
             (vec![foreign.clone(), local.clone()], &capture_error),
         ] {
             assert!(matches!(
@@ -3759,9 +3758,9 @@ mod tests {
             ));
         }
 
-        // Direct and asynchronous executions of a compiled function reject the argument the same way. An eager call runs
-        // in the session of its first argument, so the argument of the other client comes second, and the placement
-        // decision of the call rejects it with the error of an execution before anything moves.
+        // Direct and asynchronous executions of a compiled function reject the input the same way. An eager call runs
+        // in the session of its first input, so the input of the other client comes second, and the placement decision
+        // of the call rejects it with the error of an execution before anything moves.
         let add = crate::compile::<_, (ArrayType, ArrayType), ArrayType>(
             |(left, right)| left + right,
             (scalar_type.clone(), scalar_type.clone()),
@@ -3769,7 +3768,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let second_error = ExecutionError::ArgumentClientMismatch { index: 1 };
+        let second_error = ExecutionError::InputClientMismatch { index: 1 };
         assert_eq!(
             add.executable().execute(&session, (local.clone(), foreign.clone())).unwrap_err().to_string(),
             second_error.to_string(),
@@ -3787,7 +3786,7 @@ mod tests {
             ProgramError::InvalidArgument { message: second_error.to_string() },
         );
 
-        // A stateful execution rejects a public argument of the other client before it binds its references, which
+        // A stateful execution rejects a public input of the other client before it binds its references, which
         // keep their state.
         let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let reference = builder.add_input(Type::Reference(ReferenceType::new(scalar_type.clone())));
@@ -3803,7 +3802,7 @@ mod tests {
         let reference = Value::Reference(crate::Reference::new(holder.clone(), session.clone()));
         assert!(matches!(
             session.execute_statefully(&compiled, vec![reference, Value::Array(foreign.clone())]).r#await(),
-            Err(Error::Execution(error)) if error.to_string() == argument_error.to_string(),
+            Err(Error::Execution(error)) if error.to_string() == input_error.to_string(),
         ));
         assert_eq!(read_first_shard::<f32>(client, &holder.read().unwrap()), vec![1.0]);
 
@@ -3811,7 +3810,7 @@ mod tests {
         let device_ids = [mesh.devices()[0].id()];
         assert!(matches!(
             ExecutionArguments::from_arrays(vec![local.clone(), foreign.clone()], &device_ids),
-            Err(Error::Execution(ExecutionError::ArgumentClientMismatch { index: 1 })),
+            Err(Error::Execution(ExecutionError::InputClientMismatch { index: 1 })),
         ));
         assert_eq!(read_first_shard::<f32>(other_client, &foreign), vec![2.0]);
     }
@@ -3970,12 +3969,12 @@ mod tests {
         let stateful = session.compile_program(&lowered).unwrap();
 
         // A pending sum over the auto axis cannot cross the boundary of an executable compiled for the type of the
-        // argument, whichever path executes it, so it is rejected before any reshard is attempted.
+        // input, whichever path executes it, so it is rejected before any reshard is attempted.
         let unreduced = input(&replicated.clone().with_unreduced_axes(["x"]).unwrap());
         let is_rejected = |result: Result<(), Error>| {
             matches!(
                 result,
-                Err(Error::Execution(ExecutionError::UnreducedAutoAxisArgument { index: 0, axes }))
+                Err(Error::Execution(ExecutionError::UnreducedAutoAxisInput { index: 0, axes }))
                     if axes == vec!["x".to_string()],
             )
         };
@@ -3986,14 +3985,14 @@ mod tests {
         let stateful_inputs = vec![reference.clone(), Value::Array(unreduced)];
         assert!(is_rejected(session.execute_statefully(&stateful, stateful_inputs).r#await().map(|_| ())));
         assert_eq!(read_first_shard::<f32>(client, &holder.read().unwrap()), vec![1.0]);
-        let message = "public argument #0 is unreduced along the mesh axes [\"x\"], which the executable cannot receive \
+        let message = "public input #0 is unreduced along the mesh axes [\"x\"], which the executable cannot receive \
                        because a staged type does not record a pending reduction over auto mesh axes; reduce the \
                        argument (e.g., with `Array::to_placement` onto a sharding without unreduced axes), or place it \
                        over explicit mesh axes, before passing it to a compiled function or an eager operation";
-        let error = ExecutionError::UnreducedAutoAxisArgument { index: 0, axes: vec!["x".to_string()] };
+        let error = ExecutionError::UnreducedAutoAxisInput { index: 0, axes: vec!["x".to_string()] };
         assert_eq!(error.to_string(), message);
 
-        // An eager call moves its argument to the boundary of its callee before it compiles anything, and the same
+        // An eager call moves its input to the boundary of its callee before it compiles anything, and the same
         // admission rule rejects it there.
         assert!(matches!(
             function.call(input(&replicated.clone().with_unreduced_axes(["x"]).unwrap())),
@@ -4018,10 +4017,10 @@ mod tests {
         assert_eq!(reduced.sharding(), &replicated);
         assert_eq!(reduced.copy_to_host_bytes().unwrap(), 3f32.to_ne_bytes().to_vec());
 
-        // A captured array is admitted by the same rule as an argument, for a pending sum, maximum, or minimum alike,
-        // whether the function is compiled for the mesh of the array or for a mesh of another topology (here, one
-        // device), so that placing it on the mesh of the function never completes its reduction silently. Its
-        // placement is known when the function is compiled, so compilation rejects it. An argument in the same state is
+        // A captured array is admitted by the same rule as a public input, for a pending sum, maximum, or minimum
+        // alike, whether the function is compiled for the mesh of the array or for a mesh of another topology (here,
+        // one device), so that placing it on the mesh of the function never completes its reduction silently. Its
+        // placement is known when the function is compiled, so compilation rejects it. An input in the same state is
         // rejected by a function compiled for a mesh of another topology too, by a direct execution for its committed
         // devices, which it checks first, and by an eager call, which runs on those devices, for its reduction.
         let single_device_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![mesh.devices()[0]]).unwrap();
@@ -4090,12 +4089,12 @@ mod tests {
                 _ => logical_type.clone(),
             };
 
-            // The input override states the pending sum with which the argument arrives, which the executable admits,
-            // and the argument declares a layout that differs from the one that the executable expects.
+            // The input override states the pending sum with which the input arrives, which the executable admits, and
+            // the input declares a layout that differs from the one that the executable expects.
             let mut builder = ProgramBuilder::<Constant, Operation>::new();
-            let argument = builder.add_input(input_type.into());
+            let program_input = builder.add_input(input_type.into());
             let program = builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![argument], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![program_input], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let options = Options::new(mesh.clone()).with_input_shardings(vec![pending.clone()]);
             let compiled = session.compile_program(&session.lower_program(&program, 0, &options).unwrap()).unwrap();
@@ -4114,15 +4113,15 @@ mod tests {
             )
             .unwrap();
 
-            // The storage of each shard is converted on its own, so the argument keeps its contributions and the
-            // executable completes the sum over the auto axis where the argument enters and keeps it over the explicit
+            // The storage of each shard is converted on its own, so the input keeps its contributions and the
+            // executable completes the sum over the auto axis where the input enters and keeps it over the explicit
             // axis, whose type records it.
             let prepared = session.prepare_compiled_execution(&compiled, vec![input.clone()], &[]).unwrap();
-            let argument = &prepared.inputs[0];
-            assert_eq!(argument.sharding(), &pending);
-            assert_eq!(argument.layout(), compiled.plan().physical_input_types[0].layout());
+            let converted = &prepared.inputs[0];
+            assert_eq!(converted.sharding(), &pending);
+            assert_eq!(converted.layout(), compiled.plan().physical_input_types[0].layout());
             assert_eq!(
-                argument.addressable_shards().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>(),
+                converted.addressable_shards().map(|shard| shard.copy_to_host_bytes().unwrap()).collect::<Vec<_>>(),
                 contributions.iter().map(|values| values_to_bytes(values.as_slice())).collect::<Vec<_>>(),
             );
             let output = session.execute_program(&compiled, vec![input.clone()]).unwrap().pop().unwrap();
@@ -4133,7 +4132,7 @@ mod tests {
             assert_eq!(output.sharding(), expected_sharding);
             assert_eq!(output.copy_to_host().unwrap().elements::<f32>().unwrap(), sums);
 
-            // Placing the argument through borrowing and consuming placements agrees, as both complete the sum on the
+            // Placing the input through borrowing and consuming placements agrees, as both complete the sum on the
             // devices.
             let target = Placement::new(mesh.clone(), replicated.clone()).unwrap();
             let borrowed = input.to_placement(&session, target.clone()).unwrap();
@@ -4144,7 +4143,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_prepare_compiled_execution_admits_inputs_without_executable_arguments() {
+    fn test_session_prepare_compiled_execution_admits_inputs_without_physical_inputs() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         for device_count in [1, 2] {
@@ -4168,11 +4167,11 @@ mod tests {
                     .unwrap()
             };
 
-            // An input of the zero data type has no executable argument, but it is admitted like one that has one, so
+            // An input of the zero data type has no physical input, but it is admitted like one that has one, so
             // a pending sum over an auto axis is rejected as an eager call of the same function rejects it, rather than
             // returned with its reduction state erased.
             let pending = input(&replicated.clone().with_unreduced_axes(["d"]).unwrap());
-            let error = ExecutionError::UnreducedAutoAxisArgument { index: 0, axes: vec!["d".to_string()] };
+            let error = ExecutionError::UnreducedAutoAxisInput { index: 0, axes: vec!["d".to_string()] };
             assert!(matches!(
                 identity.executable().execute(&session, pending.clone()),
                 Err(Error::Execution(ref actual)) if actual.to_string() == error.to_string(),
@@ -4517,7 +4516,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
         let declared_type = bounded_vector_type(Sharding::replicated(mesh.logical_mesh().clone(), 1));
-        let signature = ExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
+        let signature = MlirProgramSignature::new(std::slice::from_ref(&declared_type), &[]);
 
         // An input that is already at its bound is passed through with its storage, followed by its extent scalar.
         let exact_type = replicated_vector_type(&mesh, 8);
@@ -4584,7 +4583,7 @@ mod tests {
         let right =
             Array::from_host_buffer(&session, right_type.clone(), mesh.clone(), None, right_values.as_slice()).unwrap();
         let declared_types = [declared_type.clone(), declared_type];
-        let signature = ExecutableSignature::new(&declared_types, &[]);
+        let signature = MlirProgramSignature::new(&declared_types, &[]);
 
         // The padded inputs come first, in input order, followed by one extent scalar per bounded dimension.
         let padded = session
@@ -4633,7 +4632,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&session, actual_type.clone(), mesh.clone(), None, source_values.as_slice())
                 .unwrap();
-        let signature = ExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
+        let signature = MlirProgramSignature::new(std::slice::from_ref(&declared_type), &[]);
 
         // The padding runs on the four devices and keeps the result sharded over them.
         let padded = session
@@ -4666,7 +4665,7 @@ mod tests {
         let values = values_to_bytes::<i32>(&[1, 2, 3, 4]);
         let input =
             Array::from_host_buffer(&session, actual_type.clone(), mesh.clone(), None, values.as_slice()).unwrap();
-        let signature = ExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
+        let signature = MlirProgramSignature::new(std::slice::from_ref(&declared_type), &[]);
 
         // The elements stay at the origin and zeros follow them along every axis, with one extent scalar per axis.
         let padded = session
@@ -4728,8 +4727,8 @@ mod tests {
 
     #[test]
     fn test_session_materialize_bounded_dynamic_inputs_rejects_pending_reductions_below_their_bounds() {
-        // An argument with a pending sum is passed as it is at its bound and rejected below it, over an auto axis and
-        // over an explicit one alike, with one error that names the limit. Before, padding admitted the argument again
+        // An input with a pending sum is passed as it is at its bound and rejected below it, over an auto axis and
+        // over an explicit one alike, with one error that names the limit. Before, padding admitted the input again
         // over the auto axis and combined its pending sum with a replicated padding value over the explicit axis, and
         // each rejected it with an error of its own.
         let client = cpu_client(1);
@@ -4780,7 +4779,7 @@ mod tests {
 
     #[test]
     fn test_session_prepare_compiled_execution_places_split_inputs_before_padding_them() {
-        // A bounded identity compiled for replicated inputs receives its argument split over two devices. Every
+        // A bounded identity compiled for replicated inputs receives its input split over two devices. Every
         // length below the bound is placed on the replicated sharding before it is padded, as an eager call places
         // it, so the uneven lengths `1` and `3` also return their values through both entry points. Before, direct
         // execution padded the uneven split first and failed to compile it.
@@ -4825,12 +4824,12 @@ mod tests {
     #[test]
     fn test_session_prepare_compiled_execution_rejects_pending_reductions_introduced_below_bounds() {
         // A bounded identity whose input sharding has a pending sum over a singleton auto axis receives a replicated
-        // argument without one. At the bound both entry points return its values. Below it direct execution rejects
-        // the argument before placing it, with an error that names the input sharding of the function. Before, it
-        // placed the argument on the pending sum and padding told the caller to complete a reduction that the argument
-        // never had. An eager call places the argument on the input sharding before it executes, so the argument
-        // arrives with the pending sum and keeps the error of the register entry "A bounded-dynamic argument with a
-        // pending reduction arrives at its bound".
+        // input without one. At the bound both entry points return its values. Below it direct execution rejects the
+        // input before placing it, with an error that names the input sharding of the function. Before, it placed the
+        // input on the pending sum and padding told the caller to complete a reduction that the input never had. An
+        // eager call places the input on the input sharding before it executes, so the input arrives with the pending
+        // sum and keeps the error of the register entry "A bounded-dynamic input with a pending reduction arrives at
+        // its bound".
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -4891,9 +4890,9 @@ mod tests {
 
     #[test]
     fn test_session_prepare_compiled_execution_builds_zero_space_carriers_on_receiving_placement() {
-        // An uncommitted argument of the zero data type on device 0 is passed to a bounded identity whose input
+        // An uncommitted input of the zero data type on device 0 is passed to a bounded identity whose input
         // sharding replicates it on a mesh of other devices. Both entry points return the same committed zero there,
-        // at the bound and below it. Before, direct execution built the carrier of the argument on its own mesh and
+        // at the bound and below it. Before, direct execution built the carrier of the input on its own mesh and
         // failed with a mesh mismatch.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -4938,7 +4937,7 @@ mod tests {
         // An `f32[4]` replicated over two devices is imported with the buffer of the first device only. An executable
         // reads the buffer of every device of this process, so preparation copies the replica of the first device to
         // the second, and both entry points return the four elements. Before, both rejected the absent buffer, because
-        // an argument whose mesh and sharding match skipped preparation. A split argument whose second half has no
+        // an input whose mesh and sharding match skipped preparation. A split input whose second half has no
         // buffer on this process has no replica to serve it and keeps that error.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -4985,7 +4984,7 @@ mod tests {
         // of every tile, and of every contribution of a pending sum along `x`. An identity that takes it replicated
         // from split, split from replicated, or with the same pending sum serves the missing buffers from those
         // replicas, through a compiled reshard for the first two and directly for the third. Before, the compiled
-        // reshard rejected the absent buffers, and the matching argument with a pending sum kept them absent.
+        // reshard rejected the absent buffers, and the matching input with a pending sum kept them absent.
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
         let devices = client.addressable_devices().unwrap();
@@ -5076,9 +5075,9 @@ mod tests {
 
     #[test]
     fn test_session_materialize_bounded_dynamic_inputs_uploads_extents_on_receiving_mesh() {
-        // An uncommitted argument of the zero data type on a device that this process chose on its own is not placed
+        // An uncommitted input of the zero data type on a device that this process chose on its own is not placed
         // before its extent scalar is uploaded. The scalar is uploaded on the receiving mesh, like the scalar of an
-        // ordinary argument that was placed there. Before, it was uploaded on the devices of the argument, which named
+        // ordinary input that was placed there. Before, it was uploaded on the devices of the input, which named
         // a device that this process chose on its own as if every process knew it.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -5093,7 +5092,7 @@ mod tests {
                 .unwrap()
         };
         let declared_types = [bounded_type(DataType::Zero, "n"), bounded_type(DataType::F32, "m")];
-        let signature = ExecutableSignature::new(&declared_types, &[]);
+        let signature = MlirProgramSignature::new(&declared_types, &[]);
         let zero =
             Array::from_host_buffer(&session, ArrayType::new_static(DataType::Zero, [2]), None, None, []).unwrap();
         let value_type = ArrayType::new_static(DataType::F32, [3]).with_sharding(replicated.clone()).unwrap();
@@ -5116,9 +5115,9 @@ mod tests {
 
     #[test]
     fn test_session_materialize_bounded_dynamic_inputs_pads_completed_reductions_and_manual_variation() {
-        // An argument with a completed reduction or with manual variation is padded below its bound with a padding
+        // An input with a completed reduction or with manual variation is padded below its bound with a padding
         // value that carries the same markers, which `Pad` requires of it. Before, the padding value was plainly
-        // replicated and padding rejected the argument below its bound.
+        // replicated and padding rejected the input below its bound.
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         for (axis_type, varies) in
@@ -5212,14 +5211,14 @@ mod tests {
         )
         .with_sharding(sharding.clone())
         .unwrap();
-        let signature = ExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
+        let signature = MlirProgramSignature::new(std::slice::from_ref(&declared_type), &[]);
         let actual_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(sharding)
             .unwrap();
         let zero = Array::from_host_buffer(&session, actual_type.clone(), mesh.clone(), None, []).unwrap();
 
         // The input of the zero data type below its bounds must bypass the padding, because it has no payload, and
-        // rely on the carrier materialization to synthesize the predicate argument at its bounds.
+        // rely on the carrier materialization to synthesize the predicate input at its bounds.
         let inputs = session
             .materialize_bounded_dynamic_inputs(
                 &mesh,
@@ -5631,7 +5630,7 @@ mod tests {
         let lower_first_update =
             Array::from_host_buffer(&session, array_type, mesh, None, 2.0f32.to_ne_bytes().as_slice()).unwrap();
 
-        // The two calls present the same holders in opposite argument order and start together. Both must finish,
+        // The two calls present the same holders in opposite input order and start together. Both must finish,
         // because internal identity ordering serializes their retained guard windows without creating a lock cycle.
         std::thread::scope(|scope| {
             let start = Arc::new(Barrier::new(3));

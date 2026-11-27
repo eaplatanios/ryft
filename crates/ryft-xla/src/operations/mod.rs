@@ -167,17 +167,17 @@ where
     /// Portable kernel instruction whose actual body remains attached until explicit XLA compiler selection.
     Kernel(KernelOperation),
 
-    /// Mixed zero constructor whose explicit first-class dimension operands provide its dynamic result extents.
+    /// Mixed zero constructor whose explicit first-class dimension inputs provide its dynamic output extents.
     /// This variant cannot be represented by the homogeneous array member because its signature crosses member
     /// kinds, since it consumes dimension members and produces an array member.
     #[ryft(mixed(structural), skip_from)]
     Zero(ZeroOperation<ArrayType>),
 
-    /// Mixed one constructor whose explicit operands provide its dynamic result extents.
+    /// Mixed one constructor whose explicit inputs provide its dynamic output extents.
     #[ryft(mixed(structural), skip_from)]
     DynamicOne(OneOperation<ArrayType>),
 
-    /// Mixed iota constructor whose explicit operands provide its dynamic result extents.
+    /// Mixed iota constructor whose explicit inputs provide its dynamic output extents.
     #[ryft(mixed(structural), skip_from)]
     DynamicIota(IotaOperation<ArrayType>),
 
@@ -240,37 +240,37 @@ where
     /// Converts a first-class dimension into scalar array data.
     DimensionToScalar(DimensionToScalarOperation),
 
-    /// Reshapes an array using explicit dimension operands.
+    /// Reshapes an array using explicit dimension inputs.
     Reshape(DynamicReshapeOperation),
 
-    /// Broadcasts an array using explicit dimension operands.
+    /// Broadcasts an array using explicit dimension inputs.
     Broadcast(DynamicBroadcastOperation),
 
-    /// Concatenates arrays with an explicit result extent.
+    /// Concatenates arrays with an explicit output extent.
     Concatenate(ConcatenateOperation<Type>),
 
-    /// Calls a foreign kernel with explicit dynamic result extents.
+    /// Calls a foreign kernel with explicit dynamic output extents.
     #[ryft(mixed)]
     CustomCall(CustomCallOperation),
 
-    /// Pads an array with explicit result extents.
+    /// Pads an array with explicit output extents.
     Pad(PadOperation<Type>),
 
     /// Slices an array using first-class start and size dimensions.
     DynamicSlice(DynamicSliceOperation<Type>),
 
-    /// Generates random bits with explicit dynamic result extents.
+    /// Generates random bits with explicit dynamic output extents.
     RngBitGenerator(RngBitGeneratorOperation<Type>),
 
-    /// Gathers values with one explicit extent per result axis.
+    /// Gathers values with one explicit extent per output axis.
     #[ryft(mixed, collective, lockstep)]
     ParallelAllGather(ParallelAllGatherOperation),
 
-    /// Scatters values with one explicit extent per result axis.
+    /// Scatters values with one explicit extent per output axis.
     #[ryft(mixed, collective, lockstep)]
     ParallelSumScatter(ParallelSumScatterOperation),
 
-    /// Exchanges values with one explicit extent per result axis.
+    /// Exchanges values with one explicit extent per output axis.
     #[ryft(mixed, collective, lockstep)]
     ParallelAllToAll(ParallelAllToAllOperation),
 
@@ -302,7 +302,7 @@ where
     #[ryft(collective)]
     CompositeTranspose(CompositeTransposeOperation<Payload, Operation<Payload>>),
 
-    /// Call owned by differentiation to an explicitly transposable linear map with ordinary trailing residual operands,
+    /// Call owned by differentiation to an explicitly transposable linear map with ordinary trailing residual inputs,
     /// which lowers by inlining its forward region.
     #[ryft(lockstep)]
     LinearCall(LinearCallOperation<Type>),
@@ -528,7 +528,7 @@ where
 macro_rules! impl_array_ir_operation_conversion {
     // Generates the array IR operation conversions that the derive cannot generate directly, namely the canonical
     // constructors whose lift selects between the homogeneous member carrier and the mixed carrier with dimension
-    // operands, and the homogeneous array payload forms of mixed operations whose canonical array IR payload has a
+    // inputs, and the homogeneous array payload forms of mixed operations whose canonical array IR payload has a
     // promoted type.
     ($operation:ty) => {
         impl<Payload> From<$operation> for Operation<Payload>
@@ -1066,7 +1066,7 @@ fn array_data_dependent_padding_discipline(
             Unsupported { reason: "ragged collective metadata may address physical padding positions" }
         }
         ArrayOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
-        ArrayOperation::Print(_) => Unsupported { reason: "print exposes the physical representation of its operand" },
+        ArrayOperation::Print(_) => Unsupported { reason: "print exposes the physical representation of its input" },
         // Entry guards and `cast`s narrow or widen bounded dynamic values explicitly. The physical buffer is sliced or
         // padded, and every axis that stays dynamic gets its logical size back.
         ArrayOperation::Guard(_) | ArrayOperation::Cast(_) => RyftMasked,
@@ -1171,8 +1171,8 @@ impl Transform<CoreRegion<Constant, Operation>> for UnreadLiftedCapturesAnalysis
 }
 
 /// Returns, for each input of `callee`, the callee of a call whose first `capture_count` inputs are its lifted
-/// captures, whether it is a capture that an executable of the callee has no argument for (i.e., an array of a static
-/// shape that no region which lowering emits for `target_platform` reads, refer to [`emitted_capture_reads`] and
+/// captures, whether it is a capture that an executable of the callee has no physical input for (i.e., an array of a
+/// static shape that no region which lowering emits for `target_platform` reads, refer to [`emitted_capture_reads`] and
 /// `ProgramLoweringExtension::to_mlir`), or [`None`] when the callee has no such
 /// capture. An eager application of the call (refer to `CallEagerExtension::eager_decision`) requires nothing of such a
 /// capture, as an execution of the callee requires nothing of it. The flags depend on the callee, the number of its
@@ -1201,7 +1201,7 @@ pub(crate) fn unread_lifted_captures(
 }
 
 /// Converts and broadcasts one implicitly compatible elementwise operand to the exact StableHLO result tensor type.
-pub(crate) fn normalize_elementwise_operand<'b, 'c: 'b, 't: 'c, B, L>(
+pub(crate) fn normalize_elementwise_input<'b, 'c: 'b, 't: 'c, B, L>(
     input: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
     block: &mut B,
@@ -1215,7 +1215,7 @@ where
     let input_type = input.r#type()?;
     let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| {
         Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: "normalize_elementwise_operand".to_string(),
+            operation: "normalize_elementwise_input".to_string(),
             reason: format!("elementwise operand has non-tensor MLIR type `{input_type}`"),
         })
     })?;
@@ -1233,7 +1233,7 @@ where
         let input_rank = input_tensor_type.rank();
         let first_dimension = output_rank.checked_sub(input_rank).ok_or_else(|| {
             Error::Lowering(LoweringError::UnsupportedOperation {
-                operation: "normalize_elementwise_operand".to_string(),
+                operation: "normalize_elementwise_input".to_string(),
                 reason: format!("cannot broadcast rank-{input_rank} elementwise operand to rank-{output_rank} output"),
             })
         })?;
@@ -1270,7 +1270,7 @@ impl AccuracyLoweringExtension for CoreAccuracy {
 }
 
 /// Normalizes both operands of one implicitly broadcasting binary elementwise operation to its exact result type.
-pub(crate) fn normalize_binary_elementwise_operands<'b, 'c: 'b, 't: 'c, B, L>(
+pub(crate) fn normalize_binary_elementwise_inputs<'b, 'c: 'b, 't: 'c, B, L>(
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     block: &mut B,
@@ -1305,7 +1305,7 @@ where
             // logical extents from the array input. The scalar itself cannot supply these sizes, and inventing the
             // maximum sizes would incorrectly make padding observable. Other broadcasting cases use the ordinary path
             // below.
-            let scalar = normalize_elementwise_operand(
+            let scalar = normalize_elementwise_input(
                 input_values[index],
                 &ArrayType::scalar(output_type.data_type()),
                 block,
@@ -1333,7 +1333,7 @@ where
                 location.as_ref(),
             )?;
         } else {
-            inputs[index] = normalize_elementwise_operand(input_values[index], output_type, block, context, location)?;
+            inputs[index] = normalize_elementwise_input(input_values[index], output_type, block, context, location)?;
         }
     }
     Ok(inputs)
@@ -1743,7 +1743,7 @@ mod tests {
     #[test]
     fn test_core_composite_and_rematerialization_promotions_preserve_metadata() {
         // These payloads are promoted by move rather than reconstructed, so their complete stored surface must survive,
-        // including the rule layout and the non-differentiated operand split of composite calls, and the policy and
+        // including the rule layout and the non-differentiated input split of composite calls, and the policy and
         // flags of rematerialized calls. The promoted carrier must also keep contributing the payload's own operation
         // name and region slots, because the attached regions are matched against those slots by name.
         for (jvp_rule, has_vjp_rule, non_differentiated_count) in [
@@ -1869,7 +1869,7 @@ mod tests {
 
     #[test]
     fn test_rematerialize_recomputes_known_calls_in_its_body() {
-        // A rematerialized body squares its input inside a `call` operation and squares the result of the call
+        // A rematerialized body squares its input inside a `call` operation and squares the output of the call
         // outside of it. Linearizing it with the default policy, which saves nothing, saves only the input. Its pure
         // primal call, whose inputs are all known, keeps its boundary, and the residual body replays that call to
         // recompute the multiplication.
@@ -2290,15 +2290,15 @@ mod tests {
         let token = block.as_ref().argument(0).unwrap().as_ref();
         let matrix = block.as_ref().argument(1).unwrap().as_ref();
         assert!(matches!(
-            normalize_elementwise_operand(token, &vector_type, &mut block.as_ref(), &context, location),
+            normalize_elementwise_input(token, &vector_type, &mut block.as_ref(), &context, location),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
-                if operation == "normalize_elementwise_operand"
+                if operation == "normalize_elementwise_input"
                     && reason == "elementwise operand has non-tensor MLIR type `!stablehlo.token`",
         ));
         assert!(matches!(
-            normalize_elementwise_operand(matrix, &vector_type, &mut block.as_ref(), &context, location),
+            normalize_elementwise_input(matrix, &vector_type, &mut block.as_ref(), &context, location),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
-                if operation == "normalize_elementwise_operand"
+                if operation == "normalize_elementwise_input"
                     && reason == "cannot broadcast rank-2 elementwise operand to rank-1 output",
         ));
     }
@@ -2455,7 +2455,7 @@ mod tests {
     /// Inputs of [`UnreducedRow`], each over the mesh axis `x` of size two. Values "with the kind" are unreduced over
     /// `x` with the kind of the row, and the other values are replicated, with equal contributions of both devices.
     #[derive(Clone, Copy, Debug)]
-    enum UnreducedOperands {
+    enum UnreducedInputs {
         /// One `f32` vector with the kind.
         Vector,
 
@@ -2484,7 +2484,7 @@ mod tests {
         BooleanVector,
     }
 
-    impl UnreducedOperands {
+    impl UnreducedInputs {
         /// Returns these inputs, unreduced with `kind`.
         fn inputs(self, kind: UnreducedKind) -> Vec<UnreducedInput> {
             let vector = || {
@@ -2547,7 +2547,7 @@ mod tests {
 
     /// Row of the tests of the lowering of operations over unreduced values.
     #[derive(Clone, Copy, Debug)]
-    struct UnreducedRow(UnreducedOperation, UnreducedOperands);
+    struct UnreducedRow(UnreducedOperation, UnreducedInputs);
 
     impl UnreducedApplication for UnreducedRow {
         fn apply<V: ArrayOperations>(&self, inputs: &[V]) -> Result<V, ProgramError> {
@@ -2582,19 +2582,19 @@ mod tests {
 
     #[test]
     fn test_normalize_binary_elementwise_operands_lower_unreduced_values() {
-        // A scalar operand is broadcast to the shape of the vector, and an `f32` operand is converted to `f64`, before
-        // the operation. Both are computed by each device on its own contribution, so they are unreduced like the
-        // operands of the operation.
+        // A scalar input is broadcast to the shape of the vector, and an `f32` input is converted to `f64`, before the
+        // operation. Both are computed by each device on its own contribution, so they are unreduced like the inputs
+        // of the operation.
         let mut modules = Vec::new();
-        for (operation, operands, kind) in [
-            (UnreducedOperation::Max, UnreducedOperands::VectorAndScalar, UnreducedKind::Max),
-            (UnreducedOperation::Min, UnreducedOperands::VectorAndScalar, UnreducedKind::Min),
-            (UnreducedOperation::Add, UnreducedOperands::VectorAndScalar, UnreducedKind::Sum),
-            (UnreducedOperation::Add, UnreducedOperands::VectorAndF64Vector, UnreducedKind::Sum),
+        for (operation, inputs, kind) in [
+            (UnreducedOperation::Max, UnreducedInputs::VectorAndScalar, UnreducedKind::Max),
+            (UnreducedOperation::Min, UnreducedInputs::VectorAndScalar, UnreducedKind::Min),
+            (UnreducedOperation::Add, UnreducedInputs::VectorAndScalar, UnreducedKind::Sum),
+            (UnreducedOperation::Add, UnreducedInputs::VectorAndF64Vector, UnreducedKind::Sum),
         ] {
             let lowering =
-                lower_unreduced_application(&UnreducedRow(operation, operands), &operands.inputs(kind)).unwrap();
-            assert_eq!(lowering.outcomes, lowering.expected_outcomes, "{operation:?} of {operands:?} with {kind}");
+                lower_unreduced_application(&UnreducedRow(operation, inputs), &inputs.inputs(kind)).unwrap();
+            assert_eq!(lowering.outcomes, lowering.expected_outcomes, "{operation:?} of {inputs:?} with {kind}");
             modules.push(lowering.module);
         }
         assert_eq!(
@@ -2704,42 +2704,42 @@ mod tests {
         // compiled function, in the body of a `scan`, and in a called function, executes on each device what the same
         // operation computes for the contribution of that device. The core type rules reject the other combinations.
         let rows = [
-            UnreducedRow(UnreducedOperation::Neg, UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::Add, UnreducedOperands::Vectors),
-            UnreducedRow(UnreducedOperation::Add, UnreducedOperands::VectorAndScalar),
-            UnreducedRow(UnreducedOperation::Add, UnreducedOperands::VectorAndF64Vector),
-            UnreducedRow(UnreducedOperation::Add, UnreducedOperands::VectorAndReplicated),
-            UnreducedRow(UnreducedOperation::Sub, UnreducedOperands::Vectors),
-            UnreducedRow(UnreducedOperation::Mul, UnreducedOperands::VectorAndReduced),
-            UnreducedRow(UnreducedOperation::Mul, UnreducedOperands::Vectors),
-            UnreducedRow(UnreducedOperation::Div, UnreducedOperands::VectorAndReduced),
-            UnreducedRow(UnreducedOperation::Max, UnreducedOperands::Vectors),
-            UnreducedRow(UnreducedOperation::Max, UnreducedOperands::VectorAndScalar),
-            UnreducedRow(UnreducedOperation::Max, UnreducedOperands::VectorAndF64Vector),
-            UnreducedRow(UnreducedOperation::Min, UnreducedOperands::Vectors),
-            UnreducedRow(UnreducedOperation::Min, UnreducedOperands::VectorAndScalar),
-            UnreducedRow(UnreducedOperation::Min, UnreducedOperands::VectorAndF64Vector),
-            UnreducedRow(UnreducedOperation::Clamp, UnreducedOperands::ThreeVectors),
-            UnreducedRow(UnreducedOperation::Abs, UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::Exp, UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::ConvertToF64, UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Sum), UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Mean), UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Max), UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Min), UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Product), UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::ArgMax, UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::Reshape, UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::Transpose, UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::Slice, UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::Reverse, UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::Concatenate, UnreducedOperands::VectorAndReplicated),
-            UnreducedRow(UnreducedOperation::Select, UnreducedOperands::ConditionAndVectors),
-            UnreducedRow(UnreducedOperation::Pad, UnreducedOperands::VectorAndScalar),
-            UnreducedRow(UnreducedOperation::CumulativeSum, UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::CumulativeMax, UnreducedOperands::Vector),
-            UnreducedRow(UnreducedOperation::Compare, UnreducedOperands::Vectors),
-            UnreducedRow(UnreducedOperation::Not, UnreducedOperands::BooleanVector),
+            UnreducedRow(UnreducedOperation::Neg, UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::Add, UnreducedInputs::Vectors),
+            UnreducedRow(UnreducedOperation::Add, UnreducedInputs::VectorAndScalar),
+            UnreducedRow(UnreducedOperation::Add, UnreducedInputs::VectorAndF64Vector),
+            UnreducedRow(UnreducedOperation::Add, UnreducedInputs::VectorAndReplicated),
+            UnreducedRow(UnreducedOperation::Sub, UnreducedInputs::Vectors),
+            UnreducedRow(UnreducedOperation::Mul, UnreducedInputs::VectorAndReduced),
+            UnreducedRow(UnreducedOperation::Mul, UnreducedInputs::Vectors),
+            UnreducedRow(UnreducedOperation::Div, UnreducedInputs::VectorAndReduced),
+            UnreducedRow(UnreducedOperation::Max, UnreducedInputs::Vectors),
+            UnreducedRow(UnreducedOperation::Max, UnreducedInputs::VectorAndScalar),
+            UnreducedRow(UnreducedOperation::Max, UnreducedInputs::VectorAndF64Vector),
+            UnreducedRow(UnreducedOperation::Min, UnreducedInputs::Vectors),
+            UnreducedRow(UnreducedOperation::Min, UnreducedInputs::VectorAndScalar),
+            UnreducedRow(UnreducedOperation::Min, UnreducedInputs::VectorAndF64Vector),
+            UnreducedRow(UnreducedOperation::Clamp, UnreducedInputs::ThreeVectors),
+            UnreducedRow(UnreducedOperation::Abs, UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::Exp, UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::ConvertToF64, UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Sum), UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Mean), UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Max), UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Min), UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::Reduce(ReductionKind::Product), UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::ArgMax, UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::Reshape, UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::Transpose, UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::Slice, UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::Reverse, UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::Concatenate, UnreducedInputs::VectorAndReplicated),
+            UnreducedRow(UnreducedOperation::Select, UnreducedInputs::ConditionAndVectors),
+            UnreducedRow(UnreducedOperation::Pad, UnreducedInputs::VectorAndScalar),
+            UnreducedRow(UnreducedOperation::CumulativeSum, UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::CumulativeMax, UnreducedInputs::Vector),
+            UnreducedRow(UnreducedOperation::Compare, UnreducedInputs::Vectors),
+            UnreducedRow(UnreducedOperation::Not, UnreducedInputs::BooleanVector),
         ];
         let mut outcomes = Vec::new();
         for row in rows {

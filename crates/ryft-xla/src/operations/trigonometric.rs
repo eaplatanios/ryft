@@ -4,7 +4,7 @@ use ryft_mlir::dialects::stable_hlo::Accuracy;
 use ryft_mlir::{Block, Context as MlirContext, Location, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
 use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat};
-use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_operands};
+use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_inputs};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for SinOperation<ArrayType> {
@@ -90,7 +90,7 @@ impl LowerableOperation for Atan2Operation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = input_types;
-        let [left, right] = normalize_binary_elementwise_operands(
+        let [left, right] = normalize_binary_elementwise_inputs(
             input_values,
             output_types,
             &mut lowerer.block(),

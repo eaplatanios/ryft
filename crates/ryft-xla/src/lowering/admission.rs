@@ -137,8 +137,8 @@ pub enum DataDependentPaddingDiscipline {
     /// Ryft delegates padding the contraction positions with zeros to the bounded dynamic legalizer of XLA.
     XlaZeroPadded,
 
-    /// Ryft explicitly materializes bounded physical operands with operation-specific padding values or masks and
-    /// restores dynamic result metadata after the physical computation.
+    /// Ryft explicitly materializes bounded physical inputs with operation-specific padding values or masks and
+    /// restores dynamic output metadata after the physical computation.
     RyftMasked,
 
     /// Ryft lacks sufficient semantic or execution evidence to admit this operation safely.
@@ -416,7 +416,7 @@ mod tests {
                     std::slice::from_ref(size),
                 );
 
-                // The runtime row extent of `scaled_dot` is not contracted. Both dynamic element and scale operands
+                // The runtime row extent of `scaled_dot` is not contracted. Both dynamic element and scale inputs
                 // share it, while the static right-hand side input fixes one output column and the static block shape
                 // fixes `k` to the block size of the element type (i.e., 32 for FP8 elements and 16 otherwise).
                 let scaled_lhs =
@@ -553,7 +553,7 @@ mod tests {
             ),
         ));
 
-        // `print` renders whatever the physical buffer holds, so the padded suffix of a bounded-dynamic operand would
+        // `print` renders whatever the physical buffer holds, so the padded suffix of a bounded-dynamic input would
         // become observable.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
@@ -579,11 +579,11 @@ mod tests {
                     if *message
                         == "operation `print` cannot consume data-derived \
                         dimensions during XLA lowering because \
-                        print exposes the physical representation of its operand",
+                        print exposes the physical representation of its input",
             ),
         ));
 
-        // Bit generation over a bounded-dynamic result would advance the functional generator state by the physical
+        // Bit generation over a bounded-dynamic output would advance the functional generator state by the physical
         // upper-bound element count rather than the logical one.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));

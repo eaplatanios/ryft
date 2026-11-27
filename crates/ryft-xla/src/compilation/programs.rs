@@ -21,25 +21,25 @@ use crate::compilation::keys::{COMPILER_IDENTITY, canonical_boundary_types};
 use crate::compilation::options::FeedbackDirectedProfile;
 use crate::execution::{ExecutionPlan, validate_input_reduction};
 use crate::lowering::programs::MlirProgram;
-use crate::lowering::signatures::ExecutableSignature;
+use crate::lowering::programs::MlirProgramSignature;
 use crate::{Array, Error, RetainedArray, RuntimeRequirement, Session, Target, Type};
 
 // TODO(eaplatanios): Review this module.
 
-/// A hidden argument that binds an original IR constant to the array supplied to the executable.
+/// A hidden input that binds an original IR constant to the array supplied to the executable.
 #[derive(Clone, Debug)]
 pub(crate) struct SessionConstantBinding {
     /// Constant that defines the declared type, identity, and placement behavior of the capture in the program.
     source: RetainedArray,
 
-    /// Retained array at the placement where the executable receives this argument.
-    argument: RetainedArray,
+    /// Retained array at the placement where the executable receives this input.
+    input: RetainedArray,
 }
 
 impl SessionConstantBinding {
-    /// Binds `source` to the retained array `argument` that supplies its executable buffers.
-    pub(super) fn new(source: RetainedArray, argument: RetainedArray) -> Self {
-        Self { source, argument }
+    /// Binds `source` to the retained array `input` that supplies its executable buffers.
+    pub(super) fn new(source: RetainedArray, input: RetainedArray) -> Self {
+        Self { source, input }
     }
 
     /// Returns the original constant as it appears in the IR.
@@ -48,8 +48,8 @@ impl SessionConstantBinding {
     }
 
     /// Returns the array that supplies the executable buffers.
-    pub(super) fn argument(&self) -> &RetainedArray {
-        &self.argument
+    pub(super) fn input(&self) -> &RetainedArray {
+        &self.input
     }
 }
 
@@ -74,7 +74,7 @@ pub(super) struct ProgramLowering {
     /// Invocation contract prior to native compilation.
     invocation: InvocationMetadata,
 
-    /// Binding for each session constant of the program in hidden argument order, following the staged capture table.
+    /// Binding for each session constant of the program in hidden input order, following the staged capture table.
     session_constants: Arc<[SessionConstantBinding]>,
 }
 
@@ -93,7 +93,7 @@ impl ProgramLowering {
     ///   - `donation_flags`: Donation declaration of each public input.
     ///   - `capture_count`: Number of leading inputs that are lowered captures.
     ///   - `session_constants`: Bindings of session constants to the arrays that execution passes as captures.
-    ///   - `expected_argument_shardings`: Sharding that each physical argument must have at the call boundary.
+    ///   - `expected_input_shardings`: Sharding that each physical input must have at the call boundary.
     ///   - `output_shardings`: Declared sharding of each output.
     ///   - `open_outputs`: Whether the compiler chooses the placement of each output over auto mesh axes.
     ///   - `committed_outputs`: Whether executions commit each output whatever the commitment of their inputs.
@@ -111,7 +111,7 @@ impl ProgramLowering {
         donation_flags: Arc<[bool]>,
         capture_count: usize,
         session_constants: Arc<[SessionConstantBinding]>,
-        expected_argument_shardings: Arc<[Sharding]>,
+        expected_input_shardings: Arc<[Sharding]>,
         output_shardings: Arc<[Sharding]>,
         open_outputs: Arc<[bool]>,
         committed_outputs: Arc<[bool]>,
@@ -133,7 +133,7 @@ impl ProgramLowering {
                 requires_assertion_handler,
                 donation_flags,
                 capture_count,
-                expected_argument_shardings,
+                expected_input_shardings,
                 output_shardings,
                 open_outputs: Some(open_outputs),
                 committed_outputs,
@@ -145,24 +145,24 @@ impl ProgramLowering {
         }
     }
 
-    /// Returns the session constant bindings after the staged capture table, in hidden argument order.
+    /// Returns the session constant bindings after the staged capture table, in hidden input order.
     pub(super) fn session_constants(&self) -> &[SessionConstantBinding] {
         &self.session_constants
     }
 }
 
-/// Plans a pure, statically shaped eager result on a process that owns no device of its singleton mesh.
+/// Plans a pure, statically shaped eager output on a process that owns no device of its singleton mesh.
 pub(crate) struct RemoteEagerProgram {
     /// Expected runtime sharding for every logical input, with `None` for unread inputs.
     input_shardings: Vec<Option<Sharding>>,
 
-    /// Number of leading arguments sourced from session constants.
+    /// Number of leading inputs sourced from session constants.
     capture_count: usize,
 
-    /// Result plans in logical output order, with no local buffer positions.
+    /// Output plans in logical output order, with no local buffer positions.
     outputs: Vec<ArrayOutputPlan>,
 
-    /// Whether each result's lowering commits it independently of its inputs.
+    /// Whether each output's lowering commits it independently of its inputs.
     committed_outputs: Arc<[bool]>,
 }
 
@@ -178,7 +178,7 @@ impl RemoteEagerProgram {
             }
             .into());
         }
-        // Erased zero arrays have a sharding and can carry a failed producer. Only unread arguments have no dependency.
+        // Erased zero arrays have a sharding and can carry a failed producer. Only unread inputs have no dependency.
         let input_shardings = signature
             .input_mapping()
             .iter()
@@ -189,7 +189,7 @@ impl RemoteEagerProgram {
                     return None;
                 }
                 Some(match physical_index {
-                    Some(index) => program.expected_argument_shardings[*index].clone(),
+                    Some(index) => program.expected_input_shardings[*index].clone(),
                     None => CallOperation::declared_input_sharding(input_type, program.mesh.logical_mesh()),
                 })
             })
@@ -212,7 +212,7 @@ impl RemoteEagerProgram {
         &self.committed_outputs
     }
 
-    /// Reconstructs results with no local buffers, preserving producer dependencies of the admitted inputs.
+    /// Reconstructs outputs with no local buffers, preserving producer dependencies of the admitted inputs.
     pub(crate) fn execute(&self, session: &Session, inputs: &[Array]) -> Result<Vec<Array>, Error> {
         debug_assert_eq!(inputs.len(), self.input_shardings.len());
         let mut fences = Vec::new();
@@ -237,7 +237,7 @@ pub(crate) enum EagerDispatchProgram {
     /// This process loads an executable and submits it to its local devices.
     Local(Arc<CompiledProgram>),
 
-    /// This process reconstructs remote results of a singleton without submitting device work.
+    /// This process reconstructs remote outputs of a singleton without submitting device work.
     Remote(Arc<RemoteEagerProgram>),
 }
 
@@ -360,7 +360,7 @@ impl LoweredProgram {
         &self.lowering.invocation.mesh
     }
 
-    /// Returns the bindings of the session constants after the staged capture table, in hidden argument order.
+    /// Returns the bindings of the session constants after the staged capture table, in hidden input order.
     #[inline]
     pub(crate) fn session_constants(&self) -> &[SessionConstantBinding] {
         self.lowering.session_constants()
@@ -397,11 +397,11 @@ impl LoweredProgram {
     }
 
     /// Returns the mapping between the logical boundary of the program and the physical boundary of its executable.
-    pub(crate) fn signature(&self) -> &ExecutableSignature {
+    pub(crate) fn signature(&self) -> &MlirProgramSignature {
         &self.lowering.invocation.signature
     }
 
-    /// Returns the number of leading logical outputs exposed through the structured public function result.
+    /// Returns the number of leading logical outputs exposed through the structured public function output.
     #[inline]
     pub(super) fn output_count(&self) -> usize {
         self.lowering.invocation.output_count
@@ -427,21 +427,20 @@ impl LoweredProgram {
     }
 
     /// Returns the number of leading logical inputs supplied by the staged capture table, followed by the hidden
-    /// arguments that carry [`Self::session_constants`].
+    /// inputs that carry [`Self::session_constants`].
     #[inline]
     pub(super) fn capture_count(&self) -> usize {
         self.lowering.invocation.capture_count
     }
 
-    /// Returns the effective sharding expected for every physical executable argument, including materialized captures
-    /// first.
+    /// Returns the effective sharding expected for every physical input, including materialized captures first.
     #[inline]
-    pub(super) fn expected_argument_shardings(&self) -> &[Sharding] {
-        &self.lowering.invocation.expected_argument_shardings
+    pub(super) fn expected_input_shardings(&self) -> &[Sharding] {
+        &self.lowering.invocation.expected_input_shardings
     }
 
     /// Returns the runtime placement of every logical output over all mesh axes, including the auto mesh axes that
-    /// output types never record. It also covers the hidden final reference states after the public result. The
+    /// output types never record. It also covers the hidden final reference states after the public outputs. The
     /// placement of an output flagged in [`Self::open_outputs`] is only the placement that its type records, and
     /// compilation resolves its placement over auto mesh axes from the executable.
     #[inline]
@@ -518,7 +517,7 @@ impl TypedProgram for LoweredProgram {
 /// replacement executables must preserve the complete invocation contract before execution.
 ///
 /// The invoking [`Session`] validates inputs, resolves placement and runtime resources,
-/// materializes bounded dynamic arguments, and reconstructs logical outputs. Ordinary calls carry completion through
+/// materializes bounded dynamic inputs, and reconstructs logical outputs. Ordinary calls carry completion through
 /// their outputs. Stateful calls coordinate external references through [`ryft_core::StatefulExecution`], publishing
 /// mutations only after submission and tracking completion of the whole invocation.
 #[derive(Clone)]
@@ -602,12 +601,12 @@ impl CompiledProgram {
     ///   - `output_types`: Flat output types, including the hidden final reference states.
     ///   - `output_count`: Number of public outputs.
     ///   - `reference_states`: External reference states of the program.
-    ///   - `signature`: Mapping between the logical boundary and the physical executable arguments and results.
+    ///   - `signature`: Mapping between the logical boundary and the physical inputs and outputs.
     ///   - `runtime_requirements`: Runtime contracts that executions of the program need.
     ///   - `requires_assertion_handler`: Whether executions need the runtime assertion handler.
     ///   - `donation_flags`: Donation declaration of each public input.
     ///   - `capture_count`: Number of leading inputs that are lowered captures.
-    ///   - `expected_argument_shardings`: Sharding that each physical argument must have at the call boundary.
+    ///   - `expected_input_shardings`: Sharding that each physical input must have at the call boundary.
     ///   - `output_shardings`: Resolved sharding of each output.
     ///   - `committed_outputs`: Whether executions commit each output whatever the commitment of their inputs.
     ///   - `output_device_assignment`: Whether this invocation takes output assignment from the caller.
@@ -628,12 +627,12 @@ impl CompiledProgram {
         output_types: Arc<[ArrayType]>,
         output_count: usize,
         reference_states: Arc<[ExternalReferenceBinding]>,
-        signature: ExecutableSignature,
+        signature: MlirProgramSignature,
         runtime_requirements: Arc<[RuntimeRequirement]>,
         requires_assertion_handler: bool,
         donation_flags: Arc<[bool]>,
         capture_count: usize,
-        expected_argument_shardings: Arc<[Sharding]>,
+        expected_input_shardings: Arc<[Sharding]>,
         output_shardings: Arc<[Sharding]>,
         committed_outputs: Arc<[bool]>,
         output_device_assignment: OutputDeviceAssignment,
@@ -660,7 +659,7 @@ impl CompiledProgram {
                 requires_assertion_handler,
                 donation_flags,
                 capture_count,
-                expected_argument_shardings,
+                expected_input_shardings,
                 output_shardings,
                 committed_outputs,
                 output_device_assignment,
@@ -762,7 +761,7 @@ impl CompiledProgram {
 
     /// Returns the mapping between the logical boundary of the program and the physical boundary of its executable.
     #[inline]
-    pub(crate) fn signature(&self) -> &ExecutableSignature {
+    pub(crate) fn signature(&self) -> &MlirProgramSignature {
         &self.invocation.signature
     }
 
@@ -778,10 +777,10 @@ impl CompiledProgram {
         self.invocation.capture_count
     }
 
-    /// Returns the sharding that the executable expects of each physical argument, in argument order.
+    /// Returns the sharding that the executable expects of each physical input, in physical input order.
     #[inline]
-    pub(crate) fn expected_argument_shardings(&self) -> &[Sharding] {
-        &self.invocation.expected_argument_shardings
+    pub(crate) fn expected_input_shardings(&self) -> &[Sharding] {
+        &self.invocation.expected_input_shardings
     }
 
     /// Returns the runtime placement of each logical output, including over auto mesh axes.
@@ -860,7 +859,7 @@ impl CompiledProgram {
                     == canonical_boundary_types(inputs, outputs))
     }
 
-    /// Returns the number of leading logical outputs exposed through the structured public result.
+    /// Returns the number of leading logical outputs exposed through the structured public output.
     #[inline]
     pub(super) fn output_count(&self) -> usize {
         self.invocation.output_count
@@ -948,7 +947,7 @@ pub(super) struct InvocationMetadata {
     /// Effective logical output types after applying output sharding overrides.
     output_types: Arc<[ArrayType]>,
 
-    /// Number of leading logical outputs exposed through the structured public function result.
+    /// Number of leading logical outputs exposed through the structured public function output.
     output_count: usize,
 
     /// Logical binding recipes of external reference states in canonical source order.
@@ -960,7 +959,7 @@ pub(super) struct InvocationMetadata {
     input_types: Arc<[ArrayType]>,
 
     /// Mapping from the logical boundary to the physical StableHLO and PJRT boundary.
-    signature: ExecutableSignature,
+    signature: MlirProgramSignature,
 
     /// Canonical runtime contracts resolved against the invoking session.
     runtime_requirements: Arc<[RuntimeRequirement]>,
@@ -974,11 +973,11 @@ pub(super) struct InvocationMetadata {
     /// Number of leading logical inputs supplied by the staged capture table and [`LoweredProgram::session_constants`].
     capture_count: usize,
 
-    /// Effective sharding expected for every physical executable argument, including materialized captures first.
-    expected_argument_shardings: Arc<[Sharding]>,
+    /// Effective sharding expected for every physical input, including materialized captures first.
+    expected_input_shardings: Arc<[Sharding]>,
 
     /// Runtime placement of every logical output over all mesh axes, including the auto mesh axes that output types
-    /// never record. It also covers the hidden final reference states after the public result. The placement of an
+    /// never record. It also covers the hidden final reference states after the public outputs. The placement of an
     /// output flagged in [`LoweredProgram::open_outputs`] is only the placement that its type records. Compilation
     /// resolves its placement over auto mesh axes from the executable.
     output_shardings: Arc<[Sharding]>,
@@ -1028,8 +1027,8 @@ impl InvocationMetadata {
             Some("donation flags")
         } else if self.capture_count != other.capture_count {
             Some("capture count")
-        } else if self.expected_argument_shardings != other.expected_argument_shardings {
-            Some("argument shardings")
+        } else if self.expected_input_shardings != other.expected_input_shardings {
+            Some("input shardings")
         } else if !self.has_compatible_output_shardings(other) {
             Some("output shardings")
         } else if self.committed_outputs != other.committed_outputs {
@@ -1088,7 +1087,7 @@ mod tests {
     };
 
     use crate::compilation::functions::stage;
-    use crate::lowering::signatures::ExecutableSignature;
+    use crate::lowering::programs::MlirProgramSignature;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{device_mesh_2x2, execution_client};
     use crate::{Error, Options, Session};
@@ -1131,8 +1130,8 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let other_mesh = device_mesh_2x2();
-        let signature = ExecutableSignature::new(&[], &[]);
-        let other_signature = ExecutableSignature::new(&[ArrayType::scalar(DataType::F32)], &[]);
+        let signature = MlirProgramSignature::new(&[], &[]);
+        let other_signature = MlirProgramSignature::new(&[ArrayType::scalar(DataType::F32)], &[]);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let current = InvocationMetadata {
             compilation_options: CompilationOptions::default(),
@@ -1144,7 +1143,7 @@ mod tests {
             runtime_requirements: [].into(),
             donation_flags: [false].into(),
             capture_count: 0,
-            expected_argument_shardings: [].into(),
+            expected_input_shardings: [].into(),
             output_shardings: [].into(),
             committed_outputs: [].into(),
             output_device_assignment: OutputDeviceAssignment::Fixed,
@@ -1168,10 +1167,10 @@ mod tests {
         );
         assert_eq!(
             current.incompatible_field(&InvocationMetadata {
-                expected_argument_shardings: [sharding.clone()].into(),
+                expected_input_shardings: [sharding.clone()].into(),
                 ..current.clone()
             }),
-            Some("argument shardings"),
+            Some("input shardings"),
         );
         assert_eq!(
             current.incompatible_field(&InvocationMetadata { mesh: other_mesh, ..current.clone() }),
@@ -1202,7 +1201,7 @@ mod tests {
     fn test_invocation_metadata_validate_replacement() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let signature = ExecutableSignature::new(&[], &[]);
+        let signature = MlirProgramSignature::new(&[], &[]);
         let current = InvocationMetadata {
             compilation_options: CompilationOptions::default(),
             input_types: [].into(),
@@ -1213,7 +1212,7 @@ mod tests {
             runtime_requirements: [].into(),
             donation_flags: [false].into(),
             capture_count: 0,
-            expected_argument_shardings: [].into(),
+            expected_input_shardings: [].into(),
             output_shardings: [].into(),
             committed_outputs: [].into(),
             output_device_assignment: OutputDeviceAssignment::Fixed,

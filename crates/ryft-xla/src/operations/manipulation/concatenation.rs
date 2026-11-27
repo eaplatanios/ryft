@@ -44,16 +44,16 @@ impl LowerableOperation for ConcatenateOperation<Type> {
         let location = lowerer.location();
         let block = &mut lowerer.block();
         let effect_tokens = lowerer.effect_tokens_mut();
-        let Some((result_extent, array_inputs)) = input_values.split_last() else {
+        let Some((output_extent, array_inputs)) = input_values.split_last() else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }.into());
         };
-        let Some((result_extent_type, array_input_types)) = input_types.split_last() else {
+        let Some((output_extent_type, array_input_types)) = input_types.split_last() else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: input_types.len() }.into());
         };
         if array_inputs.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: input_values.len() }.into());
         }
-        <&DimensionType>::try_from(result_extent_type)?;
+        <&DimensionType>::try_from(output_extent_type)?;
 
         if self.effects().classes().contains(EffectClass::OrderedAssertion) {
             // The callback receives every concrete logical input extent and computes their checked sum on the
@@ -77,7 +77,7 @@ impl LowerableOperation for ConcatenateOperation<Type> {
             }
             lower_concatenate_extent_assertion(
                 self.axis(),
-                *result_extent,
+                *output_extent,
                 input_extents.as_slice(),
                 effect_tokens,
                 block,
@@ -86,8 +86,8 @@ impl LowerableOperation for ConcatenateOperation<Type> {
             )?;
         }
 
-        // The explicit extent may refine the sum's bound or even prove a static result. Native concatenate
-        // infers its own bound from its inputs, so reconcile that physical type with the declared result.
+        // The explicit extent may refine the sum's bound or even prove a static output. Native concatenate
+        // infers its own bound from its inputs, so reconcile that physical type with the declared output.
         let mut result = lower_concatenate_tree(array_inputs, self.axis(), block, location)?;
         let [output_type] = output_types else {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
@@ -182,7 +182,7 @@ fn lower_concatenate_tree<'b, 'c: 'b, 't: 'c>(
     Ok(values[0])
 }
 
-/// Lowers the runtime check that the explicit result extent of an array IR [`ConcatenateOperation`] along `axis`, given
+/// Lowers the runtime check that the explicit output extent of an array IR [`ConcatenateOperation`] along `axis`, given
 /// by `actual`, equals the sum of `input_extents`.
 fn lower_concatenate_extent_assertion<'b, 'c: 'b, 't: 'c>(
     axis: usize,
@@ -246,8 +246,7 @@ mod tests {
 
     #[test]
     fn test_concatenate_operation_lower() {
-        // A concatenate with static shapes along axis 0 lowers to a single `stablehlo.concatenate` joining the
-        // operands.
+        // A concatenate with static shapes along axis 0 lowers to a single `stablehlo.concatenate` joining the inputs.
         let first_type = test_matrix_type(1, 2);
         let second_type = test_matrix_type(3, 2);
         let mut builder = ProgramBuilder::new();
@@ -277,8 +276,8 @@ mod tests {
             "#},
         );
 
-        // Dynamic concatenation requires its derived result extent as an explicit operand rather than manufacturing
-        // an unstable result identity.
+        // Dynamic concatenation requires its derived output extent as an explicit input rather than manufacturing an
+        // unstable output identity.
         let dynamic_type =
             ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", None), Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
@@ -296,29 +295,29 @@ mod tests {
             ))),
         );
 
-        // A mixed concatenate whose static operand types prove its explicit result extent is pure and lowers without
+        // A mixed concatenate whose static input types prove its explicit output extent is pure and lowers without
         // an assertion callback or dimension size machinery.
         let first_type = test_matrix_type(1, 2);
         let second_type = test_matrix_type(3, 2);
-        let result_extent = DimensionValue::constant(4).unwrap();
+        let output_extent = DimensionValue::constant(4).unwrap();
         let operation = ConcatenateOperation::<Type>::new(
             0,
-            &[first_type.clone().into(), second_type.clone().into(), result_extent.r#type().into_owned().into()],
+            &[first_type.clone().into(), second_type.clone().into(), output_extent.r#type().into_owned().into()],
         )
         .unwrap();
         let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
         let first = builder.add_input(first_type.clone().into());
         let second = builder.add_input(second_type.clone().into());
-        let result_extent = builder
+        let output_extent = builder
             .add_instruction(
-                DimensionOperation::from(ConstantOperation::new(result_extent)),
+                DimensionOperation::from(ConstantOperation::new(output_extent)),
                 Vec::new(),
                 Vec::new(),
                 None,
             )
             .unwrap()[0];
         let joined =
-            builder.add_instruction(operation, Vec::new(), vec![first, second, result_extent], None).unwrap()[0];
+            builder.add_instruction(operation, Vec::new(), vec![first, second, output_extent], None).unwrap()[0];
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![joined], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
@@ -349,10 +348,10 @@ mod tests {
         let add_operation =
             DimensionAddOperation::new(first_size_operation.output_type(), second_size_operation.output_type())
                 .unwrap();
-        let result_extent_type = DimensionType::new(add_operation.output_name(), add_operation.output_bounds());
+        let output_extent_type = DimensionType::new(add_operation.output_name(), add_operation.output_bounds());
         let concatenate_operation = ConcatenateOperation::<Type>::new(
             0,
-            &[first_type.clone().into(), second_type.clone().into(), result_extent_type.into()],
+            &[first_type.clone().into(), second_type.clone().into(), output_extent_type.into()],
         )
         .unwrap();
         let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
@@ -360,11 +359,11 @@ mod tests {
         let second = builder.add_input(second_type.clone().into());
         let first_size = builder.add_instruction(first_size_operation, Vec::new(), vec![first], None).unwrap()[0];
         let second_size = builder.add_instruction(second_size_operation, Vec::new(), vec![second], None).unwrap()[0];
-        let result_extent = builder
+        let output_extent = builder
             .add_instruction(DimensionOperation::Add(add_operation), Vec::new(), vec![first_size, second_size], None)
             .unwrap()[0];
         let joined = builder
-            .add_instruction(concatenate_operation, Vec::new(), vec![first, second, result_extent], None)
+            .add_instruction(concatenate_operation, Vec::new(), vec![first, second, output_extent], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![joined], vec![Placeholder, Placeholder], vec![Placeholder])
@@ -417,11 +416,11 @@ mod tests {
     }
 
     #[test]
-    fn test_concatenate_operation_lower_refined_result_extents() {
+    fn test_concatenate_operation_lower_refined_output_extents() {
         let client = execution_client();
         crate::operations::assertions::ensure_assertion_handler_registered(client).unwrap();
         // The actual sum is three, while the input allocation bounds sum to eight. Both tighter and wider declared
-        // output bounds must preserve the logical concatenation, including a fully static result refinement.
+        // output bounds must preserve the logical concatenation, including a fully static output refinement.
         for data_type in [DataType::I64, DataType::C64] {
             let element = if data_type == DataType::I64 { "i64" } else { "complex<f32>" };
             for extent in [

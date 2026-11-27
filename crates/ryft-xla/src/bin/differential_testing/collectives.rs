@@ -370,7 +370,7 @@ impl CollectiveCase {
         }
     }
 
-    /// Computes the physical result shape from the collective contract without using backend inference.
+    /// Computes the physical output shape from the collective contract without using backend inference.
     fn output_shape(&self, mesh_shape: &[usize]) -> Vec<usize> {
         let axis_position = if self.axis_name == "y" { 1 } else { 0 };
         let group_size = self.groups.as_ref().map_or(mesh_shape[axis_position], |groups| groups[0].len());

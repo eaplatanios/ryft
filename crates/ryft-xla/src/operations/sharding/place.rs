@@ -48,7 +48,7 @@ impl LowerableOperation for PlaceOperation {
         // whose buffers the caller gave up and no other handle can observe (refer to the donation pairing of
         // `ProgramLoweringOptions::with_reference_states`), so no public output ever shares
         // storage with an array that the caller holds. An eager placement is not lowered here, and it applies the copy
-        // policy to its result itself (refer to `Session::bind` and `Session::place`).
+        // policy to its output itself (refer to `Session::bind` and `Session::place`).
         check_count!("input", input_values, 1, ProgramError);
         check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
@@ -189,7 +189,7 @@ mod tests {
     }
 
     /// Returns the devices on which `array` lives, its `f32` elements, and whether it is committed, which is what the
-    /// eager transform tests of placements observe of a result.
+    /// eager transform tests of placements observe of an output.
     fn observe_placement(array: Array) -> (Vec<Device>, Vec<f32>, bool) {
         let elements = array.copy_to_host().unwrap().elements::<f32>().unwrap();
         (array.mesh().devices().to_vec(), elements, array.is_committed())
@@ -253,7 +253,7 @@ mod tests {
 
         // A target states the placement along auto mesh axes as well, which types do not track, so the constraint is
         // closed over the dimensions of the target and the compiler cannot shard them along further auto axes. The
-        // result is annotated with the target, as compilation places it, rather than with its type.
+        // output is annotated with the target, as compilation places it, rather than with its type.
         let mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
             vec![Device::new(0, 0), Device::new(1, 0)],
@@ -452,7 +452,7 @@ mod tests {
         );
 
         // A device target completes a pending reduction along an axis of size one, so its output is constrained to the
-        // sharding of its type, without that reduction, and the annotation of the result is that sharding too.
+        // sharding of its type, without that reduction, and the annotation of the output is that sharding too.
         let unreduced_type = ArrayType::new_static(DataType::F32, [4, 2])
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2).with_unreduced_axes(["x"]).unwrap())
             .unwrap();
@@ -516,7 +516,7 @@ mod tests {
     #[test]
     fn test_place_operation_lower_in_place_target_inside_manual_regions() {
         // A value inside a manual region cannot be moved to another placement, but an in-place target leaves it on the
-        // devices of the region and changes only its storage, so it lowers there like anywhere else. The result of the
+        // devices of the region and changes only its storage, so it lowers there like anywhere else. The output of the
         // region keeps the memory that its body selects, so the function returns it in that memory.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn test_place_operation_lower_executes_in_place_targets() {
-        // A compiled function moves its result to the memory of an in-place target on the devices and with the
+        // A compiled function moves its output to the memory of an in-place target on the devices and with the
         // distribution of its input.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -714,7 +714,7 @@ mod tests {
     fn test_place_operation_lower_executes_device_targets_of_stateful_functions() {
         // A stateful function traces values of the array IR type universe, which `Session::place` does not accept, so
         // it stages a device target through the `PlaceDispatch` primitive of `Place` directly, and the compiled
-        // function moves its result to the memory of that target on the device.
+        // function moves its output to the memory of that target on the device.
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let (mesh, _) = single_device_meshes(client);
@@ -942,8 +942,8 @@ mod tests {
             compiled.executable().execute(&session, input).unwrap()
         };
 
-        // The type of the result drops the split along the auto axis `x`, and the reduction state along the explicit
-        // axis `r` keeps the compiler from choosing the placement of the result, so the result is placed as the target
+        // The type of the output drops the split along the auto axis `x`, and the reduction state along the explicit
+        // axis `r` keeps the compiler from choosing the placement of the output, so the output is placed as the target
         // requests.
         let reduced = sharded.clone().with_reduced_axes(["r"]).unwrap();
         let output = place(replicated.clone().with_reduced_axes(["r"]).unwrap(), reduced.clone());
@@ -969,7 +969,7 @@ mod tests {
         )
         .unwrap();
 
-        // The result keeps the split of its first dimension even though an unconstrained dimension leaves the rest of
+        // The output keeps the split of its first dimension even though an unconstrained dimension leaves the rest of
         // its placement to the compiler.
         let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
@@ -1015,7 +1015,7 @@ mod tests {
                 .unwrap();
 
         // The compiler would keep the split of the input along `r` on the unconstrained dimension, but the runtime
-        // placement of the result reads that dimension as replicated, so the executable returns the result with the
+        // placement of the output reads that dimension as replicated, so the executable returns the output with the
         // split along `x` that the target requires and the unconstrained dimension replicated.
         let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
@@ -1056,7 +1056,7 @@ mod tests {
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
-        // A result of the zero data type has no buffer whose placement the compiler could report, so its placement
+        // An output of the zero data type has no buffer whose placement the compiler could report, so its placement
         // comes from the target alone.
         let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
@@ -1071,7 +1071,7 @@ mod tests {
         let output = compiled.executable().execute(&session, input.clone()).unwrap();
         assert_eq!(output.sharding(), &sharded);
 
-        // A placement without a target leaves the placed value where it is, so the result keeps the target placement.
+        // A placement without a target leaves the placed value where it is, so the output keeps the target placement.
         let target = Placement::new(mesh.clone(), sharded.clone()).unwrap();
         let compiled: CompiledFunction<ArrayType, ArrayType> = compile_with_options(
             move |input: CompileTracer| {
@@ -1092,7 +1092,7 @@ mod tests {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
 
-        // An operation that returns its input unchanged (i.e., `stop_gradient`) keeps the placement of a result of the
+        // An operation that returns its input unchanged (i.e., `stop_gradient`) keeps the placement of an output of the
         // zero data type, which has no buffer whose placement the compiler could report.
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
         let input_type = ArrayType::new_static(DataType::Zero, [4]);
@@ -1110,7 +1110,7 @@ mod tests {
         let output = compiled.executable().execute(&session, input).unwrap();
         assert_eq!(output.sharding(), &sharded);
 
-        // It also keeps the split along an auto axis of a result whose reduction state along an explicit axis keeps
+        // It also keeps the split along an auto axis of an output whose reduction state along an explicit axis keeps
         // the compiler from choosing its placement.
         let logical_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
@@ -1185,7 +1185,7 @@ mod tests {
         assert_eq!(shard_values(&output), vec![vec![1., 2.]]);
 
         // Another device moves the array onto that device with its logical mesh and sharding, which is what the type
-        // of the staged result records, and in the memory that the target names.
+        // of the staged output records, and in the memory that the target names.
         let memory = Memory::Host { pinned: true };
         let target = PlacementRequest::Device { device: second_device, memory: Some(memory), layout: None };
         let output = interpret(traced(target, &input), &input);
@@ -1925,7 +1925,7 @@ mod tests {
                 .map(observe_placement);
             outcomes.push(vec![through_array, through_value]);
         }
-        // The transposed placement has a target (where the primal lived), so its result is committed to it.
+        // The transposed placement has a target (where the primal lived), so its output is committed to it.
         let accepted = Ok((vec![devices[0]], vec![5., 6.], true));
         assert_eq!(outcomes, vec![vec![accepted.clone(), accepted.clone()]; 3]);
     }
@@ -1980,7 +1980,7 @@ mod tests {
                     ))),
                 );
 
-                // Negation runs where the anonymous seed lives and the placement sends the result to the source.
+                // Negation runs where the anonymous seed lives and the placement sends the output to the source.
                 let (_, pullback) = differentiate().vjp(|x| x.place(&target, &source)?.neg()).unwrap();
                 let gradient =
                     pullback.apply_materialized(lift(bare_seed.clone())).map(into_array).map(observe_placement);
@@ -2120,7 +2120,7 @@ mod tests {
         )
         .unwrap();
 
-        // Each batch item is placed on the target device, so the packed result lives there.
+        // Each batch item is placed on the target device, so the packed output lives there.
         let output: Array =
             batch(|x| x.place(&target, None), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
         assert_eq!(output.mesh(), &target_mesh);
@@ -2143,7 +2143,7 @@ mod tests {
         )
         .unwrap();
 
-        // Batching passes the device target through unchanged, so the packed result moves onto the device.
+        // Batching passes the device target through unchanged, so the packed output moves onto the device.
         let target = PlacementRequest::from(device);
         let output: Array =
             batch(|x| place_on(&x, &target), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();

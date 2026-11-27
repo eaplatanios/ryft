@@ -1,7 +1,7 @@
 //! Lowering of [`SelectOperation`] to [StableHLO `select`](https://openxla.org/stablehlo/spec#select).
 //!
 //! StableHLO requires the condition and both branches of a `stablehlo.select` to match the output shape exactly, so
-//! [`normalize_select_operands`] first broadcasts and converts them. The condition becomes a Boolean array of the
+//! [`normalize_select_inputs`] first broadcasts and converts them. The condition becomes a Boolean array of the
 //! output shape and each branch takes the output type, and an `I1` branch of a wider output type first recovers its
 //! sign. When the output has more than one dynamic axis, each input whose shape differs from the output shape is
 //! broadcast at its physical bound and then given the runtime extent of every output axis, which is read from an input
@@ -17,7 +17,7 @@ use ryft_mlir::{
 
 use crate::lowering::types::{ArrayTypeLoweringExtension, lower_signed_one_bit_to_mlir, physical_bound_type};
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
-use crate::operations::normalize_elementwise_operand;
+use crate::operations::normalize_elementwise_input;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 impl LowerableOperation for SelectOperation<ArrayType> {
@@ -28,7 +28,7 @@ impl LowerableOperation for SelectOperation<ArrayType> {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let [condition, on_true, on_false] = normalize_select_operands(
+        let [condition, on_true, on_false] = normalize_select_inputs(
             input_values,
             input_types,
             output_types,
@@ -47,7 +47,7 @@ impl LowerableOperation for SelectOperation<ArrayType> {
 /// Normalizes the condition and both branches of a [`SelectOperation`] to the exact tensor descriptors that
 /// `stablehlo.select` requires, and returns them as `[condition, on_true, on_false]`. The condition is converted to a
 /// Boolean array of the output shape and each branch to the output type.
-fn normalize_select_operands<'b, 'c: 'b, 't: 'c, B, L>(
+fn normalize_select_inputs<'b, 'c: 'b, 't: 'c, B, L>(
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
     output_types: &[ArrayType],
@@ -109,7 +109,7 @@ where
             // Native broadcast supports at most one bounded dynamic result axis. Convert at the input shape,
             // expose its physical capacity, broadcast that capacity, then restore the composed logical extents.
             let converted_type = input_types[index].clone().with_data_type(target_type.data_type());
-            let converted = normalize_elementwise_operand(inputs[index], &converted_type, block, context, location)?;
+            let converted = normalize_elementwise_input(inputs[index], &converted_type, block, context, location)?;
             let physical_input = converted_type.lower_physical_bound_value(
                 converted,
                 0.0,
@@ -148,7 +148,7 @@ where
                 location.as_ref(),
             )?;
         } else {
-            inputs[index] = normalize_elementwise_operand(inputs[index], &target_type, block, context, location)?;
+            inputs[index] = normalize_elementwise_input(inputs[index], &target_type, block, context, location)?;
         }
     }
     Ok(inputs)
@@ -241,7 +241,7 @@ mod tests {
             MixedValue::Array(vec![-7.], Vec::new()),
         ];
         // Scalar branches inherit both logical extents from a matrix condition, and a scalar condition inherits
-        // them from a matrix branch. Capacity padding must not appear in either selected result.
+        // them from a matrix branch. Capacity padding must not appear in either selected output.
         assert_eq!(
             execute_mixed_program(client, &program, &inputs, &[2, 2]).unwrap(),
             vec![
@@ -333,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_select_operands() {
+    fn test_normalize_select_inputs() {
         // An output with more than one dynamic axis takes the runtime extent of each axis from an input that carries
         // it, so an output axis that no input carries and an input of higher rank than the output are rejected.
         let context = MlirContext::new();
@@ -349,7 +349,7 @@ mod tests {
                     .collect::<Vec<_>>(),
             );
             let input_values = (0..3).map(|index| block.as_ref().argument(index).unwrap().as_ref()).collect::<Vec<_>>();
-            normalize_select_operands(
+            normalize_select_inputs(
                 &input_values,
                 &input_types,
                 std::slice::from_ref(&output_type),

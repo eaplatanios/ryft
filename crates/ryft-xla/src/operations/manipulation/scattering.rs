@@ -440,19 +440,19 @@ mod tests {
 
     #[test]
     fn test_scatter_operation_lower() {
-        // Scatter with addition row updates into a [3, 2] operand at the row indices in a [2, 1] index array. Output is
+        // Scatter with addition row updates into a [3, 2] input at the row indices in a [2, 1] index array. Output is
         // [3, 2], and the Add combiner lowers to a `stablehlo.add` inside the scatter region.
-        let operand_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         let updates_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let operation =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Add);
         let mut builder = ProgramBuilder::new();
-        let operand = builder.add_input(operand_type);
+        let input = builder.add_input(input_type);
         let indices = builder.add_input(indices_type);
         let updates = builder.add_input(updates_type);
         let output = builder
-            .add_instruction(ArrayOperation::Scatter(operation), Vec::new(), vec![operand, indices, updates], None)
+            .add_instruction(ArrayOperation::Scatter(operation), Vec::new(), vec![input, indices, updates], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
@@ -481,17 +481,17 @@ mod tests {
         );
 
         // Complex scatter extrema share the explicit lexicographic combiner used by complex reductions.
-        let operand_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
+        let input_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
         let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
         let updates_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let operation =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Max);
         let mut builder = ProgramBuilder::new();
-        let operand = builder.add_input(operand_type);
+        let input = builder.add_input(input_type);
         let indices = builder.add_input(indices_type);
         let updates = builder.add_input(updates_type);
         let output = builder
-            .add_instruction(ArrayOperation::Scatter(operation), Vec::new(), vec![operand, indices, updates], None)
+            .add_instruction(ArrayOperation::Scatter(operation), Vec::new(), vec![input, indices, updates], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(

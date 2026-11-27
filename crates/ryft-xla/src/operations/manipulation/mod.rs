@@ -1,7 +1,7 @@
 /// StableHLO lowering of broadcasting operations.
 pub(crate) mod broadcasting;
-/// StableHLO lowering of concatenation operations. Concatenation result refinements resize bounded storage, so
-/// reconciling a different result extent or allocation bound requires finite input and output allocation bounds.
+/// StableHLO lowering of concatenation operations. Concatenation output refinements resize bounded storage, so
+/// reconciling a different output extent or allocation bound requires finite input and output allocation bounds.
 mod concatenation;
 /// StableHLO lowering of conversion operations (i.e., element type conversions, bitcasts, precision reductions, and
 /// casts between compatible array types).
@@ -10,8 +10,8 @@ pub(crate) mod conversions;
 mod gathering;
 /// StableHLO lowering of memory placement operations.
 pub(crate) mod memory;
-/// StableHLO lowering of padding operations. Padding result refinements resize bounded storage, so reconciling a
-/// different result extent or allocation bound requires finite input and output allocation bounds.
+/// StableHLO lowering of padding operations. Padding output refinements resize bounded storage, so reconciling a
+/// different output extent or allocation bound requires finite input and output allocation bounds.
 mod padding;
 /// StableHLO lowering of reshaping operations.
 mod reshaping;
@@ -105,7 +105,7 @@ mod tests {
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| {
                 // Runtime dimension operations live in the mixed IR family. Explicitly retain that family while
-                // indexing symbolic extents, and project the array results back to the public JIT signature.
+                // indexing symbolic extents, and project the array outputs back to the public JIT signature.
                 let inputs = inputs.into_iter().map(|input| input.into_value()).collect::<Vec<_>>();
                 let selection = index![&inputs[1]];
                 vec![

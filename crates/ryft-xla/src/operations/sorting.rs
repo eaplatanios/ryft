@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_sort_operation_lower() {
-        // A descending sort of two operands in the total order (i.e., the top-k idiom) lowers to a stable
+        // A descending sort of two inputs in the total order (i.e., the top-k idiom) lowers to a stable
         // `stablehlo.sort` whose synthesized comparator compares the key pair with `GT` and `TOTALORDER` semantics,
         // and whose index passenger rides along unexamined.
         let key_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));

@@ -48,9 +48,9 @@ const SCHEMA: &str = "ryft-jax-differential-v1";
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum StagingObservation {
-    /// The program staged successfully with the rendered type of its first result.
+    /// The program staged successfully with the rendered type of its first output.
     Supported {
-        /// Rendered type of the first result of the staged program.
+        /// Rendered type of the first output of the staged program.
         output_type: String,
     },
 }

@@ -50,7 +50,7 @@ impl ProgramLoweringState {
         }
     }
 
-    /// Returns a copy of this state whose scope reaches the hidden entry arguments carrying `session_constants`.
+    /// Returns a copy of this state whose scope reaches the hidden entry inputs carrying `session_constants`.
     pub(crate) fn with_session_constants(mut self, session_constants: &[RetainedArray]) -> Self {
         let indices = session_constants.iter().enumerate().map(|(index, constant)| (constant.clone(), index)).collect();
         self.scope.session_constants = Rc::new(indices);
@@ -275,10 +275,10 @@ struct LoweringScopeState {
     /// Axes bound by every enclosing manual region, excluded from shard-local placement constraints.
     bound_manual_axes: Vec<String>,
 
-    /// Distinct [`RetainedArray`]s of the module, in the order of the hidden entry arguments that carry them (refer
-    /// to `collect_session_constants`). Their values form the suffix of every `captured_values` table that can reach
-    /// the entry function's arguments. Scopes that cannot reach them (i.e., `sdy.manual_computation` bodies) carry no
-    /// session constants. Each one maps to its position among those arguments, so that looking one up costs one hash.
+    /// Distinct [`RetainedArray`]s of the module, in the order of the hidden entry inputs that carry them (refer to
+    /// `collect_session_constants`). Their values form the suffix of every `captured_values` table that can reach the
+    /// entry function's inputs. Scopes that cannot reach them (i.e., `sdy.manual_computation` bodies) carry no session
+    /// constants. Each one maps to its position among those inputs, so that looking one up costs one hash.
     session_constants: Rc<HashMap<RetainedArray, usize>>,
 }
 

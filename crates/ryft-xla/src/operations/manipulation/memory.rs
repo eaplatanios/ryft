@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_operation_lower_pullback() {
-        // The pullback of a transfer moves the cotangent back to the operand's source memory, which is the default
+        // The pullback of a transfer moves the cotangent back to the input's source memory, which is the default
         // device space here, so it lowers to an `annotate_device_placement` custom call targeting `device`.
         let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
             .vjp(|x, ()| x.transfer_to_memory(Memory::Host { pinned: true }), CoreArray::scalar(2.0).unwrap(), ())
@@ -141,7 +141,7 @@ mod tests {
                 values,
             );
 
-            // XLA's CUDA compiler places no program argument or result in unpinned host memory, although its plugin
+            // XLA's CUDA compiler places no program input or output in unpinned host memory, although its plugin
             // can hold buffers there, so a program with such a boundary is rejected when it is lowered.
             if client.platform_name().unwrap().eq_ignore_ascii_case("cuda")
                 && memory == (Memory::Host { pinned: false })
@@ -167,7 +167,7 @@ mod tests {
                 continue;
             }
 
-            // A compiled host result must occupy the requested host memory, not just carry host metadata on a device
+            // A compiled host output must occupy the requested host memory, not just carry host metadata on a device
             // buffer.
             let to_host: CompiledFunction<ArrayType, ArrayType> =
                 compile(|input| input.transfer_to_memory(memory).unwrap(), input_type.clone(), &engine, mesh.clone())

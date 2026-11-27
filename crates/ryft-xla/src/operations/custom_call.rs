@@ -92,9 +92,9 @@ impl MemberLowerableOperation<Type> for CustomCallOperation {
             }
             .into());
         }
-        // An exact trailing extent operand refines every occurrence of its dimension identity. Validate the symbolic
-        // extent operands of refined axes before omitting them, and retain the predicate to gate the foreign
-        // invocation itself.
+        // An exact trailing extent input refines every occurrence of its dimension identity. Validate the symbolic
+        // extent inputs of refined axes before omitting them, and retain the predicate to gate the foreign invocation
+        // itself.
         let validation = lower_output_extent_validation(
             CUSTOM_CALL_OPERATION_NAME,
             self.output_types(),
@@ -1011,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_call_operation_lower_threads_assertions_without_array_results() {
+    fn test_custom_call_operation_lower_threads_assertions_without_array_outputs() {
         let mut builder = ProgramBuilder::new();
         let call =
             CustomCallOperation::new("ryft.test.assertion", vec![]).with_effect_class(EffectClass::OrderedAssertion);
@@ -1131,7 +1131,7 @@ mod tests {
             .unwrap();
 
         // A bounded dynamic aliased input reaches the handler as its static buffer at the bound, and the aliased
-        // result regains the input's runtime extent after the call.
+        // output regains the input's runtime extent after the call.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
         let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();
@@ -1177,7 +1177,7 @@ mod tests {
     #[test]
     fn test_custom_call_operation_lower_with_exact_output_extent() {
         // An exact extent refines the declared dynamic output axis to a static one, so the call allocates that exact
-        // extent and its redundant extent operand does not refine the result.
+        // extent and its redundant extent input does not refine the output.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let mut builder = ArrayIrProgramBuilder::<Constant, Operation>::new();

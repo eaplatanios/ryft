@@ -97,7 +97,7 @@ pub(crate) fn emitted_regions<'r, V: Value<Type = Type>, O: LowerableOperationFa
 /// Returns the regions of [`emitted_regions`], without the callees of the `call`s among them and the regions below
 /// those callees unless `enters_calls` is set. Without them, these are the regions of one capture scope: a constant of
 /// one of them that names capture `k` names capture `k` of `entry`, whereas the same constant in a callee names its own
-/// input `k` (refer to `CallProgramLoweringExtension::lower_call`), which the call receives as its operand `k`.
+/// input `k` (refer to `CallProgramLoweringExtension::lower_call`), which the call receives as its input `k`.
 pub(crate) fn emitted_regions_entering_calls<'r, V: Value<Type = Type>, O: LowerableOperationFamily>(
     entry: RegionRef<'r, V, O>,
     target_platform: Option<&'r str>,
@@ -128,7 +128,7 @@ pub(crate) fn emitted_regions_entering_calls<'r, V: Value<Type = Type>, O: Lower
 }
 
 /// Returns, for each of the first `capture_count` captures of the program whose entry region is `entry`, whether a
-/// region that lowering emits for `target_platform` reads it (refer to [`emitted_regions`]), as an operand of one of
+/// region that lowering emits for `target_platform` reads it (refer to [`emitted_regions`]), as an input of one of
 /// its instructions or as one of its outputs. Every region names a capture through a constant whose
 /// [`Value::capture_index`] is its position, except the entry region of a program with lifted captures (i.e., when
 /// `lifted` is set), which names capture `k` through its input `k`. A capture that no emitted region reads (e.g., one
@@ -137,7 +137,7 @@ pub(crate) fn emitted_regions_entering_calls<'r, V: Value<Type = Type>, O: Lower
 /// `ProgramLoweringExtension::to_mlir`), so that admission and lowering read this one
 /// decision. A capture that a region only passes on to a call as a capture which the callee never reads is not read
 /// either (refer to [`visit_emitted_reads`]). The regions of the callees of calls are not visited, because their
-/// constants name the captures of those callees, which a callee reads only through the operands of its call (refer to
+/// constants name the captures of those callees, which a callee reads only through the inputs of its call (refer to
 /// [`emitted_regions_entering_calls`]).
 pub(crate) fn emitted_capture_reads<'r, O: LowerableOperationFamily>(
     entry: RegionRef<'r, Constant, O>,
@@ -168,8 +168,8 @@ pub(crate) fn emitted_capture_reads<'r, O: LowerableOperationFamily>(
     is_read
 }
 
-/// Calls `visit` with every atom that `region` reads, as an operand of one of its instructions or as one of its
-/// outputs, and with whether that read is live. Every read is live except an operand that a `call` passes as a
+/// Calls `visit` with every atom that `region` reads, as an input of one of its instructions or as one of its
+/// outputs, and with whether that read is live. Every read is live except an input that a `call` passes as a
 /// lifted capture which its callee never reads (refer to [`unread_call_captures`]), which the lowering of the call
 /// replaces with a value that requires no buffer. This is the one rule by which the captures of a program (refer to
 /// [`emitted_capture_reads`]) and its session constants (refer to [`partition_session_constants`]) are read, so that
@@ -198,7 +198,7 @@ fn visit_emitted_reads<O: LowerableOperationFamily>(
     }
 }
 
-/// Returns, for each input of `callee`, the callee of a call whose first `capture_count` operands are its lifted
+/// Returns, for each input of `callee`, the callee of a call whose first `capture_count` inputs are its lifted
 /// captures, whether it is a capture that the callee never reads, as the family of the call answers it (refer to
 /// `LowerableOperation::unread_captures`, which `Operation` answers with `unread_lifted_captures`), or [`None`]
 /// when every capture counts as read.
@@ -210,19 +210,19 @@ pub(crate) fn unread_call_captures<O: LowerableOperationFamily>(
     O::unread_captures(callee, capture_count, target_platform)
 }
 
-/// Returns, for each logical argument of the entry function of `program`, whose types are `argument_types` and whose
-/// first `capture_count` arguments are captures that end with the arguments of its `session_count` session constants,
-/// whether the executable has no argument for it because nothing reads it. That is a capture that no region which
+/// Returns, for each logical input of the entry function of `program`, whose types are `logical_input_types` and whose
+/// first `capture_count` inputs are captures that end with the inputs of its `session_count` session constants, whether
+/// the executable has no physical input for it because nothing reads it. That is a capture that no region which
 /// lowering emits for `target_platform` reads (refer to [`emitted_capture_reads`]) and a public input that
 /// `unread_inputs` flags, which the caller states because it cannot be read from `program` (refer to
 /// `Options::with_unread_inputs`), of a static shape and backing no reference state (i.e., not at one of
 /// `reference_state_inputs`). This is the one liveness decision of an executable boundary: the admission and the
-/// placement of its arguments when a function is compiled, the signature of its executable, which records it (refer to
-/// `ExecutableSignature::is_unread_input`), and every execution and persisted copy of it read it, and none of them
-/// requires anything of such an argument.
-pub(crate) fn unread_entry_arguments<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+/// placement of its inputs when a function is compiled, the signature of its executable, which records it (refer to
+/// `MlirProgramSignature::is_unread_input`), and every execution and persisted copy of it read it, and none of them
+/// requires anything of such an input.
+pub(crate) fn unread_entry_inputs<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
-    argument_types: &[ArrayType],
+    logical_input_types: &[ArrayType],
     capture_count: usize,
     session_count: usize,
     unread_inputs: &[bool],
@@ -233,11 +233,11 @@ where
     ProgramInput: Parameterized<Constant>,
     ProgramOutput: Parameterized<Constant>,
 {
-    let lifted = program.input_count() + session_count == argument_types.len();
+    let lifted = program.input_count() + session_count == logical_input_types.len();
     let source_capture_count = capture_count.saturating_sub(session_count);
     let capture_reads =
         emitted_capture_reads(program.entry_region_ref(), source_capture_count, lifted, target_platform);
-    argument_types
+    logical_input_types
         .iter()
         .enumerate()
         .map(|(index, r#type)| {
@@ -253,12 +253,12 @@ where
 /// Returns the distinct [`RetainedArray`]s that `program` references in the regions that lowering emits for
 /// `target_platform` (i.e., its entry region and the executed nested regions of that region, refer to
 /// `emitted_regions`), in the order of their first occurrence in those regions. Lowering passes their arrays as hidden
-/// entry arguments that follow the lifted captures, in this order, and so the caller that assembles the executable
-/// arguments must use the same order and the same target as that lowering. Regions that lowering never reaches (e.g.,
-/// the rule regions of composites, the transpose region of a `linear_call`, or a body that the implementation of a
-/// named composite replaces for the target) are skipped, so that an array that only they refer to does not become an
-/// argument of the executable. So is an array that the emitted regions only pass on to calls as captures which their
-/// callees never read (refer to [`partition_session_constants`]).
+/// entry inputs that follow the lifted captures, in this order, and so the caller that assembles the physical inputs of
+/// the executable must use the same order and the same target as that lowering. Regions that lowering never reaches
+/// (e.g., the rule regions of composites, the transpose region of a `linear_call`, or a body that the implementation of
+/// a named composite replaces for the target) are skipped, so that an array that only they refer to does not become a
+/// physical input of the executable. So is an array that the emitted regions only pass on to calls as captures which
+/// their callees never read (refer to [`partition_session_constants`]).
 pub(crate) fn collect_session_constants<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
     target_platform: Option<&str>,
@@ -273,9 +273,9 @@ where
 /// Returns the distinct [`RetainedArray`]s that the regions which lowering emits for `target_platform` below `entry`
 /// reference, in the order of their first occurrence in those regions, split into the session constants of the program
 /// (refer to [`collect_session_constants`]) and the arrays that those regions only pass on to calls as captures which
-/// their callees never read (refer to [`visit_emitted_reads`]). The latter require nothing of an execution, so they have
-/// no executable argument, and lowering binds each of them to a value that requires no buffer (i.e., the value with
-/// which the entry function binds an erased argument), which the calls receive in its place.
+/// their callees never read (refer to [`visit_emitted_reads`]). The latter require nothing of an execution, so they
+/// have no physical input, and lowering binds each of them to a value that requires no buffer (i.e., the value with
+/// which the entry function binds an erased input), which the calls receive in its place.
 pub(crate) fn partition_session_constants<O: LowerableOperationFamily>(
     entry: RegionRef<'_, Constant, O>,
     target_platform: Option<&str>,
@@ -363,7 +363,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_collect_session_constants_assigns_the_same_arguments_on_every_process() {
+    fn test_collect_session_constants_assigns_the_same_inputs_on_every_process() {
         // Two single-device clients stand for two processes. Each independently places its default scalar on global
         // device 0 twice. Only the owner can reuse the original device buffer.
         let clients = [0, 1].map(|process| {
@@ -455,7 +455,7 @@ mod tests {
         };
 
         // A session constant that only the dormant transpose region of a `linear_call` refers to is never lowered, so
-        // it does not become a hidden argument of the entry function, unlike one that its forward region refers to.
+        // it does not become a hidden input of the entry function, unlike one that its forward region refers to.
         assert_eq!(
             collect_session_constants(&linear_call_program(&with_constant(false), &with_constant(true)), None),
             vec![],
@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_collect_session_constants_skips_bodies_that_the_target_replaces() {
-        // A session constant that only the body of a named composite call refers to becomes a hidden argument where
+        // A session constant that only the body of a named composite call refers to becomes a hidden input where
         // lowering emits the body, and not on a target whose backend implementation replaces the whole call
         // (`ryft.tests.xla_named_square` version 1 on CUDA, refer to `omits_regions`), which never lowers the body,
         // as the collection of the module mesh and the validation of placements skip it.

@@ -459,10 +459,10 @@ impl TotalOrderKeys {
 /// shift itself defined. A raw maximum of `-∞`, which is the maximum's identity and therefore the result for an
 /// all-`-∞` slice or an empty reduction, would compute `-∞ - -∞ = NaN`, while substituting zero there leaves
 /// `log(0) + 0`, which is the correct `-∞`. The `+∞` maximum is guarded the same way, and NaN propagates through the
-/// sum. Complex operands take the maximum of their real components, which alone determine the magnitudes of their
+/// sum. Complex inputs take the maximum of their real components, which alone determine the magnitudes of their
 /// exponentials, and shift by it as a complex value with a zero imaginary component. The shift is broadcast back over
-/// the reduced axes with the identity map from the output's axes to the operand's kept axes, so both reductions see the
-/// operand's own shape. The maximum uses the provided [`FloatExtremumForm`].
+/// the reduced axes with the identity map from the output's axes to the input's kept axes, so both reductions see the
+/// input's own shape. The maximum uses the provided [`FloatExtremumForm`].
 fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     axes: &[usize],
     input_value: ValueRef<'b, 'c, 't>,
@@ -2117,7 +2117,7 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let argument_shardings = [input_type.sharding().unwrap().clone()];
+            let input_shardings = [input_type.sharding().unwrap().clone()];
             let output_shardings = [output_type.sharding().unwrap().clone()];
             (unproject_plain_program(program))
                 .to_mlir(
@@ -2127,7 +2127,7 @@ mod tests {
                         .with_input_types(&vec![input_type])
                         .with_output_types(&vec![output_type])
                         .without_boundary_shardings()
-                        .with_exact_input_shardings(argument_shardings.iter().cloned().map(Some).collect())
+                        .with_exact_input_shardings(input_shardings.iter().cloned().map(Some).collect())
                         .with_exact_output_shardings(output_shardings.iter().cloned().map(Some).collect())
                         .with_target_platform(target_platform),
                 )
@@ -2238,7 +2238,7 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let argument_shardings = [input_type.sharding().unwrap().clone()];
+            let input_shardings = [input_type.sharding().unwrap().clone()];
             let output_shardings = [output_type.sharding().unwrap().clone()];
             (unproject_plain_program(program))
                 .to_mlir(
@@ -2248,7 +2248,7 @@ mod tests {
                         .with_input_types(&vec![input_type])
                         .with_output_types(&vec![output_type])
                         .without_boundary_shardings()
-                        .with_exact_input_shardings(argument_shardings.iter().cloned().map(Some).collect())
+                        .with_exact_input_shardings(input_shardings.iter().cloned().map(Some).collect())
                         .with_exact_output_shardings(output_shardings.iter().cloned().map(Some).collect()),
                 )
                 .unwrap()
@@ -2475,7 +2475,7 @@ mod tests {
         );
 
         // Mean needs the runtime extent of the removed axis as a divisor, which the reduce instruction does not take as
-        // an operand, so the lowering rejects a mean over a dynamically sized axis.
+        // an input, so the lowering rejects a mean over a dynamically sized axis.
         let reduced = DimensionVariable::new("reduced", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(reduced), Dimension::Static(3)]));
@@ -2607,7 +2607,7 @@ mod tests {
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
 
-        // Complex operands are shifted by the maximum of their real components, and `-∞ + 0i` padding contributes a
+        // Complex inputs are shifted by the maximum of their real components, and `-∞ + 0i` padding contributes a
         // zero exponential. XLA's complex exponential and logarithm round differently from the host's.
         let first = Complex::new(1f32, 0.5);
         let second = Complex::new(3f32, -2.0);
