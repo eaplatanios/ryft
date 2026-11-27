@@ -3623,12 +3623,9 @@ impl<'o> SourceReplicas<'o> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Names of the varying manual axes that are not unreduced of the two ends of a placement whose contributions
-/// correspond (refer to [`moves_contributions`]), in the order in which their coordinates are compared. The unreduced
-/// axes need no names, because the contributions to a pending reduction correspond by their ordinals (refer to
-/// [`ShardContribution`]).
+/// correspond, in the order in which their coordinates are compared. The unreduced axes need no names, because the
+/// contributions to a pending reduction correspond by their ordinals.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ContributionAxes {
     /// Varying manual axes of the source in mesh order.
@@ -3640,8 +3637,7 @@ struct ContributionAxes {
 
 /// One PJRT cross-host transfer that the current process takes part in, which [`issue_cross_host_transfers`] issues.
 enum CrossHostTransfer<'b> {
-    /// Send of `buffer` from its device `source` of the current process to the device `target` of another
-    /// process.
+    /// Send of `buffer` from its device `source` of the current process to the device `target` of another process.
     Send {
         /// ID of the source device.
         source: DeviceId,
@@ -3680,10 +3676,17 @@ enum CrossHostTransfer<'b> {
 }
 
 impl CrossHostTransfer<'_> {
-    /// Returns the IDs of the source and target devices of this transfer.
-    fn devices(&self) -> (DeviceId, DeviceId) {
+    /// Returns the ID of the source device.
+    fn source(&self) -> DeviceId {
         match self {
-            Self::Send { source, target, .. } | Self::Receive { source, target, .. } => (*source, *target),
+            Self::Send { source, .. } | Self::Receive { source, .. } => *source,
+        }
+    }
+
+    /// Returns the ID of the target device.
+    fn target(&self) -> DeviceId {
+        match self {
+            Self::Send { target, .. } | Self::Receive { target, .. } => *target,
         }
     }
 }
@@ -3697,8 +3700,7 @@ struct ReceivedShardBuffer {
     buffer: Buffer<'static>,
 }
 
-/// Addressable devices of the client of an array by their identifiers, which a placement looks up once for all of its
-/// shards (refer to [`Array::addressable_devices_by_id`]).
+/// Addressable devices of the client of an array by their identifiers.
 struct AddressableDevices {
     /// Index of the process of the client.
     process_index: usize,
@@ -3720,10 +3722,9 @@ impl AddressableDevices {
 }
 
 /// Index of the shards of an array that hold a buffer on the process with index [`Self::process_index`] by the
-/// contribution that they hold (refer to [`ShardContribution`]), which a placement keeps for all of its lookups of
-/// [`Array::local_replica_shard`], so that many targets of one resident replica cost linear rather than quadratic work.
-/// The index is built on the first lookup that needs another replica, so a placement whose planned shards all have
-/// buffers never builds it.
+/// contribution that they hold, which a placement keeps for all of its lookups of [`Array::local_replica_shard`],
+/// so that many targets of one resident replica cost linear rather than quadratic work. The index is built on the
+/// first lookup that needs another replica, so a placement whose planned shards all have buffers never builds it.
 struct LocalReplicas {
     /// Index of the process whose shards the index holds.
     process_index: usize,
@@ -3738,6 +3739,8 @@ impl LocalReplicas {
         Self { process_index, shards: OnceCell::new() }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns whether `session` has no declared or listed peers and its client has no coordination store. A
 /// standalone cross-client bridge may treat distinct process indices as two names for the current process.
@@ -4151,12 +4154,13 @@ fn issue_cross_host_transfers(
     if transfers.is_empty() {
         return Ok((None, Vec::new()));
     }
-    transfers.sort_by_key(CrossHostTransfer::devices);
+    transfers.sort_by_key(|transfer| (transfer.source(), transfer.target()));
     let transfers = transfers
         .into_iter()
         .map(|transfer| {
-            let (source, target) = transfer.devices();
-            Ok((cross_host_global_device_id(source)?, cross_host_global_device_id(target)?, transfer))
+            let source = cross_host_global_device_id(transfer.source())?;
+            let target = cross_host_global_device_id(transfer.target())?;
+            Ok((source, target, transfer))
         })
         .collect::<Result<Vec<_>, Error>>()?;
     let client = session.client();

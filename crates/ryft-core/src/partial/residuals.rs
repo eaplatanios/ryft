@@ -3483,11 +3483,11 @@ mod tests {
     };
     use crate::differentiation::{MemoryTransferStorage, NothingSavable};
     use crate::operations::{
-        AddOperation, CompareOperation, ComparisonDirection, CompositeJvpRule, CompositeOperation, ConditionOperation,
-        CosOperation, DimensionSizeOperation, DotDimensionNumbers, DotOperation, ExpOperation, LinearCallOperation,
-        MulOperation, NegOperation, ReducePrecisionOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceWriteOperation, RematerializeOperation, ReshapeOperation, ScanOperation,
-        SinOperation, TagOperation, TransferToMemoryOperation, WhileOperation,
+        AddOperation, CallOperation, CompareOperation, ComparisonDirection, CompositeJvpRule, CompositeOperation,
+        ConditionOperation, CosOperation, DimensionSizeOperation, DotDimensionNumbers, DotOperation, ExpOperation,
+        LinearCallOperation, MulOperation, NegOperation, ReducePrecisionOperation, ReferenceFreezeOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation, RematerializeOperation,
+        ReshapeOperation, ScanOperation, SinOperation, TagOperation, TransferToMemoryOperation, WhileOperation,
     };
     use crate::partial::values::PartialEvaluationOutput;
     use crate::programs::{
@@ -6081,6 +6081,88 @@ mod tests {
             ArrayIrValue::Array(Array::scalar(2.0f64).unwrap()),
         ];
         assert_eq!(run(&placed, &inputs), program.interpret(inputs.clone()).unwrap());
+    }
+
+    #[test]
+    fn test_residual_policy_reference_place_residuals_ignores_unused_call_result() {
+        // The callee of the `call` returns a tagged sine and a tagged cosine of its input, and the policy rejects the
+        // cosine. The second output of the call remains a primal result, so its presence must not classify it as a
+        // residual. The call keeps its boundary, and the policy saves its first output, which it classifies through the
+        // callee. Requiring the same result in residual work propagates the rejection instead.
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(scalar_type.clone());
+        let sine = add(&mut builder, ArrayOperation::from(SinOperation::new()), vec![input]);
+        let needed = add(&mut builder, ArrayOperation::from(TagOperation::<ArrayType>::new("needed")), vec![sine]);
+        let cosine = add(&mut builder, ArrayOperation::from(CosOperation::new()), vec![input]);
+        let unused = add(&mut builder, ArrayOperation::from(TagOperation::<ArrayType>::new("unused")), vec![cosine]);
+        let callee = build(builder, vec![needed, unused]);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let known = builder.add_input(scalar_type.clone());
+        let unknown = builder.add_input(scalar_type);
+        let callee = builder.import_program(callee);
+        let called = builder
+            .add_instruction(TestOperation::Call(CallOperation::new(0)), vec![callee], vec![known], None)
+            .unwrap()
+            .to_vec();
+        let first = add(&mut builder, ArrayOperation::from(MulOperation::new()), vec![called[0], unknown]);
+        let second = add(&mut builder, ArrayOperation::from(MulOperation::new()), vec![called[1], unknown]);
+        let program = build(builder, vec![first, second, called[1]]);
+        let reject =
+            policy("save_needed_reject_unused", |candidate| {
+                if candidate.producers().iter().any(|producer| {
+                    producer.payload::<TagOperation<ArrayType>>().is_some_and(|tag| tag.key() == "unused")
+                }) {
+                    Err(ResidualRejection::new("the unused result must not cross the residual boundary"))
+                } else {
+                    Ok(ResidualDecision::<NoStorage>::Save)
+                }
+            });
+        let placed = program
+            .clone()
+            .with_outputs(&[0, 2])
+            .unwrap()
+            .partition_with_residual_policy(&[true, false], &reject);
+        assert_eq!(
+            placed.unwrap().to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Unknown(0), Known(0)],
+                ]
+                known={
+                    lambda %0:f32[] .
+                    let %1:f32[], %2:f32[] = call %0 [
+                        callee={
+                            lambda %0:f32[] .
+                            let %1:f32[] = sin %0
+                                %2:f32[] = tag [key=needed] %1
+                                %3:f32[] = cos %0
+                                %4:f32[] = tag [key=unused] %3
+                            in (%2, %4)
+                        },
+                    ]
+                    in (%2, %1)
+                }
+                residual={
+                    lambda %0:f32[], %1:f32[] .
+                    let %2:f32[] = mul %1 %0
+                    in (%2)
+                }"},
+        );
+        assert_eq!(
+            program
+                .with_outputs(&[0, 1])
+                .unwrap()
+                .partition_with_residual_policy(&[true, false], &reject)
+                .map(|_| ())
+                .map_err(ResidualPolicyError::from),
+            Err(ResidualPolicyError::Rejected {
+                policy: "save_needed_reject_unused".to_owned(),
+                rejection: ResidualRejection::new("the unused result must not cross the residual boundary"),
+            }),
+        );
     }
 
     #[test]

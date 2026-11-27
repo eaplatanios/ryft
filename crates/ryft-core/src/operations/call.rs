@@ -3555,10 +3555,7 @@ mod tests {
     use crate::operations::tagging::TagOperation;
     use crate::operations::trigonometric::{CosOperation, SinOperation};
     use crate::parameters::Placeholder;
-    use crate::partial::{
-        NoStorage, PartialEvaluation, PartialEvaluationInput, ResidualCandidate, ResidualDecision, ResidualPolicy,
-        ResidualPolicyError, ResidualRejection,
-    };
+    use crate::partial::{NoStorage, PartialEvaluation, PartialEvaluationInput, ResidualDecision, ResidualRejection};
     use crate::programs::{
         AtomId, EffectClass, EffectClasses, ProgramBuilder, ReferenceSource, ReferenceType, RegionDriver, TypeIdentity,
     };
@@ -5603,6 +5600,183 @@ mod tests {
 
         // Debug builds re-derive every cache hit to validate deterministic derivation.
         assert_eq!(partitions.get(), if cfg!(debug_assertions) { 4 } else { 2 });
+    }
+
+    #[test]
+    fn test_call_operation_refine_derived_value() {
+        // Each case stages the value of a derived call at its `declared` type and states the `refined` type that it has
+        // in the caller, over a mesh with an explicit axis `x` and a manual axis `y`.
+        let axes = |axis_type: MeshAxisType| {
+            vec![MeshAxis::new("x", 2, axis_type).unwrap(), MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap()]
+        };
+        let mesh = LogicalMesh::new(axes(MeshAxisType::Explicit)).unwrap();
+        let typed = |mesh: &LogicalMesh, dimensions: Vec<ShardingDimension>| {
+            let r#type = ArrayType::new_static(DataType::F32, vec![4; dimensions.len()]);
+            r#type.with_sharding(Sharding::new(mesh.clone(), dimensions).unwrap()).unwrap()
+        };
+        let with_sharding = |r#type: &ArrayType, sharding: Sharding| r#type.clone().with_sharding(sharding).unwrap();
+        let stage = |declared: &ArrayType, refined: &ArrayType, call_mesh: Option<&DeviceMesh>| {
+            let context = TracingContext::<TestValue, TestOperation>::new();
+            let value = context.input(ArrayIrType::Array(declared.clone()));
+            let call = CallOperation::<ArrayIrType>::new(0).with_boundary(call_mesh, Vec::new(), Vec::new());
+            let value = call.refine_derived_value(&context, ArrayIrType::Array(refined.clone()), value).unwrap();
+            context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<TestValue>, Vec<TestValue>>(
+                    vec![value.atom_id().unwrap()],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+                .to_string()
+        };
+        let (replicated, unconstrained, split) =
+            (ShardingDimension::Replicated, ShardingDimension::Unconstrained, ShardingDimension::sharded(["x"]));
+        let untracked = f32_vector_type(4);
+        let replicated_vector = typed(&mesh, vec![replicated.clone()]);
+        let sharding = replicated_vector.sharding().unwrap().clone();
+
+        // A value whose type tracks a sharding without reduction state, manual variation, or a split over manual axes
+        // is cast to a type of the same shape that tracks none.
+        let untracked_cases = [
+            replicated_vector.clone(),
+            typed(&mesh, vec![unconstrained.clone()]),
+            typed(&mesh, vec![split.clone()]),
+            with_sharding(&untracked, sharding.clone().with_unreduced_axes(["y"]).unwrap()),
+            with_sharding(&untracked, sharding.clone().with_reduced_axes(["y"]).unwrap()),
+            with_sharding(&untracked, sharding.clone().with_varying_manual_axes(["y"]).unwrap()),
+            typed(&mesh, vec![ShardingDimension::sharded(["y"])]),
+        ];
+        assert_eq!(
+            untracked_cases
+                .iter()
+                .map(|declared| stage(declared, &untracked, None))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}] .
+                let %1:f32[4] = cast [
+                    type=f32[4],
+                    inputs=[f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}]],
+                ] %0
+                in (%1)
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}]}] .
+                let %1:f32[4] = cast [
+                    type=f32[4],
+                    inputs=[f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}]}]],
+                ] %0
+                in (%1)
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{'x'}]}] .
+                let %1:f32[4] = cast [
+                    type=f32[4],
+                    inputs=[f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{'x'}]}]],
+                ] %0
+                in (%1)
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}], unreduced={'y'}}] .
+                in (%0)
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}], reduced={'y'}}] .
+                in (%0)
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}], varying_manual={'y'}}] .
+                in (%0)
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{'y'}]}] .
+                in (%0)"},
+        );
+
+        // Equal types, types that track no sharding, and types of other shapes leave the value as it is.
+        assert_eq!(
+            [
+                stage(&replicated_vector, &replicated_vector, None),
+                stage(&untracked, &untracked, None),
+                stage(&replicated_vector, &f32_vector_type(3), None),
+            ]
+            .join("\n"),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}] .
+                in (%0)
+                lambda %0:f32[4] .
+                in (%0)
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}] .
+                in (%0)"},
+        );
+
+        // Shardings that differ only in dimensions that one leaves unconstrained and the other replicates place a
+        // value alike, so it is cast, in either direction. Any other difference in placement over a mesh of the same
+        // topology is a reshard, and a difference in reduction state or manual variation leaves the value as it is.
+        let open = typed(&mesh, vec![unconstrained.clone(), split.clone()]);
+        let closed = typed(&mesh, vec![replicated.clone(), split.clone()]);
+        let auto_mesh = LogicalMesh::new(axes(MeshAxisType::Auto)).unwrap();
+        let replicated_matrix = typed(&mesh, vec![replicated.clone(), replicated.clone()]);
+        let matrix_sharding = replicated_matrix.sharding().unwrap().clone();
+        assert_eq!(
+            [
+                stage(&open, &closed, None),
+                stage(&closed, &open, None),
+                stage(&typed(&mesh, vec![unconstrained.clone(), replicated.clone()]), &closed, None),
+                stage(&replicated_matrix, &closed, None),
+                stage(&open, &typed(&auto_mesh, vec![replicated.clone(), replicated.clone()]), None),
+                stage(
+                    &typed(&mesh, vec![unconstrained.clone(), replicated.clone()]),
+                    &with_sharding(&replicated_matrix, matrix_sharding.clone().with_unreduced_axes(["y"]).unwrap()),
+                    None,
+                ),
+                stage(
+                    &typed(&mesh, vec![unconstrained.clone(), replicated.clone()]),
+                    &with_sharding(&replicated_matrix, matrix_sharding.with_varying_manual_axes(["y"]).unwrap()),
+                    None,
+                ),
+            ]
+            .join("\n"),
+            indoc! {"
+                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}] .
+                let %1:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] = cast [
+                    type=f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}],
+                    inputs=[f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}]],
+                ] %0
+                in (%1)
+                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] .
+                let %1:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}] = cast [
+                    type=f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}],
+                    inputs=[f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}]],
+                ] %0
+                in (%1)
+                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {}]}] .
+                let %1:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] = reshard [sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] %0
+                in (%1)
+                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {}]}] .
+                let %1:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] = reshard [sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] %0
+                in (%1)
+                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}] .
+                let %1:f32[4, 4][sharding={mesh<['x'=2:auto, 'y'=2:manual]>, [{}, {}]}] = reshard [sharding={mesh<['x'=2:auto, 'y'=2:manual]>, [{}, {}]}] %0
+                in (%1)
+                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {}]}] .
+                in (%0)
+                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {}]}] .
+                in (%0)"},
+        );
+
+        // A value whose type tracks no sharding is cast to a refined type that tracks one, unless the call names
+        // devices over a mesh of another topology, on which the value lives.
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("z", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let devices = (0..4).map(|id| Device::new(id, 0)).collect::<Vec<_>>();
+        let call_mesh = DeviceMesh::new(other_mesh, devices).unwrap();
+        assert_eq!(
+            stage(&untracked, &replicated_vector, None),
+            indoc! {"
+                lambda %0:f32[4] .
+                let %1:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}] = cast [
+                    type=f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}],
+                    inputs=[f32[4]],
+                ] %0
+                in (%1)"},
+        );
+        assert_eq!(
+            stage(&untracked, &replicated_vector, Some(&call_mesh)),
+            indoc! {"
+                lambda %0:f32[4] .
+                in (%0)"},
+        );
     }
 
     #[test]
@@ -7919,12 +8093,13 @@ mod tests {
         // Partial evaluation of a mixed `call` against a live outer trace wraps the known half of the callee again as a
         // known-side `call`, which it stages into the outer program over the symbolic known input. The unknown half
         // stays behind a residual `call`, and the known→unknown residual edge flows from the outputs of the known-side
-        // call into the inputs of the residual call.
+        // call into the inputs of the residual call. The known callee returns `a + a` once, because the residual call
+        // reads that known output directly (i.e., JAX's `out_fwd`).
         let r#type = ArrayIrType::Array(f64_vector_type(4));
 
         // Callee `f(a, x) = (a + a, x * x, (a + a) * x)` over a known `a` and an unknown `x`. Capture constants are
         // absent, because a capture-bearing callee preserves its boundary instead of splitting, which
-        // `test_call_operation_partially_evaluate_preserves_boundary_for_capture_bearing_callees` pins.
+        // `test_call_operation_partially_evaluate_keeps_capture_bearing_callees_whole` pins.
         let callee = build_program(vec![r#type.clone(); 2], |builder, inputs| {
             let (known_input, runtime_input) = (inputs[0], inputs[1]);
             let shifted = builder
@@ -8023,64 +8198,68 @@ mod tests {
     }
 
     #[test]
-    fn test_call_operation_partially_evaluate_forwards_known_output_residuals() {
-        // When the callee `f(a, x) = (sin(a), sin(a) * x)` is partitioned with `a` known and `x` unknown, the residual
-        // call needs `sin(a)`, which is also a known output, so the known call returns it once and the residual call is
-        // fed from that output (JAX's `out_fwd`). The outer partition repeats the known call's output as its own
-        // residual edge, because `Program::partition` keeps one edge per residual feeder.
-        let r#type = ArrayIrType::Array(f64_vector_type(4));
-        let callee = build_program(vec![r#type.clone(); 2], |builder, inputs| {
-            let sine = builder
+    fn test_call_operation_partially_evaluate_does_not_forward_outputs_of_unshareable_or_effectful_calls() {
+        // Under a residual policy, an all-known call whose callee is effectful or cannot share splits keeps its
+        // outputs, even when one of them returns its only public array input unchanged. Each callee returns its only
+        // public array input, whose type is replicated over an explicit mesh, so the call would forward that input if
+        // partial evaluation applied `CallOperation::resolve_forwarded_outputs` to it. The known program therefore
+        // keeps each call unchanged, which a forwarded output would replace by the input.
+        let policy = ResidualPolicyReference::new(NothingSavable);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let call_program = |callee: TestProgram| {
+            build_program(callee.input_types().into_owned(), |builder, inputs| {
+                let callee = builder.import_program(callee);
+                let call = TestOperation::Call(CallOperation::new(0));
+                builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+            })
+        };
+        let empty_residual_program = indoc! {"
+            lambda  .
+            in ()"};
+
+        // Nominal dimensions remain scoped to the call, so a callee whose input type has one cannot share splits, even
+        // when it is otherwise pure.
+        let dimension = DimensionVariable::new("length", DimensionBounds::new(1, Some(8)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dimension)]))
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let program = call_program(build_program(vec![dynamic_type.into()], |builder, inputs| {
+            let output = builder
                 .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![inputs[0]], None)
                 .unwrap()[0];
-            let product = builder
-                .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![sine, inputs[1]], None)
-                .unwrap()[0];
-            vec![sine, product]
-        });
-        let program = build_program(vec![r#type; 2], |builder, inputs| {
-            let callee = builder.intern_callee(&Arc::new(callee), None).unwrap();
-            let call = TestOperation::Call(CallOperation::new(0));
-            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
-        });
-        assert_eq!(
-            program.partition(&[true, false]).unwrap().to_string(),
-            indoc! {"
-                partition [
-                    known_inputs=[0],
-                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
-                    outputs=[Known(0), Unknown(0)],
-                ]
-                known={
-                    lambda %0:f64[4] .
-                    let %1:f64[4] = call [derived_input_shardings=[_]] %0 [
-                        callee={
-                            lambda %0:f64[4] .
-                            let %1:f64[4] = sin %0
-                            in (%1)
-                        },
-                    ]
-                    in (%1, %1)
-                }
-                residual={
-                    lambda %0:f64[4], %1:f64[4] .
-                    let %2:f64[4] = call [derived_input_shardings=[_, _]] %0 %1 [
-                        callee={
-                            lambda %0:f64[4], %1:f64[4] .
-                            let %2:f64[4] = mul %1 %0
-                            in (%2)
-                        },
-                    ]
-                    in (%2)
-                }"},
+            vec![output, inputs[0]]
+        }));
+        let partition = program.partition_with_residual_policy(&[true], &policy).unwrap();
+        assert_eq!(partition.known_program().to_string(), program.to_string());
+        assert_eq!(partition.residual_program().to_string(), empty_residual_program);
+
+        // An ordered assertion must keep the same owning call and execution order.
+        let predicate_type = ArrayIrType::from(
+            ArrayType::scalar(DataType::Boolean).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap(),
         );
+        let program = call_program(build_program(vec![predicate_type], |builder, inputs| {
+            let assert = ArrayOperation::from(AssertOperation::<ArrayType>::new("required predicate"));
+            builder.add_instruction(assert, Vec::new(), vec![inputs[0]], None).unwrap();
+            vec![inputs[0]]
+        }));
+        let partition = program.partition_with_residual_policy(&[true], &policy).unwrap();
+        assert_eq!(partition.known_program().to_string(), program.to_string());
+        assert_eq!(partition.residual_program().to_string(), empty_residual_program);
+
+        // A reference input keeps the call from sharing a split, so its outputs are not forwarded either.
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let value_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh, 0)).unwrap().into();
+        let program = call_program(build_program(vec![reference_type, value_type], |_, inputs| inputs.to_vec()));
+        let partition = program.partition_with_residual_policy(&[true, true], &policy).unwrap();
+        assert_eq!(partition.known_program().to_string(), program.to_string());
+        assert_eq!(partition.residual_program().to_string(), empty_residual_program);
     }
 
     #[test]
     fn test_call_operation_partially_evaluate_splits_concrete_known_inputs() {
         // Partial evaluation splits a mixed `call` whose known inputs are concrete arrays exactly as it splits one
         // whose known inputs are symbolic. The known-side call runs immediately, so the output `a + a` is known and
-        // concrete, and the residual call keeps only `(a + a) * x`, fed by that known output (JAX's `out_fwd`).
+        // concrete, and the residual call keeps only `(a + a) * x`, fed by that known output (i.e., JAX's `out_fwd`).
         let array_type = ArrayType::new_static(DataType::F64, [4]);
         let r#type = ArrayIrType::Array(array_type.clone());
 
@@ -8141,7 +8320,68 @@ mod tests {
     }
 
     #[test]
-    fn test_call_operation_partially_evaluate_partitions_a_callee_with_a_dead_allocation() {
+    fn test_call_operation_partially_evaluate_places_callee_residuals_with_the_context_policy() {
+        // The callee computes `cos(dot(x, x)) * t`. Partitioning the caller with `x` known splits the call, and the
+        // policy then plans the callee partition, in which the known call returns the dot product instead of its
+        // cosine and the residual call recomputes the cosine.
+        let vector_type = ArrayIrType::Array(f64_vector_type(4));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let callee = Arc::new(build_program(vec![vector_type.clone(), scalar_type.clone()], |builder, inputs| {
+            let (x, t) = (inputs[0], inputs[1]);
+            let dot = DotOperation::new(DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]));
+            let product = builder.add_instruction(ArrayOperation::from(dot), Vec::new(), vec![x, x], None).unwrap()[0];
+            let cosine = builder
+                .add_instruction(ArrayOperation::from(CosOperation::new()), Vec::new(), vec![product], None)
+                .unwrap()[0];
+            builder
+                .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![cosine, t], None)
+                .unwrap()
+                .to_vec()
+        }));
+        let program = build_program(vec![vector_type, scalar_type], |builder, inputs| {
+            vec![add_call(builder, &callee, inputs.to_vec())]
+        });
+        let partition = program
+            .partition_with_residual_policy(&[true, false], &ResidualPolicyReference::new(DotsSavable))
+            .unwrap();
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:f64[4] .
+                    let %1:f64[] = call [derived_input_shardings=[_]] %0 [
+                        callee={
+                            lambda %0:f64[4] .
+                            let %1:f64[] = dot [
+                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            ] %0 %0
+                            in (%1)
+                        },
+                    ]
+                    in (%1)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = call [derived_input_shardings=[_, _]] %0 %1 [
+                        callee={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = cos %1
+                                %3:f64[] = mul %2 %0
+                            in (%3)
+                        },
+                    ]
+                    in (%2)
+                }"},
+        );
+    }
+
+    #[test]
+    fn test_call_operation_partially_evaluate_splits_callees_with_dead_allocations_per_call() {
         let r#type = ArrayIrType::Array(f64_vector_type(4));
         let callee = build_program(vec![r#type.clone(); 2], |builder, inputs| {
             let (known_input, runtime_input) = (inputs[0], inputs[1]);
@@ -8170,9 +8410,10 @@ mod tests {
             builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
         });
 
-        // The callee partitions like any other. Its pure prefix over the known input folds into the known side, which
-        // is staged into the outer program, while the runtime-dependent product stays in the residual callee, and the
-        // allocation, which nothing observes, is a dead intrinsic state operation that neither side retains.
+        // The reference type of the allocation keeps the split from being shared, so the call is split per call.
+        // Nothing accesses the allocation, so it is dead intrinsic state that neither side retains. The pure prefix
+        // over the known input folds into the known side, which is staged into the outer program, while the product
+        // with the unknown input stays in the residual callee.
         let outer = TracingContext::<TestValue, TestOperation>::new();
         let known = outer.input(r#type.clone());
         let evaluation = program
@@ -8266,9 +8507,9 @@ mod tests {
     #[test]
     fn test_call_operation_partially_evaluate_keeps_escaping_allocation_callees_whole() {
         // The callee `f(k, x) = (reference_new(k), k * x)` allocates a reference from the known input and returns it
-        // beside a runtime-dependent product. The allocation is computable from known inputs alone, but it escapes
-        // through a reference output whose later accesses the callee cannot see, so it is live state rather than dead
-        // intrinsic state, and the call stays whole instead of hoisting the allocation into the known side.
+        // beside a product that depends on the unknown input. The allocation is computable from known inputs alone, but
+        // it escapes through a reference output whose later accesses the callee cannot see, so it is live state rather
+        // than dead intrinsic state, and the call stays whole instead of hoisting the allocation into the known side.
         let r#type = ArrayIrType::Array(f64_vector_type(4));
         let callee = build_program(vec![r#type.clone(); 2], |builder, inputs| {
             let reference =
@@ -8311,7 +8552,7 @@ mod tests {
     }
 
     #[test]
-    fn test_call_operation_partially_evaluate_preserves_boundary_for_capture_bearing_callees() {
+    fn test_call_operation_partially_evaluate_keeps_capture_bearing_callees_whole() {
         // Partitioning does not remap the absolute indices of retained capture constants, so a mixed call whose
         // callee still holds one must keep its original boundary instead of splitting into derived callees whose
         // compacted or absent capture prefixes those indices would misname.
@@ -8399,944 +8640,9 @@ mod tests {
     }
 
     #[test]
-    fn test_call_operation_partially_evaluate_places_callee_residuals_with_the_context_policy() {
-        struct SaveDots;
-
-        impl ResidualPolicy<ArrayIrType> for SaveDots {
-            type Storage = NoStorage;
-
-            fn name(&self) -> &str {
-                "save_dots"
-            }
-
-            fn classify(
-                &self,
-                candidate: &ResidualCandidate<'_, ArrayIrType>,
-            ) -> Result<ResidualDecision<NoStorage>, ResidualRejection> {
-                Ok(match candidate.producers().iter().any(|producer| producer.payload::<DotOperation>().is_some()) {
-                    true => ResidualDecision::Save,
-                    false => ResidualDecision::Recompute,
-                })
-            }
-        }
-
-        // The callee computes `cos(dot(x, x)) * t`. Partitioning the caller with `x` known splits the call, and the
-        // policy then plans the callee partition, in which the known call returns the dot product instead of its
-        // cosine and the residual call recomputes the cosine.
-        let callee = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let x = builder.add_input(ArrayIrType::Array(f64_vector_type(4)));
-            let t = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
-            let dot = ArrayOperation::<Array>::from(DotOperation::new(DotDimensionNumbers::new(
-                vec![0],
-                vec![0],
-                vec![],
-                vec![],
-            )));
-            let product = builder.add_instruction(dot, Vec::new(), vec![x, x], None).unwrap()[0];
-            let cosine = ArrayOperation::<Array>::from(CosOperation::<ArrayType>::new());
-            let cosine = builder.add_instruction(cosine, Vec::new(), vec![product], None).unwrap()[0];
-            let tangent = ArrayOperation::<Array>::from(MulOperation::<ArrayType>::new());
-            let tangent = builder.add_instruction(tangent, Vec::new(), vec![cosine, t], None).unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![tangent], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let x = builder.add_input(ArrayIrType::Array(f64_vector_type(4)));
-        let t = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
-        let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
-        let output = builder
-            .add_instruction(TestOperation::Call(CallOperation::new(0)), vec![callee_region], vec![x, t], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let partition = program
-            .partition_with_residual_policy(&[true, false], &ResidualPolicyReference::new(SaveDots))
-            .unwrap();
-        assert_eq!(
-            partition.to_string(),
-            indoc! {"
-                partition [
-                    known_inputs=[0],
-                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
-                    outputs=[Unknown(0)],
-                ]
-                known={
-                    lambda %0:f64[4] .
-                    let %1:f64[] = call [derived_input_shardings=[_]] %0 [
-                        callee={
-                            lambda %0:f64[4] .
-                            let %1:f64[] = dot [
-                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                            ] %0 %0
-                            in (%1)
-                        },
-                    ]
-                    in (%1)
-                }
-                residual={
-                    lambda %0:f64[], %1:f64[] .
-                    let %2:f64[] = call [derived_input_shardings=[_, _]] %0 %1 [
-                        callee={
-                            lambda %0:f64[], %1:f64[] .
-                            let %2:f64[] = cos %1
-                                %3:f64[] = mul %2 %0
-                            in (%3)
-                        },
-                    ]
-                    in (%2)
-                }"},
-        );
-    }
-
-    #[test]
-    fn test_call_operation_partially_evaluate_retains_splits_of_mixed_calls() {
-        // Callee `g(k, x) = x ⊙ sin(k · k) + k` over a known `k` and an unknown `x`, whose known part computes
-        // `sin(k · k)` and whose residual part computes the rest. The repeated workload chains `h ↦ g(k, h)` from `x`,
-        // and the nested workload is the diamond `g_d(k, x) = g_{d-1}(k, x) + g_{d-1}(k, sin x)` with `g_0 = g`.
-        let matrix_type = residual_demand_matrix_type();
-        let callee = Arc::new(build_program(vec![matrix_type.clone(); 2], |builder, inputs| {
-            let (known, unknown) = (inputs[0], inputs[1]);
-            let dot = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]));
-            let product =
-                builder.add_instruction(ArrayOperation::from(dot), Vec::new(), vec![known, known], None).unwrap()[0];
-            let sine = builder
-                .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![product], None)
-                .unwrap()[0];
-            let scaled = builder
-                .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![unknown, sine], None)
-                .unwrap()[0];
-            builder
-                .add_instruction(ArrayOperation::from(AddOperation::new()), Vec::new(), vec![scaled, known], None)
-                .unwrap()
-                .to_vec()
-        }));
-        let program = |body: &dyn Fn(&mut ProgramBuilder<TestValue, TestOperation>, AtomId, AtomId) -> AtomId| {
-            build_program(vec![matrix_type.clone(); 2], |builder, inputs| vec![body(builder, inputs[0], inputs[1])])
-        };
-        let repeated = |count: usize| {
-            program(&|builder, known, unknown| {
-                (0..count).fold(unknown, |hidden, _| add_call(builder, &callee, vec![known, hidden]))
-            })
-        };
-        let nested = |depth: usize| {
-            let mut nested_callee = callee.clone();
-            for _ in 0..depth {
-                nested_callee = Arc::new(build_program(vec![matrix_type.clone(); 2], |builder, inputs| {
-                    let (known, unknown) = (inputs[0], inputs[1]);
-                    let first = add_call(builder, &nested_callee, vec![known, unknown]);
-                    let shifted = builder
-                        .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![unknown], None)
-                        .unwrap()[0];
-                    let second = add_call(builder, &nested_callee, vec![known, shifted]);
-                    builder
-                        .add_instruction(
-                            ArrayOperation::from(AddOperation::new()),
-                            Vec::new(),
-                            vec![first, second],
-                            None,
-                        )
-                        .unwrap()
-                        .to_vec()
-                }));
-            }
-            program(&|builder, known, unknown| add_call(builder, &nested_callee, vec![known, unknown]))
-        };
-        let closure_sizes = |program: &TestProgram| {
-            let partition = program.partition(&[true, false]).unwrap();
-            let closure_size = |program: &TestProgram| program.entry_region_ref().instructions_in_closure().count();
-            [closure_size(partition.known_program()), closure_size(partition.residual_program())]
-        };
-
-        // Every call shares one known callee and one residual callee, so both programs grow by one call per call site.
-        // Each nesting level adds its two known calls to the known program and its two residual calls, the shifted
-        // input, and the sum to the residual program, rather than copying the callees of the level below for each
-        // call, which would make both programs grow exponentially with the nesting depth. The outer partition returns
-        // `k` as a residual edge of its own, because `Program::partition` keeps one edge per residual feeder.
-        assert_eq!([1, 2, 4, 8].map(|count| closure_sizes(&repeated(count))), [[3, 3], [4, 4], [6, 6], [10, 10]]);
-        assert_eq!([1, 2, 3, 4].map(|depth| closure_sizes(&nested(depth))), [[5, 7], [7, 11], [9, 15], [11, 19]]);
-        let partition = repeated(2).partition(&[true, false]).unwrap();
-        assert_eq!(
-            format!("{}\n{}", partition.known_program(), partition.residual_program()),
-            indoc! {"
-                lambda %0:f32[2, 2] .
-                let %1:f32[2, 2] = call [derived_input_shardings=[_]] %0 [
-                    callee=^0={
-                        lambda %0:f32[2, 2] .
-                        let %1:f32[2, 2] = dot [
-                            dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                        ] %0 %0
-                            %2:f32[2, 2] = sin %1
-                        in (%2)
-                    },
-                ]
-                    %2:f32[2, 2] = call [derived_input_shardings=[_]] %0 [
-                        callee=^0,
-                    ]
-                in (%1, %0, %2)
-                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2], %3:f32[2, 2] .
-                let %4:f32[2, 2] = call [derived_input_shardings=[_, _, _]] %0 %1 %2 [
-                    callee=^0={
-                        lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
-                        let %3:f32[2, 2] = mul %0 %1
-                            %4:f32[2, 2] = add %3 %2
-                        in (%4)
-                    },
-                ]
-                    %5:f32[2, 2] = call [derived_input_shardings=[_, _, _]] %4 %3 %2 [
-                        callee=^0,
-                    ]
-                in (%5)"},
-        );
-
-        // The splits are retained by the region transform cache of the shared callee, so partitioning the same
-        // workload again binds the very same known callee instead of partitioning the callee again.
-        let first_callee = |program: &TestProgram| {
-            let region = program.instructions()[0].regions()[0];
-            program.region_ref(region).unwrap().interned_callee().unwrap().clone()
-        };
-        let other_partition = repeated(4).partition(&[true, false]).unwrap();
-        assert!(Arc::ptr_eq(&first_callee(partition.known_program()), &first_callee(other_partition.known_program())));
-
-        // Interpreting the known program and then the residual program reproduces the outputs of the original program.
-        let matrix = |elements: &[f32]| f32_value(ArrayType::new_static(DataType::F32, [2, 2]), elements);
-        let inputs = vec![matrix(&[0.5, -1.0, 0.25, 2.0]), matrix(&[0.3, 0.1, -0.2, 0.4])];
-        for program in [repeated(4), nested(3)] {
-            let partition = program.partition(&[true, false]).unwrap();
-            let known_inputs = partition.known_input_indices().iter().map(|index| inputs[*index].clone()).collect();
-            let known_outputs = partition.known_program().interpret(known_inputs).unwrap();
-            let known_output_count = partition.outputs().iter().filter(|output| output.is_known()).count();
-            let residual_inputs = partition
-                .residual_inputs()
-                .iter()
-                .map(|source| match *source {
-                    ResidualInputSource::UnknownInput(index) | ResidualInputSource::KnownInput(index) => {
-                        inputs[index].clone()
-                    }
-                    ResidualInputSource::KnownOutput(index) => known_outputs[index].clone(),
-                    ResidualInputSource::ResidualEdge(edge) => known_outputs[known_output_count + edge].clone(),
-                })
-                .collect();
-            assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
-            assert_eq!(partition.residual_program().interpret(residual_inputs), program.interpret(inputs.clone()));
-        }
-    }
-
-    #[test]
-    fn test_call_operation_partially_evaluate_retains_splits_of_effectful_mixed_calls() {
-        let callee = effectful_mixed_callee(EffectClass::UnorderedIo);
-        let program = |callee: &Arc<TestProgram>, count: usize| {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
-            let known = builder.add_input(scalar_type.clone());
-            let unknown = builder.add_input(scalar_type);
-            let output = (0..count).fold(unknown, |value, _| add_call(&mut builder, callee, vec![known, value]));
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let statistics = |program: &TestProgram| {
-            let partition = program.partition(&[true, false]).unwrap();
-            let count = |program: &TestProgram| {
-                let region = program.entry_region_ref();
-                [region.instructions_in_closure().count(), region.region_ids_in_closure().len()]
-            };
-            [count(partition.known_program()), count(partition.residual_program())]
-        };
-
-        // These counts precede lowering and count each shared callee once. Unordered effects let every known call
-        // remain known, so sharing changes representation without changing the number or placement of runtime prints.
-        assert_eq!(
-            [1, 2, 4, 16].map(|count| statistics(&program(&callee, count))),
-            [[[3, 2], [3, 2]], [[4, 2], [4, 2]], [[6, 2], [6, 2]], [[18, 2], [18, 2]]],
-        );
-        let partition = program(&callee, 1).partition(&[true, false]).unwrap();
-        let other = program(&callee, 16).partition(&[true, false]).unwrap();
-        let first_callee = |program: &TestProgram| {
-            program
-                .region_ref(program.instructions()[0].regions()[0])
-                .unwrap()
-                .interned_callee()
-                .unwrap()
-                .clone()
-        };
-        assert_eq!(
-            partition.to_string(),
-            indoc! {"
-                partition [
-                    known_inputs=[0],
-                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
-                    outputs=[Unknown(0)],
-                ]
-                known={
-                    lambda %0:f32[] .
-                    let %1:f32[] = call [derived_input_shardings=[_]] %0 [
-                        callee={
-                            lambda %0:f32[] .
-                            let %1:f32[] = mul %0 %0
-                                %2:f32[] = print [label=known, effect_class=unordered_io] %1
-                            in (%2)
-                        },
-                    ]
-                    in (%1)
-                }
-                residual={
-                    lambda %0:f32[], %1:f32[] .
-                    let %2:f32[] = call [derived_input_shardings=[_, _]] %0 %1 [
-                        callee={
-                            lambda %0:f32[], %1:f32[] .
-                            let %2:f32[] = mul %0 %1
-                                %3:f32[] = print [label=residual, effect_class=unordered_io] %2
-                            in (%3)
-                        },
-                    ]
-                    in (%2)
-                }"},
-        );
-        assert!(Arc::ptr_eq(&first_callee(partition.known_program()), &first_callee(other.known_program())));
-        assert!(Arc::ptr_eq(&first_callee(partition.residual_program()), &first_callee(other.residual_program())));
-
-        let mut nested = callee;
-        let mut counts = Vec::new();
-        for _ in 0..6 {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
-            let known = builder.add_input(scalar_type.clone());
-            let unknown = builder.add_input(scalar_type);
-            let first = add_call(&mut builder, &nested, vec![known, unknown]);
-            let second = add_call(&mut builder, &nested, vec![known, unknown]);
-            let sum = builder
-                .add_instruction(ArrayOperation::from(AddOperation::new()), Vec::new(), vec![first, second], None)
-                .unwrap()[0];
-            nested = Arc::new(
-                builder
-                    .build::<Vec<TestValue>, Vec<TestValue>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
-                    .unwrap(),
-            );
-            counts.push(statistics(&program(&nested, 1)));
-        }
-        assert_eq!(
-            counts,
-            vec![
-                [[5, 3], [6, 3]],
-                [[7, 4], [9, 4]],
-                [[9, 5], [12, 5]],
-                [[11, 6], [15, 6]],
-                [[13, 7], [18, 7]],
-                [[15, 8], [21, 8]],
-            ],
-        );
-    }
-
-    #[test]
-    fn test_call_operation_partially_evaluate_cached_effectful_splits_preserve_order() {
-        // With a policy that saves nothing, a prefix print of the unknown input keeps the ordered known print of the
-        // callee in the residual program, which binds the known callee that the split cache retained for the call
-        // without that prefix.
-        let callee = effectful_mixed_callee(EffectClass::OrderedIo);
-        let program = |prefix: bool| {
-            let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
-            build_program(vec![scalar_type.clone(), scalar_type], |builder, inputs| {
-                if prefix {
-                    let print = ArrayOperation::from(PrintOperation::<ArrayType>::new("before"));
-                    builder.add_instruction(print, Vec::new(), vec![inputs[1]], None).unwrap();
-                }
-                vec![add_call(builder, &callee, vec![inputs[0], inputs[1]])]
-            })
-        };
-        let policy = ResidualPolicyReference::new(NothingSavable);
-        let warm = program(false).partition_with_residual_policy(&[true, false], &policy).unwrap();
-        let partition = program(true).partition_with_residual_policy(&[true, false], &policy).unwrap();
-        assert_eq!(
-            partition.to_string(),
-            indoc! {"
-                partition [
-                    known_inputs=[0],
-                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
-                    outputs=[Unknown(0)],
-                ]
-                known={
-                    lambda %0:f32[] .
-                    in (%0)
-                }
-                residual={
-                    lambda %0:f32[], %1:f32[] .
-                    let %2:f32[] = print [label=before] %0
-                        %3:f32[] = call [derived_input_shardings=[_]] %1 [
-                            callee={
-                                lambda %0:f32[] .
-                                let %1:f32[] = mul %0 %0
-                                    %2:f32[] = print [label=known] %1
-                                in (%2)
-                            },
-                        ]
-                        %4:f32[] = call [derived_input_shardings=[_, _]] %0 %3 [
-                            callee={
-                                lambda %0:f32[], %1:f32[] .
-                                let %2:f32[] = mul %0 %1
-                                    %3:f32[] = print [label=residual] %2
-                                in (%3)
-                            },
-                        ]
-                    in (%4)
-                }"},
-        );
-        let known_callee =
-            warm.known_program().region_ref(warm.known_program().instructions()[0].regions()[0]).unwrap();
-        let cached_callee = partition
-            .residual_program()
-            .region_ref(partition.residual_program().instructions()[1].regions()[0])
-            .unwrap();
-        assert!(Arc::ptr_eq(known_callee.interned_callee().unwrap(), cached_callee.interned_callee().unwrap()));
-    }
-
-    #[test]
-    fn test_call_operation_partially_evaluate_cached_effectful_splits_keep_outputless_residuals() {
-        // The callee returns the square of its known input and prints its unknown input, so the residual program keeps
-        // that print in a residual call without outputs, also when the split comes from the cache.
-        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
-        let callee = Arc::new(build_program(vec![scalar_type.clone(); 2], |builder, inputs| {
-            let squared = builder
-                .add_instruction(
-                    ArrayOperation::from(MulOperation::new()),
-                    Vec::new(),
-                    vec![inputs[0], inputs[0]],
-                    None,
-                )
-                .unwrap()[0];
-            let print = ArrayOperation::from(PrintOperation::<ArrayType>::new("residual"));
-            builder.add_instruction(print, Vec::new(), vec![inputs[1]], None).unwrap();
-            vec![squared]
-        }));
-        let program =
-            build_program(vec![scalar_type; 2], |builder, inputs| vec![add_call(builder, &callee, inputs.to_vec())]);
-        let warm = program.partition(&[true, false]).unwrap();
-        let partition = program.partition(&[true, false]).unwrap();
-        assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0)]);
-        assert_eq!(
-            partition.residual_program().to_string(),
-            indoc! {"
-                lambda %0:f32[] .
-                let () = call [derived_input_shardings=[_]] %0 [
-                    callee={
-                        lambda %0:f32[] .
-                        let %1:f32[] = print [label=residual] %0
-                        in ()
-                    },
-                ]
-                in ()"},
-        );
-        let scalar = |value: f32| f32_value(ArrayType::scalar(DataType::F32), &[value]);
-        assert_eq!(partition.known_program().interpret(vec![scalar(2.0)]), Ok(vec![scalar(4.0)]));
-        for unknown in [3.0, 5.0] {
-            assert_eq!(partition.residual_program().interpret(vec![scalar(unknown)]), Ok(Vec::new()));
-        }
-        assert_eq!(warm.residual_program().to_string(), partition.residual_program().to_string());
-    }
-
-    #[test]
-    fn test_call_operation_partially_evaluate_keeps_forced_copies_under_specialization() {
-        // Specializing a program never folds a copy that every execution must make (i.e., a `place` with `may_alias`
-        // disabled), so an all-known call whose callee makes one stays residual, and two executions of the specialized
-        // program return arrays with distinct storage. An all-known call without such a copy still folds.
-        let array_type = ArrayType::new_static(DataType::F64, [4]);
-        let r#type = ArrayIrType::Array(array_type.clone());
-        let array = |values: &[f64]| f64_value(array_type.clone(), values);
-        let storage = |value: &TestValue| match value {
-            ArrayIrValue::Array(array) => array.shared_storage_bytes().clone(),
-            _ => panic!("expected an array value"),
-        };
-
-        // Program `(a, x) -> call(a, x)` whose callee returns `copy(a)` or `-a`.
-        let program = |copy: bool| {
-            let callee = Arc::new(build_program(vec![r#type.clone(); 2], |builder, inputs| {
-                let operation = if copy {
-                    ArrayOperation::from(PlaceOperation::new(None, None).with_may_alias(false))
-                } else {
-                    ArrayOperation::from(NegOperation::new())
-                };
-                builder.add_instruction(operation, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
-            }));
-            build_program(vec![r#type.clone(); 2], |builder, inputs| {
-                let callee = builder.intern_callee(&callee, None).unwrap();
-                let call = TestOperation::Call(CallOperation::new(0));
-                builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
-            })
-        };
-        let context = EagerContext::<TestValue, TestOperation>::new();
-        let known = array(&[1.0, 2.0, 3.0, 4.0]);
-
-        // An all-known call whose callee forces a copy stays residual as a whole.
-        let evaluation = program(true)
-            .partially_evaluate_in_context(
-                &context,
-                &[PartialValue::Known(known.clone()), PartialValue::Known(known.clone())],
-            )
-            .unwrap();
-        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
-        assert_eq!(
-            evaluation.program().to_string(),
-            indoc! {"
-                lambda %0:f64[4], %1:f64[4] .
-                let %2:f64[4] = call %0 %1 [
-                    callee={
-                        lambda %0:f64[4], %1:f64[4] .
-                        let %2:f64[4] = place [may_alias=false] %0
-                        in (%2)
-                    },
-                ]
-                in (%2)"},
-        );
-        let first = evaluation.interpret(&context, &[]).unwrap();
-        let second = evaluation.interpret(&context, &[]).unwrap();
-        assert_eq!(first, vec![known.clone()]);
-        assert_eq!(second, vec![known.clone()]);
-        assert!(!Arc::ptr_eq(&storage(&first[0]), &storage(&second[0])));
-        assert!(!Arc::ptr_eq(&storage(&first[0]), &storage(&known)));
-
-        // An all-known call without a forced copy folds.
-        let evaluation = program(false)
-            .partially_evaluate_in_context(&context, &[PartialValue::Known(known.clone()), PartialValue::Known(known)])
-            .unwrap();
-        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Known(array(&[-1.0, -2.0, -3.0, -4.0]))]);
-    }
-
-    #[test]
-    fn test_call_operation_partially_evaluate_does_not_reuse_splits_that_fold_forced_copies() {
-        // The split of a mixed call is cached per callee and partial evaluation configuration, so a split that a
-        // partition which folds copies computed is not reused by a specialization, which must not fold them.
-        let array_type = ArrayType::new_static(DataType::F64, [4]);
-        let r#type = ArrayIrType::Array(array_type.clone());
-        let array = |values: &[f64]| f64_value(array_type.clone(), values);
-        let storage = |value: &TestValue| match value {
-            ArrayIrValue::Array(array) => array.shared_storage_bytes().clone(),
-            _ => panic!("expected an array value"),
-        };
-
-        // Program `(a, x) -> call(a, x)` whose callee returns `(copy(a), -x)`.
-        let callee = Arc::new(build_program(vec![r#type.clone(); 2], |builder, inputs| {
-            let place = ArrayOperation::from(PlaceOperation::new(None, None).with_may_alias(false));
-            let copy = builder.add_instruction(place, Vec::new(), vec![inputs[0]], None).unwrap()[0];
-            let negated = builder
-                .add_instruction(ArrayOperation::from(NegOperation::new()), Vec::new(), vec![inputs[1]], None)
-                .unwrap()[0];
-            vec![copy, negated]
-        }));
-        let mixed = build_program(vec![r#type.clone(); 2], |builder, inputs| {
-            let callee = builder.intern_callee(&callee, None).unwrap();
-            let call = TestOperation::Call(CallOperation::new(0));
-            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
-        });
-        let context = EagerContext::<TestValue, TestOperation>::new();
-        let known = array(&[1.0, 2.0, 3.0, 4.0]);
-        let unknown = array(&[5.0, 6.0, 7.0, 8.0]);
-
-        // A mixed call whose split was cached by a partition that folds copies does not reuse that split.
-        mixed.partition(&[true, false]).unwrap();
-        let evaluation = mixed
-            .partially_evaluate_in_context(
-                &context,
-                &[PartialValue::Known(known.clone()), PartialValue::Unknown(r#type)],
-            )
-            .unwrap();
-        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]);
-        assert_eq!(
-            evaluation.program().to_string(),
-            indoc! {"
-                lambda %0:f64[4], %1:f64[4] .
-                let %2:f64[4], %3:f64[4] = call %1 %0 [
-                    callee={
-                        lambda %0:f64[4], %1:f64[4] .
-                        let %2:f64[4] = place [may_alias=false] %0
-                            %3:f64[4] = neg %1
-                        in (%2, %3)
-                    },
-                ]
-                in (%2, %3)"},
-        );
-        let first = evaluation.interpret(&context, std::slice::from_ref(&unknown)).unwrap();
-        let second = evaluation.interpret(&context, std::slice::from_ref(&unknown)).unwrap();
-        assert_eq!(first, vec![known.clone(), array(&[-5.0, -6.0, -7.0, -8.0])]);
-        assert!(!Arc::ptr_eq(&storage(&first[0]), &storage(&second[0])));
-        assert!(!Arc::ptr_eq(&storage(&first[0]), &storage(&known)));
-    }
-
-    #[test]
-    fn test_call_operation_partially_evaluate_preserves_guarded_known_callees() {
-        let policy = ResidualPolicyReference::new(NothingSavable);
-        let check_boundary = |callee: TestProgram, capture_count: usize| {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let inputs = callee
-                .input_types()
-                .into_owned()
-                .into_iter()
-                .map(|r#type| builder.add_input(r#type))
-                .collect::<Vec<_>>();
-            let input_count = inputs.len();
-            let callee = builder.import_program(callee);
-            let outputs = builder
-                .add_instruction(TestOperation::Call(CallOperation::new(capture_count)), vec![callee], inputs, None)
-                .unwrap()
-                .to_vec();
-            let output_count = outputs.len();
-            let program = builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(
-                    outputs,
-                    vec![Placeholder; input_count],
-                    vec![Placeholder; output_count],
-                )
-                .unwrap();
-            let partition = program.partition_with_residual_policy(&vec![true; input_count], &policy).unwrap();
-            assert_eq!(partition.known_program().to_string(), program.to_string());
-            assert_eq!(
-                partition.residual_program().to_string(),
-                indoc! {"
-                    lambda  .
-                    in ()"},
-            );
-        };
-
-        // Each callee returns an array input whose type is replicated over an explicit mesh, which is the only public
-        // array argument of its call, so forwarding would replace that output by the input if the guard did not keep
-        // the boundary of the call.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-
-        // Nominal dimensions remain scoped to the call, even when the callee is otherwise pure.
-        let dimension = DimensionVariable::new("length", DimensionBounds::new(1, Some(8)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(dimension)]))
-            .with_sharding(Sharding::replicated(mesh.clone(), 1))
-            .unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let input = builder.add_input(dynamic_type.into());
-        let output = builder
-            .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![input], None)
-            .unwrap()[0];
-        check_boundary(
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output, input], vec![Placeholder], vec![Placeholder; 2])
-                .unwrap(),
-            0,
-        );
-
-        // An ordered assertion must keep the same owning call and execution order.
-        let predicate_type = ArrayIrType::from(
-            ArrayType::scalar(DataType::Boolean).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap(),
-        );
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let predicate = builder.add_input(predicate_type);
-        builder
-            .add_instruction(
-                ArrayOperation::from(AssertOperation::<ArrayType>::new("required predicate")),
-                Vec::new(),
-                vec![predicate],
-                None,
-            )
-            .unwrap();
-        check_boundary(
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
-                .unwrap(),
-            0,
-        );
-
-        // Reference handles keep their existing boundary semantics too.
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
-        let value = builder
-            .add_input(ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh, 0)).unwrap().into());
-        check_boundary(
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(
-                    vec![reference, value],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
-                .unwrap(),
-            0,
-        );
-
-        // A known value without a staged parent atom must not trigger per-operation replay. The same guard keeps
-        // concrete eager calls whole. Using a literal in a live trace makes the retained call directly observable.
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-        let callee = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let outer = TracingContext::<TestValue, TestOperation>::new();
-        let context = PartialEvaluationContext::new(outer.clone()).with_residual_policy(&policy);
-        let literal = Array::from_elements(ArrayType::scalar(DataType::Boolean), &[true]).unwrap();
-        let input = context.lift(ArrayIrValue::Array(literal)).unwrap();
-        context.bind(TestOperation::Call(CallOperation::new(0)), vec![callee], &[input]).unwrap();
-        let known_program = outer
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), Vec::new(), Vec::new())
-            .unwrap();
-        assert_eq!(
-            known_program.to_string(),
-            indoc! {"
-                lambda  .
-                let %0:bool[] = const true
-                    %1:bool[] = call %0 [
-                        callee={
-                            lambda %0:bool[] .
-                            in (%0)
-                        },
-                    ]
-                in ()"},
-        );
-    }
-
-    #[test]
-    fn test_call_operation_partially_evaluate_forwards_unchanged_inputs() {
-        // The callee `f(a) = (a, sin(a))` returns its only input, whose type is replicated over an explicit mesh, and
-        // its call places nothing. The call therefore returns `a` unchanged whatever its argument is, so partial
-        // evaluation under a residual policy resolves the first output of an all-known call to the call input, and the
-        // known call no longer returns it.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let r#type: ArrayIrType = ArrayType::new_static(DataType::F32, [4])
-            .with_sharding(Sharding::replicated(mesh, 1))
-            .unwrap()
-            .into();
-        let callee = Arc::new(build_program(vec![r#type.clone()], |builder, inputs| {
-            let sine = builder
-                .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![inputs[0]], None)
-                .unwrap()[0];
-            vec![inputs[0], sine]
-        }));
-        let program = build_program(vec![r#type], |builder, inputs| {
-            let callee = builder.intern_callee(&callee, None).unwrap();
-            let call = TestOperation::Call(CallOperation::new(0));
-            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
-        });
-        let policy = ResidualPolicyReference::new(NothingSavable);
-        assert_eq!(
-            program.partition_with_residual_policy(&[true], &policy).unwrap().to_string(),
-            indoc! {"
-                partition [known_inputs=[0], residual_inputs=[], outputs=[Known(0), Known(1)]]
-                known={
-                    lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
-                    let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = call %0 [
-                        callee={
-                            lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
-                            let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = sin %0
-                            in (%1)
-                        },
-                    ]
-                    in (%0, %1)
-                }
-                residual={
-                    lambda  .
-                    in ()
-                }"},
-        );
-    }
-
-    #[test]
-    fn test_call_operation_partially_evaluate_does_not_forward_inputs_across_call_boundaries() {
-        // The callee `f(a, x) = (a, sin(a) * x)` returns its first input, which the boundary of the compiled function
-        // that it comes from replicates on its own devices. Logical types do not record those devices, so neither an
-        // all-known call of it nor the known call of its split may be replaced by its input under a residual policy.
-        // The inputs are typed over an explicit mesh, so a known call whose only argument is `a` would otherwise be
-        // forwarded, which is the known call of the split under a policy that saves `sin(a)`. The all-known call also
-        // has `x` as a second public argument, and under a policy that saves nothing the known callee of the split is
-        // empty, so the whole call stays residual.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
-        let replicated = Sharding::replicated(mesh, 1);
-        let r#type: ArrayIrType =
-            ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated.clone()).unwrap().into();
-        let callee = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let a = builder.add_input(r#type.clone());
-            let x = builder.add_input(r#type.clone());
-            let sine = builder
-                .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![a], None)
-                .unwrap()[0];
-            let product = builder
-                .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![sine, x], None)
-                .unwrap()[0];
-            Arc::new(
-                builder
-                    .build::<Vec<TestValue>, Vec<TestValue>>(
-                        vec![a, product],
-                        vec![Placeholder; 2],
-                        vec![Placeholder; 2],
-                    )
-                    .unwrap(),
-            )
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let a = builder.add_input(r#type.clone());
-        let x = builder.add_input(r#type.clone());
-        let callee_region = builder.intern_callee(&callee, None).unwrap();
-        let call = CallOperation::new(0).with_boundary(Some(&device_mesh), Vec::new(), vec![Some(replicated), None]);
-        let outputs = builder
-            .add_instruction(TestOperation::Call(call), vec![callee_region], vec![a, x], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-        let policy = ResidualPolicyReference::new(NothingSavable);
-        assert_eq!(
-            program.partition_with_residual_policy(&[true, true], &policy).unwrap().to_string(),
-            indoc! {"
-                partition [known_inputs=[0, 1], residual_inputs=[], outputs=[Known(0), Known(1)]]
-                known={
-                    lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
-                    let %2:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %3:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = call [output_shardings=[{mesh<['x'=2:explicit]>, [{}]}, _], devices=[0, 1]] %0 %1 [
-                        callee={
-                            lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
-                            let %2:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = sin %0
-                                %3:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = mul %2 %1
-                            in (%0, %3)
-                        },
-                    ]
-                    in (%2, %3)
-                }
-                residual={
-                    lambda  .
-                    in ()
-                }"},
-        );
-        assert_eq!(
-            program.partition_with_residual_policy(&[true, false], &policy).unwrap().to_string(),
-            indoc! {"
-                partition [
-                    known_inputs=[0],
-                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
-                    outputs=[Unknown(0), Unknown(1)],
-                ]
-                known={
-                    lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
-                    in (%0)
-                }
-                residual={
-                    lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
-                    let %2:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %3:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = call [output_shardings=[{mesh<['x'=2:explicit]>, [{}]}, _], devices=[0, 1]] %1 %0 [
-                        callee={
-                            lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
-                            let %2:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = sin %0
-                                %3:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = mul %2 %1
-                            in (%0, %3)
-                        },
-                    ]
-                    in (%2, %3)
-                }"},
-        );
-        let policy = ResidualPolicyReference::new(EverythingSavable);
-        assert_eq!(
-            program.partition_with_residual_policy(&[true, false], &policy).unwrap().to_string(),
-            indoc! {"
-                partition [
-                    known_inputs=[0],
-                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
-                    outputs=[Known(0), Unknown(0)],
-                ]
-                known={
-                    lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
-                    let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %2:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = call [
-                        output_shardings=[{mesh<['x'=2:explicit]>, [{}]}, _],
-                        derived_input_shardings=[{mesh<['x'=2:explicit]>, [{}]}],
-                        devices=[0, 1],
-                    ] %0 [
-                        callee={
-                            lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
-                            let %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = sin %0
-                            in (%0, %1)
-                        },
-                    ]
-                    in (%1, %2)
-                }
-                residual={
-                    lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
-                    let %2:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = call [derived_input_shardings=[{mesh<['x'=2:explicit]>, [{}]}, _], devices=[0, 1]] %0 %1 [
-                        callee={
-                            lambda %0:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}], %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
-                            let %2:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] = mul %1 %0
-                            in (%2)
-                        },
-                    ]
-                    in (%2)
-                }"},
-        );
-    }
-
-    #[test]
-    fn test_call_operation_partially_evaluate_keeps_calls_with_several_public_arguments_under_a_staged_known_side() {
-        // The callee `g(w, b) = (w, w ⊙ b)` returns its first argument and has two public array arguments, and its call
-        // is one that a transform derived, whose boundary places neither argument (e.g., the primal call of a
-        // linearized callee). Partitioning a caller with both inputs known stages the known side, and partial
-        // evaluation keeps `w` as an output of the call instead of forwarding the argument, because a staged known
-        // program may later be interpreted eagerly, where a committed `b` selects the devices of the call, moves `w`
-        // there, and commits it (refer to `CallOperation::resolve_forwarded_outputs`). The known program therefore
-        // returns the output of the call, which a residual planner then plans as a value of its own. Both arguments
-        // are replicated over an explicit mesh, so that their number alone keeps `w` from being forwarded.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let matrix_type: ArrayIrType = ArrayType::new_static(DataType::F32, [2, 2])
-            .with_sharding(Sharding::replicated(mesh, 2))
-            .unwrap()
-            .into();
-        let callee = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let left = builder.add_input(matrix_type.clone());
-            let right = builder.add_input(matrix_type.clone());
-            let output = builder
-                .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![left, right], None)
-                .unwrap()[0];
-            Arc::new(
-                builder
-                    .build::<Vec<TestValue>, Vec<TestValue>>(
-                        vec![left, output],
-                        vec![Placeholder; 2],
-                        vec![Placeholder; 2],
-                    )
-                    .unwrap(),
-            )
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let w = builder.add_input(matrix_type.clone());
-        let b = builder.add_input(matrix_type);
-        let callee_region = builder.intern_callee(&callee, None).unwrap();
-        let derived = CallOperation::<ArrayIrType>::new(0).with_derived_input_shardings(vec![None, None]);
-        let outputs = builder
-            .add_instruction(TestOperation::Call(derived), vec![callee_region], vec![w, b], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-        let partition = program
-            .partition_with_residual_policy(&[true, true], &ResidualPolicyReference::new(NothingSavable))
-            .unwrap();
-        assert_eq!(
-            partition.to_string(),
-            indoc! {"
-                partition [known_inputs=[0, 1], residual_inputs=[], outputs=[Known(0), Known(1)]]
-                known={
-                    lambda %0:f32[2, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}], %1:f32[2, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}] .
-                    let %2:f32[2, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}], %3:f32[2, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}] = call [derived_input_shardings=[_, _]] %0 %1 [
-                        callee={
-                            lambda %0:f32[2, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}], %1:f32[2, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}] .
-                            let %2:f32[2, 2][sharding={mesh<['x'=2:explicit]>, [{}, {}]}] = mul %0 %1
-                            in (%0, %2)
-                        },
-                    ]
-                    in (%2, %3)
-                }
-                residual={
-                    lambda  .
-                    in ()
-                }"},
-        );
-    }
-
-    #[test]
     fn test_call_operation_split_on_residual_demand() {
+        // An all-known call whose callee saves interior values under the residual policy is split into a known call
+        // that also returns those values and a replay call that recomputes the demanded output from them.
         let callee = residual_demand_leaf_callee();
         let repeated = |count: usize, policy: Option<ResidualPolicyReference<ArrayIrType>>| {
             residual_demand_program(policy, |builder, weights, bias| {
@@ -9555,75 +8861,6 @@ mod tests {
     }
 
     #[test]
-    fn test_call_operation_split_on_residual_demand_replays_all_known_calls_without_saved_interior_values() {
-        let callee = residual_demand_leaf_callee();
-        let repeated = |count: usize, policy: Option<ResidualPolicyReference<ArrayIrType>>| {
-            residual_demand_program(policy, |builder, weights, bias| {
-                (0..count).fold(weights, |hidden, _| add_call(builder, &callee, vec![hidden, bias]))
-            })
-        };
-
-        // A policy that saves nothing splits no call. The tangent replays every call whole from the saved weights and
-        // bias, which it saves no matter how many calls there are, and the calls keep sharing one callee.
-        let policy = ResidualPolicyReference::new(NothingSavable);
-        assert_eq!(
-            [1, 2, 4, 8].map(|count| residual_demand_statistics(&repeated(count, Some(policy.clone())), &[0])),
-            [[2, 7, 8], [2, 8, 9], [2, 10, 11], [2, 14, 15]],
-        );
-        let linearization = repeated(2, Some(policy.clone())).linearize_with_respect_to(&[0]).unwrap();
-        assert_eq!(
-            format!("{}\n{}", linearization.primal(), linearization.tangent()),
-            indoc! {"
-                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
-                let %3:f32[2, 2] = call %1 %2 [
-                    callee=^0={
-                        lambda %0:f32[2, 2], %1:f32[2, 2] .
-                        let %2:f32[2, 2] = dot [
-                            dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                        ] %0 %1
-                            %3:f32[2, 2] = sin %2
-                            %4:f32[2, 2] = cos %2
-                            %5:f32[2, 2] = mul %3 %4
-                            %6:f32[2, 2] = add %5 %0
-                        in (%6)
-                    },
-                ]
-                    %4:f32[2, 2] = call %3 %2 [
-                        callee=^0,
-                    ]
-                    %5:f32[2, 2] = mul %0 %4
-                in (%5, %1, %2)
-                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
-                let %3:f32[2, 2] = rematerialize [differentiated=true] %0 %1 %2 [
-                    body={
-                        lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
-                        let %3:f32[2, 2] = call %1 %2 [
-                            callee=^0={
-                                lambda %0:f32[2, 2], %1:f32[2, 2] .
-                                let %2:f32[2, 2] = dot [
-                                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                                ] %0 %1
-                                    %3:f32[2, 2] = sin %2
-                                    %4:f32[2, 2] = cos %2
-                                    %5:f32[2, 2] = mul %3 %4
-                                    %6:f32[2, 2] = add %5 %0
-                                in (%6)
-                            },
-                        ]
-                            %4:f32[2, 2] = call %3 %2 [
-                                callee=^0,
-                            ]
-                            %5:f32[2, 2] = mul %4 %0
-                        in (%5)
-                    },
-                ]
-                in (%3)"},
-        );
-
-        assert_residual_demand_linearizations_match(&repeated(4, Some(policy)), &repeated(4, None), &[0], None);
-    }
-
-    #[test]
     fn test_call_operation_split_on_residual_demand_places_all_known_callee_intermediates() {
         // Only the expanded activation is needed by the tangent. Its all-known call must expose the compact tagged
         // scale to the policy, saving 4 KiB instead of 256 KiB, so the call is split on residual demand into a known
@@ -9663,43 +8900,8 @@ mod tests {
                     .unwrap()
                     .to_vec()
             });
-
-        // Ordinary partial evaluation preserves the boundary of the original compiled call and the expanded residual.
-        let ordinary = program.partition(&[false, true]).unwrap();
-        assert_eq!(ordinary.known_program().output_types(), vec![ArrayIrType::from(expanded_type.clone())]);
-        assert_eq!(
-            ordinary.to_string(),
-            indoc! {"
-                partition [
-                    known_inputs=[1],
-                    residual_inputs=[UnknownInput(0), ResidualEdge(0)],
-                    outputs=[Unknown(0)],
-                ]
-                known={
-                    lambda %0:f32[1024] .
-                    let %1:f32[64, 1024] = call %0 [
-                        callee={
-                            lambda %0:f32[1024] .
-                            let %1:f32[1024] = sin %0
-                                %2:f32[1024] = tag [key=scale] %1
-                                %3:f32[64, 1024] = broadcast [output_type=f32[64, 1024], output_axes=[1]] %2
-                            in (%3)
-                        },
-                    ]
-                    in (%1)
-                }
-                residual={
-                    lambda %0:f32[64, 1024], %1:f32[64, 1024] .
-                    let %2:f32[64, 1024] = mul %0 %1
-                    in (%2)
-                }"},
-        );
-        assert_eq!(expanded_type.element_count().unwrap().unwrap() * size_of::<f32>(), 262_144);
-
         let policy = ResidualPolicyReference::new(SaveOnlyTheseNames::new(["scale"]));
         let placed = program.partition_with_residual_policy(&[false, true], &policy).unwrap();
-        assert_eq!(placed.known_program().output_types(), vec![ArrayIrType::from(compact_type.clone())]);
-        assert_eq!(compact_type.element_count().unwrap().unwrap() * size_of::<f32>(), 4096);
         assert_eq!(
             placed.to_string(),
             indoc! {"
@@ -9744,11 +8946,6 @@ mod tests {
                 builder.add_instruction(rematerialize, vec![body], inputs.to_vec(), None).unwrap().to_vec()
             });
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
-        assert_eq!(linearization.residual_count(), 1);
-        assert_eq!(
-            linearization.primal().output_types(),
-            vec![ArrayIrType::from(expanded_type.clone()), ArrayIrType::from(compact_type.clone())],
-        );
         assert_eq!(
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
@@ -9798,14 +8995,7 @@ mod tests {
             let pullback = linearization.pullback().unwrap().into_program().interpret(pullback_inputs).unwrap();
             vec![value, tangent[0].clone(), pullback[0].clone()]
         };
-        let actual = evaluate(&linearization);
-        assert_eq!(actual, evaluate(&plain_linearization));
-        for value in &actual {
-            let ArrayIrValue::Array(array) = value else {
-                panic!("expected an array value");
-            };
-            assert!(array.elements::<f32>().unwrap().iter().all(|value| value.is_finite() && *value != 0.0));
-        }
+        assert_eq!(evaluate(&linearization), evaluate(&plain_linearization));
     }
 
     #[test]
@@ -9904,113 +9094,33 @@ mod tests {
     }
 
     #[test]
-    fn test_call_operation_split_on_residual_demand_keeps_effectful_all_known_calls_whole() {
-        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let input = builder.add_input(scalar_type.clone());
-        builder
-            .add_instruction(
-                ArrayOperation::from(PrintOperation::<ArrayType>::new("known")),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap();
-        let callee = Arc::new(
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
-                .unwrap(),
-        );
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let known = builder.add_input(scalar_type.clone());
-        let unknown = builder.add_input(scalar_type);
-        let forwarded = add_call(&mut builder, &callee, vec![known]);
-        let output = builder
-            .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![forwarded, unknown], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let partition = program
-            .partition_with_residual_policy(&[true, false], &ResidualPolicyReference::new(NothingSavable))
-            .unwrap();
-        assert_eq!(
-            partition.to_string(),
-            indoc! {"
-                partition [
-                    known_inputs=[0],
-                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
-                    outputs=[Unknown(0)],
-                ]
-                known={
-                    lambda %0:f32[] .
-                    let %1:f32[] = call %0 [
-                        callee={
-                            lambda %0:f32[] .
-                            let %1:f32[] = print [label=known] %0
-                            in (%0)
-                        },
-                    ]
-                    in (%1)
-                }
-                residual={
-                    lambda %0:f32[], %1:f32[] .
-                    let %2:f32[] = mul %1 %0
-                    in (%2)
-                }"},
-        );
-    }
-
-    #[test]
-    fn test_call_operation_split_on_residual_demand_saves_guarded_known_callee_outputs() {
-        // The callee computes a matrix product that `DotsSavable` saves, so replaying its call would recompute a saved
-        // value. An ordered assertion keeps the boundary of the call, so the residual planner saves the demanded output
-        // of the call instead of splitting it.
+    fn test_call_operation_split_on_residual_demand_keeps_effectful_calls_whole() {
+        // The callee computes a matrix product that `DotsSavable` saves, so a pure call would be split on residual
+        // demand. An ordered assertion in the callee keeps the call whole instead, so the residual planner saves the
+        // demanded output of the call.
         let matrix_type = residual_demand_matrix_type();
         let predicate_type = ArrayIrType::from(ArrayType::scalar(DataType::Boolean));
-        let dot = ArrayOperation::<Array>::from(DotOperation::new(DotDimensionNumbers::new(
-            vec![1],
-            vec![0],
-            vec![],
-            vec![],
-        )));
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let predicate = builder.add_input(predicate_type);
-        let input = builder.add_input(matrix_type.clone());
-        builder
-            .add_instruction(
-                ArrayOperation::from(AssertOperation::<ArrayType>::new("required predicate")),
-                Vec::new(),
-                vec![predicate],
-                None,
-            )
-            .unwrap();
-        let product = builder.add_instruction(dot, Vec::new(), vec![input, input], None).unwrap()[0];
-        let output = builder
-            .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![product], None)
-            .unwrap()[0];
-        let callee = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let inputs = callee
-            .input_types()
-            .into_owned()
-            .into_iter()
-            .map(|r#type| builder.add_input(r#type))
-            .collect::<Vec<_>>();
-        let tangent = builder.add_input(matrix_type);
-        let callee = builder.import_program(callee);
-        let called = builder
-            .add_instruction(TestOperation::Call(CallOperation::new(0)), vec![callee], inputs, None)
-            .unwrap()[0];
-        let output = builder
-            .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![called, tangent], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
-            .unwrap();
+        let callee = build_program(vec![predicate_type.clone(), matrix_type.clone()], |builder, inputs| {
+            let (predicate, input) = (inputs[0], inputs[1]);
+            let assert = ArrayOperation::from(AssertOperation::<ArrayType>::new("required predicate"));
+            builder.add_instruction(assert, Vec::new(), vec![predicate], None).unwrap();
+            let dot = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]));
+            let product =
+                builder.add_instruction(ArrayOperation::from(dot), Vec::new(), vec![input, input], None).unwrap()[0];
+            builder
+                .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![product], None)
+                .unwrap()
+                .to_vec()
+        });
+        let program = build_program(vec![predicate_type, matrix_type.clone(), matrix_type], |builder, inputs| {
+            let callee = builder.import_program(callee);
+            let call = TestOperation::Call(CallOperation::new(0));
+            let called = builder.add_instruction(call, vec![callee], inputs[..2].to_vec(), None).unwrap()[0];
+            builder
+                .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![called, inputs[2]], None)
+                .unwrap()
+                .to_vec()
+        });
         let partition = program
             .partition_with_residual_policy(&[true, true, false], &ResidualPolicyReference::new(DotsSavable))
             .unwrap();
@@ -10046,114 +9156,72 @@ mod tests {
     }
 
     #[test]
-    fn test_call_operation_split_on_residual_demand_ignores_undemanded_known_outputs() {
-        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let input = builder.add_input(scalar_type.clone());
-        let sine = builder
-            .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![input], None)
-            .unwrap()[0];
-        let needed = builder
-            .add_instruction(
-                ArrayOperation::from(TagOperation::<ArrayType>::new("needed")),
-                Vec::new(),
-                vec![sine],
-                None,
-            )
-            .unwrap()[0];
-        let cosine = builder
-            .add_instruction(ArrayOperation::from(CosOperation::new()), Vec::new(), vec![input], None)
-            .unwrap()[0];
-        let unused = builder
-            .add_instruction(
-                ArrayOperation::from(TagOperation::<ArrayType>::new("unused")),
-                Vec::new(),
-                vec![cosine],
-                None,
-            )
-            .unwrap()[0];
-        let callee = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![needed, unused], vec![Placeholder], vec![Placeholder; 2])
-            .unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let known = builder.add_input(scalar_type.clone());
-        let unknown = builder.add_input(scalar_type.clone());
-        let callee = builder.import_program(callee);
-        let called = builder
-            .add_instruction(TestOperation::Call(CallOperation::new(0)), vec![callee], vec![known], None)
-            .unwrap()
-            .to_vec();
-        let first = builder
-            .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![called[0], unknown], None)
-            .unwrap()[0];
-        let second = builder
-            .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![called[1], unknown], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(
-                vec![first, second, called[1]],
-                vec![Placeholder; 2],
-                vec![Placeholder; 3],
-            )
-            .unwrap();
-        let policy =
-            ResidualPolicyReference::new(RematerializationPolicyFn::new::<ArrayIrType>(|candidate| {
-                if candidate.producers().iter().any(|producer| {
-                    producer.payload::<TagOperation<ArrayType>>().is_some_and(|tag| tag.key() == "unused")
-                }) {
-                    Err(ResidualRejection::new("the unused result must not cross the residual boundary"))
-                } else {
-                    Ok(ResidualDecision::<NoStorage>::Save)
-                }
-            }));
+    fn test_call_operation_split_on_residual_demand_keeps_calls_without_saved_interior_values_whole() {
+        let callee = residual_demand_leaf_callee();
+        let repeated = |count: usize, policy: Option<ResidualPolicyReference<ArrayIrType>>| {
+            residual_demand_program(policy, |builder, weights, bias| {
+                (0..count).fold(weights, |hidden, _| add_call(builder, &callee, vec![hidden, bias]))
+            })
+        };
 
-        // The second call output remains a primal result. Its presence must not classify it as a residual. The call
-        // keeps its boundary, and the policy saves its first output, which it classifies through the callee.
-        let primal_only = program.clone().with_outputs(&[0, 2]).unwrap();
-        let placed = primal_only.partition_with_residual_policy(&[true, false], &policy).unwrap();
-        assert_eq!(placed.known_program().output_types(), vec![scalar_type.clone(), scalar_type]);
+        // A policy that saves nothing splits no call. The tangent replays every call whole from the saved weights and
+        // bias, which it saves no matter how many calls there are, and the calls keep sharing one callee.
+        let policy = ResidualPolicyReference::new(NothingSavable);
         assert_eq!(
-            placed.to_string(),
+            [1, 2, 4, 8].map(|count| residual_demand_statistics(&repeated(count, Some(policy.clone())), &[0])),
+            [[2, 7, 8], [2, 8, 9], [2, 10, 11], [2, 14, 15]],
+        );
+        let linearization = repeated(2, Some(policy.clone())).linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
-                partition [
-                    known_inputs=[0],
-                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
-                    outputs=[Unknown(0), Known(0)],
+                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
+                let %3:f32[2, 2] = call %1 %2 [
+                    callee=^0={
+                        lambda %0:f32[2, 2], %1:f32[2, 2] .
+                        let %2:f32[2, 2] = dot [
+                            dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        ] %0 %1
+                            %3:f32[2, 2] = sin %2
+                            %4:f32[2, 2] = cos %2
+                            %5:f32[2, 2] = mul %3 %4
+                            %6:f32[2, 2] = add %5 %0
+                        in (%6)
+                    },
                 ]
-                known={
-                    lambda %0:f32[] .
-                    let %1:f32[], %2:f32[] = call %0 [
-                        callee={
-                            lambda %0:f32[] .
-                            let %1:f32[] = sin %0
-                                %2:f32[] = tag [key=needed] %1
-                                %3:f32[] = cos %0
-                                %4:f32[] = tag [key=unused] %3
-                            in (%2, %4)
-                        },
+                    %4:f32[2, 2] = call %3 %2 [
+                        callee=^0,
                     ]
-                    in (%2, %1)
-                }
-                residual={
-                    lambda %0:f32[], %1:f32[] .
-                    let %2:f32[] = mul %1 %0
-                    in (%2)
-                }"},
+                    %5:f32[2, 2] = mul %0 %4
+                in (%5, %1, %2)
+                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
+                let %3:f32[2, 2] = rematerialize [differentiated=true] %0 %1 %2 [
+                    body={
+                        lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
+                        let %3:f32[2, 2] = call %1 %2 [
+                            callee=^0={
+                                lambda %0:f32[2, 2], %1:f32[2, 2] .
+                                let %2:f32[2, 2] = dot [
+                                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                                ] %0 %1
+                                    %3:f32[2, 2] = sin %2
+                                    %4:f32[2, 2] = cos %2
+                                    %5:f32[2, 2] = mul %3 %4
+                                    %6:f32[2, 2] = add %5 %0
+                                in (%6)
+                            },
+                        ]
+                            %4:f32[2, 2] = call %3 %2 [
+                                callee=^0,
+                            ]
+                            %5:f32[2, 2] = mul %4 %0
+                        in (%5)
+                    },
+                ]
+                in (%3)"},
         );
 
-        // Requiring the same result in residual work must propagate the original rejection instead.
-        assert_eq!(
-            program
-                .with_outputs(&[0, 1])
-                .unwrap()
-                .partition_with_residual_policy(&[true, false], &policy)
-                .map(|_| ())
-                .map_err(ResidualPolicyError::from),
-            Err(ResidualPolicyError::Rejected {
-                policy: policy.name().to_owned(),
-                rejection: ResidualRejection::new("the unused result must not cross the residual boundary"),
-            }),
-        );
+        assert_residual_demand_linearizations_match(&repeated(4, Some(policy)), &repeated(4, None), &[0], None);
     }
 
     #[test]
@@ -12145,367 +11213,5 @@ mod tests {
         let rebound = first.renamed(&renamed).unwrap();
         assert_eq!(rebound.definitions(), vec![local]);
         assert_ne!(rebound.outputs, first.outputs);
-    }
-
-    #[test]
-    fn test_call_operation_split() {
-        /// Supplies only the source callee and partition mode, while the test provides the partition closure directly.
-        struct SplitCacheDriver {
-            /// Callee shared across both partition modes.
-            callee: Arc<TestProgram>,
-
-            /// Mode to include in the retained split's key.
-            repeated_residual: bool,
-        }
-
-        impl RegionDriver<TestValue, TestOperation> for SplitCacheDriver {
-            fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, TestValue, TestOperation>>
-            where
-                TestValue: 'r,
-                TestOperation: 'r,
-            {
-                std::iter::once(self.callee.entry_region_ref())
-            }
-        }
-
-        impl PartialEvaluationDriver<TracingContext<TestValue, TestOperation>> for SplitCacheDriver {
-            fn partially_evaluate_region(
-                &self,
-                _: &PartialEvaluationContext<TracingContext<TestValue, TestOperation>>,
-                _: usize,
-                _: Vec<PartialEvaluationValue<Tracer<TracingContext<TestValue, TestOperation>>>>,
-            ) -> Result<Vec<PartialEvaluationValue<Tracer<TracingContext<TestValue, TestOperation>>>>, ProgramError>
-            {
-                unreachable!("the split cache fixture does not recursively evaluate regions")
-            }
-
-            fn partially_evaluate_program(
-                &self,
-                _: &PartialEvaluationContext<TracingContext<TestValue, TestOperation>>,
-                _: RegionRef<'_, TestValue, TestOperation>,
-                _: &[PartialValue<Tracer<TracingContext<TestValue, TestOperation>>>],
-            ) -> Result<PartialEvaluation<TracingContext<TestValue, TestOperation>>, ProgramError> {
-                unreachable!("the split cache fixture does not recursively evaluate programs")
-            }
-
-            fn partition_program(
-                &self,
-                _: &PartialEvaluationContext<TracingContext<TestValue, TestOperation>>,
-                _: RegionRef<'_, TestValue, TestOperation>,
-                _: &[bool],
-            ) -> Result<PartitionedProgram<TestValue, TestOperation>, ProgramError> {
-                unreachable!("the split cache fixture supplies the partition closure directly")
-            }
-
-            fn partitions_for_repeated_residual_calls(&self) -> bool {
-                self.repeated_residual
-            }
-        }
-
-        // Mixed call `g(k, x) = print(x * print(k * k))`, whose known coefficient and unknown value are its inputs.
-        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
-        let callee = effectful_mixed_callee(EffectClass::UnorderedIo);
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let known = builder.add_input(scalar_type.clone());
-        let squared = builder
-            .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![known, known], None)
-            .unwrap()[0];
-        let ordinary_known = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![squared], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let unknown = builder.add_input(scalar_type.clone());
-        let coefficient = builder.add_input(scalar_type.clone());
-        let printed = builder
-            .add_instruction(
-                ArrayOperation::from(
-                    PrintOperation::<ArrayType>::new("known").with_effect_class(EffectClass::UnorderedIo),
-                ),
-                Vec::new(),
-                vec![coefficient],
-                None,
-            )
-            .unwrap()[0];
-        let product = builder
-            .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![unknown, printed], None)
-            .unwrap()[0];
-        let output = builder
-            .add_instruction(
-                ArrayOperation::from(
-                    PrintOperation::<ArrayType>::new("residual").with_effect_class(EffectClass::UnorderedIo),
-                ),
-                Vec::new(),
-                vec![product],
-                None,
-            )
-            .unwrap()[0];
-        let ordinary_residual = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let partitions = Cell::new(0);
-        let mut renderings = Vec::new();
-        for repeated_residual in [false, false, true, true] {
-            let driver = SplitCacheDriver { callee: callee.clone(), repeated_residual };
-            let outer = TracingContext::<TestValue, TestOperation>::new();
-            let known = outer.input(scalar_type.clone());
-            let context = PartialEvaluationContext::new(outer).with_allow_effect_folding(false);
-            let inputs = [context.known_value(known), context.unknown_input(scalar_type.clone(), 1)];
-            let partition = |callee: RegionRef<'_, TestValue, TestOperation>| {
-                partitions.set(partitions.get() + 1);
-                if repeated_residual {
-                    // Partitioning for repeated calls permits known effects in its fresh analysis despite the caller's
-                    // effect folding restriction. Emission still defers those effects through the active context.
-                    callee.partition(&[true, false])
-                } else {
-                    // Ordinary specialization inherits that restriction, so only the pure square remains known.
-                    PartitionedProgram::from_parts(
-                        ordinary_known.clone(),
-                        ordinary_residual.clone(),
-                        2,
-                        vec![0],
-                        vec![ResidualInputSource::UnknownInput(1), ResidualInputSource::ResidualEdge(0)],
-                        vec![PartialEvaluationOutput::Unknown(0)],
-                    )
-                }
-            };
-            let outputs = CallOperation::<ArrayIrType>::new(0)
-                .split(&context, &driver, &inputs, CallSplitKind::Knownness(vec![true, false]), &partition)
-                .unwrap();
-            let known_program = context
-                .parent()
-                .builder()
-                .borrow()
-                .clone()
-                .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new())
-                .unwrap();
-            drop(inputs);
-            let evaluation = context.into_evaluation(outputs).unwrap();
-            renderings.push(format!("{known_program}\n{}", evaluation.program()));
-        }
-
-        // Ordinary specialization stages the pure square on the known side, while partitioning for repeated calls
-        // defers the known print, so the whole split lands in the residual program. Repeating a mode reuses its split.
-        let ordinary = indoc! {"
-            lambda %0:f32[] .
-            let %1:f32[] = call [derived_input_shardings=[_]] %0 [
-                callee={
-                    lambda %0:f32[] .
-                    let %1:f32[] = mul %0 %0
-                    in (%1)
-                },
-            ]
-            in ()
-            lambda %0:f32[], %1:f32[] .
-            let %2:f32[] = call [derived_input_shardings=[_, _]] %0 %1 [
-                callee={
-                    lambda %0:f32[], %1:f32[] .
-                    let %2:f32[] = print [label=known, effect_class=unordered_io] %1
-                        %3:f32[] = mul %0 %2
-                        %4:f32[] = print [label=residual, effect_class=unordered_io] %3
-                    in (%4)
-                },
-            ]
-            in (%2)"};
-        let repeated = indoc! {"
-            lambda %0:f32[] .
-            in ()
-            lambda %0:f32[], %1:f32[] .
-            let %2:f32[] = call [derived_input_shardings=[_]] %1 [
-                callee={
-                    lambda %0:f32[] .
-                    let %1:f32[] = mul %0 %0
-                        %2:f32[] = print [label=known, effect_class=unordered_io] %1
-                    in (%2)
-                },
-            ]
-                %3:f32[] = call [derived_input_shardings=[_, _]] %0 %2 [
-                    callee={
-                        lambda %0:f32[], %1:f32[] .
-                        let %2:f32[] = mul %0 %1
-                            %3:f32[] = print [label=residual, effect_class=unordered_io] %2
-                        in (%3)
-                    },
-                ]
-            in (%3)"};
-        assert_eq!(renderings, vec![ordinary, ordinary, repeated, repeated]);
-        // Debug builds re-derive every cache hit to validate deterministic derivation.
-        assert_eq!(partitions.get(), if cfg!(debug_assertions) { 4 } else { 2 });
-    }
-
-    #[test]
-    fn test_call_operation_refine_derived_value() {
-        // Each case stages the value of a derived call at its `declared` type and states the `refined` type that it has
-        // in the caller, over a mesh with an explicit axis `x` and a manual axis `y`.
-        let axes = |axis_type: MeshAxisType| {
-            vec![MeshAxis::new("x", 2, axis_type).unwrap(), MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap()]
-        };
-        let mesh = LogicalMesh::new(axes(MeshAxisType::Explicit)).unwrap();
-        let typed = |mesh: &LogicalMesh, dimensions: Vec<ShardingDimension>| {
-            let r#type = ArrayType::new_static(DataType::F32, vec![4; dimensions.len()]);
-            r#type.with_sharding(Sharding::new(mesh.clone(), dimensions).unwrap()).unwrap()
-        };
-        let with_sharding = |r#type: &ArrayType, sharding: Sharding| r#type.clone().with_sharding(sharding).unwrap();
-        let stage = |declared: &ArrayType, refined: &ArrayType, call_mesh: Option<&DeviceMesh>| {
-            let context = TracingContext::<TestValue, TestOperation>::new();
-            let value = context.input(ArrayIrType::Array(declared.clone()));
-            let call = CallOperation::<ArrayIrType>::new(0).with_boundary(call_mesh, Vec::new(), Vec::new());
-            let value = call.refine_derived_value(&context, ArrayIrType::Array(refined.clone()), value).unwrap();
-            context
-                .builder()
-                .borrow()
-                .clone()
-                .build::<Vec<TestValue>, Vec<TestValue>>(
-                    vec![value.atom_id().unwrap()],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
-                .unwrap()
-                .to_string()
-        };
-        let (replicated, unconstrained, split) =
-            (ShardingDimension::Replicated, ShardingDimension::Unconstrained, ShardingDimension::sharded(["x"]));
-        let untracked = f32_vector_type(4);
-        let replicated_vector = typed(&mesh, vec![replicated.clone()]);
-        let sharding = replicated_vector.sharding().unwrap().clone();
-
-        // A value whose type tracks a sharding without reduction state, manual variation, or a split over manual axes
-        // is cast to a type of the same shape that tracks none.
-        let untracked_cases = [
-            replicated_vector.clone(),
-            typed(&mesh, vec![unconstrained.clone()]),
-            typed(&mesh, vec![split.clone()]),
-            with_sharding(&untracked, sharding.clone().with_unreduced_axes(["y"]).unwrap()),
-            with_sharding(&untracked, sharding.clone().with_reduced_axes(["y"]).unwrap()),
-            with_sharding(&untracked, sharding.clone().with_varying_manual_axes(["y"]).unwrap()),
-            typed(&mesh, vec![ShardingDimension::sharded(["y"])]),
-        ];
-        assert_eq!(
-            untracked_cases
-                .iter()
-                .map(|declared| stage(declared, &untracked, None))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            indoc! {"
-                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}] .
-                let %1:f32[4] = cast [
-                    type=f32[4],
-                    inputs=[f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}]],
-                ] %0
-                in (%1)
-                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}]}] .
-                let %1:f32[4] = cast [
-                    type=f32[4],
-                    inputs=[f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}]}]],
-                ] %0
-                in (%1)
-                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{'x'}]}] .
-                let %1:f32[4] = cast [
-                    type=f32[4],
-                    inputs=[f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{'x'}]}]],
-                ] %0
-                in (%1)
-                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}], unreduced={'y'}}] .
-                in (%0)
-                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}], reduced={'y'}}] .
-                in (%0)
-                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}], varying_manual={'y'}}] .
-                in (%0)
-                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{'y'}]}] .
-                in (%0)"},
-        );
-
-        // Equal types, types that track no sharding, and types of other shapes leave the value as it is.
-        assert_eq!(
-            [
-                stage(&replicated_vector, &replicated_vector, None),
-                stage(&untracked, &untracked, None),
-                stage(&replicated_vector, &f32_vector_type(3), None),
-            ]
-            .join("\n"),
-            indoc! {"
-                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}] .
-                in (%0)
-                lambda %0:f32[4] .
-                in (%0)
-                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}] .
-                in (%0)"},
-        );
-
-        // Shardings that differ only in dimensions that one leaves unconstrained and the other replicates place a
-        // value alike, so it is cast, in either direction. Any other difference in placement over a mesh of the same
-        // topology is a reshard, and a difference in reduction state or manual variation leaves the value as it is.
-        let open = typed(&mesh, vec![unconstrained.clone(), split.clone()]);
-        let closed = typed(&mesh, vec![replicated.clone(), split.clone()]);
-        let auto_mesh = LogicalMesh::new(axes(MeshAxisType::Auto)).unwrap();
-        let replicated_matrix = typed(&mesh, vec![replicated.clone(), replicated.clone()]);
-        let matrix_sharding = replicated_matrix.sharding().unwrap().clone();
-        assert_eq!(
-            [
-                stage(&open, &closed, None),
-                stage(&closed, &open, None),
-                stage(&typed(&mesh, vec![unconstrained.clone(), replicated.clone()]), &closed, None),
-                stage(&replicated_matrix, &closed, None),
-                stage(&open, &typed(&auto_mesh, vec![replicated.clone(), replicated.clone()]), None),
-                stage(
-                    &typed(&mesh, vec![unconstrained.clone(), replicated.clone()]),
-                    &with_sharding(&replicated_matrix, matrix_sharding.clone().with_unreduced_axes(["y"]).unwrap()),
-                    None,
-                ),
-                stage(
-                    &typed(&mesh, vec![unconstrained.clone(), replicated.clone()]),
-                    &with_sharding(&replicated_matrix, matrix_sharding.with_varying_manual_axes(["y"]).unwrap()),
-                    None,
-                ),
-            ]
-            .join("\n"),
-            indoc! {"
-                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}] .
-                let %1:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] = cast [
-                    type=f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}],
-                    inputs=[f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}]],
-                ] %0
-                in (%1)
-                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] .
-                let %1:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}] = cast [
-                    type=f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}],
-                    inputs=[f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}]],
-                ] %0
-                in (%1)
-                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {}]}] .
-                let %1:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] = reshard [sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] %0
-                in (%1)
-                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {}]}] .
-                let %1:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] = reshard [sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] %0
-                in (%1)
-                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}] .
-                let %1:f32[4, 4][sharding={mesh<['x'=2:auto, 'y'=2:manual]>, [{}, {}]}] = reshard [sharding={mesh<['x'=2:auto, 'y'=2:manual]>, [{}, {}]}] %0
-                in (%1)
-                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {}]}] .
-                in (%0)
-                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {}]}] .
-                in (%0)"},
-        );
-
-        // A value whose type tracks no sharding is cast to a refined type that tracks one, unless the call names
-        // devices over a mesh of another topology, on which the value lives.
-        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("z", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let devices = (0..4).map(|id| Device::new(id, 0)).collect::<Vec<_>>();
-        let call_mesh = DeviceMesh::new(other_mesh, devices).unwrap();
-        assert_eq!(
-            stage(&untracked, &replicated_vector, None),
-            indoc! {"
-                lambda %0:f32[4] .
-                let %1:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}] = cast [
-                    type=f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}],
-                    inputs=[f32[4]],
-                ] %0
-                in (%1)"},
-        );
-        assert_eq!(
-            stage(&untracked, &replicated_vector, Some(&call_mesh)),
-            indoc! {"
-                lambda %0:f32[4] .
-                in (%0)"},
-        );
     }
 }
