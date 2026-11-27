@@ -32,14 +32,13 @@ mod tests {
         ReverseModeDifferentiate, Sharding, Trace, TransferToMemory, Typed,
     };
 
-    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{ProgramBuilder, test_vector_type, to_mlir_module_for_plain_program};
     use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, Error, LoweringError, Session, compile,
-        to_mlir_module_for_program,
+        Array, ArrayConstant, CompiledFunction, Constant, Error, LowerableProgram, LoweringError,
+        ProgramLoweringOptions, Session, compile,
     };
 
     use super::*;
@@ -236,15 +235,10 @@ mod tests {
             "#}.replace("KIND", kind);
             assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
             let program = program.into_unprojected::<Constant, Operation>().unwrap();
-            let types = vec![r#type];
-            assert_eq!(
-                to_mlir_module_for_program(&program, &[], &types, &types, "main", None, None).unwrap(),
-                expected,
-            );
+            assert_eq!(program.to_mlir_module("main").unwrap(), expected,);
 
             // A program compiled for CUDA can place its boundary in pinned host memory only.
-            let lowered =
-                lower_mlir_module_for_program(&program, &[], &types, &types, "main", None, None, Some("cuda"));
+            let lowered = program.lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda")));
             if memory == (Memory::Host { pinned: true }) {
                 assert_eq!(lowered.unwrap().into_stable_hlo(), expected);
             } else {

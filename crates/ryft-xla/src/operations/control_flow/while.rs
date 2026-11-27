@@ -531,7 +531,7 @@ mod tests {
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::sessions::tests::{domain_mesh, program_array, read_first_shard};
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
-    use crate::{Constant, Session, Value, to_mlir_module_for_program};
+    use crate::{Constant, LowerableProgram, ProgramLoweringOptions, Session, Value};
 
     use super::*;
 
@@ -555,8 +555,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo =
-            to_mlir_module_for_program(&program, &[], &state_type, &state_type, "main", None, None).unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -641,8 +640,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo =
-            to_mlir_module_for_program(&program, &[], &state_type, &state_type, "main", None, None).unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -732,16 +730,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![dynamic_vector_type.clone(), scalar_type],
-            &vec![dynamic_vector_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -821,16 +810,7 @@ mod tests {
             .unwrap();
         assert_eq!(program.output_types(), vec![Type::Array(static_type.clone()), Type::Array(static_type.clone())],);
 
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![state_type, static_type.clone()],
-            &vec![static_type.clone(), static_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -1010,8 +990,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo =
-            to_mlir_module_for_program(&program, &[], &state_type, &state_type, "main", None, None).unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -1367,16 +1346,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap();
-            let module = to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![predicate_type, state_type.clone()],
-                &vec![state_type],
-                "main",
-                None,
-                None,
-            )
-            .unwrap();
+            let module = program.to_mlir_module("main").unwrap();
 
             assert_eq!(module, expected, "upper bound {upper_bound:?}");
         }
@@ -1443,16 +1413,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![dynamic_vector_type, state_type.clone()],
-            &state_type,
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
 
         // The condition region `or`-reduces the carried `tensor<3xi1>` predicate, the array carry takes one
         // `stablehlo.select` against the carried predicate, and the dimension carry (i.e., `%iterArg`) is returned
@@ -1563,16 +1524,24 @@ mod tests {
                 predicate = "bool[][sharding={mesh<['x'=2:explicit]>, []}]",
             ),
         );
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &state_types.to_vec(),
-            &vec![vector_type.clone()],
-            "main",
-            Some(&[scalar_sharding.clone(), scalar_sharding, vector_sharding.clone()]),
-            Some(&[vector_sharding]),
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&state_types.to_vec())
+                    .with_output_types(&vec![vector_type.clone()])
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(
+                        (&[scalar_sharding.clone(), scalar_sharding, vector_sharding.clone()])
+                            .iter()
+                            .cloned()
+                            .map(Some)
+                            .collect(),
+                    )
+                    .with_exact_output_shardings(vec![Some(vector_sharding)]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"

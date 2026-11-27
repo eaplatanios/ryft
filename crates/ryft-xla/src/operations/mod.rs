@@ -29,16 +29,17 @@ use ryft_core::{
     Operation as CoreOperation, OperationProvider, OrOperation, PadOperation, ParallelAllGatherOperation,
     ParallelAllToAllOperation, ParallelBroadcastOperation, ParallelCastOperation, ParallelPermuteOperation,
     ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation,
-    PlaceOperation, PowOperation, PrintOperation, ProgramError, RaggedDotOperation, RealOperation, ReduceOperation,
-    ReducePrecisionOperation, ReductionKind, ReferenceAccessDescriptor, ReferenceAccessOperation,
-    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Region as CoreRegion, RegionRef,
-    RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation,
-    RsqrtOperation, SaturatingSubOperation, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation,
-    ScatterReductionKind, SelectOperation, ShardMapOperation, SignOperation, SinOperation, SliceOperation,
-    SortDirection, SortOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation, TanOperation,
-    TanhOperation, TransferToMemoryOperation, Transform, TransformArtifact, TransposeOperation, UnavailableCustomRules,
-    UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
+    Parameterized, PlaceOperation, PowOperation, PrintOperation, Program, ProgramError, RaggedDotOperation,
+    RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionKind, ReferenceAccessDescriptor,
+    ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation,
+    ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
+    Region as CoreRegion, RegionRef, RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation,
+    RngBitGeneratorOperation, RoundOperation, RsqrtOperation, SaturatingSubOperation, ScaledDotOperation,
+    ScanOperation, ScatterMode, ScatterOperation, ScatterReductionKind, SelectOperation, ShardMapOperation,
+    SignOperation, SinOperation, SliceOperation, SortDirection, SortOperation, SqrtOperation, StopGradientOperation,
+    SubOperation, TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, Transform, TransformArtifact,
+    TransposeOperation, UnavailableCustomRules, UpdateSliceOperation, Value, ValueProjection, WhileOperation,
+    XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_kernels::KernelReferenceOperation;
 use ryft_mlir::dialects::stable_hlo;
@@ -50,6 +51,7 @@ use ryft_mlir::{
 
 use crate::lowering::DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked, XlaZeroPadded};
 use crate::lowering::emissions::emitted_capture_reads;
+use crate::lowering::extensions::without_stale_call_meshes;
 use crate::lowering::types::{lower_restore_dynamic_dimensions, lower_tensor_type, physical_bound_type};
 use crate::lowering::{DataDependentPaddingDiscipline, MlirLowerableValue, validate_local_output_placement};
 use crate::operations::composites::NamedCompositeImplementation;
@@ -827,6 +829,18 @@ impl LowerableOperation for Operation {
     }
 
     #[inline]
+    fn without_stale_call_meshes<Input, Output>(
+        program: Program<Constant, Self, Input, Output>,
+        target_platform: Option<&str>,
+    ) -> Result<Program<Constant, Self, Input, Output>, ProgramError>
+    where
+        Input: Parameterized<Constant>,
+        Output: Parameterized<Constant>,
+    {
+        without_stale_call_meshes(program, target_platform)
+    }
+
+    #[inline]
     fn unread_captures(
         callee: RegionRef<'_, Constant, Self>,
         capture_count: usize,
@@ -1103,11 +1117,11 @@ impl Transform<CoreRegion<Constant, Operation>> for UnreadLiftedCapturesAnalysis
 /// Returns, for each input of `callee`, the callee of a call whose first `capture_count` inputs are its lifted
 /// captures, whether it is a capture that an executable of the callee has no argument for (i.e., an array of a static
 /// shape that no region which lowering emits for `target_platform` reads, refer to [`emitted_capture_reads`] and
-/// `lower_mlir_module_for_program_with_effect_boundary`), or [`None`] when the callee has no such capture. An eager
-/// application of the call (refer to `CallEagerExtension::eager_decision`) requires nothing of such a capture, as an
-/// execution of the callee requires nothing of it. The flags depend on the callee, the number of its captures, and the
-/// platform alone, so they are derived once for each of them and retained with the callee, and repeated applications
-/// only look them up.
+/// `LoweredModule::new`), or [`None`] when the callee has no such
+/// capture. An eager application of the call (refer to `CallEagerExtension::eager_decision`) requires nothing of such a
+/// capture, as an execution of the callee requires nothing of it. The flags depend on the callee, the number of its
+/// captures, and the platform alone, so they are derived once for each of them and retained with the callee, and
+/// repeated applications only look them up.
 pub(crate) fn unread_lifted_captures(
     callee: RegionRef<'_, Constant, Operation>,
     capture_count: usize,
@@ -1299,7 +1313,7 @@ mod tests {
     };
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes, vector_type};
-    use crate::{Array, ArrayConstant, ArrayTracer, Constant, Session, Tracer, Type, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, ArrayTracer, Constant, LowerableProgram, Session, Tracer, Type};
 
     use super::*;
 
@@ -2164,11 +2178,8 @@ mod tests {
     #[test]
     fn test_normalize_elementwise_operand_in_traced_programs() {
         let plain_program = elementwise_normalization_program();
-        let input_types = plain_program.input_types().into_owned();
-        let output_types = plain_program.output_types().into_owned();
         let program = plain_program.into_unprojected::<Constant, Operation>().unwrap();
-        let stablehlo =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
         assert_elementwise_operands_are_normalized(&stablehlo);
     }
 

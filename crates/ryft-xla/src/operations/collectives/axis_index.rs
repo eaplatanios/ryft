@@ -135,7 +135,7 @@ mod tests {
 
     use crate::lowering::tests::{shard_map_module, static_sharded_array_type, test_manual_mesh, test_vector_type};
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayTracer, ExecutionArguments, FromPjrt, ProgramExtension, Session, TracedProgram, trace};
+    use crate::{Array, ArrayTracer, ExecutionArguments, FromPjrt, LowerableProgram, Session, TracedProgram, trace};
 
     use super::*;
 

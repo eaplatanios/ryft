@@ -10,8 +10,8 @@ use ryft_core::{
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 use ryft_xla::{
-    Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, Operation, Type, lower_operation_variants,
-    to_mlir_module_for_program,
+    Constant, Error, LowerableOperation, LowerableOperationFamily, LowerableProgram, Lowerer, Operation, Type,
+    lower_operation_variants,
 };
 
 /// Downstream operation that doubles its input, which `ryft-xla` knows nothing about.
@@ -95,9 +95,7 @@ fn test_downstream_operation_family_lowers_through_the_public_api() {
     let program = builder
         .build::<Vec<Constant>, Vec<Constant>>(vec![sum], vec![Placeholder], vec![Placeholder])
         .unwrap();
-    let module =
-        to_mlir_module_for_program(&program, &[], &vec![vector_type.clone()], &vec![vector_type], "main", None, None)
-            .unwrap();
+    let module = program.to_mlir_module("main").unwrap();
     assert_eq!(
         module,
         indoc! {"

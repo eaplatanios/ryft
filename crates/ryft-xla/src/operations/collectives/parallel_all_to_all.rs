@@ -182,7 +182,7 @@ mod tests {
     use crate::lowering::types::lower_array_ir_type;
     use crate::operations::Operation;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayTracer, ExecutionArguments, FromPjrt, ProgramExtension, Session, TracedProgram, trace};
+    use crate::{Array, ArrayTracer, ExecutionArguments, FromPjrt, LowerableProgram, Session, TracedProgram, trace};
 
     use super::*;
 

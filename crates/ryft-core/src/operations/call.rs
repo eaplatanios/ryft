@@ -7889,8 +7889,8 @@ mod tests {
         // type, and the callee, traced at that plain type, selects with a `condition` whose branches declare it too.
         // The emulation runs the callee at the types that it was traced at, as a backend does, so the `condition`
         // accepts `a` and squares it on both devices, and the sum over `x` that follows is `1 + 4`. The second callee
-        // input declares the variation of `a`, so the callee also sums `a` over `x`, which runs the call in lockstep for
-        // that reason too, and the second output then counts that sum `3` once per device.
+        // input declares the variation of `a`, so the callee also sums `a` over `x`, which runs the call in lockstep
+        // for that reason too, and the second output then counts that sum `3` once per device.
         let (mesh, a_local_type, invariant) = lockstep_call_mesh_and_types();
         let plain_type = ArrayIrType::Array(f32_vector_type(1));
         let callee = build_program(vec![plain_type.clone(), a_local_type.clone()], |builder, inputs| {
@@ -10774,28 +10774,15 @@ mod tests {
         // inactive over that prefix, numeric captures included, so the fused callee consumes the primal inputs,
         // capture prefix first, followed only by the live input tangent.
         let r#type = ArrayIrType::Array(f64_vector_type(4));
-        let callee = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let captured = builder.add_input(r#type.clone());
-            let input = builder.add_input(r#type.clone());
-            let product = builder
-                .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![captured, input], None)
-                .unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let captured = builder.add_input(r#type.clone());
-        let input = builder.add_input(r#type);
-        let output = builder
-            .add_instruction(TestOperation::Call(CallOperation::new(1)), vec![callee], vec![captured, input], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
+        let callee = build_program(vec![r#type.clone(); 2], |builder, inputs| {
+            let mul = ArrayOperation::from(MulOperation::new());
+            builder.add_instruction(mul, Vec::new(), inputs.to_vec(), None).unwrap().to_vec()
+        });
+        let program = build_program(vec![r#type; 2], |builder, inputs| {
+            let callee = builder.import_region(callee.entry_region_ref());
+            let call = TestOperation::Call(CallOperation::new(1));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
         assert_eq!(
             program.jvp().unwrap().to_string(),
             indoc! {"
@@ -10818,11 +10805,9 @@ mod tests {
         // reads a captured plumbing reference and mutates an active reference input.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
-        let callee = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let captured = builder.add_input(reference_type.clone());
-            let reference = builder.add_input(reference_type.clone());
-            let update = builder.add_input(scalar_type.clone());
+        let input_types = vec![reference_type.clone(), reference_type, scalar_type];
+        let callee = build_program(input_types.clone(), |builder, inputs| {
+            let (captured, reference, update) = (inputs[0], inputs[1], inputs[2]);
             builder
                 .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
                 .unwrap();
@@ -10830,29 +10815,14 @@ mod tests {
                 builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
             let scale =
                 builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![captured], None).unwrap()[0];
-            let output = builder
-                .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![state, scale], None)
-                .unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let captured = builder.add_input(reference_type.clone());
-        let reference = builder.add_input(reference_type.clone());
-        let update = builder.add_input(scalar_type.clone());
-        let output = builder
-            .add_instruction(
-                TestOperation::Call(CallOperation::new(1)),
-                vec![callee],
-                vec![captured, reference, update],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
-            .unwrap();
+            let mul = ArrayOperation::from(MulOperation::new());
+            builder.add_instruction(mul, Vec::new(), vec![state, scale], None).unwrap().to_vec()
+        });
+        let program = build_program(input_types, |builder, inputs| {
+            let callee = builder.import_region(callee.entry_region_ref());
+            let call = TestOperation::Call(CallOperation::new(1));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
 
         // The plumbing capture is inactive and the active reference receives a tangent reference input, so the fused
         // program and its one fused call consume `[captured, r, x, ṫr, ẋ]`, keeping the capture prefix verbatim.
@@ -10883,30 +10853,16 @@ mod tests {
         // tangent for it, while the doubled value output gains one.
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let mut callee_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = callee_builder.add_input(reference_type.clone());
-        let value = callee_builder.add_input(scalar_type.clone());
-        let doubled = callee_builder
-            .add_instruction(ArrayOperation::from(AddOperation::new()), Vec::new(), vec![value, value], None)
-            .unwrap()[0];
-        let callee = callee_builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(
-                vec![reference, doubled],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = builder.add_input(reference_type.clone());
-        let value = builder.add_input(scalar_type.clone());
-        let callee = builder.import_region(callee.entry_region_ref());
-        let outputs = builder
-            .add_instruction(TestOperation::Call(CallOperation::new(1)), vec![callee], vec![reference, value], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
+        let input_types = vec![reference_type, scalar_type];
+        let callee = build_program(input_types.clone(), |builder, inputs| {
+            let add = ArrayOperation::from(AddOperation::new());
+            vec![inputs[0], builder.add_instruction(add, Vec::new(), vec![inputs[1], inputs[1]], None).unwrap()[0]]
+        });
+        let program = build_program(input_types, |builder, inputs| {
+            let callee = builder.import_region(callee.entry_region_ref());
+            let call = TestOperation::Call(CallOperation::new(1));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
         assert_eq!(
             program.entry_region_ref().jvp(&[1]).unwrap().to_string(),
             indoc! {"
@@ -10929,30 +10885,20 @@ mod tests {
         // of `y` gets no fused callee slot, and the tangent of `cos(y)`, which then depends on no tangent input, is a
         // structural zero that the fused call does not return.
         let r#type = ArrayIrType::Array(f64_vector_type(4));
-        let callee = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let x = builder.add_input(r#type.clone());
-            let y = builder.add_input(r#type.clone());
+        let callee = build_program(vec![r#type.clone(); 2], |builder, inputs| {
             let sine = builder
-                .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![x], None)
+                .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![inputs[0]], None)
                 .unwrap()[0];
             let cosine = builder
-                .add_instruction(ArrayOperation::from(CosOperation::new()), Vec::new(), vec![y], None)
+                .add_instruction(ArrayOperation::from(CosOperation::new()), Vec::new(), vec![inputs[1]], None)
                 .unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![sine, cosine], vec![Placeholder; 2], vec![Placeholder; 2])
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let inputs = (0..2).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
-        let outputs = builder
-            .add_instruction(TestOperation::Call(CallOperation::new(0)), vec![callee], inputs, None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
+            vec![sine, cosine]
+        });
+        let program = build_program(vec![r#type; 2], |builder, inputs| {
+            let callee = builder.import_region(callee.entry_region_ref());
+            let call = TestOperation::Call(CallOperation::new(0));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
         assert_eq!(
             program.entry_region_ref().jvp(&[0]).unwrap().to_string(),
             indoc! {"
@@ -10978,33 +10924,19 @@ mod tests {
         // structural zero that the fused call does not return. Projecting that slot must leave both live tangents
         // aligned with their original primal outputs rather than pairing the final tangent with the zero.
         let r#type = ArrayIrType::Array(f64_vector_type(4));
-        let callee = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let input = builder.add_input(r#type.clone());
+        let callee = build_program(vec![r#type.clone()], |builder, inputs| {
             let sine = builder
-                .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![input], None)
+                .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![inputs[0]], None)
                 .unwrap()[0];
             let zero = ArrayOperation::from(ZeroOperation::new(f64_vector_type(4)));
             let zero = builder.add_instruction(zero, Vec::new(), Vec::new(), None).unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(
-                    vec![sine, zero, input],
-                    vec![Placeholder],
-                    vec![Placeholder; 3],
-                )
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let input = builder.add_input(r#type.clone());
-        let outputs = builder
-            .add_instruction(TestOperation::Call(CallOperation::new(0)), vec![callee], vec![input], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder], vec![Placeholder; 3])
-            .unwrap();
-
+            vec![sine, zero, inputs[0]]
+        });
+        let program = build_program(vec![r#type], |builder, inputs| {
+            let callee = builder.import_region(callee.entry_region_ref());
+            let call = TestOperation::Call(CallOperation::new(0));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
         assert_eq!(
             program.jvp().unwrap().to_string(),
             indoc! {"
@@ -11030,26 +10962,15 @@ mod tests {
         // of `y` and the tangent callee has no effects, so only the source call is bound and the output tangent is a
         // structural zero.
         let r#type = ArrayIrType::Array(f64_vector_type(4));
-        let callee = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let x = builder.add_input(r#type.clone());
-            builder.add_input(r#type.clone());
-            let sine = builder
-                .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![x], None)
-                .unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![sine], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let inputs = (0..2).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
-        let output = builder
-            .add_instruction(TestOperation::Call(CallOperation::new(0)), vec![callee], inputs, None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
+        let callee = build_program(vec![r#type.clone(); 2], |builder, inputs| {
+            let sine = ArrayOperation::from(SinOperation::new());
+            builder.add_instruction(sine, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
+        });
+        let program = build_program(vec![r#type; 2], |builder, inputs| {
+            let callee = builder.import_region(callee.entry_region_ref());
+            let call = TestOperation::Call(CallOperation::new(0));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
         assert_eq!(
             program.entry_region_ref().jvp(&[1]).unwrap().to_string(),
             indoc! {"
@@ -11110,31 +11031,22 @@ mod tests {
         let value_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let size_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
         let rows = DimensionType::from(DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap()));
-        let callee = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let value = builder.add_input(value_type.clone());
-            let size = builder.add_input(size_type.clone());
+        let input_types = vec![value_type, size_type];
+        let callee = build_program(input_types.clone(), |builder, inputs| {
             let dimension = builder
-                .add_instruction(DimensionFromScalarOperation::new(rows), Vec::new(), vec![size], None)
+                .add_instruction(DimensionFromScalarOperation::new(rows), Vec::new(), vec![inputs[1]], None)
                 .unwrap()[0];
-            let broadcast = builder
-                .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension], None)
-                .unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![broadcast], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
+            let broadcast = DynamicBroadcastOperation::new(Vec::new());
+            builder.add_instruction(broadcast, Vec::new(), vec![inputs[0], dimension], None).unwrap().to_vec()
+        });
         let operation = CallOperation::new(0)
             .with_callee_type_signature(&callee.input_types(), &callee.output_types())
             .unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let inputs = vec![builder.add_input(value_type), builder.add_input(size_type)];
-        let output = builder.add_instruction(TestOperation::Call(operation), vec![callee], inputs, None).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
+        let program = build_program(input_types, |builder, inputs| {
+            let callee = builder.import_region(callee.entry_region_ref());
+            let call = TestOperation::Call(operation);
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
         assert_eq!(
             program.jvp().unwrap().to_string(),
             indoc! {"
@@ -11482,32 +11394,17 @@ mod tests {
         // consumes `[ȳ]` only, returns `x̄` only, and neither it nor its callee stages a cotangent reference.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
-        let callee = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let reference = builder.add_input(reference_type.clone());
-            let update = builder.add_input(scalar_type.clone());
-            builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
-                .unwrap();
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![update], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let callee_region = builder.import_region(callee.entry_region_ref());
-        let reference = builder.add_input(reference_type.clone());
-        let update = builder.add_input(scalar_type.clone());
-        let output = builder
-            .add_instruction(
-                TestOperation::Call(CallOperation::new(0)),
-                vec![callee_region],
-                vec![reference, update],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
+        let input_types = vec![reference_type, scalar_type];
+        let callee = build_program(input_types.clone(), |builder, inputs| {
+            let update = ReferenceAddUpdateOperation::new();
+            builder.add_instruction(update, Vec::new(), inputs.to_vec(), None).unwrap();
+            vec![inputs[1]]
+        });
+        let program = build_program(input_types, |builder, inputs| {
+            let callee = builder.import_region(callee.entry_region_ref());
+            let call = TestOperation::Call(CallOperation::new(0));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
         let destination_kinds = [CotangentDestinationKind::Ignore, CotangentDestinationKind::Return];
         let transposed = program.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
         assert_eq!(
@@ -11529,34 +11426,18 @@ mod tests {
         // The linear callee `ẏ = { ṫr += ẋ; read(ṫr) }` accumulates into its reference input and reads it back.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
-        let callee = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let reference = builder.add_input(reference_type.clone());
-            let update = builder.add_input(scalar_type.clone());
-            builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
-                .unwrap();
-            let output =
-                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let callee_region = builder.import_region(callee.entry_region_ref());
-        let reference = builder.add_input(reference_type.clone());
-        let update = builder.add_input(scalar_type.clone());
-        let output = builder
-            .add_instruction(
-                TestOperation::Call(CallOperation::new(0)),
-                vec![callee_region],
-                vec![reference, update],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
+        let input_types = vec![reference_type, scalar_type];
+        let callee = build_program(input_types.clone(), |builder, inputs| {
+            let update = ReferenceAddUpdateOperation::new();
+            builder.add_instruction(update, Vec::new(), inputs.to_vec(), None).unwrap();
+            let read = ReferenceReadOperation::new();
+            builder.add_instruction(read, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
+        });
+        let program = build_program(input_types, |builder, inputs| {
+            let callee = builder.import_region(callee.entry_region_ref());
+            let call = TestOperation::Call(CallOperation::new(0));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
 
         // Transposed under a `Reference` destination for the reference input, the pullback consumes `[ȳ, r̄]` and
         // returns the cotangent reference by identity ahead of `x̄`. The cotangent of the reference input lives in that
@@ -11593,30 +11474,19 @@ mod tests {
         // place, and returns `x̄` read back from it.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F64)));
-        let callee = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let reference = builder.add_input(reference_type.clone());
-            let update = builder.add_input(scalar_type.clone());
-            builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
-                .unwrap();
+        let input_types = vec![reference_type, scalar_type];
+        let callee = build_program(input_types.clone(), |builder, inputs| {
+            let update = ReferenceAddUpdateOperation::new();
+            builder.add_instruction(update, Vec::new(), inputs.to_vec(), None).unwrap();
             let read =
-                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![read, update], vec![Placeholder; 2], vec![Placeholder; 2])
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let reference = builder.add_input(reference_type.clone());
-        let update = builder.add_input(scalar_type.clone());
-        let outputs = builder
-            .add_instruction(TestOperation::Call(CallOperation::new(0)), vec![callee], vec![reference, update], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            vec![read, inputs[1]]
+        });
+        let program = build_program(input_types, |builder, inputs| {
+            let callee = builder.import_region(callee.entry_region_ref());
+            let call = TestOperation::Call(CallOperation::new(0));
+            vec![builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap()[0]]
+        });
         let destination_kinds = [CotangentDestinationKind::Reference, CotangentDestinationKind::Return];
         let transposed = program.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
         assert_eq!(
@@ -11663,24 +11533,13 @@ mod tests {
         // extent residual, and the transposed call consumes and returns the cotangent of the live input alone.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let mut callee_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        callee_builder.add_input(dynamic_type.clone().into());
-        let live = callee_builder.add_input(scalar_type.clone().into());
-        let callee = callee_builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![live], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let disconnected = builder.add_input(dynamic_type.into());
-        let live = builder.add_input(scalar_type.into());
-        let callee = builder.import_region(callee.entry_region_ref());
-        let outputs = builder
-            .add_instruction(TestOperation::Call(CallOperation::new(0)), vec![callee], vec![disconnected, live], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
+        let input_types = vec![dynamic_type.into(), ArrayType::scalar(DataType::F32).into()];
+        let callee = build_program(input_types.clone(), |_, inputs| vec![inputs[1]]);
+        let program = build_program(input_types, |builder, inputs| {
+            let callee = builder.import_region(callee.entry_region_ref());
+            let call = TestOperation::Call(CallOperation::new(0));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
         let linearization = program.linearize().unwrap();
         assert_eq!(linearization.residual_count(), 0);
         let pullback = linearization.pullback().unwrap();
@@ -12276,29 +12135,13 @@ mod tests {
     fn test_call_operation_transpose_omits_zero_space_seeds() {
         // The predicate output's cotangent is a zero space that arrives as a structural zero, so the transposed callee
         // has no input for it and the transposed call consumes the value output's seed alone.
-        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)]));
-        let value_program_type = ArrayIrType::Array(value_type.clone());
-        let source = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let value = builder.add_input(value_program_type.clone());
+        let value_program_type = ArrayIrType::Array(f32_vector_type(4));
+        let source = build_program(vec![value_program_type.clone()], |builder, inputs| {
             let predicate = Array::from_elements(predicate_type.clone(), &[true, false, true, false]).unwrap();
-            let predicate = builder.add_constant(ArrayIrValue::Array(predicate));
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(
-                    vec![value, predicate],
-                    vec![Placeholder],
-                    vec![Placeholder; 2],
-                )
-                .unwrap()
-        };
-        let transposed = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let value_cotangent = builder.add_input(value_program_type.clone());
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![value_cotangent], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
+            vec![inputs[0], builder.add_constant(ArrayIrValue::Array(predicate))]
+        });
+        let transposed = build_program(vec![value_program_type.clone()], |_, inputs| inputs.to_vec());
         let driver = TestTranspositionDriver { source, transposed };
         let mut context = TranspositionContext::new(TracingContext::<TestValue, TestOperation>::new());
         let value_cotangent = context.input(value_program_type.clone());
@@ -12350,7 +12193,7 @@ mod tests {
         // known, receives a structural zero of the cotangent type of its input type (i.e., a pending sum becomes a
         // completed one).
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+        let tangent_type = f32_vector_type(4)
             .with_sharding(
                 Sharding::new(mesh, vec![ShardingDimension::replicated()])
                     .unwrap()
@@ -12362,12 +12205,8 @@ mod tests {
         let tangent_type = ArrayIrType::Array(tangent_type);
         // Zero cotangents skip a pure callee only after its effects have been inspected. Supply the real boundary of
         // the identity region rather than an empty driver that cannot answer that query.
-        let mut source_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let input = source_builder.add_input(tangent_type.clone());
-        let source = source_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-        let mut transpose_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let input = transpose_builder.add_input(expected.clone());
-        let transposed = transpose_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let source = build_program(vec![tangent_type.clone()], |_, inputs| inputs.to_vec());
+        let transposed = build_program(vec![expected.clone()], |_, inputs| inputs.to_vec());
         let driver = TestTranspositionDriver { source, transposed };
         let mut context = TranspositionContext::new(TracingContext::<TestValue, TestOperation>::new());
         let accumulators = [context.cotangent_accumulator(expected.clone(), true)];

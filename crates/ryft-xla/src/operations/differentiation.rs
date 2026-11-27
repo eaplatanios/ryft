@@ -144,7 +144,9 @@ mod tests {
     use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type};
     use crate::tests::{execution_client, values_to_bytes};
-    use crate::{Array, CompiledFunction, Constant, Session, Tracer, compile, to_mlir_module_for_program};
+    use crate::{
+        Array, CompiledFunction, Constant, LowerableProgram, ProgramLoweringOptions, Session, Tracer, compile,
+    };
 
     use super::*;
 
@@ -289,8 +291,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo =
-            to_mlir_module_for_program(&program, &[], &scalar_type, &scalar_type, "main", None, None).unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -343,14 +344,14 @@ mod tests {
 
         // The enclosing function's capture prefix has a matching slot #0, so before rematerialized bodies were scoped
         // to an empty capture namespace this lowering silently forwarded that unrelated captured value.
-        let result = to_mlir_module_for_program(
-            &program,
-            std::slice::from_ref(&scalar_type),
-            &scalar_type,
-            &scalar_type,
+        let result = program.to_mlir_module_with_options(
             "main",
-            None,
-            None,
+            &ProgramLoweringOptions::new()
+                .without_pruning()
+                .with_capture_types((std::slice::from_ref(&scalar_type)).to_vec())
+                .with_input_types(&scalar_type)
+                .with_output_types(&scalar_type)
+                .without_boundary_shardings(),
         );
         assert!(matches!(result, Err(Error::Lowering(LoweringError::MissingCapturedConstant { index: 0 }))));
     }
@@ -377,7 +378,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            to_mlir_module_for_program(&program, &[], &scalar_type, &scalar_type, "main", None, None).unwrap()
+            program.to_mlir_module("main").unwrap()
         };
         let operation = RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable));
         assert_eq!(
@@ -431,7 +432,15 @@ mod tests {
                 Type::from(scalar_type.clone()),
             )
             .unwrap();
-            to_mlir_module_for_program(&program, &[], &scalar_type, &scalar_type, "main", None, None).unwrap()
+            program
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_input_types(&scalar_type)
+                        .with_output_types(&scalar_type),
+                )
+                .unwrap()
         };
         assert_eq!(
             lower(RematerializationOptimizationBarrier::All),
@@ -517,7 +526,15 @@ mod tests {
             };
             let input_types = array_types(program.input_types().into_owned());
             let output_types = array_types(program.output_types().into_owned());
-            to_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None).unwrap()
+            program
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_input_types(&input_types)
+                        .with_output_types(&output_types),
+                )
+                .unwrap()
         };
         assert_eq!(
             lower(&gradient.jvp().unwrap()),
@@ -606,7 +623,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            to_mlir_module_for_program(&gradient, &[], &scalar_type, &scalar_type, "main", None, None).unwrap(),
+            gradient
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_input_types(&scalar_type)
+                        .with_output_types(&scalar_type)
+                )
+                .unwrap(),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<bf16>) -> tensor<bf16> {
@@ -647,7 +672,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            to_mlir_module_for_program(&gradient, &[], &scalar_type, &scalar_type, "main", None, None).unwrap(),
+            gradient
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_input_types(&scalar_type)
+                        .with_output_types(&scalar_type)
+                )
+                .unwrap(),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<f32>) -> tensor<f32> {
@@ -708,16 +741,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[vector_type.clone(), vector_type.clone()],
-            &[vector_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"

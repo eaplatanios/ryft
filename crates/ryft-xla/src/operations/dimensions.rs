@@ -403,7 +403,7 @@ mod tests {
     use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_scalar_type};
     use crate::tests::{cpu_client, execution_client};
-    use crate::{Array, Constant, Options, Session, to_mlir_module_for_program};
+    use crate::{Array, Constant, LowerableProgram, Options, ProgramLoweringOptions, Session};
 
     use super::*;
 
@@ -422,16 +422,16 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let boundary_type = ArrayType::scalar(DataType::I64);
-        to_mlir_module_for_program(
-            &program,
-            &[],
-            &[boundary_type.clone(), boundary_type.clone()],
-            &[boundary_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap()
+        program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&[boundary_type.clone(), boundary_type.clone()])
+                    .with_output_types(&[boundary_type])
+                    .without_boundary_shardings(),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -460,16 +460,14 @@ mod tests {
             )
             .unwrap();
         let boundary_type = ArrayType::scalar(DataType::I64);
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[input_type],
-            &[boundary_type.clone(), boundary_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&[input_type])
+                    .with_output_types(&[boundary_type.clone(), boundary_type]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -630,16 +628,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap();
-            to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![scalar_type.clone(), scalar_type.clone()],
-                &vec![scalar_type.clone()],
-                "main",
-                None,
-                None,
-            )
-            .unwrap()
+            program.to_mlir_module("main").unwrap()
         };
 
         // An unproven subtraction keeps its diagnostic assertions, which are two gateway checks and one arithmetic
@@ -722,16 +711,14 @@ mod tests {
             .unwrap();
         let boundary_type = ArrayType::scalar(DataType::I64);
         assert_eq!(
-            to_mlir_module_for_program(
-                &program,
-                &[],
-                &[boundary_type.clone(), boundary_type.clone()],
-                &[boundary_type],
-                "main",
-                None,
-                None,
-            )
-            .unwrap(),
+            program
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .with_input_types(&[boundary_type.clone(), boundary_type.clone()])
+                        .with_output_types(&[boundary_type])
+                )
+                .unwrap(),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) -> tensor<i64> {

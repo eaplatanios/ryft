@@ -531,7 +531,7 @@ pub(crate) mod tests {
         KernelOperation as PortableKernelOperation, KernelParameter, KernelParameterAccess,
     };
 
-    use crate::lowering::modules::lower_mlir_module_for_program;
+    use crate::lowering::extensions::{LowerableProgram, ProgramLoweringOptions};
     use crate::{Constant, Operation};
 
     use super::*;
@@ -928,17 +928,16 @@ pub(crate) mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(program.clone().into_simplified().unwrap().to_string(), program.to_string());
-        let lowered = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![vector.clone()],
-            &vec![vector],
-            "main",
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let lowered = program
+            .lower(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&vec![vector.clone()])
+                    .with_output_types(&vec![vector])
+                    .without_boundary_shardings(),
+            )
+            .unwrap();
         let (module, _signature, requires_assertion_handler, _requirements) = lowered.into_parts();
         assert!(requires_assertion_handler);
         let semantic = hex::encode(Sha256::digest(definition.semantic_key().unwrap().as_bytes()));
@@ -1085,17 +1084,16 @@ pub(crate) mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(program.reference_analysis(0).unwrap().roots().next().is_none());
-        let lowered = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![scalar.clone()],
-            &vec![scalar],
-            "main",
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let lowered = program
+            .lower(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&vec![scalar.clone()])
+                    .with_output_types(&vec![scalar])
+                    .without_boundary_shardings(),
+            )
+            .unwrap();
         let (module, _signature, requires_assertion_handler, _requirements) = lowered.into_parts();
         assert!(!requires_assertion_handler);
         let semantic = hex::encode(Sha256::digest(definition.semantic_key().unwrap().as_bytes()));

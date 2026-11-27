@@ -706,7 +706,7 @@ mod tests {
         execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::types::DataTypeExtension;
-    use crate::{Array, ArrayConstant, Constant, Options, Session, Type, Value, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, Constant, LowerableProgram, Options, Session, Type, Value};
 
     use super::*;
 
@@ -1081,16 +1081,7 @@ mod tests {
                     )
                     .unwrap(),
             );
-            let module = to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![input_type.clone(), update_type.clone(), index_type.clone()],
-                &vec![update_type, input_type],
-                "main",
-                None,
-                None,
-            )
-            .unwrap();
+            let module = program.to_mlir_module("main").unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
@@ -1165,20 +1156,7 @@ mod tests {
             builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         let discharged = pullback.discharge_references(0).unwrap();
-        let stablehlo = to_mlir_module_for_program(
-            discharged.program(),
-            &[],
-            &vec![
-                ArrayType::new_static(DataType::F64, [2]),
-                ArrayType::new_static(DataType::F64, [5]),
-                ArrayType::scalar(DataType::I32),
-            ],
-            &vec![ArrayType::new_static(DataType::F64, [5])],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let stablehlo = discharged.program().to_mlir_module("main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -1487,17 +1465,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![input_type, scalar_type.clone(), scalar_type],
-            &vec![output_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
             .unwrap();
@@ -1600,17 +1568,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap();
-            let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
-            let module = to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![input_type.clone(), ArrayType::scalar(start_type), size_type.clone()],
-                &vec![output_type],
-                "main",
-                None,
-                None,
-            )
-            .unwrap();
+            let module = program.to_mlir_module("main").unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();

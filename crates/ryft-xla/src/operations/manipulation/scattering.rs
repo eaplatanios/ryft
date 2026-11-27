@@ -417,14 +417,15 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{ProgramBuilder, to_mlir_module_for_plain_program, unproject_plain_program};
     use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, read_first_shard};
     use crate::tests::{
         execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
-    use crate::{Array, ArrayConstant, Constant, Options, Session, ToPjrt, Type, to_mlir_module_for_program};
+    use crate::{
+        Array, ArrayConstant, Constant, LowerableProgram, Options, ProgramLoweringOptions, Session, ToPjrt, Type,
+    };
 
     use super::*;
 
@@ -599,16 +600,7 @@ mod tests {
                         )
                         .unwrap(),
                 );
-                let module = to_mlir_module_for_program(
-                    &program,
-                    &[],
-                    &vec![input_type.clone(), indices_type, updates_type],
-                    &vec![input_type],
-                    "main",
-                    None,
-                    None,
-                )
-                .unwrap();
+                let module = program.to_mlir_module("main").unwrap();
                 let executable = client
                     .compile(
                         &PjrtProgram::Mlir { bytecode: module.into_bytes() },
@@ -878,7 +870,6 @@ mod tests {
                 ArrayType::new_static(DataType::I32, [2, 1]),
                 ArrayType::new_static(data_type, [2]),
             ];
-            let output_types = vec![input_types[0].clone()];
             let mut builder = ProgramBuilder::new();
             let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect();
             let output = builder
@@ -895,18 +886,10 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap();
-            let module = lower_mlir_module_for_program(
-                &unproject_plain_program(program),
-                &[],
-                &input_types,
-                &output_types,
-                "main",
-                None,
-                None,
-                platform,
-            )
-            .unwrap()
-            .into_stable_hlo();
+            let module = (unproject_plain_program(program))
+                .lower("main", &ProgramLoweringOptions::new().with_target_platform(platform))
+                .unwrap()
+                .into_stable_hlo();
             assert_eq!(module, expected_module, "{data_type} on {platform:?}");
 
             // Execute the selected backend's lowering as well as checking its rendering. In particular, the CUDA

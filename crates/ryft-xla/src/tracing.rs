@@ -1,6 +1,6 @@
 //! General XLA program tracing. The [`trace`] entry point stages an arbitrary function over [`ArrayTracer`]s in a fresh
 //! root tracing context of [`Session`]. Its result is a staged [`Program`] of `ryft-core` (refer to [`TracedProgram`]),
-//! which [`ProgramExtension`](crate::ProgramExtension) lowers to a StableHLO/Shardy MLIR module. [`Error`] reports
+//! which [`LowerableProgram`](crate::LowerableProgram) lowers to a StableHLO/Shardy MLIR module. [`Error`] reports
 //! the failures of both tracing and lowering.
 //!
 //! Traced functions may compose `shard_map` with other transforms (e.g., differentiation or batching). The logical
@@ -10,7 +10,7 @@
 //! simply a traced function whose body binds one `shard_map` (e.g., through [`ShardMap`](ryft_core::ShardMap) on the
 //! context that [`trace_with_context`] passes to it). The lowered function signature carries the sharding of every
 //! global input and output type that has one (refer to
-//! [`ProgramExtension::to_mlir_module`](crate::ProgramExtension::to_mlir_module)). Tracing such a function over input
+//! [`LowerableProgram::to_mlir_module`](crate::LowerableProgram::to_mlir_module)). Tracing such a function over input
 //! types that carry the input shardings of its `shard_map` therefore yields function arguments and results placed
 //! as the `shard_map` boundary specifies.
 //!
@@ -41,7 +41,7 @@ type NormalizedArrayTracer = ProjectedValue<ArrayType, CoreTracer<TracingContext
 /// Traced XLA program over global array types structured as `Input` and `Output`, as returned by [`trace`]. It is
 /// the staged [`Program`] of `ryft-core` itself, whose entry region carries the global input and output types, which
 /// describe the whole logical arrays at the function boundary. For example, a global array of shape `[8]` split evenly
-/// across two devices has shape `[4]` on each device. [`ProgramExtension`](crate::ProgramExtension) exports the program
+/// across two devices has shape `[4]` on each device. [`LowerableProgram`](crate::LowerableProgram) exports the program
 /// as a StableHLO/Shardy MLIR module.
 pub type TracedProgram<Input, Output> = Program<
     Constant,

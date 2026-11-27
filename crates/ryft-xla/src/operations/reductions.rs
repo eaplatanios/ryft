@@ -954,14 +954,13 @@ mod tests {
     };
     use ryft_mlir::Location;
 
-    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         ProgramBuilder, UnreducedApplication, UnreducedInput, lower_unreduced_application, lowered_reduce_module,
         lowered_unary_module, to_mlir_module_for_plain_program, unproject_plain_program,
     };
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type, two_device_mesh};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayConstant, CompiledFunction, Session, compile, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, CompiledFunction, LowerableProgram, ProgramLoweringOptions, Session, compile};
 
     use super::*;
 
@@ -1774,7 +1773,6 @@ mod tests {
         // signed zeros there, and keeps the explicit NaN propagation.
         let lowered = |kind: ReductionKind| {
             let input_type = ArrayType::new_static(DataType::F32, [2, 3]);
-            let output_type = ArrayType::new_static(DataType::F32, [2]);
             let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type.clone());
             let output = builder
@@ -1788,18 +1786,10 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            lower_mlir_module_for_program(
-                &unproject_plain_program(program),
-                &[],
-                &vec![input_type],
-                &vec![output_type],
-                "main",
-                None,
-                None,
-                Some("cuda"),
-            )
-            .unwrap()
-            .into_stable_hlo()
+            (unproject_plain_program(program))
+                .lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda")))
+                .unwrap()
+                .into_stable_hlo()
         };
         assert_eq!(
             lowered(ReductionKind::Max),
@@ -2080,18 +2070,20 @@ mod tests {
                 .unwrap();
             let argument_shardings = [input_type.sharding().unwrap().clone()];
             let output_shardings = [output_type.sharding().unwrap().clone()];
-            lower_mlir_module_for_program(
-                &unproject_plain_program(program),
-                &[],
-                &vec![input_type],
-                &vec![output_type],
-                "main",
-                Some(&argument_shardings),
-                Some(&output_shardings),
-                target_platform,
-            )
-            .unwrap()
-            .into_stable_hlo()
+            (unproject_plain_program(program))
+                .lower(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_input_types(&vec![input_type])
+                        .with_output_types(&vec![output_type])
+                        .without_boundary_shardings()
+                        .with_exact_argument_shardings(argument_shardings.iter().cloned().map(Some).collect())
+                        .with_exact_output_shardings(output_shardings.iter().cloned().map(Some).collect())
+                        .with_target_platform(target_platform),
+                )
+                .unwrap()
+                .into_stable_hlo()
         };
         let constraint = r#"sdy.sharding_constraint %arg0 <@mesh, [{}, {}], replicated={"x"}>"#;
         for (kind, data_type, target_platform, constrained) in [
@@ -2199,18 +2191,19 @@ mod tests {
                 .unwrap();
             let argument_shardings = [input_type.sharding().unwrap().clone()];
             let output_shardings = [output_type.sharding().unwrap().clone()];
-            lower_mlir_module_for_program(
-                &unproject_plain_program(program),
-                &[],
-                &vec![input_type],
-                &vec![output_type],
-                "main",
-                Some(&argument_shardings),
-                Some(&output_shardings),
-                None,
-            )
-            .unwrap()
-            .into_stable_hlo()
+            (unproject_plain_program(program))
+                .lower(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_input_types(&vec![input_type])
+                        .with_output_types(&vec![output_type])
+                        .without_boundary_shardings()
+                        .with_exact_argument_shardings(argument_shardings.iter().cloned().map(Some).collect())
+                        .with_exact_output_shardings(output_shardings.iter().cloned().map(Some).collect()),
+                )
+                .unwrap()
+                .into_stable_hlo()
         };
         assert_eq!(
             lowered(2),
@@ -2464,7 +2457,6 @@ mod tests {
         // ordered value, or when the values are equivalent (i.e., equal under `FLOAT` semantics or both NaN) and the
         // left index is lower.
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let output_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let outputs = builder
@@ -2475,8 +2467,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let module =
-            to_mlir_module_for_program(&program, &[], &[input_type], &[output_type], "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             module,
@@ -2516,7 +2507,6 @@ mod tests {
         // An argmin starts from the highest value paired with index zero, and its comparator picks the left pair when
         // its value is smaller. Narrow floating-point inputs compare in `f32`.
         let input_type = ArrayType::new_static(DataType::BF16, [3]);
-        let output_type = ArrayType::scalar(DataType::I32);
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type.clone());
         let outputs = builder
@@ -2527,8 +2517,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let module =
-            to_mlir_module_for_program(&program, &[], &[input_type], &[output_type], "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"

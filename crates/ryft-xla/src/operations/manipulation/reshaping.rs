@@ -311,7 +311,7 @@ mod tests {
     use crate::operations::Operation;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::tests::{execution_client, test_compilation_options, values_to_bytes};
-    use crate::{ArrayConstant, ArrayTracer, Constant, Session, to_mlir_module_for_program};
+    use crate::{ArrayConstant, ArrayTracer, Constant, LowerableProgram, ProgramLoweringOptions, Session};
 
     use super::*;
 
@@ -884,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_renders_reshape_singleton_axis_sharding_propagation() {
+    fn test_program_to_mlir_module_renders_reshape_singleton_axis_sharding_propagation() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let input_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -924,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_renders_reshape_replicated_merge_sharding_propagation() {
+    fn test_program_to_mlir_module_renders_reshape_replicated_merge_sharding_propagation() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let global_input_type = ArrayType::new(
             DataType::F32,
@@ -967,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_renders_reshape_replicated_split_sharding_propagation() {
+    fn test_program_to_mlir_module_renders_reshape_replicated_split_sharding_propagation() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let global_input_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8), Dimension::Static(6)]));
@@ -1034,7 +1034,12 @@ mod tests {
         let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
         let input_types = vec![input_type, ArrayType::scalar(DataType::I64)];
         assert!(matches!(
-            to_mlir_module_for_program(&program, &[], &input_types, &vec![output_type], "main", None, None),
+            program.to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&input_types)
+                    .with_output_types(&vec![output_type]),
+            ),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "`reshape` with unequal physical capacities (input 4, output 6); dynamic bounds must \
                    preserve the physical element count",
@@ -1060,9 +1065,8 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
         assert!(matches!(
-            to_mlir_module_for_program(&program, &[], &vec![input_type], &vec![output_type], "main", None, None),
+            program.to_mlir_module("main"),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "`reshape` requires finite physical bounds for every dynamic input dimension",
         ));
@@ -1083,7 +1087,12 @@ mod tests {
         let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
         let input_types = vec![input_type, ArrayType::scalar(DataType::I64)];
         assert!(matches!(
-            to_mlir_module_for_program(&program, &[], &input_types, &vec![output_type], "main", None, None),
+            program.to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&input_types)
+                    .with_output_types(&vec![output_type]),
+            ),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "`reshape` requires finite physical bounds for every dynamic output dimension",
         ));
@@ -1125,16 +1134,14 @@ mod tests {
         let pullback = linearization.tangent().transpose_with_respect_to(&[0], &[]).unwrap();
         let cotangent_type = <&ArrayType>::try_from(&pullback.input_types()[0]).unwrap().clone();
         assert_eq!(
-            to_mlir_module_for_program(
-                &pullback,
-                &[],
-                &vec![cotangent_type, ArrayType::scalar(DataType::I64)],
-                &vec![ArrayType::new_static(DataType::F64, [6])],
-                "main",
-                None,
-                None,
-            )
-            .unwrap(),
+            pullback
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .with_input_types(&vec![cotangent_type, ArrayType::scalar(DataType::I64)])
+                        .with_output_types(&vec![ArrayType::new_static(DataType::F64, [6])])
+                )
+                .unwrap(),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<6xf64>, %arg1: tensor<i64>, %arg2: tensor<i32>) -> tensor<6xf64> {
@@ -1279,16 +1286,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![ArrayType::new_static(DataType::F64, [2, 6])],
-                &vec![ArrayType::new_static(DataType::F64, [2, 2, 3])],
-                "main",
-                None,
-                None,
-            )
-            .unwrap(),
+            program.to_mlir_module("main").unwrap(),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<2x6xf64>) -> tensor<2x2x3xf64> {
@@ -1345,16 +1343,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![input_type.clone(), ArrayType::scalar(DataType::I64)],
-            &vec![input_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -1504,17 +1493,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
-            let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
-            let module = to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![input_type, size_type],
-                &vec![output_type],
-                "main",
-                None,
-                None,
-            )
-            .unwrap();
+            let module = program.to_mlir_module("main").unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();

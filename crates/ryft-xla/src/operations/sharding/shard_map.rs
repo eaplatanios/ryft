@@ -425,9 +425,9 @@ pub(crate) mod tests {
     use crate::sessions::tests::{read_sharded_f32_array, two_device_mesh};
     use crate::tests::{cpu_client, loopback_address, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, ArrayShard, ArrayTracer, DistributedRuntime, ExecutionArguments, FromPjrt, Options,
-        PlacementOptions, Platform, ProgramExtension, Reference, Session, TracedProgram, Tracer, Value,
-        compile_statefully, to_mlir_module_for_program, trace, trace_with_context,
+        Array, ArrayConstant, ArrayShard, ArrayTracer, DistributedRuntime, ExecutionArguments, FromPjrt,
+        LowerableProgram, Options, PlacementOptions, Platform, ProgramLoweringOptions, Reference, Session,
+        TracedProgram, Tracer, Value, compile_statefully, trace, trace_with_context,
     };
 
     use super::*;
@@ -1529,7 +1529,16 @@ pub(crate) mod tests {
         let input_types = derivative.input_types().iter().map(boundary_type).collect::<Vec<_>>();
         let output_types = derivative.output_types().iter().map(boundary_type).collect::<Vec<_>>();
         assert_eq!(
-            to_mlir_module_for_program(&derivative, &[], &input_types, &output_types, "main", None, None).unwrap(),
+            derivative
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_input_types(&input_types)
+                        .with_output_types(&output_types)
+                        .without_boundary_shardings()
+                )
+                .unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
@@ -1886,16 +1895,18 @@ pub(crate) mod tests {
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &pullback,
-            &[],
-            &input_types,
-            &output_types,
-            "main",
-            Some(&[output_sharding]),
-            Some(&[input_sharding]),
-        )
-        .unwrap();
+        let module = pullback
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(vec![Some(output_sharding)])
+                    .with_exact_output_shardings(vec![Some(input_sharding)]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -1995,16 +2006,18 @@ pub(crate) mod tests {
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &pullback,
-            &[],
-            &input_types,
-            &output_types,
-            "main",
-            Some(std::slice::from_ref(&replicated)),
-            Some(std::slice::from_ref(&replicated)),
-        )
-        .unwrap();
+        let module = pullback
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(vec![Some(replicated.clone())])
+                    .with_exact_output_shardings(vec![Some(replicated.clone())]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -2502,16 +2515,18 @@ pub(crate) mod tests {
         .unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
         let global_types = [global_type];
-        let module = to_mlir_module_for_program(
-            &pullback,
-            &[],
-            &global_types,
-            &global_types,
-            "main",
-            Some(std::slice::from_ref(&sharded)),
-            Some(std::slice::from_ref(&sharded)),
-        )
-        .unwrap();
+        let module = pullback
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&global_types)
+                    .with_output_types(&global_types)
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(vec![Some(sharded.clone())])
+                    .with_exact_output_shardings(vec![Some(sharded.clone())]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -2766,16 +2781,18 @@ pub(crate) mod tests {
         let shardings = |types: &[ArrayType]| types.iter().map(|r#type| r#type.sharding().unwrap().clone()).collect();
         let input_shardings: Vec<Sharding> = shardings(&input_types);
         let output_shardings: Vec<Sharding> = shardings(&output_types);
-        let module = to_mlir_module_for_program(
-            &pullback,
-            &[],
-            &input_types,
-            &output_types,
-            "main",
-            Some(&input_shardings),
-            Some(&output_shardings),
-        )
-        .unwrap();
+        let module = pullback
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(input_shardings.iter().cloned().map(Some).collect())
+                    .with_exact_output_shardings(output_shardings.iter().cloned().map(Some).collect()),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -3830,7 +3847,14 @@ pub(crate) mod tests {
             (),
         )
         .unwrap();
-        let program = traced.to_mlir_module_with_shardings("main", Some(&[]), Some(&[sharded])).unwrap();
+        let program = traced
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_shardings(Vec::new())
+                    .with_output_shardings((&[sharded]).to_vec()),
+            )
+            .unwrap();
         assert_eq!(
             program,
             indoc! {r#"
@@ -4083,21 +4107,25 @@ pub(crate) mod tests {
             )
             .unwrap();
             let program = traced
-                .to_mlir_module_with_shardings(
+                .to_mlir_module_with_options(
                     "main",
-                    Some(&[replicated.clone(), sharded.clone()]),
-                    Some(&[
-                        replicated.clone(),
-                        replicated.clone(),
-                        sharded.clone(),
-                        replicated.clone(),
-                        sharded.clone(),
-                        replicated.clone(),
-                        replicated.clone(),
-                        sharded.clone(),
-                        sharded.clone(),
-                        replicated.clone(),
-                    ]),
+                    &ProgramLoweringOptions::new()
+                        .with_input_shardings((&[replicated.clone(), sharded.clone()]).to_vec())
+                        .with_output_shardings(
+                            (&[
+                                replicated.clone(),
+                                replicated.clone(),
+                                sharded.clone(),
+                                replicated.clone(),
+                                sharded.clone(),
+                                replicated.clone(),
+                                replicated.clone(),
+                                sharded.clone(),
+                                sharded.clone(),
+                                replicated.clone(),
+                            ])
+                                .to_vec(),
+                        ),
                 )
                 .unwrap();
             let executable = client
@@ -4266,10 +4294,11 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_shardings(
+            .to_mlir_module_with_options(
                 "main",
-                Some(&[replicated.clone(), global.clone()]),
-                Some(&[replicated.clone(), replicated.clone(), global.clone()]),
+                &ProgramLoweringOptions::new()
+                    .with_input_shardings((&[replicated.clone(), global.clone()]).to_vec())
+                    .with_output_shardings((&[replicated.clone(), replicated.clone(), global.clone()]).to_vec()),
             )
             .unwrap();
         let executable = client
@@ -4399,10 +4428,11 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_shardings(
+            .to_mlir_module_with_options(
                 "main",
-                Some(&[shared_sharding.clone(), global.clone()]),
-                Some(&[replicated.clone(), shared_sharding.clone(), global.clone()]),
+                &ProgramLoweringOptions::new()
+                    .with_input_shardings((&[shared_sharding.clone(), global.clone()]).to_vec())
+                    .with_output_shardings((&[replicated.clone(), shared_sharding.clone(), global.clone()]).to_vec()),
             )
             .unwrap();
         let executable = client
@@ -4542,10 +4572,13 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_shardings(
+            .to_mlir_module_with_options(
                 "main",
-                Some(&[replicated.clone(), sharded.clone(), sharded.clone()]),
-                Some(&[sharded.clone(), replicated.clone(), replicated.clone(), sharded.clone()]),
+                &ProgramLoweringOptions::new()
+                    .with_input_shardings((&[replicated.clone(), sharded.clone(), sharded.clone()]).to_vec())
+                    .with_output_shardings(
+                        (&[sharded.clone(), replicated.clone(), replicated.clone(), sharded.clone()]).to_vec(),
+                    ),
             )
             .unwrap();
         let executable = client
@@ -4697,10 +4730,11 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_shardings(
+            .to_mlir_module_with_options(
                 "main",
-                Some(&[replicated.clone(), sharded.clone(), replicated.clone()]),
-                Some(&[sharded.clone(), sharded.clone()]),
+                &ProgramLoweringOptions::new()
+                    .with_input_shardings((&[replicated.clone(), sharded.clone(), replicated.clone()]).to_vec())
+                    .with_output_shardings((&[sharded.clone(), sharded.clone()]).to_vec()),
             )
             .unwrap();
         let executable = client
@@ -4877,10 +4911,13 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_shardings(
+            .to_mlir_module_with_options(
                 "main",
-                Some(&[replicated.clone(), sharded.clone(), replicated.clone(), sharded.clone()]),
-                Some(&[sharded, replicated]),
+                &ProgramLoweringOptions::new()
+                    .with_input_shardings(
+                        (&[replicated.clone(), sharded.clone(), replicated.clone(), sharded.clone()]).to_vec(),
+                    )
+                    .with_output_shardings((&[sharded, replicated]).to_vec()),
             )
             .unwrap();
         let executable = client
@@ -5033,10 +5070,11 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_shardings(
+            .to_mlir_module_with_options(
                 "main",
-                Some(std::slice::from_ref(&sharded)),
-                Some(&[replicated, sharded.clone()]),
+                &ProgramLoweringOptions::new()
+                    .with_input_shardings((std::slice::from_ref(&sharded)).to_vec())
+                    .with_output_shardings((&[replicated, sharded.clone()]).to_vec()),
             )
             .unwrap();
         let executable = client

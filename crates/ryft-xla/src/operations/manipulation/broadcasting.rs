@@ -334,7 +334,7 @@ mod tests {
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, ArrayTracer, CompileTracer, CompiledFunction, Constant, ExecutionArguments, FromPjrt,
-        Session, TracedProgram, Type, Value, compile, to_mlir_module_for_program, trace_with_context,
+        LowerableProgram, ProgramLoweringOptions, Session, TracedProgram, Type, Value, compile, trace_with_context,
     };
 
     use super::*;
@@ -443,7 +443,6 @@ mod tests {
         /// Executes one homogeneous broadcast or its adjoint through the mixed executable ABI.
         fn execute(program: PlainProgram, values: &[f32], extent: i32) -> (Vec<f32>, Vec<u64>) {
             let input_type = program.input_types().into_owned().remove(0);
-            let output_type = program.output_types().into_owned().remove(0);
             let dimensions = physical_bound_type(&input_type)
                 .unwrap()
                 .static_shape()
@@ -453,16 +452,7 @@ mod tests {
                 .map(|dimension| *dimension as u64)
                 .collect::<Vec<_>>();
             let program = program.into_unprojected::<Constant, Operation>().unwrap();
-            let module = to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![input_type.clone()],
-                &vec![output_type],
-                "main",
-                None,
-                None,
-            )
-            .unwrap();
+            let module = program.to_mlir_module("main").unwrap();
             let client = execution_client();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
@@ -788,16 +778,18 @@ mod tests {
             .into_unprojected::<Constant, Operation>()
             .unwrap();
 
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![input_type],
-            &vec![output_type],
-            "main",
-            Some(&[input_sharding]),
-            Some(&[output_sharding]),
-        )
-        .unwrap();
+        let stablehlo = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&vec![input_type])
+                    .with_output_types(&vec![output_type])
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(vec![Some(input_sharding)])
+                    .with_exact_output_shardings(vec![Some(output_sharding)]),
+            )
+            .unwrap();
 
         assert_eq!(
             stablehlo,
@@ -840,16 +832,18 @@ mod tests {
             .unwrap()
             .into_unprojected::<Constant, Operation>()
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![input_type.clone()],
-            &vec![output_type],
-            "main",
-            Some(&[input_sharding]),
-            Some(&[output_sharding]),
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&vec![input_type.clone()])
+                    .with_output_types(&vec![output_type])
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(vec![Some(input_sharding)])
+                    .with_exact_output_shardings(vec![Some(output_sharding)]),
+            )
+            .unwrap();
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, Some(2)))
             .unwrap();
@@ -1421,7 +1415,6 @@ mod tests {
         let shape = Shape::new(vec![dynamic_dimension("size", Some(5))]);
         let integer_type = ArrayType::new(DataType::I64, shape.clone());
         let complex_type = ArrayType::new(DataType::C64, shape.clone());
-        let output_shape = Shape::new(vec![Dimension::Static(2), shape.dimensions()[0].clone()]);
         let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let integer_input = builder.add_input(integer_type.clone().into());
         let complex_input = builder.add_input(complex_type.clone().into());
@@ -1457,16 +1450,7 @@ mod tests {
                 vec![Placeholder; 2],
             )
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![integer_type, complex_type],
-            &vec![ArrayType::new(DataType::I64, output_shape.clone()), ArrayType::new(DataType::C64, output_shape)],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         // The executable ABI exposes physical buffers followed by each input's runtime size, and returns
         // each dynamic output size separately. One executable must handle both populated and empty shapes.
         let client = execution_client();
@@ -1604,33 +1588,27 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![rows.into(), columns.into()])).with_layout(layout);
         assert_eq!(program.output_types(), vec![Type::Array(output_type.clone())]);
         assert!(matches!(
-            to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![
+            program.to_mlir_module_with_options("main", &ProgramLoweringOptions::new().with_input_types(&vec![
                     ArrayType::scalar(DataType::F32),
                     ArrayType::scalar(DataType::I64),
                     ArrayType::scalar(DataType::I64)
-                ],
-                &output_type,
-                "main",
-                None,
-                None,
-            ),
+                ]).with_output_types(&output_type)),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "non-row-major bounded-dynamic output layout `tiled{0,1}`",
         ));
         // An unspecified executable result layout still permits the internal constraint.
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::I64), ArrayType::scalar(DataType::I64)],
-            &output_type.with_layout(None),
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&vec![
+                        ArrayType::scalar(DataType::F32),
+                        ArrayType::scalar(DataType::I64),
+                        ArrayType::scalar(DataType::I64),
+                    ])
+                    .with_output_types(&output_type.with_layout(None)),
+            )
+            .unwrap();
         // Constrain the bounded physical allocation before attaching the two runtime extents.
         assert_eq!(
             module,
@@ -1676,17 +1654,8 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()])).with_layout(layout.clone());
             assert!(matches!(
-                to_mlir_module_for_program(
-                    &program,
-                    &[],
-                    &ArrayType::scalar(DataType::F32),
-                    &output_type,
-                    "main",
-                    None,
-                    None,
-                ),
+                program.to_mlir_module("main"),
                 Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                     if reason == format!("{kind} output layout `{layout}`"),
             ));
@@ -1713,14 +1682,11 @@ mod tests {
             .unwrap();
         // An unspecified executable result layout defers the layout check to the operation lowering.
         assert!(matches!(
-            to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::I64)],
-                &ArrayType::new(DataType::F32, Shape::new(vec![size.into()])),
+            program.to_mlir_module_with_options(
                 "main",
-                None,
-                None,
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&vec![ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::I64)])
+                    .with_output_types(&ArrayType::new(DataType::F32, Shape::new(vec![size.into()]))),
             ),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "dynamic broadcast with explicit output layout needs finite allocation bounds",

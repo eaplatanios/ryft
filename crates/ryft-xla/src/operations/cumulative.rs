@@ -398,7 +398,7 @@ mod tests {
         Reduce, Shape, Sharding, associative_scan,
     };
 
-    use crate::lowering::modules::lower_mlir_module_for_program;
+    use crate::lowering::extensions::{LowerableProgram, ProgramLoweringOptions};
     use crate::lowering::tests::{
         ProgramBuilder, lowered_unary_module, to_mlir_module_for_plain_program, unproject_plain_program,
     };
@@ -777,9 +777,9 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let types = vec![input_type];
             let program = unproject_plain_program(program);
-            lower_mlir_module_for_program(&program, &[], &types, &types, "main", None, None, Some(target_platform))
+            program
+                .lower("main", &ProgramLoweringOptions::new().with_target_platform(Some(target_platform)))
                 .unwrap()
                 .into_stable_hlo()
         };
@@ -951,21 +951,12 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let program = unproject_plain_program(program);
-            let types = vec![input_type];
             for target_platform in ["cuda", "rocm"] {
                 assert_eq!(
-                    lower_mlir_module_for_program(
-                        &program,
-                        &[],
-                        &types,
-                        &types,
-                        "main",
-                        None,
-                        None,
-                        Some(target_platform),
-                    )
-                    .unwrap()
-                    .into_stable_hlo(),
+                    program
+                        .lower("main", &ProgramLoweringOptions::new().with_target_platform(Some(target_platform)))
+                        .unwrap()
+                        .into_stable_hlo(),
                     indoc! {"
                         module {
                           func.func @main(%arg0: tensor<2x4xi1>) -> tensor<2x4xi1> {

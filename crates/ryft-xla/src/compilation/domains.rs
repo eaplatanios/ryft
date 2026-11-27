@@ -36,10 +36,10 @@ use crate::lowering::emissions::{
     collect_session_constants, emitted_capture_reads, emitted_regions, omits_regions, unread_entry_arguments,
 };
 use crate::lowering::extensions::{
-    OutputShardingSource, ProgramLoweringExtension, ShardingLoweringExtension, entry_output_shardings,
-    entry_outputs_with_compiler_chosen_placement,
+    LowerableProgram, OutputShardingSource, ProgramLoweringExtension, ProgramLoweringOptions,
+    ShardingLoweringExtension, entry_output_shardings, entry_outputs_with_compiler_chosen_placement,
 };
-use crate::lowering::modules::{contains_unresolved_references, contains_unresolved_state};
+use crate::lowering::modules::{contains_unresolved_references, contains_unresolved_state, value_shardings};
 use crate::lowering::signatures::ExecutableSignature;
 use crate::{
     Array, Constant, Error, ExecutionError, LoweringError, OpShardingExtension, Operation, RetainedArray, Session,
@@ -821,22 +821,25 @@ impl Session {
         let open_outputs = (0..output_shardings.len())
             .map(|index| use_shardy_partitioner && index < output_count && public_open_outputs[index])
             .collect::<Vec<_>>();
-        let lowered_module = crate::lowering::modules::lower_mlir_module_for_program_with_reference_state(
-            program,
-            effective_capture_types.as_slice(),
-            &effective_public_input_types,
-            &output_types,
-            "main",
-            lowered_argument_shardings,
-            lowered_output_shardings,
-            target_platform,
-            supports_shardy,
-            reference_states,
-            &donation_flags,
-            options.unread_inputs().unwrap_or(&[]),
-            options.ragged_dot_lowering_strategy(),
-            &open_outputs,
-        )?;
+        // The program is already pruned, and its boundary is the one that this function resolved above.
+        let argument_count = effective_capture_types.len() + effective_public_input_types.parameter_count();
+        let lowering_options = ProgramLoweringOptions::new()
+            .without_pruning()
+            .with_capture_types(effective_capture_types.clone())
+            .with_input_types(&effective_public_input_types)
+            .with_output_types(&output_types)
+            .with_exact_argument_shardings(value_shardings(lowered_argument_shardings, argument_count))
+            .with_exact_output_shardings(value_shardings(lowered_output_shardings, output_types.parameter_count()))
+            .with_open_outputs(open_outputs.clone())
+            .with_target_platform(target_platform)
+            .with_shardy_support(supports_shardy)
+            .with_reference_states(
+                reference_states.to_vec(),
+                donation_flags.clone(),
+                options.unread_inputs().unwrap_or(&[]).to_vec(),
+            )
+            .with_ragged_dot_lowering_strategy(options.ragged_dot_lowering_strategy());
+        let lowered_module = program.lower("main", &lowering_options)?;
         // The module mesh assigns the devices of the target mesh to mesh coordinates, so a program over another
         // topology cannot be placed on it.
         if let Some(mesh) = lowered_module.mesh()
@@ -1662,7 +1665,7 @@ fn contains_shard_map(program: &FlatProgram<Session>, target_platform: Option<&s
 /// Regions that lowering never reaches (e.g., the rule regions of composites, the transpose region of a `linear_call`,
 /// a body that a backend implementation replaces, or the body of a scan whose length admits no iteration) are not
 /// checked, because they are not part of the compiled program. Entry points that lower a program without compiling it
-/// for a device mesh (e.g., [`ProgramExtension::to_mlir_module`](crate::ProgramExtension::to_mlir_module)) know no devices
+/// for a device mesh (e.g., [`LowerableProgram::to_mlir_module`]) know no devices
 /// and do not run it.
 ///
 /// # Errors
@@ -3982,17 +3985,18 @@ mod tests {
         // for Shardy and compiling it with the Shardy partitioner enabled fails on the internal dynamic tensor, even
         // though every boundary type is static.
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let annotated = crate::lowering::modules::lower_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![size_type, value_type.clone()],
-            &vec![value_type],
-            "main",
-            Some(&[replicated.clone(), replicated.clone()]),
-            Some(std::slice::from_ref(&replicated)),
-            None,
-        )
-        .unwrap();
+        let annotated = program
+            .lower(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&vec![size_type, value_type.clone()])
+                    .with_output_types(&vec![value_type])
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(vec![Some(replicated.clone()), Some(replicated.clone())])
+                    .with_exact_output_shardings(vec![Some(replicated.clone())]),
+            )
+            .unwrap();
         let mut shardy_options = jit_compilation_options(session.compilation_options(), mesh.devices(), true, None);
         resolve_shardy_debug_options(client, &mut shardy_options);
         let shardy_lowered =

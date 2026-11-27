@@ -683,8 +683,8 @@ mod tests {
         execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, CompiledFunction, Constant, Error, FromPjrt, Options, Session, Value, compile, compile_statefully,
-        to_mlir_module_for_program,
+        Array, CompiledFunction, Constant, Error, FromPjrt, LowerableProgram, Options, ProgramLoweringOptions, Session,
+        Value, compile, compile_statefully,
     };
 
     use super::*;
@@ -978,8 +978,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert_eq!(program.output_types(), vec![Type::Array(stacked_type.clone())]);
-            let stacked_types = [stacked_type];
-            to_mlir_module_for_program(&program, &[], &stacked_types, &stacked_types, "main", None, None)
+            program.to_mlir_module("main")
         };
         assert!(matches!(
             scan_program(2),
@@ -1524,16 +1523,14 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &(scalar_type.clone(), ArrayType::scalar(DataType::I64)),
-            &(scalar_type, stacked_type),
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let stablehlo = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&(scalar_type.clone(), ArrayType::scalar(DataType::I64)))
+                    .with_output_types(&(scalar_type, stacked_type)),
+            )
+            .unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -1817,16 +1814,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![scalar_type.clone()],
-            &vec![scalar_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -1896,16 +1884,14 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &(scalar_type.clone(), ArrayType::scalar(DataType::I64)),
-            &(scalar_type, stacked_type),
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let stablehlo = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&(scalar_type.clone(), ArrayType::scalar(DataType::I64)))
+                    .with_output_types(&(scalar_type, stacked_type)),
+            )
+            .unwrap();
 
         assert_eq!(
             stablehlo,
@@ -2244,16 +2230,15 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![dynamic_vector_type.clone()],
-            &vec![dynamic_vector_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let stablehlo = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&vec![dynamic_vector_type.clone()])
+                    .with_output_types(&vec![dynamic_vector_type]),
+            )
+            .unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -2354,16 +2339,14 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &(stacked_state_type.clone(), ArrayType::scalar(DataType::I64)),
-            &(stacked_state_type, stacked_bits_type),
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let stablehlo = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&(stacked_state_type.clone(), ArrayType::scalar(DataType::I64)))
+                    .with_output_types(&(stacked_state_type, stacked_bits_type)),
+            )
+            .unwrap();
 
         assert_eq!(
             stablehlo,
@@ -2535,16 +2518,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![scalar_type.clone(), stacked_type],
-            &vec![scalar_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -2850,9 +2824,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let stacked_types = [stacked_type.clone()];
-            let module =
-                to_mlir_module_for_program(&program, &[], &stacked_types, &stacked_types, "main", None, None).unwrap();
+            let module = program.to_mlir_module("main").unwrap();
             assert_eq!(module, expected, "length {length}");
         }
     }
@@ -2942,16 +2914,17 @@ mod tests {
             let output_type = program.output_types().into_owned().remove(0);
             let output_type = <&ArrayType>::try_from(&output_type).unwrap().clone();
             let stacked_types = [stacked_type.clone()];
-            let module = to_mlir_module_for_program(
-                &program,
-                &[],
-                &stacked_types,
-                &[output_type],
-                "main",
-                Some(&stacked_sharding),
-                None,
-            )
-            .unwrap();
+            let module = program
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_input_types(&stacked_types)
+                        .with_output_types(&[output_type])
+                        .without_boundary_shardings()
+                        .with_exact_argument_shardings(stacked_sharding.iter().cloned().map(Some).collect()),
+                )
+                .unwrap();
             assert_eq!(module, expected, "length {length}");
         }
     }
@@ -3004,9 +2977,18 @@ mod tests {
         );
         let types = vec![stack_type.clone()];
         let shardings = vec![stack_sharding];
-        let module =
-            to_mlir_module_for_program(&program, &[], &types, &types, "main", Some(&shardings), Some(&shardings))
-                .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&types)
+                    .with_output_types(&types)
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_exact_output_shardings(shardings.iter().cloned().map(Some).collect()),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -3134,9 +3116,18 @@ mod tests {
         );
         let types = vec![carry_type.clone(), stack_type.clone()];
         let shardings = vec![carry_sharding, stack_sharding];
-        let module =
-            to_mlir_module_for_program(&program, &[], &types, &types, "main", Some(&shardings), Some(&shardings))
-                .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&types)
+                    .with_output_types(&types)
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_exact_output_shardings(shardings.iter().cloned().map(Some).collect()),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -3308,9 +3299,18 @@ mod tests {
             ),
         );
         let types = vec![sum_type.clone(), items_type.clone()];
-        let module =
-            to_mlir_module_for_program(&program, &[], &types, &types, "main", Some(&shardings), Some(&shardings))
-                .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&types)
+                    .with_output_types(&types)
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_exact_output_shardings(shardings.iter().cloned().map(Some).collect()),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"

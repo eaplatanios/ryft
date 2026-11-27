@@ -171,7 +171,7 @@ mod tests {
     };
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
-    use crate::{ArrayConstant, Session, to_mlir_module_for_program};
+    use crate::{ArrayConstant, LowerableProgram, Session};
 
     use super::*;
 
@@ -193,16 +193,7 @@ mod tests {
             .unwrap();
         let program = unproject_plain_program(program);
         assert_eq!(
-            to_mlir_module_for_program(
-                &program,
-                &[],
-                &[condition_type, branch_type.clone(), branch_type.clone()],
-                &[branch_type],
-                "main",
-                None,
-                None,
-            )
-            .unwrap(),
+            program.to_mlir_module("main").unwrap(),
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<i1>, %arg1: tensor<3xf32>, %arg2: tensor<3xf32>) -> tensor<3xf32> {

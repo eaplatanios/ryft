@@ -345,7 +345,7 @@ mod tests {
     use crate::lowering::types::lower_static_index_constants;
     use crate::operations::Operation;
     use crate::tests::{execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
-    use crate::{ArrayConstant, Constant, ToPjrt, to_mlir_module_for_program};
+    use crate::{ArrayConstant, Constant, LowerableProgram, ToPjrt};
 
     use super::*;
 
@@ -691,16 +691,7 @@ mod tests {
                         .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
                         .unwrap();
                     let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
-                    let module = to_mlir_module_for_program(
-                        &program,
-                        &[],
-                        &vec![input_type, padding_type],
-                        &vec![output_type.clone()],
-                        "pad_dynamic",
-                        None,
-                        None,
-                    )
-                    .unwrap();
+                    let module = program.to_mlir_module("pad_dynamic").unwrap();
                     let capacity = physical_bound_type(&output_type).unwrap().dimension(0).value().unwrap();
                     let storage_type = format!("tensor<{capacity}x{element}>");
                     let body = if output_type.static_shape().is_some() {

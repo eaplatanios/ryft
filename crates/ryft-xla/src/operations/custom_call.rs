@@ -579,7 +579,6 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Program};
 
-    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, execute_mixed_program, static_sharded_array_type, test_matrix_type,
         unproject_plain_program,
@@ -593,8 +592,8 @@ mod tests {
     };
     use crate::{
         Array, ArrayConstant, ArrayTracer, Constant, ExecutionArguments, FromPjrt, KernelEmbeddingError,
-        ProgramExtension, RuntimeError, RuntimeRequirement, Session, TracedProgram, Type, Value,
-        to_mlir_module_for_program, trace,
+        LowerableProgram, ProgramLoweringOptions, RuntimeError, RuntimeRequirement, Session, TracedProgram, Type,
+        Value, trace,
     };
 
     use super::*;
@@ -645,10 +644,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let input_types = vec![column_major_type, array_type.clone()];
-        let output_types = vec![array_type];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             module,
@@ -701,15 +697,7 @@ mod tests {
             .unwrap();
         let program = unproject_plain_program(program);
         assert!(matches!(
-            to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![strided_type.clone()],
-                &vec![strided_type],
-                "main",
-                None,
-                None,
-            ),
+            program.to_mlir_module("main"),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "strided input layout `strided{12,4}`",
         ));
@@ -779,9 +767,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let module =
-            to_mlir_module_for_program(&program, &[], &vec![array_type.clone()], &vec![array_type], "main", None, None)
-                .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -811,16 +797,15 @@ mod tests {
         let program = builder.build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![], vec![]).unwrap();
         let program = unproject_plain_program(program);
         assert_eq!(
-            to_mlir_module_for_program(
-                &program,
-                &[],
-                &Vec::<ArrayType>::new(),
-                &Vec::<ArrayType>::new(),
-                "main",
-                None,
-                None,
-            )
-            .unwrap(),
+            program
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_input_types(&Vec::<ArrayType>::new())
+                        .with_output_types(&Vec::<ArrayType>::new())
+                )
+                .unwrap(),
             indoc! {r#"
                 module {
                   func.func @main() {
@@ -851,16 +836,7 @@ mod tests {
             .unwrap();
         let program = unproject_plain_program(program);
         assert_eq!(
-            to_mlir_module_for_program(
-                &program,
-                &[],
-                &Vec::<ArrayType>::new(),
-                &vec![output_type],
-                "main",
-                None,
-                None,
-            )
-            .unwrap(),
+            program.to_mlir_module("main").unwrap(),
             indoc! {r#"
                 module {
                   func.func @main() -> (tensor<2xf64> {mhlo.memory_kind = "pinned_host"}) {
@@ -894,16 +870,7 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let error = to_mlir_module_for_program(
-                &unproject_plain_program(program),
-                &[],
-                &vec![input_type.clone()],
-                &vec![output_type.clone()],
-                "main",
-                None,
-                None,
-            )
-            .unwrap_err();
+            let error = (unproject_plain_program(program)).to_mlir_module("main").unwrap_err();
             assert!(matches!(
                 error.downcast_custom::<KernelEmbeddingError>(),
                 Some(KernelEmbeddingError::Invalid { message })
@@ -938,17 +905,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![array_type.clone()],
-            &vec![array_type],
-            "main",
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let lowered = program.lower("main", &ProgramLoweringOptions::new()).unwrap();
 
         let (stable_hlo, _, _, runtime_requirements) = lowered.into_parts();
         assert_eq!(runtime_requirements.as_ref(), &[first, second]);
@@ -987,9 +944,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            lower_mlir_module_for_program(
-                &program, &[], &vec![array_type.clone()], &vec![array_type], "main", None, None, None,
-            ),
+            program.lower("main", &ProgramLoweringOptions::new()),
             Err(Error::Runtime(RuntimeError::ConflictingRequirements { identifier })) if identifier == "test.runtime",
         ));
     }
@@ -1011,8 +966,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![first], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let text = to_mlir_module_for_program(&program, &[], &vec![scalar.clone()], &vec![scalar], "main", None, None)
-            .unwrap();
+        let text = program.to_mlir_module("main").unwrap();
         let context = MlirContext::new();
         context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         context.load_dialect(DialectHandle::stable_hlo().unwrap()).unwrap();
@@ -1049,16 +1003,7 @@ mod tests {
         builder.add_instruction(call, vec![], vec![], None).unwrap();
         let program = builder.build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![], vec![]).unwrap();
         let program = unproject_plain_program(program);
-        let text = to_mlir_module_for_program(
-            &program,
-            &[],
-            &Vec::<ArrayType>::new(),
-            &Vec::<ArrayType>::new(),
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let text = program.to_mlir_module("main").unwrap();
         let context = MlirContext::new();
         context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         context.load_dialect(DialectHandle::stable_hlo().unwrap()).unwrap();
@@ -1096,16 +1041,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![dynamic_type.clone()],
-            &vec![dynamic_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             module,
@@ -1214,7 +1150,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            to_mlir_module_for_program(&program, &[], &vec![input_type], &vec![output_type], "main", None, None),
+            program.to_mlir_module("main"),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason
                     == "`custom_call` input dimension `size` needs a finite upper bound for physical buffer \
@@ -1236,9 +1172,7 @@ mod tests {
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![], vec![Placeholder]).unwrap();
         let output_type = ArrayType::new_static(DataType::F32, [3]);
         assert_eq!(program.output_types(), vec![Type::Array(output_type.clone())]);
-        let module =
-            to_mlir_module_for_program(&program, &[], &Vec::<ArrayType>::new(), &vec![output_type], "main", None, None)
-                .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -1279,17 +1213,14 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
-        let lowered = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![alias_type.clone(), ArrayType::scalar(DataType::I64)],
-            &vec![alias_type, ArrayType::new_static(DataType::F32, [3, 3])],
-            "main",
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let lowered = program
+            .lower(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&vec![alias_type.clone(), ArrayType::scalar(DataType::I64)])
+                    .with_output_types(&vec![alias_type, ArrayType::new_static(DataType::F32, [3, 3])]),
+            )
+            .unwrap();
         let (stable_hlo, signature, requires_assertion_handler, runtime_requirements) = lowered.into_parts();
         assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin("ryft.assert")]);
         // This direct lowering fixture has no ordered boundary slot and needs no transport admission.
@@ -1392,16 +1323,14 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let module = to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![ArrayType::scalar(DataType::I64)],
-                &vec![ArrayType::new_static(DataType::F64, [3, 3])],
-                "main",
-                None,
-                None,
-            )
-            .unwrap();
+            let module = program
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .with_input_types(&vec![ArrayType::scalar(DataType::I64)])
+                        .with_output_types(&vec![ArrayType::new_static(DataType::F64, [3, 3])]),
+                )
+                .unwrap();
             assert_eq!(module, expected, "{effect:?}");
         }
     }
@@ -1421,16 +1350,16 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![ArrayType::scalar(DataType::I64)],
-            &vec![ArrayType::new_static(DataType::F64, [3, 3]).with_memory(Memory::Host { pinned: true })],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&vec![ArrayType::scalar(DataType::I64)])
+                    .with_output_types(&vec![
+                        ArrayType::new_static(DataType::F64, [3, 3]).with_memory(Memory::Host { pinned: true }),
+                    ]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"

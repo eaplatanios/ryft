@@ -1427,7 +1427,6 @@ mod tests {
         BufferSpecification, BufferType, ExecutionDeviceInputs, ExecutionFence, ExecutionInput, Program as PjrtProgram,
     };
 
-    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         ProgramBuilder, add_call, execute_mixed_program, identity_branch, lower_replicated_shard_map_body, neg_branch,
         test_vector_type, unproject_plain_program,
@@ -1436,9 +1435,9 @@ mod tests {
     use crate::sessions::tests::{domain_mesh, read_first_shard, read_sharded_f32_array, two_device_mesh};
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, CompileTracer, CompiledFunction, Constant, CustomCallOperationExtension, Error, FromPjrt, Options,
-        RuntimeRequirement, StagedFunction, ToPjrt, Type, Value, compile, compile_with_options, stage,
-        to_mlir_module_for_program,
+        Array, CompileTracer, CompiledFunction, Constant, CustomCallOperationExtension, Error, FromPjrt,
+        LowerableProgram, Options, ProgramLoweringOptions, RuntimeRequirement, StagedFunction, ToPjrt, Type, Value,
+        compile, compile_with_options, stage,
     };
 
     use super::*;
@@ -1472,7 +1471,16 @@ mod tests {
         };
         let input_types = program.input_types().iter().map(array_type).collect::<Vec<_>>();
         let output_types = program.output_types().iter().map(array_type).collect::<Vec<_>>();
-        let module = to_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings(),
+            )
+            .unwrap();
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
             .unwrap();
@@ -1545,7 +1553,16 @@ mod tests {
             .unwrap();
         let input_types = vec![array_type.clone()];
         let output_types = vec![array_type];
-        to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap()
+        program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings(),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -1667,16 +1684,15 @@ mod tests {
         // which constrains its input to the replicated sharding of the declared type, but the two lower differently.
         let input_types = vec![array_type.clone()];
         let output_types = vec![array_type.clone(), array_type.clone()];
-        let module = to_mlir_module_for_program(
-            &program(&base, &derived(vec![None])),
-            &[],
-            &input_types,
-            &output_types,
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = (program(&base, &derived(vec![None])))
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings(),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -1777,17 +1793,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![array_type.clone()],
-            &vec![array_type.clone()],
-            "main",
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let lowered = program.lower("main", &ProgramLoweringOptions::new()).unwrap();
 
         let (stable_hlo, _, _, runtime_requirements) = lowered.into_parts();
         assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin("test.active")]);
@@ -1831,17 +1837,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![array_type.clone()],
-            &vec![array_type],
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap();
+        let lowered = program.lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda"))).unwrap();
 
         let (stable_hlo, _, _, runtime_requirements) = lowered.into_parts();
         assert!(runtime_requirements.is_empty());
@@ -1947,10 +1943,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let input_types = vec![ArrayType::scalar(DataType::Boolean), vector_type.clone()];
-        let output_types = vec![vector_type];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             module,
@@ -2069,16 +2062,19 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::I64), array_type.clone()],
-            &[array_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&[
+                        ArrayType::scalar(DataType::Boolean),
+                        ArrayType::scalar(DataType::I64),
+                        array_type.clone(),
+                    ])
+                    .with_output_types(&[array_type]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -2172,16 +2168,19 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![zero], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [2, 2]);
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[ArrayType::scalar(DataType::I64), ArrayType::scalar(DataType::I64), ArrayType::scalar(DataType::Boolean)],
-            &[output_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&[
+                        ArrayType::scalar(DataType::I64),
+                        ArrayType::scalar(DataType::I64),
+                        ArrayType::scalar(DataType::Boolean),
+                    ])
+                    .with_output_types(&[output_type]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -3126,16 +3125,18 @@ mod tests {
         let input_types = vec![array_type.clone()];
         let output_types = vec![array_type];
         let shardings = [replicated];
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &input_types,
-            &output_types,
-            "main",
-            Some(&shardings),
-            Some(&shardings),
-        )
-        .unwrap();
+        let stablehlo = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_exact_output_shardings(shardings.iter().cloned().map(Some).collect()),
+            )
+            .unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -3436,10 +3437,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let input_types = vec![array_type.clone()];
-        let output_types = vec![array_type];
-        let stablehlo =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"

@@ -547,7 +547,6 @@ mod tests {
         Sharding, Typed, block_scaled_dot, differentiate_at, f4e2m1fn, f8e4m3fn,
     };
 
-    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, add_call, execute_mixed_program, unproject_plain_program,
     };
@@ -555,8 +554,8 @@ mod tests {
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, LoweringError, Session, Type, compile,
-        to_mlir_module_for_program,
+        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, LowerableProgram, LoweringError,
+        ProgramLoweringOptions, Session, Type, compile,
     };
 
     use super::*;
@@ -602,9 +601,8 @@ mod tests {
         // decomposition, and the eventual XLA target decides whether to replace that boundary. The narrow inputs pass
         // through an optimization barrier, so their producers' conversions cannot fold into the decomposition's
         // conversions.
-        let (program, input_types, output_types) = scaled_dot_fixture_program();
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let (program, _, _) = scaled_dot_fixture_program();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -641,7 +639,6 @@ mod tests {
         // scale.
         let element_type =
             ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
         let inputs = vec![builder.add_input(element_type.clone()), builder.add_input(element_type.clone())];
         let output = builder
@@ -662,16 +659,7 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap(),
         );
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[element_type.clone(), element_type],
-            &[output_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             module,
@@ -748,11 +736,11 @@ mod tests {
         // block-scaled matrix product on capable devices, instead of the composite. The narrow inputs still pass
         // through the optimization barrier, because XLA's dequantized fallback for other devices would otherwise
         // expose foldable conversion pairs.
-        let (program, input_types, output_types) = scaled_dot_fixture_program();
-        let module =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
-                .unwrap()
-                .into_stable_hlo();
+        let (program, _, _) = scaled_dot_fixture_program();
+        let module = program
+            .lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda")))
+            .unwrap()
+            .into_stable_hlo();
         assert_eq!(
             module,
             indoc! {r#"
@@ -776,7 +764,6 @@ mod tests {
         let scale_type = |shape: [usize; 3]| ArrayType::new_static(DataType::F8E4M3FN, shape);
         let input_types =
             vec![element_type([1, 2, 32]), element_type([1, 32, 4]), scale_type([1, 2, 2]), scale_type([1, 2, 4])];
-        let output_types = vec![ArrayType::new_static(DataType::BF16, [1, 2, 4])];
         let mut builder = ProgramBuilder::new();
         let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
         let output = builder
@@ -797,10 +784,10 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
                 .unwrap(),
         );
-        let module =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
-                .unwrap()
-                .into_stable_hlo();
+        let module = program
+            .lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda")))
+            .unwrap()
+            .into_stable_hlo();
         assert_eq!(
             module,
             indoc! {r#"
@@ -824,7 +811,6 @@ mod tests {
         let element_type = ArrayType::new_static(DataType::F4E2M1FN, [2, 32]);
         let scale_type = ArrayType::new_static(DataType::F8E8M0FNU, [2, 1]);
         let input_types = vec![element_type.clone(), element_type, scale_type.clone(), scale_type];
-        let output_types = vec![ArrayType::new_static(DataType::F32, [2, 2])];
         let mut builder = ProgramBuilder::new();
         let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
         let output = builder
@@ -845,10 +831,10 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
                 .unwrap(),
         );
-        let module =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
-                .unwrap()
-                .into_stable_hlo();
+        let module = program
+            .lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda")))
+            .unwrap()
+            .into_stable_hlo();
 
         assert_eq!(
             module,
@@ -905,10 +891,7 @@ mod tests {
         );
         let right_scale_type =
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(1), Dimension::Static(1)]));
-        let output_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(1)]));
         let input_types = vec![left_type, right_type, left_scale_type, right_scale_type];
-        let output_types = vec![output_type];
         let mut builder = ProgramBuilder::new();
         let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
         let output = builder
@@ -929,10 +912,10 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
                 .unwrap(),
         );
-        let module =
-            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
-                .unwrap()
-                .into_stable_hlo();
+        let module = program
+            .lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda")))
+            .unwrap()
+            .into_stable_hlo();
         assert_eq!(
             module,
             indoc! {r#"
@@ -992,8 +975,6 @@ mod tests {
                     if block_bound == 2 { Dimension::Static(1) } else { Dimension::Dynamic(blocks) },
                 ]),
             );
-            let output_type =
-                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(1)]));
             let input_types = vec![element_type.clone(), element_type, scale_type.clone(), scale_type];
             let mut builder = ProgramBuilder::new();
             let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
@@ -1019,16 +1000,7 @@ mod tests {
                     )
                     .unwrap(),
             );
-            let module = lower_mlir_module_for_program(
-                &program,
-                &[],
-                &input_types,
-                &[output_type],
-                "main",
-                None,
-                None,
-                Some("cuda"),
-            );
+            let module = program.lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda")));
             if block_bound == 3 {
                 assert!(matches!(
                     module.err().unwrap(),
@@ -1055,7 +1027,6 @@ mod tests {
             ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(16)]));
         let scale_type =
             ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let mut callee_builder = ProgramBuilder::new();
         let callee_inputs = vec![
             callee_builder.add_input(element_type.clone()),
@@ -1093,19 +1064,10 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
             .unwrap();
-        let input_types = vec![element_type.clone(), element_type, scale_type.clone(), scale_type];
-        let module = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &input_types,
-            &[output_type],
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap()
-        .into_stable_hlo();
+        let module = program
+            .lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda")))
+            .unwrap()
+            .into_stable_hlo();
 
         assert_eq!(
             module,

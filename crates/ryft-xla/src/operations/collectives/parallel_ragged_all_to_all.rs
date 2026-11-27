@@ -583,13 +583,14 @@ mod tests {
         GpuPlatform, Program as PjrtProgram,
     };
 
+    use crate::lowering::extensions::{LowerableProgram, ProgramLoweringOptions};
     #[cfg(feature = "cuda-13")]
     use crate::lowering::tests::static_sharded_array_type;
     use crate::lowering::tests::{shard_map_module, test_sharding};
     #[cfg(feature = "cuda-13")]
     use crate::tests::{test_compilation_options, values_from_bytes, values_to_bytes};
     #[cfg(feature = "cuda-13")]
-    use crate::{Array, ExecutionArguments, FromPjrt, Platform, ProgramExtension, Session};
+    use crate::{Array, ExecutionArguments, FromPjrt, Platform, Session};
     use crate::{ArrayTracer, TracedProgram, trace};
 
     use super::*;
@@ -1412,19 +1413,9 @@ mod tests {
             input_types.clone(),
         )
         .unwrap();
-        let output_type = traced.output_type().unwrap();
 
         assert!(matches!(
-            crate::lowering::modules::lower_mlir_module_for_program(
-                &traced,
-                &[],
-                &input_types,
-                <&ArrayType>::try_from(&output_type).unwrap(),
-                "main",
-                None,
-                None,
-                Some("cpu"),
-            ),
+            traced.lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cpu"))),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 CoreError::Program(ProgramError::UnsupportedOperation { message })

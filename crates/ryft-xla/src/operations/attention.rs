@@ -997,12 +997,11 @@ mod tests {
 
     #[cfg(feature = "cuda-13")]
     use crate::Platform;
-    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::sessions::tests::domain_mesh;
     #[cfg(feature = "cuda-13")]
     use crate::tests::values_from_bytes;
     use crate::tests::{cpu_client, execution_client, replicated_array, values_to_bytes};
-    use crate::{Array, Session, Tracer, to_mlir_module_for_program};
+    use crate::{Array, LowerableProgram, ProgramLoweringOptions, Session, Tracer};
 
     use super::*;
 
@@ -1130,7 +1129,16 @@ mod tests {
         (program, input_types, output_types): &StagedProgram,
         target_platform: Option<&str>,
     ) -> Result<String, Error> {
-        lower_mlir_module_for_program(program, &[], input_types, output_types, "main", None, None, target_platform)
+        program
+            .lower(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(input_types)
+                    .with_output_types(output_types)
+                    .without_boundary_shardings()
+                    .with_target_platform(target_platform),
+            )
             .map(|module| module.into_stable_hlo())
     }
 
@@ -1704,7 +1712,7 @@ mod tests {
             input_types.clone(),
             2,
         );
-        let module = to_mlir_module_for_program(&program.0, &[], &program.1, &program.2, "main", None, None).unwrap();
+        let module = program.0.to_mlir_module("main").unwrap();
         assert_eq!(module.matches("func.func private @ryft.dot_product_attention.v1(").count(), 1);
         assert_eq!(module.matches("call @ryft.dot_product_attention.v1(").count(), 2);
         assert_eq!(module.matches("stablehlo.dot_general").count(), 2);

@@ -1653,13 +1653,12 @@ mod tests {
     };
     use ryft_pjrt::extensions::ffi::XLA_FFI_Buffer;
 
-    use crate::lowering::modules::lower_mlir_module_for_program_with_reference_state;
     use crate::lowering::tests::{MixedValue, execute_mixed_program};
     use crate::operations::Operation;
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::sessions::tests::{boolean_vector, domain_mesh, f32_vector, read_first_shard, replicated_scalar_type};
     use crate::tests::{cpu_client, execution_client};
-    use crate::{Array, Constant, Options, RaggedDotLoweringStrategy, Session, Type, to_mlir_module_for_program};
+    use crate::{Array, Constant, LowerableProgram, Options, ProgramLoweringOptions, Session, Type};
 
     use super::*;
 
@@ -1709,16 +1708,14 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![printed], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[ArrayType::scalar(DataType::I64), array_type.clone()],
-            &[array_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&[ArrayType::scalar(DataType::I64), array_type.clone()])
+                    .with_output_types(&[array_type]),
+            )
+            .unwrap();
         // The print's token is the guard assertion's output token, so the print cannot run before the check.
         assert_eq!(
             module,
@@ -1889,16 +1886,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![guarded, printed], vec![Placeholder; 4], vec![Placeholder; 2])
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[scalar_type.clone(), scalar_type, array_type.clone(), array_type.clone()],
-            &[array_type.clone(), array_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         // The guard emits no assertion of its own, but it joins the token of the preceding requirement into the ordered
         // I/O chain, so the print consumes that token.
         assert_eq!(
@@ -1991,9 +1979,15 @@ mod tests {
             assert_eq!(discharged.external_reference_bindings().len(), 2);
             assert!(discharged.external_reference_bindings().iter().all(|binding| binding.output_index().is_none()));
             let program = discharged.program();
-            let module =
-                to_mlir_module_for_program(program, &[], &input_types, &vec![vector(&retained)], "main", None, None)
-                    .unwrap();
+            let module = program
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_input_types(&input_types)
+                        .with_output_types(&vec![vector(&retained)]),
+                )
+                .unwrap();
             // Both members pass one barrier together with the assertion token, so the bounded conversion of the wider
             // member and the addition follow the check.
             assert_eq!(
@@ -2083,16 +2077,20 @@ mod tests {
                     in (%8, %9)"}
             };
             assert_eq!(jvp.to_string(), expected_jvp);
-            let tangent_module = to_mlir_module_for_program(
-                &jvp,
-                &[],
-                &vec![input_types[0].clone(), input_types[1].clone(), input_types[0].clone(), input_types[1].clone()],
-                &vec![vector(&retained), vector(&retained)],
-                "main",
-                None,
-                None,
-            )
-            .unwrap();
+            let tangent_module = jvp
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_input_types(&vec![
+                            input_types[0].clone(),
+                            input_types[1].clone(),
+                            input_types[0].clone(),
+                            input_types[1].clone(),
+                        ])
+                        .with_output_types(&vec![vector(&retained), vector(&retained)]),
+                )
+                .unwrap();
             let expected_tangent_module = if array_ir {
                 indoc! {"
                     module {
@@ -2293,23 +2291,18 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder, Placeholder], vec![])
             .unwrap();
-        let lowered = lower_mlir_module_for_program_with_reference_state(
-            &program,
-            &[],
-            &vec![scalar_type.clone(), scalar_type],
-            &Vec::<ArrayType>::new(),
-            "main",
-            None,
-            None,
-            Some("cpu"),
-            true,
-            &[],
-            &[],
-            &[],
-            RaggedDotLoweringStrategy::default(),
-            &[],
-        )
-        .unwrap();
+        let lowered = program
+            .lower(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&vec![scalar_type.clone(), scalar_type])
+                    .with_output_types(&Vec::<ArrayType>::new())
+                    .without_boundary_shardings()
+                    .with_target_platform(Some("cpu"))
+                    .with_reference_states(Vec::new(), Vec::new(), Vec::new()),
+            )
+            .unwrap();
         let (stable_hlo, signature, requires_assertion_handler, runtime_requirements) = lowered.into_parts();
         assert!(requires_assertion_handler);
         assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin(ASSERT_CUSTOM_CALL_TARGET)]);
@@ -2410,16 +2403,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![left], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![scalar_type.clone(), scalar_type.clone()],
-            &vec![scalar_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
 
         // The two gateway bounds checks and two explicit requirements share the assertion chain. The print receives
         // a separately created token, so it has no artificial dependency on either neighboring assertion.

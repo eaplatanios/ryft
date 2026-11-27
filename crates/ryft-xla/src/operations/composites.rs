@@ -580,12 +580,11 @@ mod tests {
     use ryft_mlir::{Block, Context as MlirContext, Location};
 
     use crate::lowering::emissions::lowers_without_regions;
-    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::test_vector_type;
     use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
-    use crate::{Array, Constant, Session, Tracer, to_mlir_module_for_program};
+    use crate::{Array, Constant, LowerableProgram, ProgramLoweringOptions, Session, Tracer};
 
     use super::*;
 
@@ -634,7 +633,16 @@ mod tests {
     fn lower_named_calls(program: &FlatProgram<Session>, target_platform: Option<&str>) -> Result<String, Error> {
         let input_types = vec![test_vector_type(4)];
         let output_types = vec![test_vector_type(4); program.output_ids().len()];
-        lower_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None, target_platform)
+        program
+            .lower(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings()
+                    .with_target_platform(target_platform),
+            )
             .map(|module| module.into_stable_hlo())
     }
 
@@ -762,10 +770,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let input_types = vec![vector_type.clone()];
-            let output_types = vec![vector_type.clone()];
-            let module =
-                to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+            let module = program.to_mlir_module("main").unwrap();
 
             assert_eq!(
                 module,
@@ -916,10 +921,8 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let input_types = vec![vector_type.clone()];
-        let output_types = vec![vector_type.clone()];
         assert_eq!(
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap(),
+            program.to_mlir_module("main").unwrap(),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
@@ -1354,11 +1357,9 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let input_types = vec![vector_type.clone(), vector_type.clone()];
-        let output_types = vec![vector_type];
 
         assert!(matches!(
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None),
+            program.to_mlir_module("main"),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 CoreError::Program(ProgramError::UnsupportedOperation { message })

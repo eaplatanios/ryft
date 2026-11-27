@@ -8507,6 +8507,62 @@ mod tests {
     }
 
     #[test]
+    fn test_session_place_places_grouped_leaves_without_communication() {
+        let clients = [cpu_client(1), process_one_cpu_client(1)];
+        let devices = clients.map(first_device);
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.to_vec()).unwrap();
+        let sharding = Sharding::replicated(logical_mesh.clone(), 1);
+
+        // A rank-0 sharding of the rank-1 source is padded to its rank.
+        let short_target = Placement::new(mesh.clone(), Sharding::replicated(logical_mesh, 0)).unwrap();
+        let assert_output = |output: &Array, expected_devices: &[Device], expected_shards: &[Vec<u8>]| {
+            assert_eq!(output.mesh().devices(), expected_devices);
+            output.block_until_ready().unwrap();
+            let shards = output.addressable_shards().map(|shard| shard.copy_to_host_bytes().unwrap());
+            assert_eq!(shards.collect::<Vec<_>>(), expected_shards);
+        };
+        for (rank, client) in clients.into_iter().enumerate() {
+            // Explicit peers exercise admission without a native comparison transport. Both ranks expose the same
+            // shard metadata and hold only their own replica.
+            let session = Session::builder().client(client).remote_devices([devices[1 - rank]]).build().unwrap();
+            let source = Array::from_host_buffer(
+                &session,
+                ArrayType::new_static(DataType::U8, [1]),
+                mesh.clone(),
+                Some(sharding.clone()),
+                [7u8],
+            )
+            .unwrap();
+
+            // Each process serves both targets from the replica on its own device, so neither placement
+            // communicates, alone or grouped with others. Only process 0 owns the first device.
+            let first_device_shards = vec![vec![7u8]; usize::from(rank == 0)];
+            let one = session.place(source.clone(), PlacementOptions::to(devices[0])).unwrap();
+            assert_output(&one, &devices[..1], &first_device_shards);
+            for (target, expected_devices, expected_shards) in [
+                (PlacementRequest::from(devices[0]), &devices[..1], first_device_shards.clone()),
+                (PlacementRequest::from(short_target.clone()), &devices[..], vec![vec![7u8]]),
+            ] {
+                let pair = (source.clone(), source.clone());
+                let (left, right) = session.place(pair, PlacementOptions::to(target.clone())).unwrap();
+                assert_output(&left, expected_devices, &expected_shards);
+                assert_output(&right, expected_devices, &expected_shards);
+
+                let operation = PlaceOperation::new(Some(target), None);
+                let outputs = ValueDomainDispatch::place_operations(vec![
+                    (source.clone(), operation.clone()),
+                    (source.clone(), operation),
+                ])
+                .unwrap();
+                let [left, right] = outputs.as_slice() else { panic!("expected one output for each input") };
+                assert_output(left, expected_devices, &expected_shards);
+                assert_output(right, expected_devices, &expected_shards);
+            }
+        }
+    }
+
+    #[test]
     fn test_session_place_rejects_traced_leaves_over_arrays_of_another_client() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();

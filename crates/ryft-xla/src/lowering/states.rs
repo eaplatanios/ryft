@@ -491,7 +491,7 @@ mod tests {
         ProgramError, ReductionKind, Shape, ShardMapBoundary, ShardMapOptions, Sharding, ShardingDimension, shard_map,
     };
 
-    use crate::{ArrayTracer, Error, ProgramExtension, TracedProgram, trace};
+    use crate::{ArrayTracer, Error, LowerableProgram, TracedProgram, trace};
 
     use crate::lowering::tests::test_manual_mesh;
 

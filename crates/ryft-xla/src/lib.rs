@@ -69,10 +69,10 @@ pub use kernels::{
     ROCM_KERNEL_CUSTOM_CALL_TARGET, stage_kernel, stage_kernel_with_fallback, stage_kernel_with_jvp,
     stage_kernel_with_rules, stage_kernel_with_vjp,
 };
-pub use lowering::extensions::ProgramExtension;
 pub use lowering::{
-    DataDependentPaddingDiscipline, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
-    MemberLowerableOperation, RaggedDotLoweringStrategy, lower_projected_operation, to_mlir_module_for_program,
+    DataDependentPaddingDiscipline, LowerableOperation, LowerableOperationFamily, LowerableProgram, LoweredModule,
+    Lowerer, LoweringError, MemberLowerableOperation, ProgramLoweringOptions, RaggedDotLoweringStrategy,
+    lower_projected_operation,
 };
 pub use mlir::ToMlir;
 pub use operations::{

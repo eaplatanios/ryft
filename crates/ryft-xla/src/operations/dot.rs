@@ -605,7 +605,6 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{
         ProgramBuilder, dynamic_dimension, to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy,
         unproject_plain_program,
@@ -616,8 +615,8 @@ mod tests {
         cpu_client, execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayConstant, ArrayTracer, Constant, Options, ProgramExtension, Session, ToPjrt, TracedProgram, Type,
-        to_mlir_module_for_program, trace,
+        Array, ArrayConstant, ArrayTracer, Constant, LowerableProgram, Options, ProgramLoweringOptions, Session,
+        ToPjrt, TracedProgram, Type, trace,
     };
 
     use super::*;
@@ -639,7 +638,16 @@ mod tests {
             .unwrap();
         let program = unproject_plain_program(program);
         let input_types = vec![left_type, right_type];
-        lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, target_platform)
+        program
+            .lower(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings()
+                    .with_target_platform(target_platform),
+            )
             .map(|module| module.into_stable_hlo())
     }
 
@@ -769,7 +777,6 @@ mod tests {
         // type.
         let operand_type =
             ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let mut builder = ProgramBuilder::new();
         let left = builder.add_input(operand_type.clone());
         let right = builder.add_input(operand_type.clone());
@@ -779,10 +786,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let input_types = vec![operand_type.clone(), operand_type];
-        let output_types = vec![output_type];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             module,
@@ -813,9 +817,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let input_types = vec![left_type, right_type.clone()];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &[right_type], "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"

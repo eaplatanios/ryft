@@ -579,15 +579,14 @@ mod tests {
 
     #[cfg(feature = "cuda-13")]
     use crate::Platform;
-    use crate::lowering::modules::lower_mlir_module_for_program_with_reference_state;
     use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::sessions::tests::{domain_mesh, f64_vector, read_first_shard};
     use crate::tests::{
         cpu_client, execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayConstant, CompiledFunction, FromPjrt, Options, RaggedDotLoweringStrategy, RuntimeError, Session,
-        compile, to_mlir_module_for_program,
+        Array, ArrayConstant, CompiledFunction, FromPjrt, LowerableProgram, Options, ProgramLoweringOptions,
+        RuntimeError, Session, compile,
     };
 
     use super::*;
@@ -746,8 +745,15 @@ mod tests {
         let program = unproject_plain_program(program);
         let input_types = vec![array_type.clone()];
         let output_types = vec![array_type];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types),
+            )
+            .unwrap();
 
         assert_eq!(
             module,
@@ -783,23 +789,18 @@ mod tests {
                 .unwrap();
             let program =
                 builder.build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![Placeholder], vec![]).unwrap();
-            let lowered = lower_mlir_module_for_program_with_reference_state(
-                &unproject_plain_program(program),
-                &[],
-                &vec![array_type],
-                &Vec::<ArrayType>::new(),
-                "main",
-                None,
-                None,
-                Some("cpu"),
-                true,
-                &[],
-                &[],
-                &[],
-                RaggedDotLoweringStrategy::default(),
-                &[],
-            )
-            .unwrap();
+            let lowered = (unproject_plain_program(program))
+                .lower(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_input_types(&vec![array_type])
+                        .with_output_types(&Vec::<ArrayType>::new())
+                        .without_boundary_shardings()
+                        .with_target_platform(Some("cpu"))
+                        .with_reference_states(Vec::new(), Vec::new(), Vec::new()),
+                )
+                .unwrap();
             let (stable_hlo, signature, _, runtime_requirements) = lowered.into_parts();
             assert_eq!(signature.has_ordered_io(), ordered);
             let requirements = if ordered {

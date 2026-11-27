@@ -4596,6 +4596,67 @@ mod tests {
     }
 
     #[test]
+    fn test_array_with_upload_completion() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 2);
+
+        // The CPU plugin has transfer managers, so the blocking host fallback that this function completes cannot be
+        // forced there. The replicas of this array stand in for its uploads, and only the second one fails.
+        let (uploaded, managers) = pending_replicated_vector(&session, &mesh);
+        let (producer_event, producer) = client.event(()).unwrap();
+        let completed =
+            uploaded.clone().with_upload_completion(Some(ExecutionFence::new(vec![producer_event]))).unwrap();
+        assert_eq!(completed.mesh(), &mesh);
+        assert_eq!(completed.sharding(), uploaded.sharding());
+        assert_eq!(completed.r#type(), uploaded.r#type());
+        assert!(
+            completed
+                .shards()
+                .iter()
+                .zip(uploaded.shards())
+                .all(|(completed, uploaded)| Arc::ptr_eq(completed.buffer().unwrap(), uploaded.buffer().unwrap())),
+        );
+        assert!(matches!(completed.execution_fence().map(ExecutionFence::is_ready), Some(Ok(false))));
+        managers[0]
+            .transfer_data(0, Arc::new(values_to_bytes(&[1f32, 2., 3., 4.])), 0, true)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        managers[1].set_error(0, PjrtError::aborted("second upload failed")).unwrap();
+        producer.set(None).unwrap();
+
+        // A readback of the plain upload reads only the first replica and succeeds, while every observation of the
+        // completed array reports the failed upload of the second one.
+        assert_eq!(values_from_bytes::<f32>(&uploaded.copy_to_host_bytes().unwrap()), [1., 2., 3., 4.]);
+        assert!(matches!(
+            completed.copy_to_host_bytes(),
+            Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "second upload failed",
+        ));
+        assert!(matches!(
+            completed.block_until_ready(),
+            Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "second upload failed",
+        ));
+
+        // A failed source of the placement fails the completed array too, even when every upload succeeded.
+        let (uploaded, managers) = pending_replicated_vector(&session, &mesh);
+        let (producer_event, producer) = client.event(()).unwrap();
+        let completed = uploaded.with_upload_completion(Some(ExecutionFence::new(vec![producer_event]))).unwrap();
+        for manager in &managers {
+            manager
+                .transfer_data(0, Arc::new(values_to_bytes(&[1f32, 2., 3., 4.])), 0, true)
+                .unwrap()
+                .r#await()
+                .unwrap();
+        }
+        producer.set(Some(PjrtError::aborted("source failed"))).unwrap();
+        assert!(matches!(
+            completed.copy_to_host_bytes(),
+            Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "source failed",
+        ));
+    }
+
+    #[test]
     fn test_array_with_copied_shard_buffers() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -4697,62 +4758,82 @@ mod tests {
     }
 
     #[test]
-    fn test_array_placement_communicates_excludes_grouped_local_shard_moves() {
-        let clients = [cpu_client(1), process_one_cpu_client(1)];
-        let devices = clients.map(first_device);
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.to_vec()).unwrap();
-        let sharding = Sharding::replicated(logical_mesh.clone(), 1);
-        let short_target = Placement::new(mesh.clone(), Sharding::replicated(logical_mesh, 0)).unwrap();
-        for (rank, client) in clients.into_iter().enumerate() {
-            // Explicit peers exercise admission without a native comparison transport. Both ranks expose the same
-            // shard metadata and hold only their own replica.
-            let session = Session::builder().client(client).remote_devices([devices[1 - rank]]).build().unwrap();
-            let source = Array::from_host_buffer(
-                &session,
-                ArrayType::new_static(DataType::U8, [1]),
-                mesh.clone(),
-                Some(sharding.clone()),
-                [7u8],
-            )
-            .unwrap();
-            // Each process serves both targets from the replica on its own device, so neither placement
-            // communicates, alone or grouped with others.
-            let one_device = DeviceMesh::new(LogicalMesh::single_device(), vec![devices[0]]).unwrap();
-            let one_device_sharding = Sharding::replicated(LogicalMesh::single_device(), 1);
-            assert!(!source.placement_communicates(&one_device, &one_device_sharding));
-            assert!(!source.placement_communicates(&mesh, &sharding));
-            let assert_output = |output: &Array, expected_devices: &[Device], owns_shard: bool| {
-                assert_eq!(output.mesh().devices(), expected_devices);
-                output.block_until_ready().unwrap();
-                assert_eq!(output.addressable_shards().count(), usize::from(owns_shard));
-                if owns_shard {
-                    assert_eq!(output.copy_to_host_bytes().unwrap(), [7]);
-                }
-            };
-            let one = session.place(source.clone(), PlacementOptions::to(devices[0])).unwrap();
-            assert_output(&one, &devices[..1], rank == 0);
+    fn test_array_placement_communicates() {
+        let client = cpu_client(1);
+        let local = first_device(client);
+        let remote = Device::new(local.id() + 1, 1);
+        let session = session_with_remote_devices(client, [remote]);
+        let mesh = explicit_mesh(&[local, remote]);
+        let local_mesh = explicit_mesh(&[local]);
+        let local_replicated = Sharding::replicated(local_mesh.logical_mesh().clone(), 1);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
 
-            for (target, expected_devices, owns_shard) in [
-                (PlacementRequest::from(devices[0]), &devices[..1], rank == 0),
-                (PlacementRequest::from(short_target.clone()), &devices[..], true),
-            ] {
-                let pair = (source.clone(), source.clone());
-                let (left, right) = session.place(pair, PlacementOptions::to(target.clone())).unwrap();
-                assert_output(&left, expected_devices, owns_shard);
-                assert_output(&right, expected_devices, owns_shard);
+        // A source split over the devices of both processes needs the half on the remote device to be placed on the
+        // local device alone, while placing it on its own mesh and sharding moves nothing.
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let r#type = ArrayType::new_static(DataType::U8, [2]);
+        let source = Array::from_addressable_buffers(&session, r#type, mesh.clone(), Some(split.clone()), Vec::new());
+        let source = source.unwrap();
+        assert!(source.placement_communicates(&local_mesh, &local_replicated));
+        assert!(!source.placement_communicates(&mesh, &split));
 
-                let operation = PlaceOperation::new(Some(target), None);
-                let outputs = ValueDomainDispatch::place_operations(vec![
-                    (source.clone(), operation.clone()),
-                    (source.clone(), operation),
-                ])
-                .unwrap();
-                let [left, right] = outputs.as_slice() else { panic!("expected one output for each input") };
-                assert_output(left, expected_devices, owns_shard);
-                assert_output(right, expected_devices, owns_shard);
-            }
-        }
+        // A source replicated over the devices of both processes serves a target on the local device from the replica
+        // on that device, and keeps every replica where it is on its own mesh and sharding.
+        let r#type = ArrayType::new_static(DataType::U8, [1]);
+        let source = Array::from_host_buffer(&session, r#type, mesh.clone(), Some(replicated.clone()), [7u8]).unwrap();
+        let one_device = DeviceMesh::new(LogicalMesh::single_device(), vec![local]).unwrap();
+        let one_device_sharding = Sharding::replicated(LogicalMesh::single_device(), 1);
+        assert!(!source.placement_communicates(&one_device, &one_device_sharding));
+        assert!(!source.placement_communicates(&local_mesh, &local_replicated));
+        assert!(!source.placement_communicates(&mesh, &replicated));
+
+        // Every process places its own value of a source whose devices it chose on its own, so placing it over the
+        // devices of both processes moves nothing between them.
+        let r#type = ArrayType::new_static(DataType::U8, [2]);
+        let source = Array::from_host_buffer(&session, r#type, None, None, [7u8, 9]).unwrap();
+        assert!(source.is_locally_assigned());
+        assert!(!source.placement_communicates(&mesh, &replicated));
+    }
+
+    #[test]
+    fn test_array_place_within_client() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let split = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [4]);
+        let values = values_to_bytes(&[1f32, 2., 3., 4.]);
+        let source =
+            Array::from_host_buffer(&session, r#type.clone(), mesh.clone(), Some(split.clone()), values.as_slice());
+        let source = source.unwrap();
+
+        // A placement onto another sharding moves the shards and commits the result to the devices of the target.
+        let target = Placement::new(mesh.clone(), replicated).unwrap();
+        let placed = source.clone().place_within_client(&session, &target, false).unwrap();
+        assert_eq!((placed.mesh(), placed.sharding()), (target.mesh(), target.sharding()));
+        assert_eq!(shard_values(&placed), vec![vec![1., 2., 3., 4.]; 2]);
+        assert!(placed.is_committed());
+        assert!(!placed.is_locally_assigned());
+
+        // A placement that only changes the memory keeps every shard on its device.
+        let pinned = Memory::Host { pinned: true };
+        let target = Placement::new(mesh, split).unwrap().with_memory(pinned);
+        let placed = source.place_within_client(&session, &target, false).unwrap();
+        assert_eq!((placed.mesh(), placed.sharding()), (target.mesh(), target.sharding()));
+        assert_eq!(placed.r#type().memory(), pinned);
+        assert_eq!(shard_memory_kinds(&placed), ["pinned_host"; 2]);
+        assert_eq!(shard_values(&placed), vec![vec![1., 2.], vec![3., 4.]]);
+        assert!(placed.is_committed());
+
+        // The result never has locally assigned devices, even when it stays on the devices of a source that has them.
+        let source = Array::from_host_buffer(&session, r#type, None, None, values.as_slice()).unwrap();
+        assert!(source.is_locally_assigned());
+        let target = Placement::new(source.mesh().clone(), source.sharding().clone()).unwrap();
+        let placed = source.place_within_client(&session, &target, false).unwrap();
+        assert_eq!(shard_values(&placed), vec![vec![1., 2., 3., 4.]]);
+        assert!(placed.is_committed());
+        assert!(!placed.is_locally_assigned());
     }
 
     #[test]
@@ -4766,7 +4847,6 @@ mod tests {
         };
         let original = on("x", devices.clone());
         let reversed = on("x", vec![devices[1], devices[0]]);
-        let renamed = on("y", devices.clone());
         let auto_reversed = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let auto_reversed = DeviceMesh::new(auto_reversed, vec![devices[1], devices[0]]).unwrap();
         let unit = LogicalMesh::new(vec![
@@ -4814,8 +4894,8 @@ mod tests {
         // A placement that keeps the reduction state and only changes where each contribution lives moves every
         // contribution as it is, so the contribution at coordinate zero moves to the first device of the target
         // mesh, which keeps the sum of two smallest subnormal `f32` values, the sum of two negative zeros, the `u8`
-        // summands `3` and `5`, and the `f8e8m0fnu` summands of a type without an additive identity. Adding an unused
-        // axis of size one changes no contribution either.
+        // summands `3` and `5`, the `f8e8m0fnu` summands of a type without an additive identity, and the pending `max`
+        // of `1` and NaN. Adding an unused axis of size one changes no contribution either.
         let contributions = [
             (DataType::F32, UnreducedKind::Sum, [vec![1u8, 0, 0, 0], vec![1, 0, 0, 0]]),
             (DataType::F32, UnreducedKind::Sum, [vec![0, 0, 0, 0x80], vec![0, 0, 0, 0x80]]),
@@ -4843,18 +4923,6 @@ mod tests {
         let placed = source.to_placement(&session, target).unwrap();
         assert_eq!(device_bytes(&placed), [(devices[0].id(), vec![1, 0, 0, 0]), (devices[1].id(), vec![1, 0, 0, 0])]);
         assert_eq!(placed.copy_to_host_bytes().unwrap(), vec![2, 0, 0, 0]);
-
-        // Renaming the axis of a pending sum is a pure move too, which the device planner serves with whole shards,
-        // although the type rule of `place` rejects it before any planning because it redefines an axis that carries
-        // reduction state.
-        let source = import(DataType::U8, UnreducedKind::Sum, &[vec![3], vec![5]]);
-        let sharding = pending(&renamed, UnreducedKind::Sum);
-        let layout_resolver = cross_host_layout_resolver(client);
-        let strategy = source.device_placement_strategy(&layout_resolver, &renamed, &sharding, 0).unwrap();
-        assert!(matches!(strategy, DevicePlacementStrategy::ExactShards { .. }));
-        let placed = source.place_with_strategy(strategy, 0, &renamed, &sharding, Memory::Device, None, false);
-        let placed = placed.map_err(|(error, _)| error).unwrap();
-        assert_eq!(device_bytes(&placed), [(devices[0].id(), vec![3]), (devices[1].id(), vec![5])]);
 
         // Adding a pending axis of size one keeps the number of contributions, so it is a pure move as well, which
         // keeps the summands of every data type as they are. Only the physical placements reach it, because the type
@@ -6379,6 +6447,146 @@ mod tests {
     }
 
     #[test]
+    fn test_array_copy_shard_through_host() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let values = [1f32, 2., 3., 4., 5., 6.];
+        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let row_major = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])).to_pjrt().unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2, 3]).with_layout(column_major);
+        let source = Array::from_host_buffer(&session, r#type, mesh, None, values_to_bytes(&values)).unwrap();
+        let shard = source.addressable_shards().next().unwrap();
+        let buffer = shard.buffer().unwrap();
+
+        // A conversion that the plugin cannot compile copies the shard through host memory into a new buffer in the
+        // requested layout and memory, which compiles nothing, and the completion records the readiness of that buffer.
+        let mut completion = PlacementCompletion::default();
+        let memory = buffer.memory().unwrap();
+        let copied = Array::copy_shard_through_host(
+            &session,
+            buffer,
+            shard.shape(),
+            BufferType::F32,
+            memory,
+            Some(row_major.clone()),
+            &mut completion,
+        )
+        .unwrap();
+        completion.join(None).unwrap().block_until_ready().unwrap();
+        assert_eq!(session.cached_program_count(), 0);
+        assert!(!Arc::ptr_eq(&copied, buffer));
+        assert_eq!(copied.memory().unwrap().kind().unwrap(), buffer.memory().unwrap().kind().unwrap());
+        assert_eq!(copied.specification().unwrap().layout, row_major);
+        assert_eq!(copied.copy_to_host(None).unwrap().r#await().unwrap(), values_to_bytes(&values));
+        session.synchronize().unwrap();
+    }
+
+    #[test]
+    fn test_array_copy_shard_through_host_completes_each_shard_independently() {
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let managers = transfer_managers(client, BufferSpecification::new(BufferType::F32, [2u64, 2]));
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])).to_pjrt().unwrap();
+        let mut completion = PlacementCompletion::default();
+        let copies = managers
+            .iter()
+            .map(|manager| {
+                let buffer = Arc::new(manager.retrieve_buffer(0).unwrap());
+                let memory = buffer.memory().unwrap();
+                let shape = StaticShape::new(vec![2, 2]);
+                let layout = Some(layout.clone());
+                Array::copy_shard_through_host(
+                    &session,
+                    &buffer,
+                    shape,
+                    BufferType::F32,
+                    memory,
+                    layout,
+                    &mut completion,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        // The copies are returned before their sources are defined, in the requested layout and memory, and without
+        // compiling any program.
+        assert_eq!(session.cached_program_count(), 0);
+        for copy in &copies {
+            assert_eq!(copy.specification().unwrap().layout, layout);
+            assert_eq!(copy.memory().unwrap(), copy.device().unwrap().default_memory().unwrap());
+            assert_eq!(copy.ready().unwrap().ready(), Ok(false));
+        }
+
+        // The background worker reads the first source back once it is defined and uploads it in the new layout, while
+        // the source of the second shard is still pending, so that a producer of that source may depend on the first
+        // copy.
+        let (sender, receiver) = mpsc::channel();
+        let first_copy_ready = copies[0].ready().unwrap();
+        thread::spawn(move || sender.send(first_copy_ready.r#await()).unwrap());
+        managers[0]
+            .transfer_data(0, Arc::new(values_to_bytes(&[1f32, 2., 3., 4.])), 0, true)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(60)), Ok(Ok(())));
+        let fence = completion.join(None).unwrap();
+        assert_eq!(fence.is_ready(), Ok(false));
+        let row_major = ryft_pjrt::Layout::dense_major_to_minor(2);
+        let first_copy = copies[0].copy_to_host(Some(row_major)).unwrap().r#await().unwrap();
+        assert_eq!(values_from_bytes::<f32>(&first_copy), [1., 2., 3., 4.]);
+
+        // The failed readback of the second source poisons its copy with its error, and the completion still joins
+        // that copy, so it reports the failure, as the session does once.
+        managers[1].set_error(0, PjrtError::aborted("second source failed")).unwrap();
+        assert!(matches!(
+            copies[1].ready().unwrap().r#await(),
+            Err(PjrtError::Aborted { message, .. }) if message == "second source failed",
+        ));
+        assert!(matches!(
+            fence.block_until_ready(),
+            Err(PjrtError::Aborted { message, .. }) if message == "second source failed",
+        ));
+        assert!(matches!(
+            session.synchronize(),
+            Err(Error::Execution(ExecutionError::SynchronizationFailures { failures }))
+                if matches!(&failures[..], [(_, Error::Pjrt(PjrtError::Aborted { message, .. }))]
+                    if message == "second source failed"),
+        ));
+    }
+
+    #[test]
+    fn test_array_copy_shard_through_host_reports_failed_source_without_elements() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+
+        // A shard without elements issues no copy, but its round trip still waits for its source and fails with it.
+        let manager = transfer_managers(client, BufferSpecification::new(BufferType::F32, [0u64, 2])).remove(0);
+        let buffer = Arc::new(manager.retrieve_buffer(0).unwrap());
+        let mut completion = PlacementCompletion::default();
+        let shape = StaticShape::new(vec![0, 2]);
+        let memory = buffer.memory().unwrap();
+        let copy =
+            Array::copy_shard_through_host(&session, &buffer, shape, BufferType::F32, memory, None, &mut completion)
+                .unwrap();
+        manager.set_error(0, PjrtError::aborted("source failed")).unwrap();
+        assert!(matches!(
+            copy.ready().unwrap().r#await(),
+            Err(PjrtError::Aborted { message, .. }) if message == "source failed",
+        ));
+        assert!(matches!(
+            completion.join(None).unwrap().block_until_ready(),
+            Err(PjrtError::Aborted { message, .. }) if message == "source failed",
+        ));
+        assert!(matches!(
+            session.synchronize(),
+            Err(Error::Execution(ExecutionError::SynchronizationFailures { failures }))
+                if matches!(&failures[..], [(_, Error::Pjrt(PjrtError::Aborted { message, .. }))]
+                    if message == "source failed"),
+        ));
+    }
+
+    #[test]
     fn test_array_reshard_on_devices() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
@@ -6812,207 +7020,6 @@ mod tests {
         let shared = source.with_locally_assigned(false);
         let output = shared.reshard_on_devices(&session, &mesh, &sharded, false).unwrap();
         assert!(!output.is_locally_assigned());
-    }
-
-    #[test]
-    fn test_array_with_upload_completion() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = domain_mesh(client, "x", 2);
-
-        // The CPU plugin has transfer managers, so the blocking host fallback that this function completes cannot be
-        // forced there. The replicas of this array stand in for its uploads, and only the second one fails.
-        let (uploaded, managers) = pending_replicated_vector(&session, &mesh);
-        let (producer_event, producer) = client.event(()).unwrap();
-        let completed =
-            uploaded.clone().with_upload_completion(Some(ExecutionFence::new(vec![producer_event]))).unwrap();
-        assert_eq!(completed.mesh(), &mesh);
-        assert_eq!(completed.sharding(), uploaded.sharding());
-        assert_eq!(completed.r#type(), uploaded.r#type());
-        assert!(
-            completed
-                .shards()
-                .iter()
-                .zip(uploaded.shards())
-                .all(|(completed, uploaded)| Arc::ptr_eq(completed.buffer().unwrap(), uploaded.buffer().unwrap())),
-        );
-        assert!(matches!(completed.execution_fence().map(ExecutionFence::is_ready), Some(Ok(false))));
-        managers[0]
-            .transfer_data(0, Arc::new(values_to_bytes(&[1f32, 2., 3., 4.])), 0, true)
-            .unwrap()
-            .r#await()
-            .unwrap();
-        managers[1].set_error(0, PjrtError::aborted("second upload failed")).unwrap();
-        producer.set(None).unwrap();
-
-        // A readback of the plain upload reads only the first replica and succeeds, while every observation of the
-        // completed array reports the failed upload of the second one.
-        assert_eq!(values_from_bytes::<f32>(&uploaded.copy_to_host_bytes().unwrap()), [1., 2., 3., 4.]);
-        assert!(matches!(
-            completed.copy_to_host_bytes(),
-            Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "second upload failed",
-        ));
-        assert!(matches!(
-            completed.block_until_ready(),
-            Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "second upload failed",
-        ));
-
-        // A failed source of the placement fails the completed array too, even when every upload succeeded.
-        let (uploaded, managers) = pending_replicated_vector(&session, &mesh);
-        let (producer_event, producer) = client.event(()).unwrap();
-        let completed = uploaded.with_upload_completion(Some(ExecutionFence::new(vec![producer_event]))).unwrap();
-        for manager in &managers {
-            manager
-                .transfer_data(0, Arc::new(values_to_bytes(&[1f32, 2., 3., 4.])), 0, true)
-                .unwrap()
-                .r#await()
-                .unwrap();
-        }
-        producer.set(Some(PjrtError::aborted("source failed"))).unwrap();
-        assert!(matches!(
-            completed.copy_to_host_bytes(),
-            Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "source failed",
-        ));
-    }
-
-    #[test]
-    fn test_array_copy_shard_through_host() {
-        let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
-        let mesh = domain_mesh(client, "x", 1);
-        let values = [1f32, 2., 3., 4., 5., 6.];
-        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
-        let row_major = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])).to_pjrt().unwrap();
-        let r#type = ArrayType::new_static(DataType::F32, [2, 3]).with_layout(column_major);
-        let source = Array::from_host_buffer(&session, r#type, mesh, None, values_to_bytes(&values)).unwrap();
-        let shard = source.addressable_shards().next().unwrap();
-        let buffer = shard.buffer().unwrap();
-
-        // A conversion that the plugin cannot compile copies the shard through host memory into a new buffer in the
-        // requested layout and memory, which compiles nothing, and the completion records the readiness of that buffer.
-        let mut completion = PlacementCompletion::default();
-        let memory = buffer.memory().unwrap();
-        let copied = Array::copy_shard_through_host(
-            &session,
-            buffer,
-            shard.shape(),
-            BufferType::F32,
-            memory,
-            Some(row_major.clone()),
-            &mut completion,
-        )
-        .unwrap();
-        completion.join(None).unwrap().block_until_ready().unwrap();
-        assert_eq!(session.cached_program_count(), 0);
-        assert!(!Arc::ptr_eq(&copied, buffer));
-        assert_eq!(copied.memory().unwrap().kind().unwrap(), buffer.memory().unwrap().kind().unwrap());
-        assert_eq!(copied.specification().unwrap().layout, row_major);
-        assert_eq!(copied.copy_to_host(None).unwrap().r#await().unwrap(), values_to_bytes(&values));
-        session.synchronize().unwrap();
-    }
-
-    #[test]
-    fn test_array_copy_shard_through_host_completes_each_shard_independently() {
-        let client = cpu_client(2);
-        let session = Session::builder().client(client).build().unwrap();
-        let managers = transfer_managers(client, BufferSpecification::new(BufferType::F32, [2u64, 2]));
-        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])).to_pjrt().unwrap();
-        let mut completion = PlacementCompletion::default();
-        let copies = managers
-            .iter()
-            .map(|manager| {
-                let buffer = Arc::new(manager.retrieve_buffer(0).unwrap());
-                let memory = buffer.memory().unwrap();
-                let shape = StaticShape::new(vec![2, 2]);
-                let layout = Some(layout.clone());
-                Array::copy_shard_through_host(
-                    &session,
-                    &buffer,
-                    shape,
-                    BufferType::F32,
-                    memory,
-                    layout,
-                    &mut completion,
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-
-        // The copies are returned before their sources are defined, in the requested layout and memory, and without
-        // compiling any program.
-        assert_eq!(session.cached_program_count(), 0);
-        for copy in &copies {
-            assert_eq!(copy.specification().unwrap().layout, layout);
-            assert_eq!(copy.memory().unwrap(), copy.device().unwrap().default_memory().unwrap());
-            assert_eq!(copy.ready().unwrap().ready(), Ok(false));
-        }
-
-        // The background worker reads the first source back once it is defined and uploads it in the new layout, while
-        // the source of the second shard is still pending, so that a producer of that source may depend on the first
-        // copy.
-        let (sender, receiver) = mpsc::channel();
-        let first_copy_ready = copies[0].ready().unwrap();
-        thread::spawn(move || sender.send(first_copy_ready.r#await()).unwrap());
-        managers[0]
-            .transfer_data(0, Arc::new(values_to_bytes(&[1f32, 2., 3., 4.])), 0, true)
-            .unwrap()
-            .r#await()
-            .unwrap();
-        assert_eq!(receiver.recv_timeout(Duration::from_secs(60)), Ok(Ok(())));
-        let fence = completion.join(None).unwrap();
-        assert_eq!(fence.is_ready(), Ok(false));
-        let row_major = ryft_pjrt::Layout::dense_major_to_minor(2);
-        let first_copy = copies[0].copy_to_host(Some(row_major)).unwrap().r#await().unwrap();
-        assert_eq!(values_from_bytes::<f32>(&first_copy), [1., 2., 3., 4.]);
-
-        // The failed readback of the second source poisons its copy with its error, and the completion still joins
-        // that copy, so it reports the failure, as the session does once.
-        managers[1].set_error(0, PjrtError::aborted("second source failed")).unwrap();
-        assert!(matches!(
-            copies[1].ready().unwrap().r#await(),
-            Err(PjrtError::Aborted { message, .. }) if message == "second source failed",
-        ));
-        assert!(matches!(
-            fence.block_until_ready(),
-            Err(PjrtError::Aborted { message, .. }) if message == "second source failed",
-        ));
-        assert!(matches!(
-            session.synchronize(),
-            Err(Error::Execution(ExecutionError::SynchronizationFailures { failures }))
-                if matches!(&failures[..], [(_, Error::Pjrt(PjrtError::Aborted { message, .. }))]
-                    if message == "second source failed"),
-        ));
-    }
-
-    #[test]
-    fn test_array_copy_shard_through_host_reports_failed_source_without_elements() {
-        let client = cpu_client(1);
-        let session = Session::builder().client(client).build().unwrap();
-
-        // A shard without elements issues no copy, but its round trip still waits for its source and fails with it.
-        let manager = transfer_managers(client, BufferSpecification::new(BufferType::F32, [0u64, 2])).remove(0);
-        let buffer = Arc::new(manager.retrieve_buffer(0).unwrap());
-        let mut completion = PlacementCompletion::default();
-        let shape = StaticShape::new(vec![0, 2]);
-        let memory = buffer.memory().unwrap();
-        let copy =
-            Array::copy_shard_through_host(&session, &buffer, shape, BufferType::F32, memory, None, &mut completion)
-                .unwrap();
-        manager.set_error(0, PjrtError::aborted("source failed")).unwrap();
-        assert!(matches!(
-            copy.ready().unwrap().r#await(),
-            Err(PjrtError::Aborted { message, .. }) if message == "source failed",
-        ));
-        assert!(matches!(
-            completion.join(None).unwrap().block_until_ready(),
-            Err(PjrtError::Aborted { message, .. }) if message == "source failed",
-        ));
-        assert!(matches!(
-            session.synchronize(),
-            Err(Error::Execution(ExecutionError::SynchronizationFailures { failures }))
-                if matches!(&failures[..], [(_, Error::Pjrt(PjrtError::Aborted { message, .. }))]
-                    if message == "source failed"),
-        ));
     }
 
     #[test]

@@ -132,12 +132,13 @@ pub(crate) fn emitted_regions_entering_calls<'r, V: Value<Type = Type>, O: Lower
 /// its instructions or as one of its outputs. Every region names a capture through a constant whose
 /// [`Value::capture_index`] is its position, except the entry region of a program with lifted captures (i.e., when
 /// `lifted` is set), which names capture `k` through its input `k`. A capture that no emitted region reads (e.g., one
-/// that only the body of a scan with zero iterations reads) is neither admitted when a function is compiled nor
-/// passed to its executable, whose signature erases it (refer to `lower_mlir_module_for_program_with_effect_boundary`),
-/// so that admission and lowering read this one decision. A capture that a region only passes on to a call as a
-/// capture which the callee never reads is not read either (refer to [`visit_emitted_reads`]). The regions of the
-/// callees of calls are not visited, because their constants name the captures of those callees, which a callee reads
-/// only through the operands of its call (refer to [`emitted_regions_entering_calls`]).
+/// that only the body of a scan with zero iterations reads) is neither admitted when a function is compiled nor passed
+/// to its executable, whose signature erases it (refer to
+/// `LoweredModule::new`), so that admission and lowering read this one
+/// decision. A capture that a region only passes on to a call as a capture which the callee never reads is not read
+/// either (refer to [`visit_emitted_reads`]). The regions of the callees of calls are not visited, because their
+/// constants name the captures of those callees, which a callee reads only through the operands of its call (refer to
+/// [`emitted_regions_entering_calls`]).
 pub(crate) fn emitted_capture_reads<'r, O: LowerableOperationFamily>(
     entry: RegionRef<'r, Constant, O>,
     capture_count: usize,
@@ -351,7 +352,7 @@ mod tests {
 
     use crate::{Constant, FromPjrt, Operation, PlacementOptions, RetainedArray, Session, Type};
 
-    use crate::lowering::modules::to_mlir_module_for_program;
+    use crate::lowering::extensions::{LowerableProgram, ProgramLoweringOptions};
 
     use crate::lowering::tests::{linear_call_program, scalar_linear_region};
 
@@ -414,7 +415,17 @@ mod tests {
 
             let captures = constants.iter().map(|constant| constant.r#type().into_owned()).collect::<Vec<_>>();
             let output_types = vec![scalar.r#type().into_owned(); 5];
-            to_mlir_module_for_program(&program, &captures, &(), &output_types, "main", None, None).unwrap()
+            program
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_capture_types(captures.to_vec())
+                        .with_input_types(&())
+                        .with_output_types(&output_types)
+                        .without_boundary_shardings(),
+                )
+                .unwrap()
         });
 
         assert_eq!(modules[0], modules[1]);

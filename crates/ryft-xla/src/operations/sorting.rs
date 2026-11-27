@@ -233,7 +233,7 @@ mod tests {
     use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
-    use crate::{ArrayConstant, Session, to_mlir_module_for_program};
+    use crate::{ArrayConstant, LowerableProgram, Session};
 
     use super::*;
 
@@ -260,10 +260,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let program = unproject_plain_program(program);
-        let input_types = vec![key_type.clone(), index_type.clone()];
-        let output_types = vec![key_type, index_type];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             module,
@@ -306,10 +303,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
             .unwrap();
         let program = unproject_plain_program(program);
-        let input_types = vec![primary_type.clone(), secondary_type.clone(), passenger_type.clone()];
-        let output_types = vec![primary_type, secondary_type, passenger_type];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             module,
@@ -359,8 +353,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let types = vec![key_type];
-        let module = to_mlir_module_for_program(&program, &[], &types, &types, "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             module,

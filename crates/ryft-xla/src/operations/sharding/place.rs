@@ -33,22 +33,21 @@ impl LowerableOperation for PlaceOperation {
         // over those devices and change its storage. Compilation rejects targets on any other devices before lowering
         // (refer to `LoweringError::PlacementOutsideProgramMesh`), because the lowering only knows the logical mesh,
         // and it also rejects targets that are not replicated in bounded dynamic programs, whose replicas ignore
-        // sharding constraints.
-        // What remains lowers to a sharding constraint for the target sharding, followed by a layout constraint when
-        // the layout changes and by a memory annotation when the memory changes. Unlike the sharding of a type (e.g.,
-        // that of `reshard`), a target states the placement along every mesh axis, including auto axes, so the
-        // constraint is closed over the dimensions that the target specifies, like that of `constrain_sharding`.
-        // The layout is constrained first, so that the conversion runs before the value leaves device memory. JAX
-        // 0.12.0.1 returns the inputs from its CPU primitive lowering. Its GPU and TPU lowerings can annotate
-        // sharding and memory for a requested memory kind. Ryft rejects changes of reduction state before lowering.
-        // The copy policy of the operation (i.e., `PlaceOperation::may_alias`) is ignored, so the lowering emits no copy
-        // instruction even for a forced copy, because a compiled program has no observable buffer identity. A forced
-        // copy is still honored where it can be observed. Every public output of an execution of the program is written
-        // to a new buffer that the execution allocates, unless it is paired with a donated input whose buffers the
-        // caller gave up and no other handle can observe (refer to the donation pairing of
-        // `lower_mlir_module_for_program_with_reference_state`), so no public output ever shares storage with an array
-        // that the caller holds. An eager placement is not lowered here, and it applies the copy policy to its result
-        // itself (refer to `Session::bind` and `Session::place`).
+        // sharding constraints. What remains lowers to a sharding constraint for the target sharding, followed by a
+        // layout constraint when the layout changes and by a memory annotation when the memory changes. Unlike the
+        // sharding of a type (e.g., that of `reshard`), a target states the placement along every mesh axis, including
+        // auto axes, so the constraint is closed over the dimensions that the target specifies, like that of
+        // `constrain_sharding`. The layout is constrained first, so that the conversion runs before the value leaves
+        // device memory. JAX 0.12.0.1 returns the inputs from its CPU primitive lowering. Its GPU and TPU lowerings can
+        // annotate sharding and memory for a requested memory kind. Ryft rejects changes of reduction state before
+        // lowering. The copy policy of the operation (i.e., `PlaceOperation::may_alias`) is ignored, so the lowering
+        // emits no copy instruction even for a forced copy, because a compiled program has no observable buffer
+        // identity. A forced copy is still honored where it can be observed. Every public output of an execution of the
+        // program is written to a new buffer that the execution allocates, unless it is paired with a donated input
+        // whose buffers the caller gave up and no other handle can observe (refer to the donation pairing of
+        // `ProgramLoweringOptions::with_reference_states`), so no public output ever shares
+        // storage with an array that the caller holds. An eager placement is not lowered here, and it applies the copy
+        // policy to its result itself (refer to `Session::bind` and `Session::place`).
         check_count!("input", input_values, 1, ProgramError);
         check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
@@ -144,8 +143,8 @@ mod tests {
     use crate::sessions::tests::{f32_vector, two_device_mesh};
     use crate::tests::{cpu_client, native_buffer_addresses, shard_values, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, Options, PlacementOptions,
-        ProgramExtension, Session, StatefulCompileTracer, TracedProgram, Type, Value, compile, compile_statefully,
+        Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, LowerableProgram, Options,
+        PlacementOptions, Session, StatefulCompileTracer, TracedProgram, Type, Value, compile, compile_statefully,
         compile_with_options, trace,
     };
 

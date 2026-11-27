@@ -159,7 +159,6 @@ mod tests {
 
     #[cfg(feature = "cuda-13")]
     use crate::distributed::tests::{read_addressable_f32s, run_as_cuda_rank, run_cuda_rank_pair};
-    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::test_manual_mesh;
     use crate::operations::sharding::shard_map::tests::{execute_inputs_on_cpu_devices, test_logical_mesh_2x2};
     #[cfg(feature = "cuda-13")]
@@ -167,7 +166,7 @@ mod tests {
     use crate::tests::{cpu_client, test_compilation_options};
     #[cfg(feature = "cuda-13")]
     use crate::{Array, FromPjrt, Options, Value};
-    use crate::{ArrayTracer, ProgramExtension, TracedProgram, to_mlir_module_for_program, trace_with_context};
+    use crate::{ArrayTracer, LowerableProgram, ProgramLoweringOptions, TracedProgram, trace_with_context};
 
     use super::*;
 
@@ -197,9 +196,18 @@ mod tests {
         .unwrap();
         let types = [global_type];
         let shardings = [sharded];
-        let module =
-            to_mlir_module_for_program(&program, &[], &types, &types, "main", Some(&shardings), Some(&shardings))
-                .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&types)
+                    .with_output_types(&types)
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_exact_output_shardings(shardings.iter().cloned().map(Some).collect()),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -229,15 +237,16 @@ mod tests {
                 if message.contains("HLO opcode `collective-broadcast` is not supported by XLA:CPU"),
         ));
         assert!(matches!(
-            lower_mlir_module_for_program(
-                &program,
-                &[],
-                &types,
-                &types,
+            program.lower(
                 "main",
-                Some(&shardings),
-                Some(&shardings),
-                Some("cpu"),
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&types)
+                    .with_output_types(&types)
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_exact_output_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_target_platform(Some("cpu")),
             ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
@@ -278,16 +287,18 @@ mod tests {
             input_types.iter().cloned().map(Type::from).collect::<Vec<_>>(),
         )
         .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &input_types,
-            &[input_types[0].clone()],
-            "main",
-            Some(&[sharded.clone(), replicated]),
-            Some(&[sharded]),
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&[input_types[0].clone()])
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(vec![Some(sharded.clone()), Some(replicated)])
+                    .with_exact_output_shardings(vec![Some(sharded)]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -401,18 +412,20 @@ mod tests {
         .unwrap();
         let types = [global_type];
         let shardings = [sharded];
-        let module = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &types,
-            &types,
-            "main",
-            Some(&shardings),
-            Some(&shardings),
-            Some("cpu"),
-        )
-        .unwrap()
-        .into_stable_hlo();
+        let module = program
+            .lower(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&types)
+                    .with_output_types(&types)
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_exact_output_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_target_platform(Some("cpu")),
+            )
+            .unwrap()
+            .into_stable_hlo();
         assert_eq!(
             execute_inputs_on_cpu_devices(module, &[(&[2], [&[1.0, 2.0], &[3.0, 4.0]])]),
             vec![vec![1.0, 2.0], vec![3.0, 4.0]],

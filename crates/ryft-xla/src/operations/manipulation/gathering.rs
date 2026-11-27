@@ -278,7 +278,7 @@ mod tests {
         execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::types::DataTypeExtension;
-    use crate::{Array, ArrayConstant, Options, Session, Type, to_mlir_module_for_program};
+    use crate::{Array, ArrayConstant, LowerableProgram, Options, Session, Type};
 
     #[test]
     fn test_gather_operation_lower() {
@@ -545,16 +545,7 @@ mod tests {
                     )
                     .unwrap(),
             );
-            let module = to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![input_type, indices_type],
-                &vec![ArrayType::new(DataType::I64, Shape::new(vec![query]))],
-                "main",
-                None,
-                None,
-            )
-            .unwrap();
+            let module = program.to_mlir_module("main").unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
@@ -632,16 +623,7 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap(),
         );
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![input_type, indices_type],
-            &vec![ArrayType::new(DataType::I64, Shape::new(vec![rows]))],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"

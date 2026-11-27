@@ -164,7 +164,10 @@ mod tests {
 
     use crate::lowering::tests::static_sharded_array_type;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayTracer, ExecutionArguments, FromPjrt, ProgramExtension, Session, TracedProgram, trace};
+    use crate::{
+        Array, ArrayTracer, ExecutionArguments, FromPjrt, LowerableProgram, ProgramLoweringOptions, Session,
+        TracedProgram, trace,
+    };
 
     use super::*;
 
@@ -512,10 +515,11 @@ mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_shardings(
+            .to_mlir_module_with_options(
                 "main",
-                Some(std::slice::from_ref(&sharded)),
-                Some(&[replicated, sharded.clone()]),
+                &ProgramLoweringOptions::new()
+                    .with_input_shardings((std::slice::from_ref(&sharded)).to_vec())
+                    .with_output_shardings((&[replicated, sharded.clone()]).to_vec()),
             )
             .unwrap();
         // Recovering the dimension residual in the tangent body checks its bounds with a runtime assertion.

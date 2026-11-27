@@ -518,12 +518,13 @@ mod tests {
     use ryft_mlir::Location;
     use ryft_pjrt::{Client, Program as PjrtProgram};
 
-    use crate::lowering::modules::lower_mlir_module_for_program;
     use crate::lowering::tests::{dynamic_dimension, test_vector_type};
     use crate::lowering::types::lower_array_ir_type;
     use crate::operations::Operation;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
-    use crate::{Array, ExecutionArguments, FromPjrt, RuntimeRequirement, Session, to_mlir_module_for_program};
+    use crate::{
+        Array, ExecutionArguments, FromPjrt, LowerableProgram, ProgramLoweringOptions, RuntimeRequirement, Session,
+    };
 
     use super::*;
 
@@ -554,7 +555,16 @@ mod tests {
         };
         let input_types = program.input_types().iter().map(boundary_type).collect::<Vec<_>>();
         let output_types = program.output_types().iter().map(boundary_type).collect::<Vec<_>>();
-        to_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None).unwrap()
+        program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings(),
+            )
+            .unwrap()
     }
 
     /// Returns a two-device CPU client and a device mesh over its devices with the single mesh axis `x` of `axis_type`.
@@ -666,17 +676,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![input, tangent], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(lowered_effect_classes(&jvp).unwrap(), EffectClasses::single(EffectClass::OrderedAssertion));
-        let active = lower_mlir_module_for_program(
-            &jvp,
-            &[],
-            &vec![array_type.clone(); 2],
-            &vec![array_type.clone(); 2],
-            "main",
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let active = jvp.lower("main", &ProgramLoweringOptions::new()).unwrap();
         let (_, _, requires_assertion_handler, runtime_requirements) = active.into_parts();
         assert!(requires_assertion_handler);
         assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin("ryft.assert")],);
@@ -696,17 +696,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let dormant = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![array_type.clone()],
-            &vec![array_type],
-            "main",
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let dormant = program.lower("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert!(lowered_effect_classes(&program).unwrap().is_empty());
         let (stable_hlo, _, requires_assertion_handler, runtime_requirements) = dormant.into_parts();
@@ -1053,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_lowers_differentiated_array_ir_control_flow() {
+    fn test_program_to_mlir_module_lowers_differentiated_array_ir_control_flow() {
         let scalar_boolean = ArrayType::scalar(DataType::Boolean);
         let scalar_f32 = ArrayType::scalar(DataType::F32);
         let vector_f32 = test_vector_type(2);
@@ -1157,30 +1147,9 @@ mod tests {
 
         let linearization = program.linearize().unwrap();
         let primal = linearization.primal();
-        let array_types = |types: &[Type]| {
-            types.iter().map(|r#type| <&ArrayType>::try_from(r#type).unwrap().clone()).collect::<Vec<_>>()
-        };
-        let primal_module = to_mlir_module_for_program(
-            primal,
-            &[],
-            &array_types(&primal.input_types()),
-            &array_types(&primal.output_types()),
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let primal_module = primal.to_mlir_module("main").unwrap();
         let pullback = linearization.pullback().unwrap().into_program();
-        let pullback_module = to_mlir_module_for_program(
-            &pullback,
-            &[],
-            &array_types(&pullback.input_types()),
-            &array_types(&pullback.output_types()),
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let pullback_module = pullback.to_mlir_module("main").unwrap();
         // The primal returns the predicate of the condition and the predicate of each loop iteration as residuals, and
         // the pullback replays the loop and the condition backwards over them.
         assert_eq!(

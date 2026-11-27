@@ -239,8 +239,7 @@ mod tests {
     use crate::operations::Operation;
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, Session, ToPjrt, Type, compile,
-        to_mlir_module_for_program,
+        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, LowerableProgram, Session, ToPjrt, Type, compile,
     };
 
     use super::*;
@@ -324,17 +323,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![joined], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(program.effects().classes(), EffectClasses::NONE);
-        let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![first_type, second_type],
-            &vec![output_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -380,17 +369,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![joined], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![first_type, second_type],
-            &vec![output_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -477,16 +456,7 @@ mod tests {
                     .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
                     .unwrap();
                 let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
-                let module = to_mlir_module_for_program(
-                    &program,
-                    &[],
-                    &vec![first_type, second_type],
-                    &vec![output_type.clone()],
-                    "concatenate_dynamic",
-                    None,
-                    None,
-                )
-                .unwrap();
+                let module = program.to_mlir_module("concatenate_dynamic").unwrap();
                 let bound = physical_bound_type(&output_type).unwrap().dimension(0).value().unwrap();
                 // Inputs carry static storage plus hidden i32 extents, and dynamic outputs also return hidden i64
                 // extents.

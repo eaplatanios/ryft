@@ -1125,8 +1125,8 @@ mod tests {
         cpu_client, execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayConstant, ArrayTracer, Constant, FromPjrt, Options, Session, ToPjrt, Tracer,
-        to_mlir_module_for_program,
+        Array, ArrayConstant, ArrayTracer, Constant, FromPjrt, LowerableProgram, Options, ProgramLoweringOptions,
+        Session, ToPjrt, Tracer,
     };
 
     use super::*;
@@ -2860,16 +2860,14 @@ mod tests {
             let %2:f64[a, 2] = cast [type=f64[a, 2], inputs=[f64[a, b], dimension<b ∈ [1, 5)>], checked=true] %1 %0
             in (%2)"};
             assert_eq!(program.to_string(), expected);
-            let module = to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![ArrayType::scalar(DataType::I64), input_type.clone()],
-                &vec![output_type.clone()],
-                "main",
-                None,
-                None,
-            )
-            .unwrap();
+            let module = program
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .with_input_types(&vec![ArrayType::scalar(DataType::I64), input_type.clone()])
+                        .with_output_types(&vec![output_type.clone()]),
+                )
+                .unwrap();
             assert_eq!(module, expected_module);
             let input = MixedValue::Array(vec![1.0; 16], vec![4, 4]);
             assert_eq!(
@@ -3050,16 +3048,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[input_type, ArrayType::new_static(DataType::F64, [3])],
-            &[ArrayType::new_static(DataType::F64, [3, 3])],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -3143,15 +3132,7 @@ mod tests {
             );
             let program = program.into_unprojected::<Constant, Operation>().unwrap();
             assert!(matches!(
-                to_mlir_module_for_program(
-                    &program,
-                    &[],
-                    &vec![input_type.clone()],
-                    &vec![output_type.clone()],
-                    "main",
-                    None,
-                    None,
-                ),
+                program.to_mlir_module("main"),
                 Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                     if reason == "non-row-major bounded-dynamic output layout `tiled{0,1}`",
             ));
@@ -3193,9 +3174,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let module =
-            to_mlir_module_for_program(&program, &[], &[exact, symbolic.clone()], &[symbolic], "main", None, None)
-                .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -3336,7 +3315,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_program(&program, &[], &[source], &[copied], "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -3699,15 +3678,7 @@ mod tests {
                 ));
                 let program = program.into_unprojected::<Constant, Operation>().unwrap();
                 assert!(matches!(
-                    to_mlir_module_for_program(
-                        &program,
-                        &[],
-                        &vec![input_type.clone()],
-                        &vec![output_type.clone()],
-                        "main",
-                        None,
-                        None,
-                    ),
+                    program.to_mlir_module("main"),
                     Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })) if reason == expected,
                 ));
             }
@@ -3812,16 +3783,15 @@ mod tests {
             assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
             let program = program.into_unprojected::<Constant, Operation>().unwrap();
             assert_eq!(
-                to_mlir_module_for_program(
-                    &program,
-                    &[],
-                    &vec![input_type.clone()],
-                    &vec![output_type.clone()],
-                    "main",
-                    None,
-                    None,
-                )
-                .unwrap(),
+                program
+                    .to_mlir_module_with_options(
+                        "main",
+                        &ProgramLoweringOptions::new()
+                            .with_input_types(&vec![input_type.clone()])
+                            .with_output_types(&vec![output_type.clone()])
+                            .without_boundary_shardings()
+                    )
+                    .unwrap(),
                 indoc! {"
                     module {
                       sdy.mesh @mesh = <[\"x\"=2]>
@@ -3928,16 +3898,15 @@ mod tests {
                 // own placement is declared through the executable signature instead.
                 let program = program.into_unprojected::<Constant, Operation>().unwrap();
                 assert_eq!(
-                    to_mlir_module_for_program(
-                        &program,
-                        &[],
-                        &vec![input_type.clone()],
-                        &vec![output_type.clone()],
-                        "main",
-                        None,
-                        None,
-                    )
-                    .unwrap(),
+                    program
+                        .to_mlir_module_with_options(
+                            "main",
+                            &ProgramLoweringOptions::new()
+                                .with_input_types(&vec![input_type.clone()])
+                                .with_output_types(&vec![output_type.clone()])
+                                .without_boundary_shardings()
+                        )
+                        .unwrap(),
                     expected_executable,
                 );
             }
@@ -3982,16 +3951,18 @@ mod tests {
             .unwrap()
             .into_unprojected::<Constant, Operation>()
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[input_type],
-            &[output_type],
-            "main",
-            Some(std::slice::from_ref(&sharding)),
-            Some(std::slice::from_ref(&sharding)),
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&[input_type])
+                    .with_output_types(&[output_type])
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(vec![Some(sharding.clone())])
+                    .with_exact_output_shardings(vec![Some(sharding.clone())]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -4042,16 +4013,18 @@ mod tests {
             .unwrap()
             .into_unprojected::<Constant, Operation>()
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[input_type],
-            &[output_type],
-            "main",
-            Some(std::slice::from_ref(&sharded)),
-            Some(std::slice::from_ref(&replicated)),
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&[input_type])
+                    .with_output_types(&[output_type])
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(vec![Some(sharded.clone())])
+                    .with_exact_output_shardings(vec![Some(replicated.clone())]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -4157,16 +4130,18 @@ mod tests {
         // constraint places, so the module cannot be compiled for a mesh with multiple devices.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let (program, input_type, output_type, replicated, sharded) = program_and_types(mesh);
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[input_type],
-            &[output_type],
-            "main",
-            Some(std::slice::from_ref(&replicated)),
-            Some(std::slice::from_ref(&sharded)),
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&[input_type])
+                    .with_output_types(&[output_type])
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(vec![Some(replicated.clone())])
+                    .with_exact_output_shardings(vec![Some(sharded.clone())]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -4323,18 +4298,8 @@ mod tests {
             let checked =
                 program.instructions()[0].operation().effects().classes().contains(EffectClass::OrderedAssertion);
             if !checked {
-                let target_types = [target.clone()];
                 assert_eq!(
-                    to_mlir_module_for_program(
-                        &program,
-                        &[],
-                        &[source.clone(), target.clone()],
-                        &target_types,
-                        "main",
-                        None,
-                        None,
-                    )
-                    .unwrap(),
+                    program.to_mlir_module("main").unwrap(),
                     // The witness is a dependency of the unchecked cast, so both inputs pass through one barrier. The
                     // negative high padding slices the physical buffer from the source bound to the target bound.
                     indoc! {"

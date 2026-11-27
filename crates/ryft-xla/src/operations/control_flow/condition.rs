@@ -172,7 +172,7 @@ mod tests {
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::sessions::tests::{domain_mesh, program_array, read_first_shard};
     use crate::tests::{execution_client, replicated_array, test_compilation_options, values_to_bytes};
-    use crate::{Constant, Session, Value, to_mlir_module_for_program};
+    use crate::{Constant, LowerableProgram, ProgramLoweringOptions, Session, Value};
 
     use super::*;
 
@@ -240,16 +240,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &(predicate_type, input_type.clone()),
-            &input_type,
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -312,16 +303,18 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::I64), array_type.clone()],
-            &[array_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&[
+                        ArrayType::scalar(DataType::Boolean),
+                        ArrayType::scalar(DataType::I64),
+                        array_type.clone(),
+                    ])
+                    .with_output_types(&[array_type]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -411,16 +404,18 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &[ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::I64), array_type.clone()],
-            &[array_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&[
+                        ArrayType::scalar(DataType::Boolean),
+                        ArrayType::scalar(DataType::I64),
+                        array_type.clone(),
+                    ])
+                    .with_output_types(&[array_type]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -503,8 +498,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo =
-            to_mlir_module_for_program(&program, &[], &input_type, &input_type, "main", None, None).unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -532,7 +526,6 @@ mod tests {
         let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let scalar_type = ArrayType::scalar(DataType::F32);
         let predicate_type = ArrayType::scalar(DataType::Boolean);
-        let output_type = dynamic_vector_type.clone();
 
         let branch = |negate: bool| {
             let mut builder = ProgramBuilder::<Constant, Operation>::new();
@@ -585,16 +578,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![dynamic_vector_type, predicate_type, scalar_type],
-            &vec![output_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -658,10 +642,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let input_types = vec![predicate_type, input_type.clone()];
-        let output_types = vec![input_type];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             module,
@@ -739,16 +720,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![ArrayType::scalar(DataType::Boolean), scalar_type.clone()],
-            &vec![scalar_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let stablehlo = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -845,16 +817,7 @@ mod tests {
                 ]
                 in ()"#},
         );
-        let module = to_mlir_module_for_program(
-            program.as_ref(),
-            &[],
-            &vec![scalar_type, predicate_type],
-            &Vec::<ArrayType>::new(),
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program.as_ref().to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -917,16 +880,7 @@ mod tests {
             .add_instruction(PrintOperation::<ArrayType>::new("after"), Vec::new(), vec![input], None)
             .unwrap();
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder; 2], vec![]).unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![predicate_type, scalar_type],
-            &Vec::<ArrayType>::new(),
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -2171,16 +2125,18 @@ mod tests {
                     ]
                 in (%4)"#},
         );
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![selector_type.clone(), vector_type.clone()],
-            &vec![vector_type.clone()],
-            "main",
-            Some(&[selector_sharding, vector_sharding.clone()]),
-            Some(&[vector_sharding]),
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&vec![selector_type.clone(), vector_type.clone()])
+                    .with_output_types(&vec![vector_type.clone()])
+                    .without_boundary_shardings()
+                    .with_exact_argument_shardings(vec![Some(selector_sharding), Some(vector_sharding.clone())])
+                    .with_exact_output_shardings(vec![Some(vector_sharding)]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"

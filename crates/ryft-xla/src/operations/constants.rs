@@ -668,7 +668,7 @@ mod tests {
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::sessions::tests::read_first_shard;
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
-    use crate::{ArrayConstant, Constant, Session, to_mlir_module_for_program};
+    use crate::{ArrayConstant, Constant, LowerableProgram, ProgramLoweringOptions, Session};
 
     use super::*;
 
@@ -1239,9 +1239,15 @@ mod tests {
             let program =
                 builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
             let input_types: Vec<ArrayType> = Vec::new();
-            let module =
-                to_mlir_module_for_program(&program, &[], &input_types, &vec![output_type], "main", None, None)
-                    .unwrap();
+            let module = program
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .with_input_types(&input_types)
+                        .with_output_types(&vec![output_type])
+                        .without_boundary_shardings(),
+                )
+                .unwrap();
             assert_eq!(module, expected);
         }
     }
@@ -1818,8 +1824,14 @@ mod tests {
             .unwrap();
         assert_eq!(program.output_types(), vec![Type::Array(output_type.clone()); 3]);
         let input_types = vec![ArrayType::scalar(DataType::I64)];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &vec![output_type; 3], "main", None, None).unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&input_types)
+                    .with_output_types(&vec![output_type; 3]),
+            )
+            .unwrap();
         // Even a singleton dimension retains its declared identity and logical extent in the lowered signature.
         assert_eq!(
             module,
@@ -1903,8 +1915,14 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![zero, iota], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let input_types = vec![ArrayType::scalar(DataType::I64)];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &vec![output_type; 2], "main", None, None).unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&input_types)
+                    .with_output_types(&vec![output_type; 2]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -1958,16 +1976,14 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![ArrayType::scalar(DataType::I64); 2],
-            &vec![output_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&vec![ArrayType::scalar(DataType::I64); 2])
+                    .with_output_types(&vec![output_type]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -2013,16 +2029,14 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![ArrayType::scalar(DataType::I64)],
-            &vec![output_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&vec![ArrayType::scalar(DataType::I64)])
+                    .with_output_types(&vec![output_type]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -2064,9 +2078,7 @@ mod tests {
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![], vec![Placeholder]).unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [3, 3]);
         assert_eq!(program.output_types(), vec![Type::Array(output_type.clone())]);
-        let module =
-            to_mlir_module_for_program(&program, &[], &Vec::<ArrayType>::new(), &vec![output_type], "main", None, None)
-                .unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -2123,16 +2135,14 @@ mod tests {
             .unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [3, 3]);
         assert_eq!(program.output_types(), vec![Type::Array(output_type.clone()); 3]);
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![ArrayType::scalar(DataType::I64)],
-            &vec![output_type; 3],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&vec![ArrayType::scalar(DataType::I64)])
+                    .with_output_types(&vec![output_type; 3]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -2191,16 +2201,14 @@ mod tests {
             .unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [2, 2, 2]);
         assert_eq!(program.output_types(), vec![Type::Array(output_type.clone())]);
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![ArrayType::scalar(DataType::I64)],
-            &vec![output_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&vec![ArrayType::scalar(DataType::I64)])
+                    .with_output_types(&vec![output_type]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"

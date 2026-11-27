@@ -264,8 +264,8 @@ mod tests {
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, Constant, Error, LowerableOperation, Lowerer, LoweringError, Session, Type,
-        to_mlir_module_for_program,
+        Array, ArrayConstant, Constant, Error, LowerableOperation, LowerableProgram, Lowerer, LoweringError,
+        ProgramLoweringOptions, Session, Type,
     };
 
     // Uploads one generator state to the device and builds the same state on the reference backend.
@@ -299,10 +299,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let program = unproject_plain_program(program);
-        let input_types = vec![state_type.clone()];
-        let output_types = vec![state_type, bits_type];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             module,
@@ -339,10 +336,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let program = unproject_plain_program(program);
-        let input_types = vec![state_type.clone()];
-        let output_types = vec![state_type, bits_type];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
 
         assert_eq!(
             module,
@@ -383,10 +377,7 @@ mod tests {
             .unwrap();
         let bits_type = ArrayType::new_static(DataType::U32, [3]);
         assert_eq!(program.output_types()[1], Type::Array(bits_type.clone()));
-        let input_types = vec![state_type.clone()];
-        let output_types = vec![state_type, bits_type];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -439,16 +430,14 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![ArrayType::scalar(DataType::I64)],
-            &vec![ArrayType::new_static(DataType::F64, [3, 3]); 2],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&vec![ArrayType::scalar(DataType::I64)])
+                    .with_output_types(&vec![ArrayType::new_static(DataType::F64, [3, 3]); 2]),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -810,10 +799,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let program = unproject_plain_program(program);
-        let input_types = vec![input_type.clone(), state_type.clone()];
-        let output_types = vec![input_type, state_type];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -849,8 +835,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let types = vec![input_type];
-        let module = to_mlir_module_for_program(&program, &[], &types, &types, "main", None, None).unwrap();
+        let module = program.to_mlir_module("main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"

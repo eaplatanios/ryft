@@ -252,8 +252,8 @@ pub(crate) mod tests {
     use crate::operations::Operation;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, Constant, ExecutionArguments, FromPjrt, ProgramExtension, Session, TracedProgram, Type,
-        trace,
+        Array, ArrayTracer, Constant, ExecutionArguments, FromPjrt, LowerableProgram, ProgramLoweringOptions, Session,
+        TracedProgram, Type, trace,
     };
 
     use super::*;
@@ -581,10 +581,11 @@ pub(crate) mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_shardings(
+            .to_mlir_module_with_options(
                 "main",
-                Some(std::slice::from_ref(&sharded)),
-                Some(&[replicated, sharded.clone()]),
+                &ProgramLoweringOptions::new()
+                    .with_input_shardings((std::slice::from_ref(&sharded)).to_vec())
+                    .with_output_shardings((&[replicated, sharded.clone()]).to_vec()),
             )
             .unwrap();
         let executable = client

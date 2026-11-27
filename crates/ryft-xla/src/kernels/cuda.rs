@@ -691,7 +691,7 @@ mod tests {
 
     use crate::kernels::CompiledKernel;
     use crate::kernels::tests::definition;
-    use crate::lowering::modules::lower_mlir_module_for_program;
+    use crate::lowering::extensions::{LowerableProgram, ProgramLoweringOptions};
     use crate::{Constant, Operation};
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     use crate::{Platform, RuntimeError};
@@ -951,17 +951,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![scalar.clone()],
-            &vec![scalar],
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap();
+        let lowered = program.lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda"))).unwrap();
         let (module, _, _, _) = lowered.into_parts();
         assert_eq!(
             module,
@@ -1057,17 +1047,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![scalar.clone()],
-            &vec![scalar],
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap();
+        let lowered = program.lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda"))).unwrap();
         let (module, signature, assertions, requirements) = lowered.into_parts();
         assert_eq!(
             module,

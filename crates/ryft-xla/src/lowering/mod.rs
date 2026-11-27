@@ -1,30 +1,32 @@
-//! Lowering of staged XLA programs to textual StableHLO/Shardy MLIR modules.
+//! Lowering of staged XLA programs to StableHLO/Shardy MLIR modules.
 //!
-//! [`to_mlir_module_for_program`] lowers a program of any [`LowerableOperationFamily`] with caller-supplied boundary
-//! types. Its entry function takes the hidden capture arguments followed by the program inputs and can carry
-//! `sdy.sharding` attributes. [`ProgramExtension::to_mlir_module`](crate::ProgramExtension::to_mlir_module) derives
-//! the signature and collects session constants when exporting traced programs over XLA's built-in operation family.
-//! The crate-internal entry points used by compilation return the `ExecutableSignature`, which maps the logical
-//! program boundary to the physical executable boundary (e.g., erasing static zero-sized leaves and appending hidden
-//! extent scalars and effect tokens), along with the module's runtime requirements. Programs must have their
-//! references and mutable state discharged before lowering. Failures that only lowering can detect are reported as
-//! [`LoweringError`]s wrapped in [`Error::Lowering`].
+//! # Exporting Programs
+//!
+//! [`LowerableProgram`] lowers a staged program over any [`LowerableOperationFamily`].
+//! [`LowerableProgram::to_mlir_module`] renders the module with the default [`ProgramLoweringOptions`], which read the
+//! entry signature from the global input and output types of the program, pass the arrays that the program imports as
+//! hidden arguments that precede its inputs, and prune the program first.
+//! [`LowerableProgram::to_mlir_module_with_options`] takes options that replace those types, attach `sdy.sharding`
+//! attributes to the arguments and results of the entry function, or lower the program as it is.
+//! [`LowerableProgram::lower`] returns the [`LoweredModule`], which pairs the module with what executing it requires.
+//! Programs must have their references and mutable state discharged before lowering. Failures that only lowering can
+//! detect are reported as [`LoweringError`]s wrapped in [`Error::Lowering`].
+//!
+//! # Lowering Custom Operations
 //!
 //! Each operation lowers itself through [`LowerableOperation::lower`], which receives a [`Lowerer`] that exposes the
-//! block receiving the emitted operations, the MLIR context and location, the attached regions of the instruction, and
-//! the ordered effect token chains of the enclosing lowering scope. Operation families dispatch to the payloads of
-//! their variants through the [`lower_operation_variants`](crate::lower_operation_variants) macro, so downstream
-//! crates extend lowering by implementing [`LowerableOperation`] for their own operations and families. One
-//! crate-internal `CollectiveLoweringState` per module carries the state that nested regions share, such
-//! collective channel counter, the enclosing manual regions, the target platform, and the registry of named
-//! compositions.
+//! block receiving the emitted operations, the MLIR context and location, the regions of the instruction, and the
+//! ordered effect token chains of the enclosing lowering scope. Operation families dispatch to the payloads of their
+//! variants through the [`lower_operation_variants`](crate::lower_operation_variants) macro, so downstream crates
+//! extend lowering by implementing [`LowerableOperation`] for their own operations and families. An operation whose
+//! types are a member of the types of its family (e.g., an operation over array types in a family over [`Type`])
+//! implements [`MemberLowerableOperation`] instead, which lowers it with the types of the family. The remaining
+//! public functions of this module lower types, constants, and dynamic dimensions, for use in such implementations.
 //!
-//! The crate-internal submodules own the parts of this pipeline. `modules` lowers a whole program to a module and
-//! `regions` lowers nested programs and regions inline. `states` holds the state that the lowering of one module
-//! shares, `emissions` decides which regions, captures, and session constants lowering emits, and `extensions`
-//! prepares programs and analyzes their placements. `reductions` lowers and validates pending reductions.
-//! `admission` rejects data-dependent dynamic programs whose padding could become observable, `signatures` defines
-//! the executable signature, and `types` lowers types, constants, and dynamic dimensions.
+//! # Options
+//!
+//! [`RaggedDotLoweringStrategy`] selects how a compilation lowers ragged dots, and an operation declares through
+//! [`DataDependentPaddingDiscipline`] how it treats the padding of data-dependent dynamic dimensions.
 
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -182,7 +184,8 @@ pub(crate) mod states;
 pub(crate) mod types;
 
 pub use admission::DataDependentPaddingDiscipline;
-pub use modules::to_mlir_module_for_program;
+pub use extensions::{LowerableProgram, ProgramLoweringOptions};
+pub use modules::LoweredModule;
 pub use types::{
     annotate_output_memory, dimension_extent_i32, dimension_extent_i64, lower_array_ir_type, lower_compare_to_mlir,
     lower_constant_elements_attribute, lower_constant_output, lower_element_type, lower_explicit_shape,
@@ -510,13 +513,12 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
 /// Each operation type implements this trait at the type universe of its [`CoreOperation`](ryft_core::Operation)
 /// contract. Homogeneous array operations implement it at [`ArrayType`], array IR operations at [`Type`], and
 /// first-class dimension operations at [`DimensionType`](ryft_core::DimensionType). Operation families (e.g.,
-/// [`ArrayOperation`](ryft_core::ArrayOperation) and [`Operation`]) implement this trait by dispatching each variant
-/// to its payload through
-/// [`lower_operation_variants`](crate::lower_operation_variants), which also handles payloads that a family stores as
-/// projected or mixed members. A family whose type universe is [`Type`] and that implements
-/// [`OperationPayloadProjection`] is a [`LowerableOperationFamily`] whose programs [`to_mlir_module_for_program`]
-/// lowers, so downstream crates extend lowering by implementing this trait for their own operations and families, just
-/// like they extend the transformation traits of `ryft-core`.
+/// [`ArrayOperation`](ryft_core::ArrayOperation) and [`Operation`]) implement this trait by dispatching each variant to
+/// its payload through [`lower_operation_variants`](crate::lower_operation_variants), which also handles payloads that
+/// a family stores as projected or mixed members. A family whose type universe is [`Type`] and that implements
+/// [`OperationPayloadProjection`] is a [`LowerableOperationFamily`] whose programs [`LowerableProgram`] lowers, so
+/// downstream crates extend lowering by implementing this trait for their own operations and families, just like they
+/// extend the transformation traits of `ryft-core`.
 ///
 /// Operations with attached regions lower them through the lowerer (e.g., [`Lowerer::lower_region_inline`]) rather
 /// than through bounds on their own family, so the bounds of a family implementation stay finite.
@@ -576,6 +578,25 @@ pub trait LowerableOperation: CoreOperation {
             reason: "its operation family does not state how it keeps the padding of data-derived dimensions \
                      unobservable",
         }
+    }
+
+    /// Returns `program`, a pruned program of this family, without the mesh that each of its `call`s records for the
+    /// devices that its callee names when that callee names none anymore once it is lowered for `target_platform`
+    /// (e.g., because pruning dropped the only request that named them). Lowering prepares every program that it
+    /// prunes with this function. It returns `program` as it is unless a family overrides it, in which case such a
+    /// call keeps its mesh.
+    #[inline]
+    fn without_stale_call_meshes<Input, Output>(
+        program: Program<Constant, Self, Input, Output>,
+        target_platform: Option<&str>,
+    ) -> Result<Program<Constant, Self, Input, Output>, ProgramError>
+    where
+        Self: CoreOperation<Type = Type> + Sized,
+        Input: Parameterized<Constant>,
+        Output: Parameterized<Constant>,
+    {
+        let _ = target_platform;
+        Ok(program)
     }
 
     /// Returns, for each input of `callee`, the callee of a `call` of this family whose first `capture_count`
@@ -1129,15 +1150,14 @@ pub(crate) mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::{
-        ArrayConstant, ArrayTracer, CompileTracer, CompiledFunction, Constant, Error, FromPjrt, Operation, Options,
-        ProgramExtension, Session, ToMlir, Type, compile, trace_with_context,
+        ArrayConstant, ArrayTracer, CompileTracer, CompiledFunction, Constant, Error, FromPjrt, LowerableProgram,
+        Operation, Options, Session, ToMlir, Type, compile, trace_with_context,
     };
 
     use crate::devices::MemoryExtension;
     use crate::lowering::LoweringError;
     use crate::lowering::modules::{
         merge_logical_meshes, normalize_function_name, remove_unused_constants, serialize_lowered_module,
-        to_mlir_module_for_program,
     };
 
     use crate::lowering::regions::tests::lower_plain_program_outputs;
@@ -1428,7 +1448,16 @@ pub(crate) mod tests {
         };
         let input_types = program.input_types().iter().map(boundary_type).collect::<Vec<_>>();
         let output_types = program.output_types().iter().map(boundary_type).collect::<Vec<_>>();
-        let module = to_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        let module = program
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings(),
+            )
+            .unwrap();
         // Lowering may synthesize runtime checks (e.g., entry guards of mixed region entries), so register their handler.
         ensure_assertion_handler_registered(client)?;
         let mut options = test_compilation_options(client, None);
@@ -1579,7 +1608,14 @@ pub(crate) mod tests {
             builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])?;
         let input_types = vec![vector_type.clone()];
         let output_types = vec![vector_type];
-        to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None)
+        program.to_mlir_module_with_options(
+            "main",
+            &ProgramLoweringOptions::new()
+                .without_pruning()
+                .with_input_types(&input_types)
+                .with_output_types(&output_types)
+                .without_boundary_shardings(),
+        )
     }
 
     /// Builds a one-instruction program applying the given single-operand operation to an input of the given data
@@ -2147,7 +2183,17 @@ pub(crate) mod tests {
         let program =
             builder.build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2]);
         let types = vec![r#type.clone(), r#type];
-        let module = to_mlir_module_for_program(&program.unwrap(), &[], &types, &types, "main", None, None).unwrap();
+        let module = program
+            .unwrap()
+            .to_mlir_module_with_options(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&types)
+                    .with_output_types(&types)
+                    .without_boundary_shardings(),
+            )
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"

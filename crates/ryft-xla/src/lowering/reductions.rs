@@ -823,12 +823,11 @@ mod tests {
 
     use crate::arrays::host::ReductionChange;
     use crate::{
-        ArrayTracer, CompileTracer, CompiledFunction, Constant, Error, FromPjrt, Operation, Options, ProgramExtension,
-        Session, TracedProgram, compile, compile_with_options, trace,
+        ArrayTracer, CompileTracer, CompiledFunction, Constant, Error, FromPjrt, LowerableProgram, Operation, Options,
+        ProgramLoweringOptions, Session, TracedProgram, compile, compile_with_options, trace,
     };
 
     use crate::lowering::LoweringError;
-    use crate::lowering::modules::to_mlir_module_for_program;
 
     use crate::lowering::tests::{
         UnreducedApplication, UnreducedInput, lower_unreduced_application, test_matrix_type, test_vector_type,
@@ -839,7 +838,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_to_mlir_module_for_program_constrains_unreduced_outputs() {
+    fn test_program_to_mlir_module_constrains_unreduced_outputs() {
         // Shardy rejects an operation whose result does not declare the unreduced axes of its inputs, so every output
         // that is unreduced over an axis that no manual region binds is constrained, also where its placement does not
         // change (e.g., a sum, and a broadcast that gives it a batch dimension).
@@ -861,16 +860,15 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![input_type.clone(), input_type],
-                &vec![output_type],
-                "main",
-                None,
-                None,
-            )
-            .unwrap(),
+            program
+                .to_mlir_module_with_options(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .with_input_types(&vec![input_type.clone(), input_type])
+                        .with_output_types(&vec![output_type])
+                        .without_boundary_shardings()
+                )
+                .unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
