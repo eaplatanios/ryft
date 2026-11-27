@@ -2216,7 +2216,7 @@ impl Array {
         work: &mut WorkReservation,
         completion: &mut PlacementCompletion,
     ) -> Result<Arc<Buffer<'static>>, Error> {
-        let dense = dense_row_major_layout(self.shape().rank());
+        let dense = Layout::Tiled(TiledLayout::new((0..self.shape().rank()).rev().collect(), Vec::new()));
         if self.layout().is_some_and(|layout| *layout != dense) {
             return self.place_shard_storage(shard, &buffer, Memory::Device, Some(&dense), work, completion);
         }
@@ -2504,7 +2504,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         // layout into execution, so admission can assume one exists without asking a PJRT client. If execution
         // declines the assumed strategy, admission has already accounted for any communication its replacement might
         // require.
-        self.strategy(&|_, _, shape| Ok(Some(dense_row_major_layout(shape.rank()).to_pjrt()?)), mesh, sharding)
+        self.strategy(&|_, _, shape| Ok(Some(ryft_pjrt::Layout::dense_major_to_minor(shape.rank()))), mesh, sharding)
             .map_or(true, |strategy| strategy.communicates())
     }
 
@@ -2749,8 +2749,9 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
 
         // A compiled reshard across meshes moves whole shards in a declared layout other than the dense row-major one,
         // which regions convert on every source device, so regions replace it only where it declines.
-        let dense =
-            self.metadata.r#type().layout().is_none_or(|layout| *layout == dense_row_major_layout(shape.rank()));
+        let dense = self.metadata.r#type().layout().is_none_or(|layout| {
+            *layout == Layout::Tiled(TiledLayout::new((0..shape.rank()).rev().collect(), Vec::new()))
+        });
         let try_regions = match &compiled {
             Ok(None) => self.mesh() != mesh && dense,
             Ok(Some(_)) => false,
@@ -4201,13 +4202,6 @@ fn issue_cross_host_transfers(
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Returns the dense row-major [`Layout`] of rank `rank` (i.e., the tiled layout without tiles whose minor-to-major
-/// order is the reverse of the order of the dimensions), which is the default layout of dense buffers of the CPU and
-/// CUDA plugins and the layout of the slices and of the received regions of [`Array::place_shard_regions`].
-fn dense_row_major_layout(rank: usize) -> Layout {
-    Layout::Tiled(TiledLayout::new((0..rank).rev().collect(), Vec::new()))
-}
 
 /// Returns `input` without the pending reductions that a placement with the sharding `output` does not keep (refer to
 /// [`kept_unreduced_axes`]) and with every dimension replicated, over `mesh`, which has the axes that `output` keeps
@@ -7253,7 +7247,7 @@ mod tests {
             assert_eq!(padded_buffer.unpadded_dimensions().unwrap(), [size as u64]);
             assert_eq!(padded_buffer.dynamic_dimensions().unwrap(), [0]);
             assert_eq!(padded_buffer.on_device_size_in_bytes().unwrap(), padded_size);
-            let default_layout = dense_row_major_layout(1).to_pjrt().unwrap();
+            let default_layout = ryft_pjrt::Layout::dense_major_to_minor(1);
             assert_eq!(padded_buffer.specification().unwrap().layout, default_layout);
             let mut completion = PlacementCompletion::default();
             let buffer = Arc::clone(padded_buffer);
@@ -8679,7 +8673,7 @@ mod tests {
             let layout = client.default_layout(element_type, dimensions).unwrap().proto().unwrap();
             assert_eq!(
                 ryft_pjrt::Layout::from_proto(layout).unwrap(),
-                dense_row_major_layout(shape.len()).to_pjrt().unwrap(),
+                ryft_pjrt::Layout::dense_major_to_minor(shape.len()),
             );
             assert!(matches!(
                 layout_resolver(element_type, 0, &StaticShape::new(shape)),
