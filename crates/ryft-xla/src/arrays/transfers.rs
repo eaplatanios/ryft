@@ -3555,6 +3555,17 @@ enum MoveRole {
 /// per slice, the slice alone identifies the group.
 type SourceReplicaKey<'o> = (&'o [Range<usize>], Option<ShardContributionMember>);
 
+/// Returns the key for finding source replicas that correspond to `shard`. The key borrows the shard's slice and
+/// includes the contribution member with its manual coordinates ordered by `axes` when supplied.
+fn source_replica_key<'o>(
+    mesh: &DeviceMesh,
+    sharding: &Sharding,
+    shard: &'o ShardDescriptor,
+    axes: Option<&[String]>,
+) -> SourceReplicaKey<'o> {
+    (shard.slice(), axes.map(|axes| ShardContributionMember::ordered(mesh, sharding, shard.index(), axes)))
+}
+
 /// Replicas of one source slice (i.e., the source shards that cover it), indexed so that a plan finds the preferred
 /// replica for each target shard without scanning all of them again (e.g., when a replicated array moves to another
 /// mesh, where every target shard has the slice of every source shard). The preference is deterministic and depends
@@ -3817,14 +3828,11 @@ fn plan_exact_shard_moves<'o>(
     Ok(Some(ShardMovePlan::new(element_type, moves)?))
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Returns how the shards of a placement of a value placed as `input` with the sharding `output` correspond, which
 /// [`plan_exact_shard_moves`] and [`PlacementPlanningView::shard_region_plan`] read: `Some(None)` when both hold one
-/// value per slice (refer to [`Sharding::holds_one_value_per_slice`]), so that any shard with the same elements
-/// corresponds, `Some(Some(axes))` when the placement only moves contributions (refer to [`moves_contributions`]), so a
-/// shard corresponds to the shards with the same elements and contribution member (refer to [`source_replica_key`]),
-/// and `None` otherwise.
+/// value per slice, so that any shard with the same elements corresponds, `Some(Some(axes))` when the placement only
+/// moves contributions, so a shard corresponds to the shards with the same elements and contribution member, and
+/// `None` otherwise.
 fn corresponding_shards(input: &Sharding, output: &Sharding) -> Option<Option<ContributionAxes>> {
     if input.holds_one_value_per_slice() && output.holds_one_value_per_slice() {
         return Some(None);
@@ -3844,43 +3852,29 @@ fn contribution_axes(sharding: &Sharding) -> (Vec<&MeshAxis>, Vec<&MeshAxis>) {
     (unreduced, varying_manual)
 }
 
-/// Returns the key for finding source replicas that correspond to `shard`. The key borrows the shard's slice and
-/// includes the contribution member with its manual coordinates ordered by `axes` when supplied.
-fn source_replica_key<'o>(
-    mesh: &DeviceMesh,
-    sharding: &Sharding,
-    shard: &'o ShardDescriptor,
-    axes: Option<&[String]>,
-) -> SourceReplicaKey<'o> {
-    let member = axes.map(|axes| ShardContributionMember::ordered(mesh, sharding, shard.index(), axes));
-    (shard.slice(), member)
-}
-
-/// Returns whether a placement of a value placed as `input` with the sharding `output` only moves its contributions
-/// (refer to [`ShardContribution`]) to other devices. An array with a pending reduction or with manual variation within
-/// a tile is a sequence of ordinary arrays, one for each contribution, and such a placement keeps that sequence and
-/// places each member like an ordinary array. Only the axes that tell the contributions of one slice apart matter,
-/// which are the unreduced axes and the varying manual axes (a split axis shows in the slice, and every other axis
-/// holds replicas, whatever its size, name, or type, and whether the other mesh has it):
+/// Returns whether a placement of a value placed as `input` with the sharding `output` only moves its contributions to
+/// other devices. An array with a pending reduction or with manual variation within a tile is a sequence of ordinary
+/// arrays, one for each contribution, and such a placement keeps that sequence and places each member like an ordinary
+/// array. Only the axes that tell the contributions of one slice apart matter, which are the unreduced axes and the
+/// varying manual axes (a split axis shows in the slice, and every other axis holds replicas, whatever its size, name,
+/// or type, and whether the other mesh has it):
 ///
-///   - **Unreduced axes:** Both ends have none, or both have the same unreduced kind and the same number of
+///   - **Unreduced Axes:** Both ends have none, or both have the same unreduced kind and the same number of
 ///     contributions (i.e., the product of the sizes of their unreduced axes). The contributions then correspond by
-///     their ordinals (refer to [`ShardContribution`]), which is the order in which the host readback combines them
-///     (refer to [`Array::copy_to_host_bytes`]), whatever the names, sizes, and order of the unreduced axes, as JAX
-///     keeps the flattened order of the shards (e.g., `(x=2, y=3)` onto `(y=3, x=2)`, onto `(z=6)`, or onto
-///     `(x=2, y=3, u=1)` with `u` pending too). Adding a pending reduction to a value without one, even along axes of
-///     size one, is not a move (refer to [`PlacementPlanningView::strategy`]).
-///   - **Reduced axes:** They hold replicas of a completed reduction, so they do not take part. Whether a placement
-///     may change them is decided where the reduction state of a placement is validated (refer to
-///     [`validate_reduction_transition`]).
-///   - **Varying manual axes:** They correspond by name when both ends have the same names with the same sizes, and
+///     their ordinals, which is the order in which the host readback combines them, whatever the names, sizes, and
+///     order of the unreduced axes, as JAX keeps the flattened order of the shards (e.g., `(x=2, y=3)` onto
+///     `(y=3, x=2)`, onto `(z=6)`, or onto `(x=2, y=3, u=1)` with `u` pending too). Adding a pending reduction to a
+///     value without one, even along axes of size one, is not a move.
+///   - **Reduced Axes:** They hold replicas of a completed reduction, so they do not take part. Whether a placement
+///     may change them is decided where the reduction state of a placement is validated.
+///   - **Varying Manual Axes:** They correspond by name when both ends have the same names with the same sizes, and
 ///     otherwise in mesh order with the same sizes (e.g., along a renamed axis). A varying axis of the source that
-///     splits a dimension of the source and along which the target does not vary takes no part, because its
-///     devices hold disjoint slices, so no two values compete for one slice (e.g., the summands of a pending sum split
-///     along a varying `m` gather into replicas of each summand).
+///     splits a dimension of the source and along which the target does not vary takes no part, because its devices
+///     hold disjoint slices, so no two values compete for one slice (e.g., the summands of a pending sum split along
+///     a varying `m` gather into replicas of each summand).
 ///
-/// The contributions of both ends then correspond by their slices and their members, so the placement changes no value
-/// (e.g., onto another order of the same devices or onto other devices, in any memory and layout), and
+/// The contributions of both ends then correspond by their slices and their members, so the placement changes
+/// no value (e.g., onto another order of the same devices or onto other devices, in any memory and layout), and
 /// [`plan_exact_shard_moves`] or [`PlacementPlanningView::shard_region_plan`] moves each contribution as it is.
 ///
 /// Returns the corresponding varying manual axes of both ends, or `None` when the placement does not only move
@@ -3888,8 +3882,10 @@ fn source_replica_key<'o>(
 fn moves_contributions(input: &Sharding, output: &Sharding) -> Option<ContributionAxes> {
     let names = |axes: &[&MeshAxis]| axes.iter().map(|axis| axis.name().to_string()).collect::<Vec<_>>();
     let count = |axes: &[&MeshAxis]| axes.iter().map(|axis| axis.size()).product::<usize>();
+
     let (source_unreduced, source_varying) = contribution_axes(input);
     let (target_unreduced, target_varying) = contribution_axes(output);
+
     let unreduced_correspond = match (source_unreduced.is_empty(), target_unreduced.is_empty()) {
         (true, true) => true,
         (false, false) => {
@@ -3897,27 +3893,33 @@ fn moves_contributions(input: &Sharding, output: &Sharding) -> Option<Contributi
         }
         _ => false,
     };
+
     if !unreduced_correspond {
         return None;
     }
+
     let paired = |source: &[&MeshAxis]| {
         if source.len() != target_varying.len() {
             return None;
         }
+
         let matches_by_name = source
             .iter()
             .all(|axis| target_varying.iter().any(|other| other.name() == axis.name() && other.size() == axis.size()));
+
         let target = if matches_by_name {
             names(source)
         } else {
             let same_sizes = source.iter().zip(&target_varying).all(|(axis, other)| axis.size() == other.size());
             same_sizes.then(|| names(&target_varying))?
         };
+
         Some(ContributionAxes { source: names(source), target })
     };
+
     paired(&source_varying).or_else(|| {
-        // A source axis that splits a dimension holds disjoint slices, so its variation gives no slice two values, and
-        // a target that does not vary along it takes the member of each slice from the one device that holds it.
+        // A source axis that splits a dimension holds disjoint slices, so its variation gives no slice two values,
+        // and a target that does not vary along it takes the member of each slice from the one device that holds it.
         // Such an axis takes no part then, which is tried only when the varying axes do not pair as they are, so that
         // they still pair by name and in mesh order (e.g., along a renamed axis).
         let gathered = source_varying
@@ -3928,6 +3930,8 @@ fn moves_contributions(input: &Sharding, output: &Sharding) -> Option<Contributi
         (gathered.len() != source_varying.len()).then(|| paired(&gathered)).flatten()
     })
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns whether a value placed as `input`, which has a pending reduction or manual variation within a tile (i.e.,
 /// does not hold one value per slice, refer to [`Sharding::holds_one_value_per_slice`]), keeps its contributions
