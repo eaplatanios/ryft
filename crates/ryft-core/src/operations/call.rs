@@ -2313,22 +2313,18 @@ impl<T: Type> CallTypeBindings<T> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Whether each region of one program requests a placement that names devices (i.e., any request except one that only
 /// moves a value to another memory) in the regions that the backend runs, which is what a call that records a mesh
-/// reads of its callee (refer to [`CallOperation::names_devices`]). Each region of the program is analyzed at most
-/// once, and its fact is read by every call of it and by every region that encloses it, so a pass over a program with
-/// nested calls is linear in the size of the program. The program must be the one that the backend runs (refer to
-/// [`Program::into_pruned`] and [`Program::into_simplified`]), because a callee is analyzed as the program holds it.
-/// The regions of an instruction that the backend omits are not analyzed (refer to [`omits_placement_regions`]).
+/// reads of its callee. Each region of the program is analyzed at most once, and its fact is read by every call of
+/// it and by every region that encloses it, so a pass over a program with nested calls is linear in the size of the
+/// program. The program must be the one that the backend runs, because a callee is analyzed as the program holds it.
+/// The regions of an instruction that the backend omits are not analyzed.
 struct DeviceNamingAnalysis<'o, V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> {
     /// Whether the region at each index of the arena of the program names devices, or [`None`] if it has not been
     /// analyzed yet.
     names_devices: Vec<Option<bool>>,
 
-    /// Returns whether the backend omits the regions of an instruction for the target platform of the analysis
-    /// (refer to [`RegionPlacementRequests::for_target`]).
+    /// Returns whether the backend omits the regions of an instruction for the target platform of the analysis.
     omits_regions: &'o dyn Fn(RegionRef<'_, V, O>, &Instruction<O>) -> bool,
 }
 
@@ -2348,13 +2344,16 @@ where
         if let Some(names_devices) = self.names_devices[region.id().index()] {
             return names_devices;
         }
+
         let mut names_devices = false;
         for instruction in region.instructions() {
             let request = self.request(region, instruction);
             names_devices |= matches!(request, Some(RequestedPlacement::Devices(_) | RequestedPlacement::Sharding));
+
             if omits_placement_regions(region, instruction, self.omits_regions) {
                 continue;
             }
+
             for (index, &nested) in instruction.regions().iter().enumerate() {
                 if instruction.operation().region_role(index) == Some(RegionRole::Computation)
                     && let Ok(nested) = region.with_id(nested)
@@ -2363,14 +2362,15 @@ where
                 }
             }
         }
+
         self.names_devices[region.id().index()] = Some(names_devices);
         names_devices
     }
 
     /// Returns the placement request that `instruction` of `region` makes explicitly, if any, which is the one
     /// classification of the placement requests of a program. A `place` with a device target is resolved as
-    /// [`RequestedPlacement::Devices`] documents, and a call that records a mesh requests a placement only when it
-    /// names devices, which a call that pruning left without the request that made it name devices does not.
+    /// [`RequestedPlacement::Devices`] documents, and a call that records a mesh requests a placement only when
+    /// it names devices, which a call that pruning left without the request that made it name devices does not.
     fn request(&mut self, region: RegionRef<'_, V, O>, instruction: &Instruction<O>) -> Option<RequestedPlacement> {
         let operation = instruction.operation();
         if let Some(place) = operation.projected_payload::<PlaceOperation>() {
@@ -2403,6 +2403,8 @@ where
         Some(RequestedPlacement::Devices(mesh.clone()))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Kind of a split of the callee of a `call` that [`split_call`] retains.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
