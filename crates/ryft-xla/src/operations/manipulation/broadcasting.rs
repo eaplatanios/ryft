@@ -7,6 +7,7 @@ use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{Block, Operation as MlirOperation, Type as MlirType, Value as MlirValue, ValueRef};
 
 use crate::lowering::modules::broadcast_changes_explicit_sharding;
+use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, dimension_extent_i64, lower_explicit_shape, lower_runtime_dimension_size_i64,
     lower_static_index_constants, physical_bound_type,
@@ -14,7 +15,6 @@ use crate::lowering::types::{
 use crate::operations::constants::{
     ArrayTypeLayoutConstraintLoweringExtension, dynamic_constructor_types, refine_dynamic_constructor_result,
 };
-use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for BroadcastOperation {

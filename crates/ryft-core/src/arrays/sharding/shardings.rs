@@ -462,6 +462,41 @@ impl Sharding {
         self.with_dimensions(dimensions)?.with_varying_manual_axes(varying)
     }
 
+    /// Returns this [`Sharding`] over its mesh without the mesh axes `axis_names`, which are also removed from its
+    /// dimension placements, reduction state, and manual variation. A dimension that is split only along removed axes
+    /// becomes replicated, and a pending reduction keeps its kind unless all of its axes are removed. Names that are
+    /// not axes of the mesh are ignored. This is the sharding as it reads where something else owns those axes (e.g.,
+    /// a constraint inside a region that binds them as manual axes).
+    pub fn without_mesh_axes(&self, axis_names: &[String]) -> Result<Self, ShardingError> {
+        let retain = |name: &String| !axis_names.contains(name);
+        let mesh = LogicalMesh::new(
+            self.mesh
+                .axes()
+                .iter()
+                .filter(|axis| !axis_names.iter().any(|name| name == axis.name()))
+                .cloned()
+                .collect(),
+        )?;
+        let dimensions = self
+            .dimensions
+            .iter()
+            .map(|dimension| match dimension {
+                ShardingDimension::Sharded(names) => {
+                    let names = names.iter().filter(|name| retain(name)).cloned().collect::<Vec<_>>();
+                    if names.is_empty() { ShardingDimension::Replicated } else { ShardingDimension::Sharded(names) }
+                }
+                dimension => dimension.clone(),
+            })
+            .collect();
+        let sharding = Self::new(mesh, dimensions)?
+            .with_unreduced_axes(self.unreduced_axes.iter().filter(|name| retain(name)).cloned())?;
+        let unreduced_kind = if sharding.unreduced_axes.is_empty() { UnreducedKind::Sum } else { self.unreduced_kind };
+        sharding
+            .with_unreduced_kind(unreduced_kind)?
+            .with_reduced_axes(self.reduced_axes.iter().filter(|name| retain(name)).cloned())?
+            .with_varying_manual_axes(self.varying_manual_axes.iter().filter(|name| retain(name)).cloned())
+    }
+
     /// Returns this [`Sharding`] re-expressed over `mesh`, which must have the same topology as [`Self::mesh`] (refer
     /// to [`LogicalMesh::has_same_topology`]), with the same placement, reduction state, and manual variation, which
     /// are then interpreted with the axis types of `mesh` and revalidated against them (e.g., manual variation is only
@@ -469,6 +504,30 @@ impl Sharding {
     /// depend on axis types, a value placed by this sharding is placed by the returned one too.
     pub fn with_mesh(&self, mesh: LogicalMesh) -> Result<Self, ShardingError> {
         if !self.mesh.has_same_topology(&mesh) {
+            return Err(ShardingError::MeshMismatch { expected: self.mesh.clone(), actual: mesh });
+        }
+        Self::new(mesh, self.dimensions.clone())?
+            .with_unreduced_axes(self.unreduced_axes.clone())?
+            .with_unreduced_kind(self.unreduced_kind)?
+            .with_reduced_axes(self.reduced_axes.clone())?
+            .with_varying_manual_axes(self.varying_manual_axes.clone())
+    }
+
+    /// Returns this [`Sharding`] re-expressed over `mesh`, which must have the axes of [`Self::mesh`] in the same
+    /// order with the same names and types, some of which may have another size (e.g., a mesh restricted to some of
+    /// its devices), with the same placement, reduction state, and manual variation. Unlike [`Self::with_mesh`], which
+    /// requires the same topology, this changes the shards of a dimension that is split along a resized axis. A value
+    /// placed by this sharding is therefore placed by the returned one only where no dimension is split along such an
+    /// axis.
+    pub fn with_resized_mesh(&self, mesh: LogicalMesh) -> Result<Self, ShardingError> {
+        let has_same_axes = self.mesh.axes().len() == mesh.axes().len()
+            && self
+                .mesh
+                .axes()
+                .iter()
+                .zip(mesh.axes())
+                .all(|(left, right)| left.name() == right.name() && left.r#type() == right.r#type());
+        if !has_same_axes {
             return Err(ShardingError::MeshMismatch { expected: self.mesh.clone(), actual: mesh });
         }
         Self::new(mesh, self.dimensions.clone())?
@@ -492,6 +551,28 @@ impl Sharding {
         sharding.reduced_axes = self.reduced_axes.clone();
         sharding.varying_manual_axes = self.varying_manual_axes.clone();
         Ok(sharding)
+    }
+
+    /// Returns this [`Sharding`] with its [`Unconstrained`](ShardingDimension::Unconstrained) dimensions replicated
+    /// (refer to [`Self::dimensions_with_unconstrained_replicated`]). This is the sharding of a value that is stored
+    /// with this sharding, because a placement reads an unconstrained dimension as replicated.
+    #[inline]
+    pub fn with_unconstrained_dimensions_replicated(&self) -> Self {
+        Self { dimensions: self.dimensions_with_unconstrained_replicated(), ..self.clone() }
+    }
+
+    /// Returns the [`Self::dimensions`] of this [`Sharding`] with every
+    /// [`Unconstrained`](ShardingDimension::Unconstrained) dimension replaced by a
+    /// [`Replicated`](ShardingDimension::Replicated) one.
+    #[inline]
+    pub fn dimensions_with_unconstrained_replicated(&self) -> Vec<ShardingDimension> {
+        self.dimensions
+            .iter()
+            .map(|dimension| match dimension {
+                ShardingDimension::Unconstrained => ShardingDimension::Replicated,
+                dimension => dimension.clone(),
+            })
+            .collect()
     }
 
     /// Returns this [`Sharding`] with its unreduced mesh axes replaced by `unreduced_axes`. Use this when the
@@ -1181,6 +1262,138 @@ mod tests {
             sharding.local_sharding(&["x".to_string()]),
             Err(ShardingError::ExpectedManualMeshAxis { name: "x".to_string() })
         );
+    }
+
+    #[test]
+    fn test_sharding_without_mesh_axes() {
+        let axis = |name: &str, r#type: MeshAxisType| MeshAxis::new(name, 2, r#type).unwrap();
+        let mesh = LogicalMesh::new(vec![
+            axis("x", MeshAxisType::Explicit),
+            axis("m", MeshAxisType::Manual),
+            axis("n", MeshAxisType::Manual),
+            axis("r", MeshAxisType::Manual),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(
+            mesh.clone(),
+            vec![
+                ShardingDimension::sharded(["x", "m"]),
+                ShardingDimension::sharded(["n"]),
+                ShardingDimension::Unconstrained,
+            ],
+        )
+        .unwrap()
+        .with_unreduced_axes(["r"])
+        .unwrap()
+        .with_unreduced_kind(UnreducedKind::Max)
+        .unwrap();
+
+        // Removing axes removes them from the mesh and from every dimension, and a dimension that was split only
+        // along them becomes replicated. The pending reduction along another axis keeps its kind.
+        let remaining =
+            LogicalMesh::new(vec![axis("x", MeshAxisType::Explicit), axis("r", MeshAxisType::Manual)]).unwrap();
+        assert_eq!(
+            sharding.without_mesh_axes(&["m".to_string(), "n".to_string()]),
+            Ok(Sharding::new(
+                remaining,
+                vec![
+                    ShardingDimension::sharded(["x"]),
+                    ShardingDimension::Replicated,
+                    ShardingDimension::Unconstrained
+                ],
+            )
+            .unwrap()
+            .with_unreduced_axes(["r"])
+            .unwrap()
+            .with_unreduced_kind(UnreducedKind::Max)
+            .unwrap())
+        );
+
+        // Removing every axis of the pending reduction leaves the canonical kind of a sharding without one.
+        let remaining = LogicalMesh::new(vec![
+            axis("x", MeshAxisType::Explicit),
+            axis("m", MeshAxisType::Manual),
+            axis("n", MeshAxisType::Manual),
+        ])
+        .unwrap();
+        assert_eq!(
+            sharding.without_mesh_axes(&["r".to_string()]),
+            Ok(Sharding::new(
+                remaining,
+                vec![
+                    ShardingDimension::sharded(["x", "m"]),
+                    ShardingDimension::sharded(["n"]),
+                    ShardingDimension::Unconstrained
+                ],
+            )
+            .unwrap())
+        );
+
+        // Manual variation along a removed axis is removed too, and unknown names are ignored.
+        let varying = Sharding::replicated(mesh, 1).with_varying_manual_axes(["m"]).unwrap();
+        let remaining = LogicalMesh::new(vec![
+            axis("x", MeshAxisType::Explicit),
+            axis("n", MeshAxisType::Manual),
+            axis("r", MeshAxisType::Manual),
+        ])
+        .unwrap();
+        assert_eq!(varying.without_mesh_axes(&["m".to_string()]), Ok(Sharding::replicated(remaining, 1)));
+        assert_eq!(sharding.without_mesh_axes(&["unknown".to_string()]), Ok(sharding.clone()));
+        assert_eq!(sharding.without_mesh_axes(&[]), Ok(sharding.clone()));
+    }
+
+    #[test]
+    fn test_sharding_with_resized_mesh() {
+        let mesh = |x: usize, r#type: MeshAxisType| {
+            LogicalMesh::new(vec![MeshAxis::new("x", x, r#type).unwrap(), MeshAxis::new("y", 2, r#type).unwrap()])
+                .unwrap()
+        };
+        let sharding = |mesh: LogicalMesh| {
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["y"])])
+                .unwrap()
+                .with_unreduced_axes(["x"])
+                .unwrap()
+                .with_unreduced_kind(UnreducedKind::Max)
+                .unwrap()
+        };
+
+        // The placement and the reduction state carry over to a mesh whose axes only differ in size, which
+        // `with_mesh` rejects.
+        let wide = sharding(mesh(2, MeshAxisType::Auto));
+        let narrow = mesh(1, MeshAxisType::Auto);
+        assert_eq!(wide.with_resized_mesh(narrow.clone()), Ok(sharding(narrow.clone())));
+        assert_eq!(
+            wide.with_mesh(narrow.clone()),
+            Err(ShardingError::MeshMismatch { expected: wide.mesh().clone(), actual: narrow })
+        );
+
+        // Axes with other names, another order, or other types are another mesh.
+        let retyped = mesh(1, MeshAxisType::Explicit);
+        assert_eq!(
+            wide.with_resized_mesh(retyped.clone()),
+            Err(ShardingError::MeshMismatch { expected: wide.mesh().clone(), actual: retyped })
+        );
+        let shorter = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        assert_eq!(
+            wide.with_resized_mesh(shorter.clone()),
+            Err(ShardingError::MeshMismatch { expected: wide.mesh().clone(), actual: shorter })
+        );
+    }
+
+    #[test]
+    fn test_sharding_with_unconstrained_dimensions_replicated() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::Unconstrained, ShardingDimension::Replicated],
+        )
+        .unwrap();
+        let dimensions =
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated, ShardingDimension::Replicated];
+        assert_eq!(sharding.dimensions_with_unconstrained_replicated(), dimensions);
+        let replicated = sharding.with_unconstrained_dimensions_replicated();
+        assert_eq!(replicated, Sharding::new(mesh, dimensions).unwrap());
+        assert_eq!(replicated.with_unconstrained_dimensions_replicated(), replicated);
     }
 
     #[test]

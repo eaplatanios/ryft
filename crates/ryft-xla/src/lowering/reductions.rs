@@ -19,9 +19,8 @@ use crate::arrays::host::{
     partial_completion_rejection,
 };
 use crate::lowering::LoweringError;
-use crate::lowering::extensions::ShardingLoweringExtension;
+use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::lowering::states::CollectiveLoweringState;
-use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Error, Type};
 
 // TODO(eaplatanios): Review this module.
@@ -214,7 +213,7 @@ fn constrained_dimensions(value: ValueRef<'_, '_, '_>) -> Result<Option<Rc<[Shar
 
 /// Returns `dimensions`, dimension shardings over `mesh` that the program states for a value (e.g., with
 /// [`constrained_dimensions`]), if they agree with `stated`, the closed dimension shardings of the type of that value
-/// (refer to [`ShardingLoweringExtension::dimensions_with_unconstrained_replicated`]), along every mesh axis that is
+/// (refer to [`Sharding::dimensions_with_unconstrained_replicated`]), along every mesh axis that is
 /// not an auto axis, which is all that a type records, and `stated` otherwise. A value whose type tracks a placement is
 /// placed as its type says along those axes, so the program can only add the placement along auto mesh axes, which its
 /// type cannot record.
@@ -344,9 +343,7 @@ impl ShardingReductionExtension for Sharding {
         block: &mut BlockRef<'b, 'c, 't>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-        let closed = self
-            .with_dimensions(self.dimensions_with_unconstrained_replicated().to_vec())
-            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        let closed = self.with_unconstrained_dimensions_replicated();
         closed.lower_sharding_constraint(value, OpenDimensions::None, bound_manual_axes, block, location)
     }
 }
@@ -630,7 +627,7 @@ pub(super) fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
         {
             let dimensions = dimensions_along_auto_axes(
                 constrained_dimensions(*value)?,
-                sharding.dimensions_with_unconstrained_replicated(),
+                sharding.dimensions_with_unconstrained_replicated().into(),
                 mesh,
             );
             forward_dimensions.push((*value, dimensions));
@@ -640,9 +637,9 @@ pub(super) fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
         .iter()
         .zip(output_types)
         .filter_map(|(value, r#type)| match r#type {
-            Type::Array(r#type) => {
-                r#type.sharding().map(|sharding| (*value, sharding.dimensions_with_unconstrained_replicated()))
-            }
+            Type::Array(r#type) => r#type
+                .sharding()
+                .map(|sharding| (*value, sharding.dimensions_with_unconstrained_replicated().into())),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -802,7 +799,7 @@ pub(super) fn constrain_unreduced_outputs<'b, 'c: 'b, 't: 'c>(
             let placed;
             let sharding = match dimensions_along_auto_axes(
                 dimensions,
-                sharding.dimensions_with_unconstrained_replicated(),
+                sharding.dimensions_with_unconstrained_replicated().into(),
                 sharding.mesh(),
             ) {
                 dimensions if *dimensions != *sharding.dimensions_with_unconstrained_replicated() => {
@@ -850,7 +847,7 @@ mod tests {
         UnreducedApplication, UnreducedInput, lower_unreduced_application, test_matrix_type, test_vector_type,
     };
 
-    use crate::sharding::tests::test_mesh;
+    use crate::lowering::sharding::tests::test_mesh;
     use crate::tests::{cpu_client, values_to_bytes};
 
     use super::*;

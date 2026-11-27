@@ -2418,7 +2418,7 @@ impl Array {
     /// every buffer of this array whose shard has no elements (refer to
     /// [`PlacementCompletion::track_empty_shard_buffers`]).
     fn restricted_to(&self, mesh: &DeviceMesh) -> Result<Self, Error> {
-        let sharding = sharding_on_mesh(self.sharding(), mesh.logical_mesh())?;
+        let sharding = self.sharding().with_resized_mesh(mesh.logical_mesh().clone())?;
         let r#type = self.r#type().into_owned().with_sharding(None)?;
         let mut completion = PlacementCompletion::default();
         completion.track_empty_shard_buffers(self)?;
@@ -2630,7 +2630,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             let first_sharding = sharding.clone().with_unreduced_axes(remaining.cloned().collect::<Vec<_>>())?;
             let coordinate_zero = || -> Result<(DeviceMesh, Sharding), Error> {
                 let first_mesh = mesh.at_coordinate_zero(&axis_indices)?;
-                let first_sharding = sharding_on_mesh(&first_sharding, first_mesh.logical_mesh())?;
+                let first_sharding = first_sharding.with_resized_mesh(first_mesh.logical_mesh().clone())?;
                 Ok((first_mesh, first_sharding))
             };
 
@@ -2654,7 +2654,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
                     Ok(sharding.with_dimensions(dimensions)?)
                 };
 
-                let restricted_sharding = sharding_on_mesh(self.sharding(), first_mesh.logical_mesh())?;
+                let restricted_sharding = self.sharding().with_resized_mesh(first_mesh.logical_mesh().clone())?;
 
                 if closed(&restricted_sharding)? == closed(&first_sharding)? {
                     (first_mesh, first_sharding, false, None)
@@ -4210,19 +4210,6 @@ fn gathered_sharding(input: &Sharding, output: &Sharding, mesh: &LogicalMesh, ra
         return Ok(replicated);
     }
     Ok(replicated.with_unreduced_axes(kept)?.with_unreduced_kind(input.unreduced_kind())?)
-}
-
-/// Returns `sharding` over `mesh`, a logical mesh with the axes of the mesh of `sharding` in the same
-/// order and with the same names and types, some of which may have another size (e.g., the logical mesh of
-/// [`DeviceMesh::at_coordinate_zero`]), with the same placement, reduction state, and manual variation. Unlike
-/// [`Sharding::with_mesh`], which requires the same topology, this lets a sharding that splits no dimension along
-/// a resized axis describe the same shards on the devices that remain.
-fn sharding_on_mesh(sharding: &Sharding, mesh: &LogicalMesh) -> Result<Sharding, Error> {
-    Ok(Sharding::new(mesh.clone(), sharding.dimensions().to_vec())?
-        .with_unreduced_axes(sharding.unreduced_axes().clone())?
-        .with_unreduced_kind(sharding.unreduced_kind())?
-        .with_reduced_axes(sharding.reduced_axes().clone())?
-        .with_varying_manual_axes(sharding.varying_manual_axes().clone())?)
 }
 
 /// Validates that a compiled reshard on `mesh` takes a value of `data_type` placed as `input` to `output` with the
@@ -8936,7 +8923,7 @@ mod tests {
             panic!("an empty placement must still introduce the pending sum");
         };
         assert_eq!(axis_indices, vec![0]);
-        assert_eq!(sharding_on_mesh(&sharding, mesh.logical_mesh()).unwrap(), replicated);
+        assert_eq!(sharding.with_resized_mesh(mesh.logical_mesh().clone()).unwrap(), replicated);
     }
 
     #[test]
@@ -9944,21 +9931,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sharding_on_mesh() {
-        // The placement, the reduction state, and the manual variation carry over to a mesh with resized axes.
-        let narrow = LogicalMesh::new(vec![
-            MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
-        let split = |mesh: &LogicalMesh| {
-            let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
-            sharding.with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(UnreducedKind::Max).unwrap()
-        };
-        assert_eq!(sharding_on_mesh(&split(&logical_mesh_2x2()), &narrow), Ok(split(&narrow)));
-    }
-
-    #[test]
     fn test_validate_reduction_transition() {
         // A change that a collective of XLA makes exactly needs no host round trip. Every other change is named with
         // the data type, both states, the axis, the reason, and what the user can do, which depends on why the
@@ -10138,7 +10110,7 @@ mod tests {
                             Ok(DevicePlacementStrategy::IntroducedSums { sharding, .. }) => {
                                 // Check the reduction rules on the full mesh even if the plan puts the first step
                                 // on its submesh at coordinate zero.
-                                first = sharding_on_mesh(&sharding, mesh.logical_mesh()).unwrap();
+                                first = sharding.with_resized_mesh(mesh.logical_mesh().clone()).unwrap();
                                 &first
                             }
                             Ok(_) => output,

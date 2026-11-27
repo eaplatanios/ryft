@@ -28,7 +28,6 @@ pub mod lowering;
 pub mod operations;
 pub mod pjrt;
 pub mod sessions;
-pub mod sharding;
 pub mod tracing;
 pub mod types;
 pub mod values;
@@ -69,23 +68,20 @@ pub use kernels::{
     stage_kernel_with_rules, stage_kernel_with_vjp,
 };
 pub use lowering::{
-    DataDependentPaddingDiscipline, EntryShardingOverride, LowerableOperation, LowerableOperationFamily,
-    LowerableProgram, LoweredModule, Lowerer, LoweringError, MemberLowerableOperation, ProgramLoweringOptions,
-    RaggedDotLoweringStrategy, lower_projected_operation,
+    DataDependentPaddingDiscipline, EntryShardingOverride, LogicalMeshExtension, LowerableOperation,
+    LowerableOperationFamily, LowerableProgram, LoweredModule, Lowerer, LoweringError, MemberLowerableOperation,
+    OpenDimensions, ProgramLoweringOptions, RaggedDotLoweringStrategy, SHARDY_MESH_SYMBOL_NAME, ShardingExtension,
+    UnreducedKindExtension, lower_projected_operation,
 };
 pub use operations::{
     Operation, PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE, ensure_print_handler_registered, with_captured_prints,
 };
-pub use pjrt::{FromPjrt, ToPjrt};
+pub use pjrt::{FromPjrt, OpShardingExtension, ToPjrt};
 pub use sessions::{
     CustomCallOperationExtension, ExecutionResources, MAX_RUNTIME_REQUIREMENTS_BYTES, Platform,
     RUNTIME_REQUIREMENTS_ATTRIBUTE, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider,
     RuntimeRequirement, Session, SessionBuilder, SessionError, Target, TargetDevice, ThroughSession, Tracer,
     normalize_runtime_requirements,
-};
-pub use sharding::{
-    LogicalMeshExtension, OpShardingExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension,
-    UnreducedKindExtension,
 };
 pub use tracing::{ArrayTracer, TracedProgram, trace, trace_with_context};
 pub use values::{ArrayConstant, Constant, Dimension, Reference, Type, Value};

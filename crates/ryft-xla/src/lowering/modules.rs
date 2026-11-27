@@ -24,12 +24,13 @@ use ryft_mlir::{
 use crate::arrays::host::ReductionChange;
 use crate::devices::MemoryExtension;
 use crate::lowering::emissions::{emitted_regions, partition_session_constants, unread_entry_arguments};
-use crate::lowering::extensions::{ProgramLoweringOptions, ShardingLoweringExtension};
+use crate::lowering::programs::ProgramLoweringOptions;
 use crate::lowering::reductions::{
     ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
     validate_pending_reduction_change,
 };
 use crate::lowering::regions::lower_program_outputs_with_inputs;
+use crate::lowering::sharding::{LogicalMeshExtension, OpenDimensions, ShardingExtension};
 use crate::lowering::signatures::ExecutableSignature;
 use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{
@@ -39,7 +40,6 @@ use crate::lowering::types::{
 use crate::lowering::{EffectTokens, LowerableOperationFamily, LoweringError};
 use crate::operations::call::{CallFunctionMap, collect_call_functions, emit_call_function};
 use crate::operations::composites::{collect_named_composition_functions, emit_named_composition_function};
-use crate::sharding::{LogicalMeshExtension, OpenDimensions, ShardingExtension};
 use crate::{
     CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME,
     Type, normalize_runtime_requirements,
@@ -1505,7 +1505,7 @@ mod tests {
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
 
     use super::*;
-    use crate::lowering::extensions::LowerableProgram;
+    use crate::lowering::programs::LowerableProgram;
 
     #[test]
     fn test_contains_unresolved_state_ignores_dormant_regions() {

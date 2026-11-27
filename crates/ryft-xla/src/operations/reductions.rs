@@ -11,13 +11,13 @@ use ryft_mlir::{
     ValueRef,
 };
 
+use crate::lowering::sharding::ShardingExtension;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, DataTypeLoweringExtension,
     lower_f64_constant_splat, lower_signed_one_bit_to_mlir, lower_unplaced_constant_output, physical_bound_type,
     signed_integer_width, unsigned_integer_width,
 };
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
-use crate::sharding::ShardingExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// Lowers the scalar product combiner of a `reduce` or `cumulative` body over `element_type`. Complex operands return

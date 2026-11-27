@@ -9,6 +9,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::modules::cast_changes_explicit_placement;
+use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, lower_f64_constant_splat, lower_signed_one_bit_to_mlir, lower_unplaced_constant_output,
     physical_bound_type, static_dimensions,
@@ -18,7 +19,6 @@ use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::operations::control_flow::{lower_refined_region_input, lower_refined_region_outputs};
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
-use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {

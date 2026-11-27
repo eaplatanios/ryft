@@ -2,7 +2,7 @@ use ryft_core::macros::check_count;
 use ryft_core::{ArrayType, ReshardOperation};
 use ryft_mlir::ValueRef;
 
-use crate::sharding::{OpenDimensions, ShardingExtension};
+use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ReshardOperation {

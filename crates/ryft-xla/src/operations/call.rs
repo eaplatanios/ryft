@@ -46,7 +46,7 @@ use crate::compilation::domains::{argument_type, commits_public_outputs};
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::EffectTokens;
 use crate::lowering::emissions::{omits_regions, partition_session_constants, unread_call_captures};
-use crate::lowering::extensions::{RegionPlacementRequestsExtension, ShardingLoweringExtension};
+use crate::lowering::programs::RegionPlacementRequestsExtension;
 use crate::lowering::reductions::validate_declared_pending_reduction;
 use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::lowering::states::CollectiveLoweringState;
@@ -889,7 +889,7 @@ impl InterpretableOperation<Session> for CallOperation<Type> {
 // function places its arguments and results. The overrides are applied at the call site, as constraints on the operands
 // and on the results of the call, rather than as annotations of the callee, because the callee may be inlined or shared
 // with calls that carry other overrides. Each constraint is the sharding with which the function annotates its own
-// boundary (refer to `ShardingLoweringExtension::with_unconstrained_dimensions_replicated`), and it is closed over auto
+// boundary (refer to `Sharding::with_unconstrained_dimensions_replicated`), and it is closed over auto
 // mesh axes, so that a replicated override stops the compiler from splitting the value, like the replicated result of
 // an execution. An effective input sharding without an override that the operand type already has is not constrained
 // again, unless the mesh has auto axes, along which the operand type cannot show where the operand is (refer to
@@ -1382,7 +1382,7 @@ impl<O: LowerableOperationFamily> CallProgramLoweringExtension<O> for FlatProgra
 /// sharding of the corresponding position of the boundary of its callee (i.e., its override, or the declared sharding
 /// of an input without one, refer to [`CallOperation::boundary_input_sharding`]), and returns the constrained value.
 /// The constraint is the sharding with which the called function annotates that position of its own boundary (refer to
-/// [`ShardingLoweringExtension::with_unconstrained_dimensions_replicated`]), closed over auto mesh axes. Values that
+/// [`Sharding::with_unconstrained_dimensions_replicated`]), closed over auto mesh axes. Values that
 /// are not arrays are returned unchanged.
 ///
 /// # Errors
@@ -1401,7 +1401,7 @@ fn lower_boundary_constraint<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     // The override states the placement along every mesh axis, so it is lowered for a type that tracks no placement,
     // with which a constraint is not merged (refer to `ConstrainShardingOperation::lowered_sharding`).
     let untracked_type = array_type.clone().with_sharding(None)?;
-    let declared = sharding.with_unconstrained_dimensions_replicated()?;
+    let declared = sharding.with_unconstrained_dimensions_replicated();
     // The constraint is lowered for the untracked type, so what the value already carries is read from its own type.
     let bound_manual_axes = lowerer.collective_state().bound_manual_axes();
     validate_declared_pending_reduction(

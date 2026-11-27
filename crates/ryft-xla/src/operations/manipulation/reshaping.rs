@@ -9,6 +9,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::EffectTokens;
+use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, dimension_extent_i32, dimension_extent_i64, lower_explicit_reshape_shape,
     lower_runtime_dimension_size_i64, lower_static_index_constants, physical_bound_type,
@@ -18,7 +19,6 @@ use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE, ASSERT_RESHAPE_KIND,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for ReshapeOperation {

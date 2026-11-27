@@ -531,7 +531,7 @@ pub(crate) mod tests {
         KernelOperation as PortableKernelOperation, KernelParameter, KernelParameterAccess,
     };
 
-    use crate::lowering::extensions::{LowerableProgram, ProgramLoweringOptions};
+    use crate::lowering::programs::{LowerableProgram, ProgramLoweringOptions};
     use crate::{Constant, Operation};
 
     use super::*;

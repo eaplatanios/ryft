@@ -10,12 +10,12 @@ use ryft_mlir::{
 };
 
 use crate::lowering::MlirLowerableValue;
+use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, annotate_output_memory, lower_constant_output, physical_bound_type,
     stable_hlo_dynamic_dimension_bound,
 };
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{
     Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation, Type,
 };

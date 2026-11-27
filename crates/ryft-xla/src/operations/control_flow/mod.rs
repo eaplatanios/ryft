@@ -15,6 +15,7 @@ use ryft_mlir::{
 
 use crate::lowering::emissions::emitted_regions;
 use crate::lowering::regions::NestedProgramLoweringExtension;
+use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, dimension_extent_i64, lower_unplaced_constant_output, physical_bound_type,
@@ -22,7 +23,6 @@ use crate::lowering::types::{
 use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::call::CallFunctionMap;
-use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Constant, Error, LowerableOperationFamily, Type};
 
 pub(crate) mod condition;

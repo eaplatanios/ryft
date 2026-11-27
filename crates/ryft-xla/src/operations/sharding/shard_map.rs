@@ -15,11 +15,11 @@ use ryft_mlir::{
 };
 
 use crate::lowering::regions::lower_program_outputs_with_inputs;
+use crate::lowering::sharding::UnreducedKindExtension;
 use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{ArrayTypeLoweringExtension, annotate_output_memory};
 use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::control_flow::lowered_effect_classes;
-use crate::sharding::UnreducedKindExtension;
 use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, SHARDY_MESH_SYMBOL_NAME, Type};
 
 impl LowerableOperation for ShardMapOperation {

@@ -169,14 +169,16 @@ pub enum RaggedDotLoweringStrategy {
 pub(crate) mod admission;
 /// Decisions about which regions, captures, and session constants of a program lowering emits.
 pub(crate) mod emissions;
-/// Placement preparation and analysis shared with compilation and eager dispatch.
-pub(crate) mod extensions;
 /// Lowering of whole programs to StableHLO modules.
 pub(crate) mod modules;
+/// Options, entry points, and placement analysis for lowering whole programs.
+pub(crate) mod programs;
 /// Lowering and validation of pending reductions.
 pub(crate) mod reductions;
 /// Lowering of nested programs and regions inline into an enclosing block.
 pub(crate) mod regions;
+/// Lowering of logical meshes, shardings, and sharding constraints to Shardy.
+pub(crate) mod sharding;
 /// Logical and physical signatures of lowered XLA executables.
 pub(crate) mod signatures;
 /// Module-scoped lowering state shared across nested regions.
@@ -185,8 +187,11 @@ pub(crate) mod states;
 pub(crate) mod types;
 
 pub use admission::DataDependentPaddingDiscipline;
-pub use extensions::{EntryShardingOverride, LowerableProgram, ProgramLoweringOptions};
 pub use modules::LoweredModule;
+pub use programs::{EntryShardingOverride, LowerableProgram, ProgramLoweringOptions};
+pub use sharding::{
+    LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension, UnreducedKindExtension,
+};
 pub use types::{
     ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, DataTypeLoweringExtension,
     MemoryLoweringExtension, TypeLoweringExtension, annotate_output_memory, dimension_extent_i32, dimension_extent_i64,
@@ -1167,7 +1172,7 @@ pub(crate) mod tests {
     use ryft_pjrt::protos::{OptionOverride, OptionValue, ShapeChecks};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::sharding::LogicalMeshExtension;
+    use crate::lowering::sharding::LogicalMeshExtension;
     use crate::{
         ArrayConstant, ArrayTracer, CompileTracer, CompiledFunction, Constant, Error, FromPjrt, LowerableProgram,
         Operation, Options, Session, Type, compile, trace_with_context,

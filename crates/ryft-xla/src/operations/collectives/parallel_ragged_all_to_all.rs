@@ -594,7 +594,7 @@ mod tests {
         GpuPlatform, Program as PjrtProgram,
     };
 
-    use crate::lowering::extensions::{LowerableProgram, ProgramLoweringOptions};
+    use crate::lowering::programs::{LowerableProgram, ProgramLoweringOptions};
     #[cfg(feature = "cuda-13")]
     use crate::lowering::tests::static_sharded_array_type;
     use crate::lowering::tests::{shard_map_module, test_sharding};

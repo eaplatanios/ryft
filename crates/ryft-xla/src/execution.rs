@@ -2168,12 +2168,12 @@ mod tests {
     use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program};
 
     use crate::execution::ExecutionArguments;
+    use crate::lowering::sharding::{LogicalMeshExtension, OpenDimensions, ShardingExtension};
     use crate::lowering::tests::static_sharded_array_type;
     use crate::sessions::tests::{
         boolean_vector, domain_mesh, f32_scalar, f32_vector, program_array, read_first_shard, read_sharded_f32_array,
         replicated_scalar_type, replicated_vector_type, two_device_mesh,
     };
-    use crate::sharding::{LogicalMeshExtension, OpenDimensions, ShardingExtension};
     use crate::tests::{
         cpu_client, execution_client, other_cpu_client, test_compilation_options, values_from_bytes, values_to_bytes,
     };

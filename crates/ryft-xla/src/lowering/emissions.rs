@@ -352,7 +352,7 @@ mod tests {
 
     use crate::{Constant, FromPjrt, Operation, PlacementOptions, RetainedArray, Session, Type};
 
-    use crate::lowering::extensions::{LowerableProgram, ProgramLoweringOptions};
+    use crate::lowering::programs::{LowerableProgram, ProgramLoweringOptions};
 
     use crate::lowering::tests::{linear_call_program, scalar_linear_region};
 

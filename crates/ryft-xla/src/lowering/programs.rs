@@ -530,13 +530,8 @@ where
                 capture_shardings
                     .iter()
                     .chain(&input_shardings)
-                    .map(|sharding| {
-                        sharding
-                            .as_ref()
-                            .map(ShardingLoweringExtension::with_unconstrained_dimensions_replicated)
-                            .transpose()
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
+                    .map(|sharding| sharding.as_ref().map(Sharding::with_unconstrained_dimensions_replicated))
+                    .collect::<Vec<_>>()
             }
         };
 
@@ -834,44 +829,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Should we merge the two functions of this trait into `ShardingExtension`?
-/// Converts core shardings to the form in which runtime arrays store them.
-pub(crate) trait ShardingLoweringExtension {
-    /// Returns this sharding with its unconstrained dimensions replicated (refer to
-    /// [`Self::dimensions_with_unconstrained_replicated`]), which is the sharding of a runtime array that is
-    /// placed with this sharding. A runtime array stores such a dimension replicated, because its placement reads
-    /// an unconstrained dimension as replicated. The entry function of a program therefore annotates a value at its
-    /// boundary (i.e., an argument or an output) with this sharding, because an annotation that left the dimension
-    /// open would let the compiler shard it and exchange buffers of other shapes than those of the array (e.g., expect
-    /// `[2, 2]` argument buffers where an array placed as `[{"x"}, {?}]` supplies `[2, 4]` buffers).
-    fn with_unconstrained_dimensions_replicated(&self) -> Result<Sharding, Error>;
-
-    /// Returns the dimension shardings of this sharding with its unconstrained dimensions replicated, which is how a
-    /// runtime array stores them and how a constraint that must state its pending reduction can declare them.
-    fn dimensions_with_unconstrained_replicated(&self) -> Rc<[ShardingDimension]>;
-}
-
-impl ShardingLoweringExtension for Sharding {
-    #[inline]
-    fn with_unconstrained_dimensions_replicated(&self) -> Result<Sharding, Error> {
-        if !self.dimensions().contains(&ShardingDimension::Unconstrained) {
-            return Ok(self.clone());
-        }
-        Ok(self.with_dimensions(self.dimensions_with_unconstrained_replicated().to_vec())?)
-    }
-
-    #[inline]
-    fn dimensions_with_unconstrained_replicated(&self) -> Rc<[ShardingDimension]> {
-        self.dimensions()
-            .iter()
-            .map(|dimension| match dimension {
-                ShardingDimension::Unconstrained => ShardingDimension::Replicated,
-                dimension => dimension.clone(),
-            })
-            .collect()
-    }
-}
-
 /// Derives the [`RegionPlacementRequests`] of the program that lowering emits for a region, and the devices that its
 /// placement requests name.
 pub(crate) trait RegionPlacementRequestsExtension: Sized {
@@ -990,11 +947,11 @@ pub(crate) fn merge_requested_placement<'r>(
 /// An override, a `place` target, an argument placement, or an output type may leave dimensions unconstrained, but the
 /// runtime placement of an array reads such a dimension as replicated, and the output type records it exactly, so it
 /// cannot record the placement that the compiler would choose for it. These dimensions are therefore replicated here
-/// (refer to [`ShardingLoweringExtension::with_unconstrained_dimensions_replicated`]), whatever operation produces the
-/// output (e.g., arithmetic whose output type inherits an unconstrained dimension from the target of a `place` that
-/// precedes it), so that the executable returns the buffers that the runtime placement of the output describes, while
-/// the dimensions that they constrain keep their placement. Provided overrides are not checked against `output_types`,
-/// so that a count mismatch is still reported when the module is lowered.
+/// (refer to [`Sharding::with_unconstrained_dimensions_replicated`]), whatever operation produces the output (e.g.,
+/// arithmetic whose output type inherits an unconstrained dimension from the target of a `place` that precedes it),
+/// so that the executable returns the buffers that the runtime placement of the output describes, while the dimensions
+/// that they constrain keep their placement. Provided overrides are not checked against `output_types`, so that a count
+/// mismatch is still reported when the module is lowered.
 ///
 /// A placement that the program gives an output never keeps reduction state that the output type does not record (i.e.,
 /// a pending reduction or a completed-reduction marker over auto mesh axes). No value of a program carries such state:
@@ -1014,7 +971,7 @@ pub(crate) fn entry_output_shardings(
     match output_shardings {
         Some(shardings) => shardings
             .iter()
-            .map(|sharding| sharding.with_unconstrained_dimensions_replicated().map(Some))
+            .map(|sharding| Ok(Some(sharding.with_unconstrained_dimensions_replicated())))
             .collect(),
         None => output_types
             .iter()
@@ -1032,15 +989,12 @@ pub(crate) fn entry_output_shardings(
                             || sharding.reduced_axes().iter().any(|axis| !reduced_axes.contains(axis)) =>
                     {
                         let unreduced = sharding.clone().with_unreduced_axes(unreduced_axes.iter().cloned())?;
-                        unreduced
-                            .with_reduced_axes(reduced_axes.iter().cloned())?
-                            .with_unconstrained_dimensions_replicated()
-                            .map(Some)
+                        let reduced = unreduced.with_reduced_axes(reduced_axes.iter().cloned())?;
+                        Ok(Some(reduced.with_unconstrained_dimensions_replicated()))
                     }
-                    stated => stated
-                        .or(output_type.sharding())
-                        .map(ShardingLoweringExtension::with_unconstrained_dimensions_replicated)
-                        .transpose(),
+                    stated => {
+                        Ok(stated.or(output_type.sharding()).map(Sharding::with_unconstrained_dimensions_replicated))
+                    }
                 }
             })
             .collect(),
@@ -1849,22 +1803,6 @@ mod tests {
             let output = function.executable().execute(&session, input.clone()).unwrap();
             assert_eq!((name, output.sharding()), (name, &split));
         }
-    }
-
-    #[test]
-    fn test_sharding_with_unconstrained_dimensions_replicated() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharded = |second: ShardingDimension| {
-            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), second]).unwrap()
-        };
-        assert_eq!(
-            sharded(ShardingDimension::unconstrained()).with_unconstrained_dimensions_replicated(),
-            Ok(sharded(ShardingDimension::replicated())),
-        );
-
-        // A sharding without unconstrained dimensions is returned as it is.
-        let constrained = sharded(ShardingDimension::replicated());
-        assert_eq!(constrained.with_unconstrained_dimensions_replicated(), Ok(constrained.clone()));
     }
 
     #[test]

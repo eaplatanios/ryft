@@ -35,11 +35,11 @@ use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::emissions::{
     collect_session_constants, emitted_capture_reads, emitted_regions, omits_regions, unread_entry_arguments,
 };
-use crate::lowering::extensions::{
-    LowerableProgram, OutputShardingSource, ProgramLoweringExtension, ProgramLoweringOptions,
-    ShardingLoweringExtension, entry_output_shardings, entry_outputs_with_compiler_chosen_placement,
-};
 use crate::lowering::modules::{contains_unresolved_references, contains_unresolved_state, value_shardings};
+use crate::lowering::programs::{
+    LowerableProgram, OutputShardingSource, ProgramLoweringExtension, ProgramLoweringOptions, entry_output_shardings,
+    entry_outputs_with_compiler_chosen_placement,
+};
 use crate::lowering::signatures::ExecutableSignature;
 use crate::{
     Array, Constant, Error, ExecutionError, LoweringError, OpShardingExtension, Operation, RetainedArray, Session,
@@ -638,12 +638,12 @@ impl Session {
         }
         // An argument is annotated as its runtime array stores it, which replicates the dimensions that its placement
         // leaves unconstrained, as the StableHLO export of traced programs annotates it (refer to
-        // `ShardingLoweringExtension::with_unconstrained_dimensions_replicated`). Execution still expects the placement
+        // `Sharding::with_unconstrained_dimensions_replicated`). Execution still expects the placement
         // itself, which describes the same buffers.
         let argument_annotations = logical_argument_shardings
             .iter()
-            .map(ShardingLoweringExtension::with_unconstrained_dimensions_replicated)
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(Sharding::with_unconstrained_dimensions_replicated)
+            .collect::<Vec<_>>();
         for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
             if effective_input_types[logical_input_index].static_shape().is_none() {
                 if state.output_index().is_some() {
@@ -1049,10 +1049,7 @@ pub(crate) fn capture_sharding(
     if sharding.mesh().has_same_topology(mesh) {
         return Ok(sharding.clone());
     }
-    let stored = array_type
-        .sharding()
-        .map(ShardingLoweringExtension::with_unconstrained_dimensions_replicated)
-        .transpose()?;
+    let stored = array_type.sharding().map(Sharding::with_unconstrained_dimensions_replicated);
     if !stored.as_ref().is_none_or(Sharding::is_replicated) {
         return Err(Error::from(ProgramError::InvalidArgument {
             message: format!(
@@ -1069,7 +1066,7 @@ pub(crate) fn capture_sharding(
 /// an array whose type is `array_type`, or [`None`] when the function must keep the placement that the type records. A
 /// capture follows the call of the function. A type without sharding, including that of a capture on the anonymous mesh
 /// of one device, stays unsharded. When its type records only replication (refer to
-/// `ShardingLoweringExtension::with_unconstrained_dimensions_replicated`), the function receives it without sharding,
+/// `Sharding::with_unconstrained_dimensions_replicated`), the function receives it without sharding,
 /// as it receives a public argument whose type declares none. The types of the values that it computes from the capture
 /// then name no mesh of the capture. A call of a function that names no devices therefore runs where its caller runs
 /// whatever the devices of its captures, as JAX computes `jit(lambda x: x + c)` on the devices of `x` whether `c` is
@@ -1082,11 +1079,7 @@ pub(crate) fn capture_sharding(
 /// does, so a `jit` dispatcher specializes for such an argument with the type that this function returns as well (refer
 /// to [`argument_type`]).
 pub(crate) fn captured_type(array_type: &ArrayType) -> Option<ArrayType> {
-    let stored = array_type
-        .sharding()
-        .map(ShardingLoweringExtension::with_unconstrained_dimensions_replicated)
-        .transpose()
-        .ok()?;
+    let stored = array_type.sharding().map(Sharding::with_unconstrained_dimensions_replicated);
     if !stored.as_ref().is_none_or(Sharding::is_replicated) {
         return None;
     }
@@ -1634,7 +1627,7 @@ fn contains_shard_map(program: &FlatProgram<Session>, target_platform: Option<&s
 /// in the same order and its topology, as JAX rejects a nested `jit` whose shardings name devices other than those of
 /// the computation that calls it. Without the Shardy partitioner and on more than one device, every override must also
 /// be fully replicated once its unconstrained dimensions are (refer to
-/// [`ShardingLoweringExtension::with_unconstrained_dimensions_replicated`]), which is the constraint that lowering
+/// [`Sharding::with_unconstrained_dimensions_replicated`]), which is the constraint that lowering
 /// emits for it, because replicas cannot enforce a split.
 ///
 /// A compiled program runs on the devices of one mesh, so a `place` inside it can only redistribute a value over those
@@ -1678,7 +1671,7 @@ fn contains_shard_map(program: &FlatProgram<Session>, target_platform: Option<&s
 /// boundary sharding (i.e., an override or where the executable of the callee places an input, refer to
 /// [`CallOperation::boundary_input_sharding`]) is not fully replicated (refer to [`Sharding::is_replicated`]), once
 /// its unconstrained dimensions are read as replicated (refer to
-/// [`ShardingLoweringExtension::with_unconstrained_dimensions_replicated`]), when `use_shardy_partitioner` is not set
+/// [`Sharding::with_unconstrained_dimensions_replicated`]), when `use_shardy_partitioner` is not set
 /// and `mesh` has more than one device.
 fn validate_placements(
     program: &FlatProgram<Session>,
@@ -1738,7 +1731,7 @@ fn validate_placements(
                         (0..instruction.outputs().len()).filter_map(|index| call.output_sharding(index).cloned()),
                     );
                     for sharding in &shardings {
-                        if !sharding.with_unconstrained_dimensions_replicated()?.is_replicated() {
+                        if !sharding.with_unconstrained_dimensions_replicated().is_replicated() {
                             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                                 operation: CALL_OPERATION_NAME.to_string(),
                                 reason: "bounded-dynamic multi-device programs currently require fully replicated \
@@ -1781,7 +1774,7 @@ fn validate_placements(
                     // An unconstrained dimension is stored replicated, as at the boundary of a call.
                     if !use_shardy_partitioner
                         && mesh.devices().len() > 1
-                        && !placement.sharding().with_unconstrained_dimensions_replicated()?.is_replicated()
+                        && !placement.sharding().with_unconstrained_dimensions_replicated().is_replicated()
                     {
                         return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                             operation: PLACE_OPERATION_NAME.to_string(),

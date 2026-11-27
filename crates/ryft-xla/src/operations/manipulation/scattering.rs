@@ -9,6 +9,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
+use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, lower_explicit_shape,
     lower_runtime_dimension_size_i64, lower_static_index_constants, lower_unplaced_constant_output,
@@ -16,7 +17,6 @@ use crate::lowering::types::{
 };
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::operations::reductions::build_reduce_body_region;
-use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 impl LowerableOperation for ScatterOperation {

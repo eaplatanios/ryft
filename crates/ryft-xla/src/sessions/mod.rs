@@ -129,8 +129,8 @@ use crate::compilation::programs::EagerDispatchProgram;
 use crate::lowering::emissions::{
     emitted_regions, emitted_regions_entering_calls, omits_operation_regions, partition_region_session_constants,
 };
-use crate::lowering::extensions::{RegionPlacementRequestsExtension, merge_requested_placement};
 use crate::lowering::modules::render_devices;
+use crate::lowering::programs::{RegionPlacementRequestsExtension, merge_requested_placement};
 use crate::operations::call::{CallEagerExtension, EagerCallDecision};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::sessions::effects::{EffectReservation, EffectScope, ensure_effect_dispatch_is_allowed};

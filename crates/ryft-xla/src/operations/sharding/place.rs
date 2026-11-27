@@ -6,9 +6,9 @@ use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
 use crate::arrays::placement::place_operation_bindings;
+use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::lowering::types::MemoryLoweringExtension;
 use crate::operations::manipulation::conversions::ArrayTypeLayoutConversionLoweringExtension;
-use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Array, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 impl PlaceDispatch<ArrayType, Array> for ValueDomainDispatch {

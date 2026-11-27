@@ -91,7 +91,7 @@ pub(crate) fn scaled_dot_composition_key(
 
 impl LowerableOperation for ScaledDotOperation {
     /// Lowers one scaled dot. On CUDA, calls whose formats cuDNN accepts, as
-    /// [`block_scaled_dot_custom_call_permutations`] decides, lower to the `__op$block_scaled_dot` custom call, which
+    /// `block_scaled_dot_custom_call_permutations` decides, lower to the `__op$block_scaled_dot` custom call, which
     /// XLA hands to cuDNN's block-scaled matrix product on capable devices. Every other call lowers to the exact
     /// four-operand `stablehlo.composite "xla.scaled_dot"` boundary consumed by XLA's block-scaling replacement pass.
     /// Either scale omitted by the public Ryft call is represented by the same JAX-compatible identity scale used by
