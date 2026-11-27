@@ -4201,14 +4201,11 @@ fn issue_cross_host_transfers(
     Ok((send_fence, received_buffers))
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Returns `input` without the pending reductions that a placement with the sharding `output` does not keep (refer to
-/// [`kept_unreduced_axes`]) and with every dimension replicated, over `mesh`, which has the axes that `output` keeps
-/// (i.e., the mesh of `input` or of `output`). This is the sharding of the value that a compiled reshard across meshes
-/// moves as whole shards (refer to [`DevicePlacementStrategy::CompiledReshardAcrossMeshes`]), so the gather on the mesh
-/// of the source completes only the reductions that the target does not keep, and the kept ones move as their
-/// contributions.
+/// Returns `input` without the pending reductions that a placement with the sharding `output` does not keep and with
+/// every dimension replicated, over `mesh`, which has the axes that `output` keeps (i.e., the mesh of `input` or of
+/// `output`). This is the sharding of the value that a compiled reshard across meshes moves as whole shards, so the
+/// gather on the mesh of the source completes only the reductions that the target does not keep, and the kept ones
+/// move as their contributions.
 fn gathered_sharding(input: &Sharding, output: &Sharding, mesh: &LogicalMesh, rank: usize) -> Result<Sharding, Error> {
     let replicated = Sharding::replicated(mesh.clone(), rank);
     let kept = kept_unreduced_axes(input, output);
@@ -4218,11 +4215,11 @@ fn gathered_sharding(input: &Sharding, output: &Sharding, mesh: &LogicalMesh, ra
     Ok(replicated.with_unreduced_axes(kept)?.with_unreduced_kind(input.unreduced_kind())?)
 }
 
-/// Returns `sharding` over `mesh`, a logical mesh with the axes of the mesh of `sharding` in the same order and with
-/// the same names and types, some of which may have another size (e.g., the logical mesh of
-/// [`DeviceMeshExtension::at_coordinate_zero`]), with the same placement, reduction state, and manual variation. Unlike
-/// [`Sharding::with_mesh`], which requires the same topology, this lets a sharding that splits no dimension along a
-/// resized axis describe the same shards on the devices that remain.
+/// Returns `sharding` over `mesh`, a logical mesh with the axes of the mesh of `sharding` in the same
+/// order and with the same names and types, some of which may have another size (e.g., the logical mesh of
+/// [`DeviceMeshExtension::at_coordinate_zero`]), with the same placement, reduction state, and manual variation.
+/// Unlike [`Sharding::with_mesh`], which requires the same topology, this lets a sharding that splits no dimension
+/// along a resized axis describe the same shards on the devices that remain.
 fn sharding_on_mesh(sharding: &Sharding, mesh: &LogicalMesh) -> Result<Sharding, Error> {
     Ok(Sharding::new(mesh.clone(), sharding.dimensions().to_vec())?
         .with_unreduced_axes(sharding.unreduced_axes().clone())?
@@ -4231,30 +4228,30 @@ fn sharding_on_mesh(sharding: &Sharding, mesh: &LogicalMesh) -> Result<Sharding,
         .with_varying_manual_axes(sharding.varying_manual_axes().clone())?)
 }
 
-/// Validates that a compiled reshard on `mesh` (refer to [`ReshardProgram`]) takes a value of `data_type` placed as
-/// `input` to `output` with the value that the meaning of its reduction state gives, as far as the reduction state
-/// (refer to [`ReductionState`]) along each non-manual mesh axis goes. That meaning is owned by
-/// [`crate::arrays::host`], whose section on pending reductions also states the contract of floating point sums. The
-/// program keeps the state of an axis as its contributions, which preserves every value, and it makes every other
-/// change with a collective of XLA (refer to [`ReshardProgram::compilation_mesh`]). The device path is taken exactly when
-/// that collective computes that meaning up to that contract, which is the case as follows.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Validates that a compiled reshard on `mesh` takes a value of `data_type` placed as `input` to `output` with the
+/// value that the meaning of its reduction state gives, as far as the reduction state along each non-manual mesh axis
+/// goes. That meaning is owned by [`crate::arrays::host`], whose section on pending reductions also states the contract
+/// of floating point sums. The program keeps the state of an axis as its contributions, which preserves every value,
+/// and it makes every other change with a collective of XLA. The device path is taken exactly when that collective
+/// computes that meaning up to that contract, which is the case as follows:
 ///
-///   - **Completing a pending reduction:** Exact only where [`collective_reduction`] classifies the completion as
+///   - **Completing a Pending Reduction:** Exact only where [`collective_reduction`] classifies the completion as
 ///     [`CollectiveReduction::Exact`] (a maximum or minimum that drops NaN values is not).
-///   - **Introducing a pending sum:** No program of a placement does, because the planner introduces pending sums with
-///     additive identities after a placement without them (refer to [`PlacementPlanningView::strategy`]). This
-///     check validates only the completion of a pending reduction of `input` along such an axis.
-///   - **Introducing a pending maximum or minimum:** XLA cannot (refer to `validate_declared_pending_reduction` in
+///   - **Introducing a Pending Sum:** No program of a placement does, because the planner introduces pending sums with
+///     additive identities after a placement without them. This check validates only the completion of a pending
+///     reduction of `input` along such an axis.
+///   - **Introducing a Pending Maximum or Minimum:** XLA cannot (refer to `validate_declared_pending_reduction` in
 ///     `crate::lowering`, whose check would reject the program).
-///   - **Completing or introducing a completed reduction:** This changes no value.
-///   - **Partial completions of wider sums:** A completion of a pending sum along some axes that keeps it along another
+///   - **Completing or Introducing a Completed Reduction:** This changes no value.
+///   - **Partial Completions of Wider Sums:** A completion of a pending sum along some axes that keeps it along another
 ///     is declined as a whole where [`partial_completion_rejection`] rejects it (i.e., where the partial sums would be
 ///     rounded to a data type narrower than the one in which the sum accumulates), which the lowering of compiled
 ///     programs reads as well.
-///   - **Axes of size one:** Completing a reduction of a single contribution changes no value, so such a completion is
-///     always made on the devices, as the lowering of compiled programs exempts it (refer to
-///     `validate_pending_reduction_change` in `crate::lowering`). XLA cannot introduce a pending maximum or minimum
-///     along such an axis either, so that is declined as along any other axis.
+///   - **Axes of Size One:** Completing a reduction of a single contribution changes no value, so such a completion is
+///     always made on the devices, as the lowering of compiled programs exempts it. XLA cannot introduce a pending
+///     maximum or minimum along such an axis either, so that is declined as along any other axis.
 ///
 /// Returns the reason why the program does not give that value, if any, which makes the placement take a host round
 /// trip with the readback and upload of [`crate::arrays::host`].
