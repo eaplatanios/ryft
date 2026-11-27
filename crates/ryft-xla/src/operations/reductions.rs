@@ -2078,7 +2078,7 @@ mod tests {
                         .with_input_types(&vec![input_type])
                         .with_output_types(&vec![output_type])
                         .without_boundary_shardings()
-                        .with_exact_argument_shardings(argument_shardings.iter().cloned().map(Some).collect())
+                        .with_exact_input_shardings(argument_shardings.iter().cloned().map(Some).collect())
                         .with_exact_output_shardings(output_shardings.iter().cloned().map(Some).collect())
                         .with_target_platform(target_platform),
                 )
@@ -2199,7 +2199,7 @@ mod tests {
                         .with_input_types(&vec![input_type])
                         .with_output_types(&vec![output_type])
                         .without_boundary_shardings()
-                        .with_exact_argument_shardings(argument_shardings.iter().cloned().map(Some).collect())
+                        .with_exact_input_shardings(argument_shardings.iter().cloned().map(Some).collect())
                         .with_exact_output_shardings(output_shardings.iter().cloned().map(Some).collect()),
                 )
                 .unwrap()

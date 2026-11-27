@@ -828,12 +828,12 @@ impl Session {
             .with_capture_types(effective_capture_types.clone())
             .with_input_types(&effective_public_input_types)
             .with_output_types(&output_types)
-            .with_exact_argument_shardings(value_shardings(lowered_argument_shardings, argument_count))
+            .with_exact_input_shardings(value_shardings(lowered_argument_shardings, argument_count))
             .with_exact_output_shardings(value_shardings(lowered_output_shardings, output_types.parameter_count()))
             .with_open_outputs(open_outputs.clone())
             .with_target_platform(target_platform)
             .with_shardy_support(supports_shardy)
-            .with_reference_states(
+            .with_reference_bindings(
                 reference_states.to_vec(),
                 donation_flags.clone(),
                 options.unread_inputs().unwrap_or(&[]).to_vec(),
@@ -3993,7 +3993,7 @@ mod tests {
                     .with_input_types(&vec![size_type, value_type.clone()])
                     .with_output_types(&vec![value_type])
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(vec![Some(replicated.clone()), Some(replicated.clone())])
+                    .with_exact_input_shardings(vec![Some(replicated.clone()), Some(replicated.clone())])
                     .with_exact_output_shardings(vec![Some(replicated.clone())]),
             )
             .unwrap();

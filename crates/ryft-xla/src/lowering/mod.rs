@@ -152,8 +152,9 @@ pub enum LoweringError {
     VerificationFailure,
 }
 
-/// XLA representation used when lowering ragged dots. The selection applies to a whole compilation and is made with
-/// [`Options::with_ragged_dot_lowering_strategy`](crate::Options::with_ragged_dot_lowering_strategy).
+/// XLA representation used when lowering ragged dots. Set it for a compilation with
+/// [`Options::with_ragged_dot_lowering_strategy`](crate::Options::with_ragged_dot_lowering_strategy) or for a direct
+/// lowering with [`ProgramLoweringOptions::with_ragged_dot_lowering_strategy`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum RaggedDotLoweringStrategy {
     /// Expand ragged dots into masking plus ordinary dense generalized dots. This is the default used by
@@ -184,7 +185,7 @@ pub(crate) mod states;
 pub(crate) mod types;
 
 pub use admission::DataDependentPaddingDiscipline;
-pub use extensions::{LowerableProgram, ProgramLoweringOptions};
+pub use extensions::{EntryShardingOverride, LowerableProgram, ProgramLoweringOptions};
 pub use modules::LoweredModule;
 pub use types::{
     annotate_output_memory, dimension_extent_i32, dimension_extent_i64, lower_array_ir_type, lower_compare_to_mlir,

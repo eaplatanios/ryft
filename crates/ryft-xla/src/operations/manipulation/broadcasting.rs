@@ -786,7 +786,7 @@ mod tests {
                     .with_input_types(&vec![input_type])
                     .with_output_types(&vec![output_type])
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(vec![Some(input_sharding)])
+                    .with_exact_input_shardings(vec![Some(input_sharding)])
                     .with_exact_output_shardings(vec![Some(output_sharding)]),
             )
             .unwrap();
@@ -840,7 +840,7 @@ mod tests {
                     .with_input_types(&vec![input_type.clone()])
                     .with_output_types(&vec![output_type])
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(vec![Some(input_sharding)])
+                    .with_exact_input_shardings(vec![Some(input_sharding)])
                     .with_exact_output_shardings(vec![Some(output_sharding)]),
             )
             .unwrap();

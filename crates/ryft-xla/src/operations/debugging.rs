@@ -798,7 +798,7 @@ mod tests {
                         .with_output_types(&Vec::<ArrayType>::new())
                         .without_boundary_shardings()
                         .with_target_platform(Some("cpu"))
-                        .with_reference_states(Vec::new(), Vec::new(), Vec::new()),
+                        .with_reference_bindings(Vec::new(), Vec::new(), Vec::new()),
                 )
                 .unwrap();
             let (stable_hlo, signature, _, runtime_requirements) = lowered.into_parts();

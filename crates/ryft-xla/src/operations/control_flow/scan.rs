@@ -2922,7 +2922,7 @@ mod tests {
                         .with_input_types(&stacked_types)
                         .with_output_types(&[output_type])
                         .without_boundary_shardings()
-                        .with_exact_argument_shardings(stacked_sharding.iter().cloned().map(Some).collect()),
+                        .with_exact_input_shardings(stacked_sharding.iter().cloned().map(Some).collect()),
                 )
                 .unwrap();
             assert_eq!(module, expected, "length {length}");
@@ -2985,7 +2985,7 @@ mod tests {
                     .with_input_types(&types)
                     .with_output_types(&types)
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_exact_input_shardings(shardings.iter().cloned().map(Some).collect())
                     .with_exact_output_shardings(shardings.iter().cloned().map(Some).collect()),
             )
             .unwrap();
@@ -3124,7 +3124,7 @@ mod tests {
                     .with_input_types(&types)
                     .with_output_types(&types)
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_exact_input_shardings(shardings.iter().cloned().map(Some).collect())
                     .with_exact_output_shardings(shardings.iter().cloned().map(Some).collect()),
             )
             .unwrap();
@@ -3307,7 +3307,7 @@ mod tests {
                     .with_input_types(&types)
                     .with_output_types(&types)
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_exact_input_shardings(shardings.iter().cloned().map(Some).collect())
                     .with_exact_output_shardings(shardings.iter().cloned().map(Some).collect()),
             )
             .unwrap();

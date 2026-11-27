@@ -204,7 +204,7 @@ mod tests {
                     .with_input_types(&types)
                     .with_output_types(&types)
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_exact_input_shardings(shardings.iter().cloned().map(Some).collect())
                     .with_exact_output_shardings(shardings.iter().cloned().map(Some).collect()),
             )
             .unwrap();
@@ -244,7 +244,7 @@ mod tests {
                     .with_input_types(&types)
                     .with_output_types(&types)
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_exact_input_shardings(shardings.iter().cloned().map(Some).collect())
                     .with_exact_output_shardings(shardings.iter().cloned().map(Some).collect())
                     .with_target_platform(Some("cpu")),
             ),
@@ -295,7 +295,7 @@ mod tests {
                     .with_input_types(&input_types)
                     .with_output_types(&[input_types[0].clone()])
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(vec![Some(sharded.clone()), Some(replicated)])
+                    .with_exact_input_shardings(vec![Some(sharded.clone()), Some(replicated)])
                     .with_exact_output_shardings(vec![Some(sharded)]),
             )
             .unwrap();
@@ -420,7 +420,7 @@ mod tests {
                     .with_input_types(&types)
                     .with_output_types(&types)
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_exact_input_shardings(shardings.iter().cloned().map(Some).collect())
                     .with_exact_output_shardings(shardings.iter().cloned().map(Some).collect())
                     .with_target_platform(Some("cpu")),
             )

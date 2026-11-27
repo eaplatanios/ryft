@@ -1532,7 +1532,7 @@ mod tests {
                     .with_input_types(&state_types.to_vec())
                     .with_output_types(&vec![vector_type.clone()])
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(
+                    .with_exact_input_shardings(
                         (&[scalar_sharding.clone(), scalar_sharding, vector_sharding.clone()])
                             .iter()
                             .cloned()

@@ -3959,7 +3959,7 @@ mod tests {
                     .with_input_types(&[input_type])
                     .with_output_types(&[output_type])
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(vec![Some(sharding.clone())])
+                    .with_exact_input_shardings(vec![Some(sharding.clone())])
                     .with_exact_output_shardings(vec![Some(sharding.clone())]),
             )
             .unwrap();
@@ -4021,7 +4021,7 @@ mod tests {
                     .with_input_types(&[input_type])
                     .with_output_types(&[output_type])
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(vec![Some(sharded.clone())])
+                    .with_exact_input_shardings(vec![Some(sharded.clone())])
                     .with_exact_output_shardings(vec![Some(replicated.clone())]),
             )
             .unwrap();
@@ -4138,7 +4138,7 @@ mod tests {
                     .with_input_types(&[input_type])
                     .with_output_types(&[output_type])
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(vec![Some(replicated.clone())])
+                    .with_exact_input_shardings(vec![Some(replicated.clone())])
                     .with_exact_output_shardings(vec![Some(sharded.clone())]),
             )
             .unwrap();

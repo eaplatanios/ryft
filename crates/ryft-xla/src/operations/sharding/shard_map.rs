@@ -1903,7 +1903,7 @@ pub(crate) mod tests {
                     .with_input_types(&input_types)
                     .with_output_types(&output_types)
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(vec![Some(output_sharding)])
+                    .with_exact_input_shardings(vec![Some(output_sharding)])
                     .with_exact_output_shardings(vec![Some(input_sharding)]),
             )
             .unwrap();
@@ -2014,7 +2014,7 @@ pub(crate) mod tests {
                     .with_input_types(&input_types)
                     .with_output_types(&output_types)
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(vec![Some(replicated.clone())])
+                    .with_exact_input_shardings(vec![Some(replicated.clone())])
                     .with_exact_output_shardings(vec![Some(replicated.clone())]),
             )
             .unwrap();
@@ -2523,7 +2523,7 @@ pub(crate) mod tests {
                     .with_input_types(&global_types)
                     .with_output_types(&global_types)
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(vec![Some(sharded.clone())])
+                    .with_exact_input_shardings(vec![Some(sharded.clone())])
                     .with_exact_output_shardings(vec![Some(sharded.clone())]),
             )
             .unwrap();
@@ -2789,7 +2789,7 @@ pub(crate) mod tests {
                     .with_input_types(&input_types)
                     .with_output_types(&output_types)
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(input_shardings.iter().cloned().map(Some).collect())
+                    .with_exact_input_shardings(input_shardings.iter().cloned().map(Some).collect())
                     .with_exact_output_shardings(output_shardings.iter().cloned().map(Some).collect()),
             )
             .unwrap();

@@ -2133,7 +2133,7 @@ mod tests {
                     .with_input_types(&vec![selector_type.clone(), vector_type.clone()])
                     .with_output_types(&vec![vector_type.clone()])
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(vec![Some(selector_sharding), Some(vector_sharding.clone())])
+                    .with_exact_input_shardings(vec![Some(selector_sharding), Some(vector_sharding.clone())])
                     .with_exact_output_shardings(vec![Some(vector_sharding)]),
             )
             .unwrap();

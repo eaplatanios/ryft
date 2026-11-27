@@ -3133,7 +3133,7 @@ mod tests {
                     .with_input_types(&input_types)
                     .with_output_types(&output_types)
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(shardings.iter().cloned().map(Some).collect())
+                    .with_exact_input_shardings(shardings.iter().cloned().map(Some).collect())
                     .with_exact_output_shardings(shardings.iter().cloned().map(Some).collect()),
             )
             .unwrap();

@@ -108,7 +108,7 @@ impl LoweredModule {
     {
         let target_platform = options.target_platform();
         let supports_shardy = options.supports_shardy();
-        let reference_states = options.reference_states();
+        let reference_states = options.reference_bindings();
         let donated_inputs = options.donated_inputs();
         let unread_inputs = options.unread_inputs();
         let ragged_dot_lowering_strategy = options.ragged_dot_lowering_strategy();
@@ -775,6 +775,15 @@ where
             kind: "output",
             expected: global_output_types.len(),
             actual: output_shardings.len(),
+        }));
+    }
+    if !open_outputs.is_empty() && open_outputs.len() != global_output_types.len() {
+        return Err(Error::Compilation(CompilationError::InvalidOptions {
+            reason: format!(
+                "expected {} open output flags or an empty list, but got {}",
+                global_output_types.len(),
+                open_outputs.len(),
+            ),
         }));
     }
     for (sharding, output_type) in output_shardings.iter().zip(global_output_types) {
@@ -2062,11 +2071,11 @@ mod tests {
                         .with_input_types(&vec![input_type.clone()])
                         .with_output_types(&output_types)
                         .without_boundary_shardings()
-                        .with_exact_argument_shardings(vec![Some(unreduced.clone())])
+                        .with_exact_input_shardings(vec![Some(unreduced.clone())])
                         .with_exact_output_shardings(vec![Some(replicated.clone())])
                         .with_target_platform(Some("cpu"))
                         .with_shardy_support(supports_shardy)
-                        .with_reference_states(Vec::new(), Vec::new(), Vec::new()),
+                        .with_reference_bindings(Vec::new(), Vec::new(), Vec::new()),
                 )
                 .unwrap()
         };
@@ -2250,9 +2259,9 @@ mod tests {
                     .with_input_types(&input_types)
                     .with_output_types(&output_types)
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(argument_shardings.iter().cloned().map(Some).collect())
+                    .with_exact_input_shardings(argument_shardings.iter().cloned().map(Some).collect())
                     .with_exact_output_shardings(output_shardings.iter().cloned().map(Some).collect())
-                    .with_reference_states(states.to_vec(), Vec::new(), Vec::new()),
+                    .with_reference_bindings(states.to_vec(), Vec::new(), Vec::new()),
             )
             .unwrap();
         assert_eq!(lowered.signature.input_mapping(), &[None, Some(0), Some(1)]);
@@ -2288,9 +2297,9 @@ mod tests {
                     .with_input_types(&input_types)
                     .with_output_types(&output_types)
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(argument_shardings.iter().cloned().map(Some).collect())
+                    .with_exact_input_shardings(argument_shardings.iter().cloned().map(Some).collect())
                     .with_exact_output_shardings(output_shardings.iter().cloned().map(Some).collect())
-                    .with_reference_states((std::slice::from_ref(&invalid_state)).to_vec(), Vec::new(), Vec::new()),
+                    .with_reference_bindings((std::slice::from_ref(&invalid_state)).to_vec(), Vec::new(), Vec::new()),
             ),
             Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
                 if message == "logical state input 0 is erased from the executable boundary",
@@ -2308,9 +2317,9 @@ mod tests {
                         .without_pruning()
                         .with_input_types(&input_types)
                         .with_output_types(&output_types)
-                        .with_exact_argument_shardings(value_shardings(argument_shardings, input_types.len()))
+                        .with_exact_input_shardings(value_shardings(argument_shardings, input_types.len()))
                         .with_exact_output_shardings(value_shardings(output_shardings, output_types.len()))
-                        .with_reference_states(states.to_vec(), Vec::new(), Vec::new()),
+                        .with_reference_bindings(states.to_vec(), Vec::new(), Vec::new()),
                 ),
                 Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
                     if message == asymmetric_sharding_message,
@@ -2326,9 +2335,9 @@ mod tests {
                     .with_input_types(&input_types)
                     .with_output_types(&output_types)
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(argument_shardings.iter().cloned().map(Some).collect())
+                    .with_exact_input_shardings(argument_shardings.iter().cloned().map(Some).collect())
                     .with_exact_output_shardings(mismatched_output_shardings.iter().cloned().map(Some).collect())
-                    .with_reference_states(states.to_vec(), Vec::new(), Vec::new()),
+                    .with_reference_bindings(states.to_vec(), Vec::new(), Vec::new()),
             ),
             Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
                 if message == "state input 1 and output 0 must use the same sharding",
@@ -2354,9 +2363,9 @@ mod tests {
                     .with_input_types(&vec![state_type.clone()])
                     .with_output_types(&vec![state_type])
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(vec![Some(sharding.clone())])
+                    .with_exact_input_shardings(vec![Some(sharding.clone())])
                     .with_exact_output_shardings(vec![Some(sharding.clone())])
-                    .with_reference_states((std::slice::from_ref(&reference_state)).to_vec(), Vec::new(), Vec::new()),
+                    .with_reference_bindings((std::slice::from_ref(&reference_state)).to_vec(), Vec::new(), Vec::new()),
             ),
             Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
                 if message == "state input 0 and output 0 must be static because bounded-dynamic mutation alias \
@@ -2386,9 +2395,9 @@ mod tests {
                     .without_pruning()
                     .with_input_types(&input_types)
                     .with_output_types(&output_types)
-                    .with_exact_argument_shardings(value_shardings(argument_shardings, input_types.len()))
+                    .with_exact_input_shardings(value_shardings(argument_shardings, input_types.len()))
                     .with_exact_output_shardings(value_shardings(output_shardings, output_types.len()))
-                    .with_reference_states(Vec::new(), (donated_inputs).to_vec(), Vec::new())
+                    .with_reference_bindings(Vec::new(), (donated_inputs).to_vec(), Vec::new())
                     .with_open_outputs((open_outputs).to_vec()),
             )
         };
@@ -2776,7 +2785,7 @@ mod tests {
                     .with_input_types(&vec![input_type])
                     .with_output_types(&Vec::<ArrayType>::new())
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(vec![Some(Sharding::replicated(incompatible.clone(), 1))]),
+                    .with_exact_input_shardings(vec![Some(Sharding::replicated(incompatible.clone(), 1))]),
             ),
             Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
                 if expected == incompatible && actual == mesh,
@@ -2852,7 +2861,7 @@ mod tests {
                     .with_input_types(&vec![input_type.clone()])
                     .with_output_types(&Vec::<ArrayType>::new())
                     .without_boundary_shardings()
-                    .with_exact_argument_shardings(vec![Some(Sharding::replicated(reordered.clone(), 1))]),
+                    .with_exact_input_shardings(vec![Some(Sharding::replicated(reordered.clone(), 1))]),
             ),
             Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
                 if expected == reordered && actual == mesh,
@@ -2883,7 +2892,7 @@ mod tests {
                         .with_input_types(&vec![input_type])
                         .with_output_types(&Vec::<ArrayType>::new())
                         .without_boundary_shardings()
-                        .with_exact_argument_shardings(vec![Some(Sharding::replicated(manual, 1))])
+                        .with_exact_input_shardings(vec![Some(Sharding::replicated(manual, 1))])
                 )
                 .unwrap(),
             indoc! {"
