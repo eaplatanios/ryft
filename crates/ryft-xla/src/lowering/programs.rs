@@ -50,8 +50,7 @@ pub struct MlirProgram {
     /// Textual StableHLO/Shardy module of this [`MlirProgram`].
     stable_hlo: String,
 
-    /// Signature of the entry function of this [`MlirProgram`], which maps its logical inputs and outputs to its
-    /// physical inputs and outputs.
+    /// Entry function signature, which maps logical inputs and outputs to executable slots.
     signature: MlirProgramSignature,
 
     /// Canonical runtime contracts required by emitted calls and synthesized checks.
@@ -81,8 +80,7 @@ impl MlirProgram {
         &self.stable_hlo
     }
 
-    /// Returns the signature of the entry function of this [`MlirProgram`], which maps its logical inputs and outputs
-    /// to its physical inputs and outputs.
+    /// Returns the entry function signature, which maps logical inputs and outputs to executable slots.
     #[inline]
     pub fn signature(&self) -> &MlirProgramSignature {
         &self.signature
@@ -110,26 +108,25 @@ impl MlirProgram {
     }
 }
 
-/// Mapping from the logical inputs and outputs of one XLA executable boundary to its physical inputs and outputs.
+/// Mapping from logical inputs and outputs to the corresponding slots of an XLA executable.
 /// Ryft retains every logical leaf in its staged and compiled function metadata. Statically shaped [`DataType::Zero`]
-/// leaves carry no runtime payload and are omitted from the StableHLO/PJRT signature, and each mapping stores
-/// the corresponding physical ordinal for materialized leaves and `None` for erased leaves. Dynamically shaped
-/// [`DataType::Zero`] leaves deliberately retain private `i1` carriers because the current executable ABI has no
-/// independent shape transport. Current XLA compilation may impose stricter limits on dynamic tensors than this
-/// projection layer.
+/// leaves carry no runtime payload and are omitted from the StableHLO/PJRT signature, and each mapping stores an
+/// executable index for each materialized leaf and `None` for each erased leaf. Dynamically shaped [`DataType::Zero`]
+/// leaves deliberately retain private `i1` carriers because the current executable ABI has no independent shape
+/// transport. Current XLA compilation may impose stricter limits on dynamic tensors than this projection layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MlirProgramSignature {
-    /// Physical input ordinal for each logical flattened input.
+    /// Executable slot index for each flattened logical input, or `None` for an erased input.
     input_mapping: Arc<[Option<usize>]>,
 
-    /// Physical output ordinal for each logical flattened output.
+    /// Executable slot index for each flattened logical output, or `None` for an erased output.
     output_mapping: Arc<[Option<usize>]>,
 
     /// Whether each logical flattened input is erased because the executable never reads it, or empty when every input
     /// is read.
     unread_inputs: Arc<[bool]>,
 
-    /// Hidden scalar inputs that restore bounded dynamic dimensions on physicalized input tensors.
+    /// Hidden scalar inputs that carry the runtime extents of tensors padded to their bounds.
     input_dimensions: Arc<[MlirProgramSignatureInputDimension]>,
 
     /// Hidden scalar outputs that report bounded dynamic logical output extents.
@@ -157,15 +154,15 @@ impl MlirProgramSignature {
         /// entries receive [`None`]. All other entries get consecutive slots starting at zero, in signature order.
         /// This includes dynamically shaped zeros, whose slots carry their runtime shape.
         fn array_slot_mapping(types: &[ArrayType]) -> Arc<[Option<usize>]> {
-            let mut physical_index = 0;
+            let mut executable_index = 0;
             types
                 .iter()
                 .map(|r#type| {
                     if r#type.data_type().is_zero() && r#type.static_shape().is_some() {
                         None
                     } else {
-                        let index = physical_index;
-                        physical_index += 1;
+                        let index = executable_index;
+                        executable_index += 1;
                         Some(index)
                     }
                 })
@@ -173,7 +170,7 @@ impl MlirProgramSignature {
         }
 
         let input_mapping = array_slot_mapping(input_types);
-        let mut physical_input_index = input_mapping.iter().flatten().count();
+        let mut executable_input_index = input_mapping.iter().flatten().count();
         let mut input_dimensions = Vec::new();
         for (logical_input_index, input_type) in input_types.iter().enumerate() {
             for (axis, dimension) in input_type.shape().dimensions().iter().enumerate() {
@@ -181,15 +178,15 @@ impl MlirProgramSignature {
                     input_dimensions.push(MlirProgramSignatureInputDimension {
                         axis,
                         logical_input_index,
-                        physical_input_index,
+                        executable_input_index,
                     });
-                    physical_input_index += 1;
+                    executable_input_index += 1;
                 }
             }
         }
 
         let output_mapping = array_slot_mapping(output_types);
-        let mut physical_output_index = output_mapping.iter().flatten().count();
+        let mut executable_output_index = output_mapping.iter().flatten().count();
         let mut output_dimensions = Vec::new();
         for (logical_output_index, output_type) in output_types.iter().enumerate() {
             for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
@@ -197,9 +194,9 @@ impl MlirProgramSignature {
                     output_dimensions.push(MlirProgramSignatureOutputDimension {
                         axis,
                         logical_output_index,
-                        physical_output_index,
+                        executable_output_index,
                     });
-                    physical_output_index += 1;
+                    executable_output_index += 1;
                 }
             }
         }
@@ -229,7 +226,7 @@ impl MlirProgramSignature {
 
         debug_assert_eq!(unread_inputs.len(), self.input_mapping.len());
 
-        let mut physical_index = 0;
+        let mut executable_index = 0;
         self.input_mapping = self
             .input_mapping
             .iter()
@@ -238,8 +235,8 @@ impl MlirProgramSignature {
                 if mapping.is_none() || *is_unread {
                     return None;
                 }
-                physical_index += 1;
-                Some(physical_index - 1)
+                executable_index += 1;
+                Some(executable_index - 1)
             })
             .collect();
 
@@ -248,7 +245,7 @@ impl MlirProgramSignature {
                 .iter()
                 .enumerate()
                 .map(|(offset, dimension)| MlirProgramSignatureInputDimension {
-                    physical_input_index: physical_index + offset,
+                    executable_input_index: executable_index + offset,
                     ..*dimension
                 });
 
@@ -280,13 +277,13 @@ impl MlirProgramSignature {
         self
     }
 
-    /// Returns the physical input ordinal of each logical input, or [`None`] for an erased input.
+    /// Returns the executable slot index of each logical input, or [`None`] for an erased input.
     #[inline]
     pub fn input_mapping(&self) -> &[Option<usize>] {
         &self.input_mapping
     }
 
-    /// Returns the physical output ordinal of each logical output, or [`None`] for an erased output.
+    /// Returns the executable slot index of each logical output, or [`None`] for an erased output.
     #[inline]
     pub fn output_mapping(&self) -> &[Option<usize>] {
         &self.output_mapping
@@ -305,13 +302,13 @@ impl MlirProgramSignature {
         self.unread_inputs.get(index).copied().unwrap_or(false)
     }
 
-    /// Returns the hidden scalar inputs of bounded dynamic input dimensions in physical executable order.
+    /// Returns the hidden scalar inputs carrying bounded dynamic input extents, in executable order.
     #[inline]
     pub fn input_dimensions(&self) -> &[MlirProgramSignatureInputDimension] {
         &self.input_dimensions
     }
 
-    /// Returns the hidden extent outputs of bounded dynamic output dimensions in physical executable order.
+    /// Returns the hidden scalar outputs carrying bounded dynamic output extents, in executable order.
     #[inline]
     pub fn output_dimensions(&self) -> &[MlirProgramSignatureOutputDimension] {
         &self.output_dimensions
@@ -396,16 +393,16 @@ impl MlirProgramSignature {
     /// Returns [`ProgramError::InvalidInputCount`] when `inputs` does not have one entry per logical input.
     pub fn executable_input_types(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, Error> {
         check_count!("input", inputs, self.input_mapping.len(), ProgramError);
-        let mut physical = Self::select_mapped_entries(&self.input_mapping, inputs);
-        let mut converted = vec![false; physical.len()];
+        let mut types = Self::select_mapped_entries(&self.input_mapping, inputs);
+        let mut converted = vec![false; types.len()];
         for input_dimension in self.input_dimensions.iter() {
             // The conversion rewrites every axis of the owning tensor at once, so an input with several dynamic axes
             // is converted only for its first hidden extent entry.
-            let physical_index = self.input_mapping[input_dimension.logical_input_index].unwrap();
-            if std::mem::replace(&mut converted[physical_index], true) {
+            let executable_index = self.input_mapping[input_dimension.logical_input_index].unwrap();
+            if std::mem::replace(&mut converted[executable_index], true) {
                 continue;
             }
-            let dimensions = physical[physical_index]
+            let dimensions = types[executable_index]
                 .shape()
                 .dimensions()
                 .iter()
@@ -419,10 +416,10 @@ impl MlirProgramSignature {
                         .map_or_else(|| dimension.clone(), Dimension::Static)
                 })
                 .collect::<Vec<_>>();
-            physical[physical_index] = physical[physical_index].clone().with_shape(Shape::new(dimensions));
+            types[executable_index] = types[executable_index].clone().with_shape(Shape::new(dimensions));
         }
-        physical.extend(self.input_dimensions.iter().map(|_| ArrayType::scalar(DataType::I32)));
-        Ok(physical)
+        types.extend(self.input_dimensions.iter().map(|_| ArrayType::scalar(DataType::I32)));
+        Ok(types)
     }
 
     /// Returns the executable's array output types for the types of the logical `outputs`, one per flattened logical
@@ -434,9 +431,9 @@ impl MlirProgramSignature {
     /// Returns [`ProgramError::InvalidOutputCount`] when `outputs` does not have one entry per logical output.
     pub fn executable_output_types(&self, outputs: &[ArrayType]) -> Result<Vec<ArrayType>, Error> {
         check_count!("output", outputs, self.output_mapping.len(), ProgramError);
-        let mut physical = Self::select_mapped_entries(&self.output_mapping, outputs);
-        physical.extend(self.output_dimensions.iter().map(|_| ArrayType::scalar(DataType::I64)));
-        Ok(physical)
+        let mut types = Self::select_mapped_entries(&self.output_mapping, outputs);
+        types.extend(self.output_dimensions.iter().map(|_| ArrayType::scalar(DataType::I64)));
+        Ok(types)
     }
 
     /// Returns the input `shardings`, one per flattened logical input, in executable order, with a replicated scalar
@@ -447,13 +444,13 @@ impl MlirProgramSignature {
     /// Returns [`ProgramError::InvalidInputCount`] when `shardings` does not have one entry per logical input.
     pub fn executable_input_shardings(&self, shardings: &[Sharding]) -> Result<Vec<Sharding>, Error> {
         check_count!("input", shardings, self.input_mapping.len(), ProgramError);
-        let mut physical = Self::select_mapped_entries(&self.input_mapping, shardings);
-        physical.extend(
+        let mut executable_shardings = Self::select_mapped_entries(&self.input_mapping, shardings);
+        executable_shardings.extend(
             self.input_dimensions
                 .iter()
                 .map(|dimension| Sharding::replicated(shardings[dimension.logical_input_index].mesh().clone(), 0)),
         );
-        Ok(physical)
+        Ok(executable_shardings)
     }
 
     /// Returns input shardings like [`Self::executable_input_shardings`], leaving a hidden extent input unannotated
@@ -467,13 +464,13 @@ impl MlirProgramSignature {
         shardings: &[Option<Sharding>],
     ) -> Result<Vec<Option<Sharding>>, Error> {
         check_count!("input", shardings, self.input_mapping.len(), ProgramError);
-        let mut physical = Self::select_mapped_entries(&self.input_mapping, shardings);
-        physical.extend(self.input_dimensions.iter().map(|dimension| {
+        let mut executable_shardings = Self::select_mapped_entries(&self.input_mapping, shardings);
+        executable_shardings.extend(self.input_dimensions.iter().map(|dimension| {
             shardings[dimension.logical_input_index]
                 .as_ref()
                 .map(|sharding| Sharding::replicated(sharding.mesh().clone(), 0))
         }));
-        Ok(physical)
+        Ok(executable_shardings)
     }
 
     /// Returns the output `shardings`, one per flattened logical output, in executable order, including the sharding
@@ -488,13 +485,13 @@ impl MlirProgramSignature {
         shardings: &[Option<Sharding>],
     ) -> Result<Vec<Option<Sharding>>, Error> {
         check_count!("output", shardings, self.output_mapping.len(), ProgramError);
-        let mut physical = Self::select_mapped_entries(&self.output_mapping, shardings);
-        physical.extend(self.output_dimensions.iter().map(|dimension| {
+        let mut executable_shardings = Self::select_mapped_entries(&self.output_mapping, shardings);
+        executable_shardings.extend(self.output_dimensions.iter().map(|dimension| {
             shardings[dimension.logical_output_index]
                 .as_ref()
                 .map(|sharding| Sharding::replicated(sharding.mesh().clone(), 0))
         }));
-        Ok(physical)
+        Ok(executable_shardings)
     }
 
     /// Clones the entries in `inputs` for logical inputs that have an executable array slot. Supply one entry per
@@ -524,20 +521,20 @@ impl MlirProgramSignature {
     }
 
     /// Clones entries from `values` whose corresponding entries in `mapping` are `Some(_)`. The signature assigns
-    /// physical indices consecutively in logical order, so keeping these entries in sequence gives executable order.
+    /// executable indices consecutively in logical order, so keeping these entries in sequence gives executable order.
     /// `mapping` and `values` must have the same length, which every caller validates before it selects.
     fn select_mapped_entries<T: Clone>(mapping: &[Option<usize>], values: &[T]) -> Vec<T> {
         debug_assert_eq!(mapping.len(), values.len());
         mapping
             .iter()
             .zip(values)
-            .filter_map(|(physical_index, value)| physical_index.map(|_| value.clone()))
+            .filter_map(|(executable_index, value)| executable_index.map(|_| value.clone()))
             .collect()
     }
 }
 
 // TODO(eaplatanios): Review this.
-/// One bounded dynamic input axis transported as a hidden scalar physical input of the executable.
+/// A bounded dynamic input axis whose extent is carried by a hidden scalar executable input.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MlirProgramSignatureInputDimension {
     /// Axis within the logical input.
@@ -546,8 +543,8 @@ pub struct MlirProgramSignatureInputDimension {
     /// Logical flattened input containing the dynamic axis.
     logical_input_index: usize,
 
-    /// Physical input of the executable containing the runtime axis extent.
-    physical_input_index: usize,
+    /// Executable input slot that carries the runtime extent.
+    executable_input_index: usize,
 }
 
 // TODO(eaplatanios): Review this.
@@ -564,15 +561,15 @@ impl MlirProgramSignatureInputDimension {
         self.logical_input_index
     }
 
-    /// Returns the physical input of the executable containing the runtime extent.
+    /// Returns the index of the executable input slot that carries the runtime extent.
     #[inline]
-    pub fn physical_input_index(self) -> usize {
-        self.physical_input_index
+    pub fn executable_input_index(self) -> usize {
+        self.executable_input_index
     }
 }
 
 // TODO(eaplatanios): Review this.
-/// One bounded dynamic output axis transported as a hidden scalar physical output of the executable.
+/// A bounded dynamic output axis whose extent is carried by a hidden scalar executable output.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MlirProgramSignatureOutputDimension {
     /// Axis within the logical output.
@@ -581,8 +578,8 @@ pub struct MlirProgramSignatureOutputDimension {
     /// Logical flattened output containing the dynamic axis.
     logical_output_index: usize,
 
-    /// Physical output of the executable containing the runtime axis extent.
-    physical_output_index: usize,
+    /// Executable output slot that carries the runtime extent.
+    executable_output_index: usize,
 }
 
 // TODO(eaplatanios): Review this.
@@ -599,10 +596,10 @@ impl MlirProgramSignatureOutputDimension {
         self.logical_output_index
     }
 
-    /// Returns the physical output of the executable containing the runtime extent.
+    /// Returns the index of the executable output slot that carries the runtime extent.
     #[inline]
-    pub fn physical_output_index(self) -> usize {
-        self.physical_output_index
+    pub fn executable_output_index(self) -> usize {
+        self.executable_output_index
     }
 }
 
@@ -1118,8 +1115,8 @@ impl ProgramLoweringOptions {
     /// `tf.aliasing_output` aliases between inputs and outputs, which are non-semantic hints that the buffers may alias
     /// and that merely permit backend buffer reuse. The runtime never donates reference state inputs, so an alias never
     /// authorizes in-place mutation of the state buffer of the caller. Read-only state may be finite and bounded
-    /// dynamic because it has no hidden alias. The validation here owns the physical alias contract, and the XLA
-    /// session additionally enforces the supported memory, sharding, and dynamic shape classes before calling it.
+    /// dynamic because it has no hidden alias. Lowering validates the executable buffer alias contract, and the XLA
+    /// session checks the supported memory, sharding, and dynamic shape classes beforehand.
     ///
     /// `donated_inputs` flags the public inputs whose buffers the caller gives up to every execution (i.e., one flag
     /// per public input, or none at all). Each donated input is paired with an output that it can share its buffers
@@ -1136,7 +1133,7 @@ impl ProgramLoweringOptions {
     /// `unread_inputs` flags the public inputs that the program never reads (i.e., one flag per public input, or none
     /// at all), which the caller states because it cannot be read from `program` (e.g., an input of the program of an
     /// eager call that the call passes as a capture which its callee never reads). Such an input with a static shape
-    /// has no physical input, like a capture that no emitted region reads.
+    /// has no executable input slot, like a capture that no emitted region reads.
     #[inline]
     pub(crate) fn with_reference_bindings(
         mut self,
@@ -1290,7 +1287,7 @@ pub(crate) struct ProgramBoundary {
     /// Name of the entry function.
     function_name: String,
 
-    /// Signature that maps the logical boundary of the program to the physical boundary of its executable.
+    /// Signature that maps the program's logical inputs and outputs to executable slots.
     signature: MlirProgramSignature,
 
     /// Session constants of the program, which the entry function receives as its trailing captures.
@@ -1303,22 +1300,21 @@ pub(crate) struct ProgramBoundary {
     /// Types of the logical inputs (i.e., of the captures followed by the public inputs).
     logical_input_types: Vec<ArrayType>,
 
-    /// Types of the physical inputs (i.e., of the inputs that the executable has).
-    physical_input_types: Vec<ArrayType>,
+    /// Types of the executable's array arguments, including hidden extent scalars.
+    executable_input_types: Vec<ArrayType>,
 
-    /// Types of the physical outputs (i.e., of the outputs that the executable has).
-    physical_output_types: Vec<ArrayType>,
+    /// Types of the executable's array results, including hidden extent scalars.
+    executable_output_types: Vec<ArrayType>,
 
-    /// Physical output that each physical input may share its buffers with, by the index of the input.
+    /// Maps each executable input index to the output index with which it may share buffers.
     aliases: HashMap<usize, usize>,
 }
 
 // TODO(eaplatanios): Review this.
 impl ProgramBoundary {
-    /// Returns the physical output that each physical input of an entry function may share its buffers with, by the
-    /// index of the input. The aliases of `reference_states` are validated and paired first, and each donated input is
-    /// then paired with an output that no earlier input was paired with. The first `capture_count` logical inputs are
-    /// captures.
+    /// Returns a map from executable input indices to the output indices with which they may share buffers.
+    /// The aliases of `reference_states` are validated and paired first. Each donated input then gets an output that
+    /// no earlier input is paired with. The first `capture_count` logical inputs are captures.
     ///
     /// # Errors
     ///
@@ -1352,7 +1348,7 @@ impl ProgramBoundary {
                     message: format!("logical input index {logical_input_index} is out of range"),
                 })
             })?;
-            let physical_input_index = signature.input_mapping()[logical_input_index].ok_or_else(|| {
+            let executable_input_index = signature.input_mapping()[logical_input_index].ok_or_else(|| {
                 Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                     message: format!(
                         "logical state input {logical_input_index} is erased from the executable boundary"
@@ -1365,7 +1361,7 @@ impl ProgramBoundary {
                         message: format!("logical output index {logical_output_index} is out of range"),
                     })
                 })?;
-                let physical_output_index = signature.output_mapping()[logical_output_index].ok_or_else(|| {
+                let executable_output_index = signature.output_mapping()[logical_output_index].ok_or_else(|| {
                     Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                         message: format!(
                             "logical state output {logical_output_index} is erased from the executable boundary",
@@ -1414,14 +1410,14 @@ impl ProgramBoundary {
                     }
                     _ => {}
                 }
-                if !aliased_outputs.insert(physical_output_index) {
+                if !aliased_outputs.insert(executable_output_index) {
                     return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                         message: "reference-state aliases must be injective".to_string(),
                     }));
                 }
-                // Distinct logical inputs, which `state_inputs` enforces above, map to distinct physical inputs, so
+                // Distinct logical inputs, which `state_inputs` enforces above, map to distinct executable slots, so
                 // this insertion can never displace an earlier alias.
-                aliases.insert(physical_input_index, physical_output_index);
+                aliases.insert(executable_input_index, executable_output_index);
             }
         }
         if !donated_inputs.is_empty() && donated_inputs.len() != logical_input_types.len() - capture_count {
@@ -1440,9 +1436,9 @@ impl ProgramBoundary {
             for (input_index, _) in donated_inputs.iter().enumerate().filter(|(_, donated)| **donated) {
                 let logical_input_index = capture_count + input_index;
                 let input_type = &logical_input_types[logical_input_index];
-                let Some(physical_input_index) = signature.input_mapping()[logical_input_index] else { continue };
+                let Some(executable_input_index) = signature.input_mapping()[logical_input_index] else { continue };
                 if state_inputs.contains(&logical_input_index)
-                    || aliases.contains_key(&physical_input_index)
+                    || aliases.contains_key(&executable_input_index)
                     || input_type.static_shape().is_none()
                     || input_type.memory() != Memory::Device
                 {
@@ -1454,9 +1450,9 @@ impl ProgramBoundary {
                 let has_single_device = input_sharding.as_ref().is_none_or(|sharding| {
                     sharding.mesh().axes().iter().map(|axis| axis.size()).product::<usize>() == 1
                 });
-                let physical_output_index =
+                let executable_output_index =
                     global_output_types.iter().enumerate().find_map(|(logical_output_index, output_type)| {
-                        let physical_output_index = signature.output_mapping()[logical_output_index]?;
+                        let executable_output_index = signature.output_mapping()[logical_output_index]?;
                         let is_open = open_outputs.get(logical_output_index).copied().unwrap_or(false);
                         let output_sharding = &output_shardings[logical_output_index];
                         let shares_buffers = match same_sharding {
@@ -1507,21 +1503,20 @@ impl ProgramBoundary {
                         };
                         (shares_buffers
                             && (has_single_device || !is_open)
-                            && !aliased_outputs.contains(&physical_output_index))
-                        .then_some(physical_output_index)
+                            && !aliased_outputs.contains(&executable_output_index))
+                        .then_some(executable_output_index)
                     });
-                if let Some(physical_output_index) = physical_output_index {
-                    aliased_outputs.insert(physical_output_index);
-                    aliases.insert(physical_input_index, physical_output_index);
+                if let Some(executable_output_index) = executable_output_index {
+                    aliased_outputs.insert(executable_output_index);
+                    aliases.insert(executable_input_index, executable_output_index);
                 }
             }
         }
         Ok(aliases)
     }
 
-    /// Returns the types and the attributes of the `func.func` arguments and results of the entry function of this
-    /// boundary (i.e., of its physical inputs and outputs), in the order of the physical boundary. The attributes
-    /// declare the sharding, the memory kind, the layout, and the aliased output of each value.
+    /// Returns the MLIR types and attributes of the entry function arguments and results in executable order.
+    /// The attributes declare the sharding, memory kind, layout, and aliased output of each value.
     ///
     /// # Errors
     ///
@@ -1537,20 +1532,20 @@ impl ProgramBoundary {
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<(Vec<TypeAndAttributes<'c, 't, 'static>>, Vec<TypeAndAttributes<'c, 't, 'static>>), Error> {
-        let Self { signature, physical_input_types, physical_output_types, aliases, .. } = self;
-        let mut physical_input_tensor_types = physical_input_types
+        let Self { signature, executable_input_types, executable_output_types, aliases, .. } = self;
+        let mut argument_types = executable_input_types
             .iter()
             .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         if signature.has_ordered_io() {
-            physical_input_tensor_types.push(context.stable_hlo_token_type()?.as_ref());
+            argument_types.push(context.stable_hlo_token_type()?.as_ref());
         }
-        let mut physical_output_tensor_types = physical_output_types
+        let mut result_types = executable_output_types
             .iter()
             .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         if signature.has_ordered_io() {
-            physical_output_tensor_types.push(context.stable_hlo_token_type()?.as_ref());
+            result_types.push(context.stable_hlo_token_type()?.as_ref());
         }
         let mut argument_sharding_attributes = signature
             .executable_optional_input_shardings(logical_input_shardings)?
@@ -1561,14 +1556,14 @@ impl ProgramBoundary {
             .collect::<Result<Vec<_>, _>>()?;
         // Results whose placement over auto mesh axes the compiler chooses are open over those axes, like JAX lowers
         // the shardings of output types without `out_shardings` (refer to `ShardingExtension::lower`).
-        let physical_open_outputs =
+        let executable_open_outputs =
             if open_outputs.is_empty() { Vec::new() } else { signature.select_output_entries(open_outputs)? };
         let mut result_sharding_attributes = signature
             .executable_optional_output_shardings(output_shardings)?
             .iter()
             .enumerate()
             .map(|(index, sharding)| {
-                let open = physical_open_outputs.get(index).copied().unwrap_or(false);
+                let open = executable_open_outputs.get(index).copied().unwrap_or(false);
                 let open_dimensions = if open { OpenDimensions::All } else { OpenDimensions::None };
                 sharding.as_ref().map(|sharding| sharding.lower(open_dimensions, location)).transpose()
             })
@@ -1589,12 +1584,12 @@ impl ProgramBoundary {
                 }
             }
         }
-        // Internal layout constraints do not constrain the executable ABI. Declare layouts on the physical boundary,
+        // Internal layout constraints do not constrain the executable ABI. Declare layouts at the executable boundary,
         // whose types already omit static zeros and include hidden extent scalars, while tokens have no array type.
-        // Placement belongs to physical array slots, including captures, but never to the appended effect token.
+        // Declare placements for array slots, including captures. The appended effect token carries only ordering.
         // Default device placement needs no attribute, but host identities still need attributes even without
         // transfers.
-        let function_arguments = physical_input_tensor_types
+        let function_arguments = argument_types
             .iter()
             .enumerate()
             .map(|(index, tensor_type)| {
@@ -1604,7 +1599,8 @@ impl ProgramBoundary {
                 {
                     attributes.insert("sdy.sharding".into(), sharding.as_ref());
                 }
-                if let Some(r#type) = physical_input_types.get(index).filter(|r#type| r#type.memory() != Memory::Device)
+                if let Some(r#type) =
+                    executable_input_types.get(index).filter(|r#type| r#type.memory() != Memory::Device)
                 {
                     validate_boundary_memory(r#type.memory(), target_platform)?;
                     attributes.insert(
@@ -1618,7 +1614,7 @@ impl ProgramBoundary {
                         context.integer_attribute(context.signless_integer_type(64), *output_index as i64).as_ref(),
                     );
                 }
-                if let Some(array_type) = physical_input_types.get(index)
+                if let Some(array_type) = executable_input_types.get(index)
                     && let Some(layout) = array_type.lower_boundary_layout("input", context)?
                 {
                     attributes.insert("mhlo.layout_mode".into(), layout);
@@ -1627,7 +1623,7 @@ impl ProgramBoundary {
                 Ok::<_, Error>(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let function_results = physical_output_tensor_types
+        let function_results = result_types
             .iter()
             .enumerate()
             .map(|(index, tensor_type)| {
@@ -1638,7 +1634,7 @@ impl ProgramBoundary {
                     attributes.insert("sdy.sharding".into(), sharding.as_ref());
                 }
                 if let Some(r#type) =
-                    physical_output_types.get(index).filter(|r#type| r#type.memory() != Memory::Device)
+                    executable_output_types.get(index).filter(|r#type| r#type.memory() != Memory::Device)
                 {
                     validate_boundary_memory(r#type.memory(), target_platform)?;
                     attributes.insert(
@@ -1646,7 +1642,7 @@ impl ProgramBoundary {
                         context.string_attribute(r#type.memory().placement_kind()).as_ref(),
                     );
                 }
-                if let Some(array_type) = physical_output_types.get(index)
+                if let Some(array_type) = executable_output_types.get(index)
                     && let Some(layout) = array_type.lower_boundary_layout("output", context)?
                 {
                     attributes.insert("mhlo.layout_mode".into(), layout);
@@ -1659,10 +1655,9 @@ impl ProgramBoundary {
         Ok((function_arguments, function_results))
     }
 
-    /// Lowers the body of the entry function of this boundary into `function_block`, whose block arguments are the
-    /// physical inputs, ending with the `func.return` of the physical outputs. It rebuilds the logical inputs from the
-    /// physical ones, completes the pending reductions that inputs arrive with, lowers `program`, and projects its
-    /// outputs onto the physical outputs. The first `capture_count` logical inputs are captures.
+    /// Lowers the entry function body into `function_block`. It reconstructs the logical inputs from the executable
+    /// arguments, completes pending input reductions, lowers `program`, and emits `func.return` with the executable
+    /// results. The first `capture_count` logical inputs are captures.
     #[allow(clippy::too_many_arguments)]
     fn lower_body<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
         &self,
@@ -1681,16 +1676,16 @@ impl ProgramBoundary {
         ProgramOutput: Parameterized<Constant>,
     {
         let Self {
-            signature, session_constants, passed_on_constants, logical_input_types, physical_input_types, ..
+            signature, session_constants, passed_on_constants, logical_input_types, executable_input_types, ..
         } = self;
         let session_count = session_constants.len();
         let mut function_block_ref = function_block.as_ref();
         let mut logical_input_values = Vec::with_capacity(logical_input_types.len());
         for (logical_index, array_type) in logical_input_types.iter().enumerate() {
             let value = match signature.input_mapping()[logical_index] {
-                Some(physical_index) => {
-                    let mut value = function_block.argument(physical_index).unwrap().as_ref();
-                    let mut refined_type = physical_input_types[physical_index].clone();
+                Some(executable_index) => {
+                    let mut value = function_block.argument(executable_index).unwrap().as_ref();
+                    let mut refined_type = executable_input_types[executable_index].clone();
                     for input_dimension in signature
                         .input_dimensions()
                         .iter()
@@ -1700,7 +1695,7 @@ impl ProgramBoundary {
                         dimensions[input_dimension.axis()] =
                             array_type.shape().dimensions()[input_dimension.axis()].clone();
                         refined_type = refined_type.with_shape(Shape::new(dimensions));
-                        let size = function_block.argument(input_dimension.physical_input_index()).unwrap().as_ref();
+                        let size = function_block.argument(input_dimension.executable_input_index()).unwrap().as_ref();
                         let operation = function_block_ref.append_operation(stable_hlo::set_dimension_size(
                             value,
                             size,
@@ -1831,7 +1826,7 @@ impl ProgramBoundary {
             lowering_state,
             &mut effect_tokens,
         )?;
-        let mut physical_outputs = signature.select_output_entries(logical_outputs.as_slice())?;
+        let mut executable_outputs = signature.select_output_entries(logical_outputs.as_slice())?;
         // XLA writes the runtime-size trailer of a bounded dynamic result only in the `SliceToDynamic` that
         // `DynamicPadder` inserts before each output leaf. When several such leaves carry values that XLA proves
         // equal (e.g., the same SSA value or equal computations merged by CSE), one `SliceToDynamic` survives and
@@ -1840,23 +1835,23 @@ impl ProgramBoundary {
         // optimization barrier makes every leaf a distinct barrier result. XLA expands barriers only after copy
         // insertion, so each leaf keeps its own `SliceToDynamic`. A single dynamic result cannot alias a static
         // one, so the barrier is only needed with two or more of them.
-        let mut dynamic_physical_indices = signature
+        let mut dynamic_output_slots = signature
             .output_dimensions()
             .iter()
             .map(|output_dimension| signature.output_mapping()[output_dimension.logical_output_index()].unwrap())
             .collect::<Vec<_>>();
-        dynamic_physical_indices.dedup();
-        if dynamic_physical_indices.len() > 1 {
+        dynamic_output_slots.dedup();
+        if dynamic_output_slots.len() > 1 {
             let barrier_inputs =
-                dynamic_physical_indices.iter().map(|index| physical_outputs[*index]).collect::<Vec<_>>();
+                dynamic_output_slots.iter().map(|index| executable_outputs[*index]).collect::<Vec<_>>();
             let barrier = function_block_ref
                 .append_operation(stable_hlo::optimization_barrier(barrier_inputs.as_slice(), location)?)?;
-            for (result_index, physical_index) in dynamic_physical_indices.into_iter().enumerate() {
-                physical_outputs[physical_index] = barrier.result(result_index).unwrap().as_ref();
+            for (result_index, executable_index) in dynamic_output_slots.into_iter().enumerate() {
+                executable_outputs[executable_index] = barrier.result(result_index).unwrap().as_ref();
             }
         }
         for output_dimension in signature.output_dimensions() {
-            physical_outputs.push(lower_runtime_dimension_size_i64(
+            executable_outputs.push(lower_runtime_dimension_size_i64(
                 logical_outputs[output_dimension.logical_output_index()],
                 output_dimension.axis(),
                 &mut function_block_ref,
@@ -1865,9 +1860,9 @@ impl ProgramBoundary {
             )?);
         }
         if signature.has_ordered_io() {
-            physical_outputs.push(effect_tokens.get(EffectClass::OrderedIo).unwrap());
+            executable_outputs.push(effect_tokens.get(EffectClass::OrderedIo).unwrap());
         }
-        function_block_ref.append_operation(func::r#return(physical_outputs.as_slice(), location)?)?;
+        function_block_ref.append_operation(func::r#return(executable_outputs.as_slice(), location)?)?;
         Ok(())
     }
 }
@@ -2215,13 +2210,13 @@ where
             .into());
         }
 
-        // The logical inputs are the captures followed by the public inputs. The signature maps them, and the
-        // outputs, to the physical inputs and outputs that the executable has.
+        // The logical inputs are the captures followed by the public inputs. The signature maps the logical inputs
+        // and outputs to executable slots.
         let logical_input_types = capture_types.iter().cloned().chain(input_types.iter().cloned()).collect::<Vec<_>>();
         let effects = self.effects().classes();
         let ordered_io = effects.contains(EffectClass::OrderedIo) || effects.contains(EffectClass::DeviceOrderedIo);
 
-        // An input that the executable never reads has no physical input, so that executions neither admit, require,
+        // An input that the executable never reads has no executable slot, so that executions neither admit, require,
         // nor wait for its buffers, and the signature records it as unread.
         let reference_state_inputs = reference_states
             .iter()
@@ -2303,8 +2298,8 @@ where
             output_shardings,
         )?;
 
-        let physical_input_types = signature.executable_input_types(logical_input_types.as_slice())?;
-        let physical_output_types = signature.executable_output_types(output_types)?;
+        let executable_input_types = signature.executable_input_types(logical_input_types.as_slice())?;
+        let executable_output_types = signature.executable_output_types(output_types)?;
 
         Ok(ProgramBoundary {
             function_name,
@@ -2312,8 +2307,8 @@ where
             session_constants,
             passed_on_constants,
             logical_input_types,
-            physical_input_types,
-            physical_output_types,
+            executable_input_types,
+            executable_output_types,
             aliases,
         })
     }
@@ -2612,11 +2607,11 @@ mod tests {
         assert_eq!(signature.input_dimensions().len(), 1);
         assert_eq!(signature.input_dimensions()[0].logical_input_index(), 2);
         assert_eq!(signature.input_dimensions()[0].axis(), 0);
-        assert_eq!(signature.input_dimensions()[0].physical_input_index(), 2);
+        assert_eq!(signature.input_dimensions()[0].executable_input_index(), 2);
         assert_eq!(signature.output_dimensions().len(), 1);
         assert_eq!(signature.output_dimensions()[0].logical_output_index(), 0);
         assert_eq!(signature.output_dimensions()[0].axis(), 0);
-        assert_eq!(signature.output_dimensions()[0].physical_output_index(), 1);
+        assert_eq!(signature.output_dimensions()[0].executable_output_index(), 1);
     }
 
     #[test]
@@ -2633,7 +2628,7 @@ mod tests {
         assert_eq!(signature.input_mapping(), &[None, None, None, Some(0), Some(1)]);
         assert_eq!(signature.unread_inputs(), &[true, true, false, false, false]);
         assert_eq!([0, 1, 2].map(|index| signature.is_unread_input(index)), [true, true, false]);
-        assert_eq!(signature.input_dimensions()[0].physical_input_index(), 2);
+        assert_eq!(signature.input_dimensions()[0].executable_input_index(), 2);
         assert_eq!(signature.executable_input_count(), 3);
     }
 
@@ -2683,8 +2678,8 @@ mod tests {
 
     #[test]
     fn test_mlir_program_signature_executable_input_types() {
-        // Every bounded dynamic axis of a materialized input becomes its physical bound, and each one appends a hidden
-        // `i32` extent input, while static zero-sized inputs are erased.
+        // Every bounded dynamic axis of a materialized input uses its maximum extent and adds a hidden `i32`
+        // extent input, while statically shaped structural zeros are erased.
         let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let dynamic = ArrayType::new(
             DataType::F32,
