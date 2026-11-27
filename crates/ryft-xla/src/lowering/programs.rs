@@ -128,12 +128,12 @@ pub struct MlirProgramSignature {
     /// Physical input ordinal for each logical flattened input.
     input_mapping: Arc<[Option<usize>]>,
 
+    /// Physical output ordinal for each logical flattened output.
+    output_mapping: Arc<[Option<usize>]>,
+
     /// Whether each logical flattened input is erased because the executable never reads it, or empty when every input
     /// is read.
     unread_inputs: Arc<[bool]>,
-
-    /// Physical output ordinal for each logical flattened output.
-    output_mapping: Arc<[Option<usize>]>,
 
     /// Hidden scalar inputs that restore bounded dynamic dimensions on physicalized input tensors.
     input_dimensions: Arc<[MlirProgramSignatureInputDimension]>,
@@ -207,8 +207,8 @@ impl MlirProgramSignature {
         }
         Self {
             input_mapping,
-            unread_inputs: Arc::from([]),
             output_mapping,
+            unread_inputs: Arc::from([]),
             input_dimensions: input_dimensions.into(),
             output_dimensions: output_dimensions.into(),
             ordered_io: false,
@@ -292,51 +292,13 @@ impl MlirProgramSignature {
         self
     }
 
-    /// Returns whether this executable carries an ordered I/O boundary token.
-    pub fn has_ordered_io(&self) -> bool {
-        self.ordered_io
-    }
-
-    /// Returns whether every ordered I/O occurrence is `DeviceOrderedIo`, permitting execution on several devices with
-    /// per-device ordering.
-    pub fn has_device_ordered_io(&self) -> bool {
-        self.device_ordered_io
-    }
-
-    /// Returns whether this executable contains unordered I/O.
-    pub fn has_unordered_io(&self) -> bool {
-        self.unordered_io
-    }
-
-    /// Returns whether lowering emitted a runtime assertion, including synthesized checks.
-    #[inline]
-    pub fn requires_assertion_handler(&self) -> bool {
-        self.requires_assertion_handler
-    }
-
-    /// Returns whether execution participates in the effect barrier, which is the case for executables with ordered or
-    /// unordered I/O and for executables that require the runtime assertion handler.
-    pub fn has_effects(&self) -> bool {
-        self.ordered_io || self.unordered_io || self.requires_assertion_handler
-    }
-
-    /// Returns the ordinal of the hidden ordered I/O token input, which follows every array and extent input.
-    pub fn ordered_io_input_index(&self) -> Option<usize> {
-        self.ordered_io.then(|| self.input_mapping.iter().flatten().count() + self.input_dimensions.len())
-    }
-
-    /// Returns the ordinal of the hidden ordered I/O token output, which follows every array and extent output.
-    pub fn ordered_io_output_index(&self) -> Option<usize> {
-        self.ordered_io.then(|| self.output_mapping.iter().flatten().count() + self.output_dimensions.len())
-    }
-
-    /// Returns the physical input ordinal of each logical input, or `None` for an erased input.
+    /// Returns the physical input ordinal of each logical input, or [`None`] for an erased input.
     #[inline]
     pub fn input_mapping(&self) -> &[Option<usize>] {
         &self.input_mapping
     }
 
-    /// Returns the physical output ordinal of each logical output, or `None` for an erased output.
+    /// Returns the physical output ordinal of each logical output, or [`None`] for an erased output.
     #[inline]
     pub fn output_mapping(&self) -> &[Option<usize>] {
         &self.output_mapping
@@ -354,33 +316,82 @@ impl MlirProgramSignature {
         &self.output_dimensions
     }
 
-    /// Returns the number of physical array inputs, including hidden extent scalars but excluding tokens.
-    pub fn array_input_count(&self) -> usize {
+    /// Returns whether this executable carries an ordered I/O boundary token.
+    #[inline]
+    pub fn has_ordered_io(&self) -> bool {
+        self.ordered_io
+    }
+
+    /// Returns whether every ordered I/O occurrence is `DeviceOrderedIo`, permitting execution on several devices with
+    /// per-device ordering.
+    #[inline]
+    pub fn has_device_ordered_io(&self) -> bool {
+        self.device_ordered_io
+    }
+
+    /// Returns whether this executable contains unordered I/O.
+    #[inline]
+    pub fn has_unordered_io(&self) -> bool {
+        self.unordered_io
+    }
+
+    /// Returns whether lowering emitted a runtime assertion, including synthesized checks.
+    #[inline]
+    pub fn requires_assertion_handler(&self) -> bool {
+        self.requires_assertion_handler
+    }
+
+    /// Returns whether execution participates in the effect barrier, which is the case for executables with ordered or
+    /// unordered I/O and for executables that require the runtime assertion handler.
+    #[inline]
+    pub fn has_effects(&self) -> bool {
+        self.ordered_io || self.unordered_io || self.requires_assertion_handler
+    }
+
+    /// Returns the ordinal of the hidden ordered I/O token input, which follows every array and extent input.
+    #[inline]
+    pub fn ordered_io_input_index(&self) -> Option<usize> {
+        self.ordered_io.then(|| self.input_mapping.iter().flatten().count() + self.input_dimensions.len())
+    }
+
+    /// Returns the ordinal of the hidden ordered I/O token output, which follows every array and extent output.
+    #[inline]
+    pub fn ordered_io_output_index(&self) -> Option<usize> {
+        self.ordered_io.then(|| self.output_mapping.iter().flatten().count() + self.output_dimensions.len())
+    }
+
+    /// Returns the number of array inputs, including hidden extent scalars but excluding tokens.
+    #[inline]
+    pub fn input_array_count(&self) -> usize {
         self.input_mapping.iter().flatten().count() + self.input_dimensions.len()
     }
 
-    /// Returns the number of physical array outputs, including hidden extent scalars but excluding tokens.
-    pub fn array_output_count(&self) -> usize {
+    /// Returns the number of array outputs, including hidden extent scalars but excluding tokens.
+    #[inline]
+    pub fn output_array_count(&self) -> usize {
         self.output_mapping.iter().flatten().count() + self.output_dimensions.len()
     }
 
-    /// Returns the total number of physical inputs of the executable, including the hidden ordered I/O token.
+    /// Returns the total number of inputs of the executable, including the hidden ordered I/O token.
     #[inline]
-    pub fn physical_input_count(&self) -> usize {
+    pub fn input_count(&self) -> usize {
         self.input_mapping.iter().flatten().count() + self.input_dimensions.len() + usize::from(self.ordered_io)
     }
 
-    /// Returns the total number of physical outputs of the executable, including the hidden ordered I/O token.
-    pub fn physical_output_count(&self) -> usize {
-        self.array_output_count() + usize::from(self.ordered_io)
+    /// Returns the total number of outputs of the executable, including the hidden ordered I/O token.
+    #[inline]
+    pub fn output_count(&self) -> usize {
+        self.output_array_count() + usize::from(self.ordered_io)
     }
 
     /// Projects logical inputs into physical executable order.
+    #[inline]
     pub fn project_inputs<T: Clone>(&self, inputs: &[T]) -> Vec<T> {
         Self::project(&self.input_mapping, inputs)
     }
 
     /// Projects logical outputs into physical executable order.
+    #[inline]
     pub fn project_outputs<T: Clone>(&self, outputs: &[T]) -> Vec<T> {
         Self::project(&self.output_mapping, outputs)
     }
@@ -734,21 +745,6 @@ where
         let location = context.unknown_location();
         let mut module = context.module(location)?;
 
-        // Emit `sdy.mesh` declarations for any sharding referenced either by inner operations or by the optional
-        // signature shardings, so the `func.func` attributes can refer to `@mesh`.
-        let mut signature_mesh = None;
-        for sharding in logical_input_shardings.iter().chain(output_shardings).flatten() {
-            signature_mesh = Some(match signature_mesh.take() {
-                Some(existing_mesh) => merge_logical_meshes(existing_mesh, sharding.mesh())?,
-                None => sharding.mesh().clone(),
-            });
-        }
-        let mesh = program.nested_sharding_mesh(signature_mesh, target_platform)?;
-        if let Some(mesh) = mesh.as_ref() {
-            let mesh_operation = mesh.lower(location)?;
-            module.body()?.append_operation(mesh_operation)?;
-        }
-
         // Trace each distinct named semantic decomposition once and retain it in the lowering state of the module,
         // so that the entry and nested function bodies resolve the same private symbol.
         let named_compositions = Rc::new(NamedCompositionFunctionMap::for_program(program, target_platform)?);
@@ -764,6 +760,13 @@ where
             .with_session_constants(
                 &[boundary.session_constants.as_slice(), boundary.passed_on_constants.as_slice()].concat(),
             );
+
+        // The module declares the mesh that the lowered shardings refer to, which is recorded as they are lowered
+        // (refer to `ProgramLoweringState::require_mesh`). The signature shardings are recorded first, so that the
+        // module mesh keeps their axis types.
+        for sharding in logical_input_shardings.iter().chain(output_shardings).flatten() {
+            lowering_state.require_mesh(sharding.mesh())?;
+        }
 
         // Deduplicate `call` callees that occur more than once into shared private `func.func`s, so repeated nested
         // programs (e.g., identical transformer blocks or the per-block primal and pullback programs of `grad`) lower
@@ -801,7 +804,6 @@ where
             logical_input_shardings,
             output_shardings,
             open_outputs,
-            mesh.is_some(),
             supports_shardy,
             target_platform,
             &context,
@@ -834,7 +836,13 @@ where
         })?;
 
         let mut signature = boundary.signature;
-        let mesh = declare_constrained_mesh(&module, program, mesh, target_platform, location.as_ref())?;
+
+        // Everything that lowering emitted over a mesh refers to the recorded one, which is declared ahead of the
+        // functions that refer to it.
+        let mesh = lowering_state.mesh();
+        if let Some(mesh) = &mesh {
+            module.body()?.insert_operation(mesh.lower(location)?, 0)?;
+        }
 
         if !supports_shardy {
             remove_shardy_operations(&mut module)?;
@@ -1472,8 +1480,7 @@ impl ProgramBoundary {
 
     /// Returns the types and the attributes of the `func.func` arguments and results of the entry function of this
     /// boundary (i.e., of its physical inputs and outputs), in the order of the physical boundary. The attributes
-    /// declare the sharding, the memory kind, the layout, and the aliased output of each value, and `has_mesh` states
-    /// whether the module declares a mesh.
+    /// declare the sharding, the memory kind, the layout, and the aliased output of each value.
     ///
     /// # Errors
     ///
@@ -1484,7 +1491,6 @@ impl ProgramBoundary {
         logical_input_shardings: &[Option<Sharding>],
         output_shardings: &[Option<Sharding>],
         open_outputs: &[bool],
-        has_mesh: bool,
         supports_shardy: bool,
         target_platform: Option<&str>,
         context: &'c MlirContext<'t>,
@@ -1528,7 +1534,7 @@ impl ProgramBoundary {
             .collect::<Result<Vec<_>, _>>()?;
         // The effect token of a signature side is annotated when any value of that side is, as each device threads its
         // own token.
-        if signature.has_ordered_io() && has_mesh {
+        if signature.has_ordered_io() {
             let token_sharding = context.shardy_tensor_sharding(
                 context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME),
                 &[],
@@ -1725,7 +1731,7 @@ impl ProgramBoundary {
                     validate_partial_completion(data_type, kind, sharding, completed, kept, "input_shardings")?;
                     let reduced = sharding.clone().with_unreduced_axes(array_type.unreduced_axes().iter().cloned())?;
                     let block = &mut function_block_ref;
-                    reduced.lower_pending_reduction_constraint(value, &[], block, location.as_ref())?
+                    reduced.lower_pending_reduction_constraint(value, lowering_state, block, location.as_ref())?
                 }
                 _ => value,
             };
@@ -1935,19 +1941,6 @@ pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
         open_outputs: &[bool],
         options: &ProgramLoweringOptions,
     ) -> Result<ProgramBoundary, Error>;
-
-    /// Returns the module mesh of this program, collected from the meshes referenced by emitted sharding constraints
-    /// and nested-computation boundaries, starting from `existing`. Every mesh whose topology differs from it is
-    /// rejected with [`LoweringError::MismatchedMeshTopology`]. The constraints include those of the boundary overrides
-    /// of `call`s, whose shardings no type records. A constraint that this function does not recognize but that
-    /// lowering emits over the sharding of a type still finds its mesh, because the module declares the mesh of those
-    /// types whenever the lowered module refers to a mesh that this function did not find. Only the regions that
-    /// lowering emits for `target_platform` contribute.
-    fn nested_sharding_mesh(
-        &self,
-        existing: Option<LogicalMesh>,
-        target_platform: Option<&str>,
-    ) -> Result<Option<LogicalMesh>, Error>;
 }
 
 impl<O, Input, Output> ProgramLoweringAnalysisExtension for Program<Constant, O, Input, Output>
@@ -2283,130 +2276,6 @@ where
             aliases,
         })
     }
-
-    fn nested_sharding_mesh(
-        &self,
-        existing: Option<LogicalMesh>,
-        target_platform: Option<&str>,
-    ) -> Result<Option<LogicalMesh>, Error> {
-        // Only the computation regions that lowering emits for `target_platform` contribute, so dormant rule regions
-        // (e.g., the transpose region of a `linear_call`) and the regions that lowering omits cannot bring other meshes
-        // into the module. Type metadata alone does not require a mesh, because bounded dynamic replica lowering
-        // retains that metadata without emitting Shardy operations.
-        let mut mesh = existing;
-        for region in emitted_regions(self.entry_region_ref(), target_platform) {
-            for instruction in region.instructions() {
-                // TODO(eaplatanios): There is a lot of special case handling of operation types here.
-                //  Is this extensible? Do we need the special casing and is it appropriate here?
-                // Payloads are recognized through their projections, so any family that embeds them declares their
-                // meshes.
-                let operation = instruction.operation();
-                let declared_mesh = operation
-                    .projected_payload::<ShardMapOperation>()
-                    .map(|operation| operation.boundary().mesh())
-                    .or_else(|| {
-                        operation.projected_payload::<ReshardOperation>().map(|operation| operation.sharding().mesh())
-                    })
-                    .or_else(|| {
-                        operation
-                            .projected_payload::<ConstrainShardingOperation>()
-                            .map(|operation| operation.sharding().mesh())
-                    })
-                    .or_else(|| {
-                        // A device target names no mesh. It lowers to a sharding constraint only when it completes a
-                        // reduction, over the mesh of its output type, which `declare_constrained_mesh` declares.
-                        operation
-                            .projected_payload::<PlaceOperation>()
-                            .and_then(PlaceOperation::target)
-                            .and_then(PlacementRequest::placement)
-                            .map(|target| target.sharding().mesh())
-                    })
-                    .or_else(|| {
-                        // A call constrains its inputs and outputs that the boundary of its callee overrides.
-                        operation
-                            .projected_payload::<CallOperation<Type>>()
-                            .and_then(|call| call.boundary_shardings().next())
-                            .map(Sharding::mesh)
-                    });
-
-                let incoming = if let Some(mesh) = declared_mesh {
-                    Some(mesh.clone())
-                } else {
-                    let output_axes = operation
-                        .projected_payload::<DynamicBroadcastOperation>()
-                        .map(DynamicBroadcastOperation::output_axes)
-                        .or_else(|| {
-                            operation.projected_payload::<BroadcastOperation>().map(BroadcastOperation::output_axes)
-                        })
-                        .or_else(|| {
-                            operation
-                                .projected_payload::<BroadcastLikeOperation>()
-                                .map(BroadcastLikeOperation::output_axes)
-                        });
-
-                    let emits_constraint = if let Some(output_axes) = output_axes {
-                        let input_type = region.atoms()[instruction.inputs()[0].index()].r#type();
-                        let input_type = <&ArrayType>::try_from(input_type.as_ref()).map_err(ProgramError::from)?;
-                        let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
-                        let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
-                        broadcast_changes_explicit_sharding(input_type, output_type, output_axes)
-                    } else if operation.projected_payload::<CastOperation<Type>>().is_some()
-                        || operation.projected_payload::<CastOperation<ArrayType>>().is_some()
-                    {
-                        // Casts of first-class dimensions carry no placement, and array casts constrain placement only
-                        // when the explicit placement changes.
-                        let input_type = region.atoms()[instruction.inputs()[0].index()].r#type();
-                        let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
-                        match (
-                            <&ArrayType>::try_from(input_type.as_ref()),
-                            <&ArrayType>::try_from(output_type.as_ref()),
-                        ) {
-                            (Ok(input_type), Ok(output_type)) => {
-                                cast_changes_explicit_placement(input_type, output_type)
-                            }
-                            _ => false,
-                        }
-                    } else {
-                        operation
-                            .projected_payload::<DynamicReshapeOperation>()
-                            .is_some_and(|operation| operation.output_sharding().is_some())
-                            || operation
-                                .projected_payload::<ReshapeOperation>()
-                                .is_some_and(|operation| operation.output_sharding().is_some())
-                            || operation
-                                .projected_payload::<GatherOperation>()
-                                .is_some_and(|operation| operation.output_sharding().is_some())
-                            || operation
-                                .projected_payload::<ScatterOperation>()
-                                .is_some_and(|operation| operation.output_sharding().is_some())
-                            || operation.projected_payload::<ZeroOperation<ArrayType>>().is_some()
-                            || operation.projected_payload::<OneOperation<ArrayType>>().is_some()
-                            || operation.projected_payload::<IotaOperation<ArrayType>>().is_some()
-                            || operation.projected_payload::<ZeroLikeOperation<ArrayType>>().is_some()
-                            || operation.projected_payload::<OneLikeOperation<ArrayType>>().is_some()
-                            || operation.projected_payload::<FillLikeOperation<ArrayType>>().is_some()
-                            || operation.projected_payload::<IotaLikeOperation<ArrayType>>().is_some()
-                    };
-
-                    if !emits_constraint {
-                        continue;
-                    }
-
-                    let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
-                    let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
-                    output_type.sharding().map(|sharding| sharding.mesh().clone())
-                };
-
-                if let Some(incoming) = incoming {
-                    mesh = Some(match mesh.take() {
-                        Some(existing_mesh) => merge_logical_meshes(existing_mesh, &incoming)?,
-                        None => incoming,
-                    });
-                }
-            }
-        }
-        Ok(mesh)
-    }
 }
 
 /// Derives the [`RegionPlacementRequests`] of the program that lowering emits for a region, and the devices that its
@@ -2700,7 +2569,7 @@ mod tests {
         assert_eq!(signature.output_mapping(), &[Some(0), None]);
         assert_eq!(signature.project_inputs(&[0, 1, 2]), vec![1, 2]);
         assert_eq!(signature.project_outputs(&[0, 1]), vec![0]);
-        assert_eq!(signature.physical_input_count(), 3);
+        assert_eq!(signature.input_count(), 3);
         assert_eq!(signature.input_dimensions().len(), 1);
         assert_eq!(signature.input_dimensions()[0].logical_input_index(), 2);
         assert_eq!(signature.input_dimensions()[0].axis(), 0);
@@ -2726,7 +2595,7 @@ mod tests {
         assert_eq!(signature.unread_inputs(), &[true, true, false, false, false]);
         assert_eq!([0, 1, 2].map(|index| signature.is_unread_input(index)), [true, true, false]);
         assert_eq!(signature.input_dimensions()[0].physical_input_index(), 2);
-        assert_eq!(signature.physical_input_count(), 3);
+        assert_eq!(signature.input_count(), 3);
     }
 
     #[test]
@@ -2743,10 +2612,10 @@ mod tests {
         assert!(!signature.has_effects());
         assert_eq!(signature.ordered_io_input_index(), None);
         assert_eq!(signature.ordered_io_output_index(), None);
-        assert_eq!(signature.array_input_count(), 3);
-        assert_eq!(signature.array_output_count(), 3);
-        assert_eq!(signature.physical_input_count(), 3);
-        assert_eq!(signature.physical_output_count(), 3);
+        assert_eq!(signature.input_array_count(), 3);
+        assert_eq!(signature.output_array_count(), 3);
+        assert_eq!(signature.input_count(), 3);
+        assert_eq!(signature.output_count(), 3);
 
         // Ordered I/O appends one token after every array and hidden extent input and output.
         let ordered = signature.clone().with_effects(true, false, false, true);
@@ -2756,10 +2625,10 @@ mod tests {
         assert!(ordered.has_effects());
         assert_eq!(ordered.ordered_io_input_index(), Some(3));
         assert_eq!(ordered.ordered_io_output_index(), Some(3));
-        assert_eq!(ordered.array_input_count(), 3);
-        assert_eq!(ordered.array_output_count(), 3);
-        assert_eq!(ordered.physical_input_count(), 4);
-        assert_eq!(ordered.physical_output_count(), 4);
+        assert_eq!(ordered.input_array_count(), 3);
+        assert_eq!(ordered.output_array_count(), 3);
+        assert_eq!(ordered.input_count(), 4);
+        assert_eq!(ordered.output_count(), 4);
 
         // Device ordering only applies together with ordered I/O, while unordered I/O and runtime assertions still
         // participate in the effect barrier.
@@ -2767,7 +2636,7 @@ mod tests {
         assert!(!unordered.has_device_ordered_io());
         assert!(unordered.has_unordered_io());
         assert!(unordered.has_effects());
-        assert_eq!(unordered.physical_input_count(), 3);
+        assert_eq!(unordered.input_count(), 3);
         let asserting = signature.with_effects(false, false, true, false);
         assert!(asserting.requires_assertion_handler());
         assert!(asserting.has_effects());
@@ -2864,6 +2733,298 @@ mod tests {
         let options = options.with_exact_input_shardings(shardings.clone()).with_exact_output_shardings(vec![None]);
         assert_eq!(options.exact_input_shardings(), Some(&EntryShardingOverride::Values(shardings)));
         assert_eq!(options.exact_output_shardings(), Some(&EntryShardingOverride::Values(vec![None])));
+    }
+
+    #[test]
+    fn test_program_to_mlir_declares_the_mesh_of_lowered_shardings() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 2);
+        let input_type = test_vector_type(4);
+        let mut builder = ProgramBuilder::<ArrayConstant, ArrayOperation<ArrayConstant>>::new();
+        let input = builder.add_input(input_type.clone());
+        builder
+            .add_instruction(
+                ReshapeOperation::new(vec![4], vec![2, 2]).with_output_sharding(sharding),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![Placeholder], vec![])
+            .unwrap()
+            .into_unprojected::<Constant, Operation>()
+            .unwrap();
+
+        // The mesh exists only on an internal value. The module still declares the symbol that the constraint of the
+        // reshape refers to, even though neither the signature nor a sharding operation supplies it.
+        let lowered = program.to_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap();
+        assert_eq!(lowered.mesh(), Some(&mesh));
+        assert_eq!(
+            lowered.into_stable_hlo(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32>) {
+                    %0 = stablehlo.reshape %arg0 : (tensor<4xf32>) -> tensor<2x2xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{}, {}], replicated={"x"}> : tensor<2x2xf32>
+                    return
+                  }
+                }
+            "#},
+        );
+
+        // The sharding of a type alone refers to no mesh, so a module in which no sharding is lowered declares none.
+        let mut builder = ProgramBuilder::<ArrayConstant, ArrayOperation<ArrayConstant>>::new();
+        builder.add_input(input_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap());
+        let metadata_only = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![Placeholder], vec![])
+            .unwrap()
+            .into_unprojected::<Constant, Operation>()
+            .unwrap();
+        let lowered =
+            metadata_only.to_mlir("main", &ProgramLoweringOptions::new().without_boundary_shardings()).unwrap();
+        assert_eq!(lowered.mesh(), None);
+        assert_eq!(
+            lowered.into_stable_hlo(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) {
+                    return
+                  }
+                }
+            "},
+        );
+
+        // The mesh of a cast that changes the explicit placement of its input can be the only mesh that the module
+        // refers to, including when the output of the cast is internal.
+        let output_type = input_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
+        for operation in [
+            CastOperation::<Type>::checked(output_type.clone().into(), vec![input_type.clone().into()])
+                .unwrap()
+                .into(),
+            Operation::Array(ArrayOperation::Cast(
+                CastOperation::checked(output_type, vec![input_type.clone()]).unwrap(),
+            )),
+        ] {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let input = builder.add_input(input_type.clone().into());
+            builder.add_instruction(operation, vec![], vec![input], None).unwrap();
+            let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder], vec![]).unwrap();
+            let lowered = program.to_mlir("main", &ProgramLoweringOptions::new()).unwrap();
+            assert_eq!(lowered.mesh(), Some(&mesh));
+            assert_eq!(
+                lowered.into_stable_hlo(),
+                indoc! {r#"
+                    module {
+                      sdy.mesh @mesh = <["x"=2]>
+                      func.func @main(%arg0: tensor<4xf32>) {
+                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{}], replicated={"x"}> : tensor<4xf32>
+                        return
+                      }
+                    }
+                "#},
+            );
+        }
+    }
+
+    #[test]
+    fn test_program_to_mlir_requires_one_mesh_topology() {
+        let mesh_2x2 = |names: [&str; 2], r#type: MeshAxisType| {
+            LogicalMesh::new(names.map(|name| MeshAxis::new(name, 2, r#type).unwrap()).to_vec()).unwrap()
+        };
+        let mesh = mesh_2x2(["x", "y"], MeshAxisType::Explicit);
+        let input_type = test_vector_type(4);
+        let mut builder = ProgramBuilder::<ArrayConstant, ArrayOperation<ArrayConstant>>::new();
+        let input = builder.add_input(input_type.clone());
+        builder
+            .add_instruction(
+                ReshapeOperation::new(vec![4], vec![2, 2]).with_output_sharding(Sharding::replicated(mesh.clone(), 2)),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![Placeholder], vec![])
+            .unwrap()
+            .into_unprojected::<Constant, Operation>()
+            .unwrap();
+        // The signature places the input over `signature_mesh`, while the constraint of the reshape refers to `mesh`.
+        let lower = |signature_mesh: &LogicalMesh| {
+            program.to_mlir(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&vec![input_type.clone()])
+                    .with_output_types(&Vec::<ArrayType>::new())
+                    .without_boundary_shardings()
+                    .with_exact_input_shardings(vec![Some(Sharding::replicated(signature_mesh.clone(), 1))]),
+            )
+        };
+
+        // Device ids follow the order of the axes of the module mesh, so a reordered mesh is another topology.
+        let reordered = mesh_2x2(["y", "x"], MeshAxisType::Explicit);
+        assert!(matches!(
+            lower(&reordered),
+            Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
+                if expected == reordered && actual == mesh,
+        ));
+        assert_eq!(
+            LoweringError::MismatchedMeshTopology { expected: reordered, actual: mesh.clone() }.to_string(),
+            "mesh `['x'=2:explicit, 'y'=2:explicit]` does not have the topology of the module mesh \
+             `['y'=2:explicit, 'x'=2:explicit]`",
+        );
+
+        // Meshes with other axes are not merged into a union.
+        let other_axes = mesh_2x2(["x", "z"], MeshAxisType::Explicit);
+        assert!(matches!(
+            lower(&other_axes),
+            Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
+                if expected == other_axes && actual == mesh,
+        ));
+
+        // A mesh with other axis sizes is another topology as well.
+        let other_sizes = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            lower(&other_sizes),
+            Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
+                if expected == other_sizes && actual == mesh,
+        ));
+
+        // Meshes that differ only in axis types share the module mesh, which keeps the axis types of the first mesh
+        // that lowering refers to, which is that of the signature.
+        let manual = mesh_2x2(["x", "y"], MeshAxisType::Manual);
+        let lowered = lower(&manual).unwrap();
+        assert_eq!(lowered.mesh(), Some(&manual));
+        assert_eq!(
+            lowered.into_stable_hlo(),
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>
+                  func.func @main(%arg0: tensor<4xf32> \
+                      {sdy.sharding = #sdy.sharding<@mesh, [{}], replicated={\"x\", \"y\"}>}) {
+                    %0 = stablehlo.reshape %arg0 : (tensor<4xf32>) -> tensor<2x2xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{}, {}], replicated={\"x\", \"y\"}> : tensor<2x2xf32>
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_program_to_mlir_declares_no_mesh_for_bodies_that_the_target_replaces() {
+        // A named composite call whose body places its input on another mesh refers to that mesh where lowering emits
+        // the body, and to none on a target whose backend implementation replaces the whole call
+        // (`ryft.tests.xla_named_square` version 1 on CUDA, refer to `omits_regions`), which never lowers the body,
+        // as the validation of placements skips it.
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let other = LogicalMesh::new(vec![MeshAxis::new("other", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let other_devices = DeviceMesh::new(other.clone(), vec![Device::new(2, 0), Device::new(3, 0)]).unwrap();
+        let placement = Placement::new(other_devices, Sharding::replicated(other.clone(), 1)).unwrap();
+        let body = {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let input = builder.add_input(vector_type.clone().into());
+            let operation = PlaceOperation::new(PlacementRequest::from(placement), None);
+            let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+            Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
+        };
+        let key = CompositeKey::new("ryft.tests.xla_named_square".to_string(), 1);
+        let named = NamedComposite::new(key, |types: &[Type]| Ok(types.to_vec()), |inputs| Ok(vec![inputs[0].clone()]));
+        let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("placing").with_named_composite(named));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(vector_type.into());
+        let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
+        let regions = vec![builder.intern_callee(&body, None).unwrap()];
+        let output = builder.add_instruction(operation, regions, vec![input], None).unwrap()[0];
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder]);
+        let program = program.unwrap();
+        let lower = |target_platform| {
+            let options = ProgramLoweringOptions::new().with_target_platform(Some(target_platform));
+            program.to_mlir("main", &options).unwrap()
+        };
+        assert_eq!(lower("cuda").mesh(), None);
+        assert_eq!(lower("cpu").mesh(), Some(&other));
+    }
+
+    #[test]
+    fn test_program_to_mlir_declares_the_mesh_of_call_boundaries() {
+        // A call constrains its output to the override of the boundary of its callee, which no type records because the
+        // override is over an auto mesh axis, so the module declares the mesh of the override even when it is lowered
+        // without signature shardings, both for a static program and for one with a bounded dynamic value. The call
+        // also constrains its input replicated over that mesh, as an execution of its callee, whose input type has no
+        // sharding, places its input (refer to `CallOperation::boundary_input_sharding`).
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let lower = |array_type: ArrayType| {
+            let callee = {
+                let mut builder = ProgramBuilder::<Constant, Operation>::new();
+                let input = builder.add_input(array_type.clone().into());
+                Arc::new(
+                    builder
+                        .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+                        .unwrap(),
+                )
+            };
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let input = builder.add_input(array_type.clone().into());
+            let callee_region = builder.intern_callee(&callee, None).unwrap();
+            let call =
+                CallOperation::new(0).with_boundary(Some(&device_mesh), Vec::new(), vec![Some(replicated.clone())]);
+            let output =
+                builder.add_instruction(Operation::Call(call), vec![callee_region], vec![input], None).unwrap()[0];
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let types = vec![array_type];
+            let lowered = program
+                .to_mlir(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .with_input_types(&types)
+                        .with_output_types(&types)
+                        .without_boundary_shardings(),
+                )
+                .unwrap();
+            assert_eq!(lowered.mesh(), Some(&mesh));
+            lowered.into_stable_hlo()
+        };
+        assert_eq!(
+            lower(test_vector_type(4)),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{}]> : tensor<4xf32>
+                    return %1 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+        let length = DimensionVariable::new("length", DimensionBounds::new(1, Some(4)).unwrap());
+        assert_eq!(
+            lower(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length)]))),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<3xf32>, %arg1: tensor<i32>) -> (tensor<?xf32, #stablehlo.bounds<3>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<3xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<3>>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{}]> : tensor<?xf32, #stablehlo.bounds<3>>
+                    %2 = sdy.sharding_constraint %1 <@mesh, [{}]> : tensor<?xf32, #stablehlo.bounds<3>>
+                    %3 = stablehlo.get_dimension_size %2, dim = 0 : (tensor<?xf32, #stablehlo.bounds<3>>) -> tensor<i32>
+                    %4 = stablehlo.convert %3 : (tensor<i32>) -> tensor<i64>
+                    return %2, %4 : tensor<?xf32, #stablehlo.bounds<3>>, tensor<i64>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
@@ -3589,282 +3750,6 @@ mod tests {
             let output = function.executable().execute(&session, input.clone()).unwrap();
             assert_eq!((name, output.sharding()), (name, &split));
         }
-    }
-
-    #[test]
-    fn test_program_nested_sharding_mesh() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharding = Sharding::replicated(mesh.clone(), 2);
-        let input_type = test_vector_type(4);
-        let mut builder = ProgramBuilder::<ArrayConstant, ArrayOperation<ArrayConstant>>::new();
-        let input = builder.add_input(input_type.clone());
-        builder
-            .add_instruction(
-                ReshapeOperation::new(vec![4], vec![2, 2]).with_output_sharding(sharding),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap();
-        let program = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![Placeholder], vec![])
-            .unwrap()
-            .into_unprojected::<Constant, Operation>()
-            .unwrap();
-        assert_eq!(program.nested_sharding_mesh(None, None).unwrap(), Some(mesh.clone()));
-        // The mesh exists only on an internal value. Lowering must still declare the symbol referenced by its
-        // reshape constraint, even though neither the signature nor an explicit sharding operation supplies it.
-        program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
-        let mut builder = ProgramBuilder::<ArrayConstant, ArrayOperation<ArrayConstant>>::new();
-        builder.add_input(input_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap());
-        let metadata_only = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![Placeholder], vec![])
-            .unwrap()
-            .into_unprojected::<Constant, Operation>()
-            .unwrap();
-        assert_eq!(metadata_only.nested_sharding_mesh(None, None).unwrap(), None);
-        let incompatible = LogicalMesh::new(vec![MeshAxis::new("x", 3, MeshAxisType::Explicit).unwrap()]).unwrap();
-        assert!(matches!(
-            program.nested_sharding_mesh(Some(incompatible.clone()), None),
-            Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
-                if expected == incompatible && actual == mesh,
-        ));
-        assert!(matches!(
-            program.to_rendered_mlir(
-                "main",
-                &ProgramLoweringOptions::new()
-                    .without_pruning()
-                    .with_input_types(&vec![input_type])
-                    .with_output_types(&Vec::<ArrayType>::new())
-                    .without_boundary_shardings()
-                    .with_exact_input_shardings(vec![Some(Sharding::replicated(incompatible.clone(), 1))]),
-            ),
-            Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
-                if expected == incompatible && actual == mesh,
-        ));
-
-        // Cast placement can be the module's only mesh use, including when its output is internal.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let input_type = test_vector_type(4);
-        let output_type = input_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
-        for operation in [
-            CastOperation::<Type>::checked(output_type.clone().into(), vec![input_type.clone().into()])
-                .unwrap()
-                .into(),
-            Operation::Array(ArrayOperation::Cast(
-                CastOperation::checked(output_type, vec![input_type.clone()]).unwrap(),
-            )),
-        ] {
-            let mut builder = ProgramBuilder::<Constant, Operation>::new();
-            let input = builder.add_input(input_type.clone().into());
-            builder.add_instruction(operation, vec![], vec![input], None).unwrap();
-            let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder], vec![]).unwrap();
-            assert_eq!(program.nested_sharding_mesh(None, None).unwrap(), Some(mesh.clone()));
-            assert_eq!(
-                program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
-                indoc! {r#"
-                    module {
-                      sdy.mesh @mesh = <["x"=2]>
-                      func.func @main(%arg0: tensor<4xf32>) {
-                        %0 = sdy.sharding_constraint %arg0 <@mesh, [{}], replicated={"x"}> : tensor<4xf32>
-                        return
-                      }
-                    }
-                "#},
-            );
-        }
-    }
-
-    #[test]
-    fn test_program_nested_sharding_mesh_requires_one_topology() {
-        let mesh_2x2 = |names: [&str; 2], r#type: MeshAxisType| {
-            LogicalMesh::new(names.map(|name| MeshAxis::new(name, 2, r#type).unwrap()).to_vec()).unwrap()
-        };
-        let mesh = mesh_2x2(["x", "y"], MeshAxisType::Explicit);
-        let input_type = test_vector_type(4);
-        let mut builder = ProgramBuilder::<ArrayConstant, ArrayOperation<ArrayConstant>>::new();
-        let input = builder.add_input(input_type.clone());
-        builder
-            .add_instruction(
-                ReshapeOperation::new(vec![4], vec![2, 2]).with_output_sharding(Sharding::replicated(mesh.clone(), 2)),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap();
-        let program = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![Placeholder], vec![])
-            .unwrap()
-            .into_unprojected::<Constant, Operation>()
-            .unwrap();
-
-        // Device ids follow the order of the axes of the module mesh, so a reordered mesh is another topology.
-        let reordered = mesh_2x2(["y", "x"], MeshAxisType::Explicit);
-        assert!(matches!(
-            program.nested_sharding_mesh(Some(reordered.clone()), None),
-            Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
-                if expected == reordered && actual == mesh,
-        ));
-        assert!(matches!(
-            program.to_rendered_mlir(
-                "main",
-                &ProgramLoweringOptions::new()
-                    .without_pruning()
-                    .with_input_types(&vec![input_type.clone()])
-                    .with_output_types(&Vec::<ArrayType>::new())
-                    .without_boundary_shardings()
-                    .with_exact_input_shardings(vec![Some(Sharding::replicated(reordered.clone(), 1))]),
-            ),
-            Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
-                if expected == reordered && actual == mesh,
-        ));
-        assert_eq!(
-            LoweringError::MismatchedMeshTopology { expected: reordered, actual: mesh.clone() }.to_string(),
-            "mesh `['x'=2:explicit, 'y'=2:explicit]` does not have the topology of the module mesh \
-             `['y'=2:explicit, 'x'=2:explicit]`",
-        );
-
-        // Meshes with other axes are not merged into a union.
-        let other_axes = mesh_2x2(["x", "z"], MeshAxisType::Explicit);
-        assert!(matches!(
-            program.nested_sharding_mesh(Some(other_axes.clone()), None),
-            Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
-                if expected == other_axes && actual == mesh,
-        ));
-
-        // Meshes that differ only in axis types share the module mesh, which keeps the axis types of its first mesh.
-        let manual = mesh_2x2(["x", "y"], MeshAxisType::Manual);
-        assert_eq!(program.nested_sharding_mesh(Some(manual.clone()), None).unwrap(), Some(manual.clone()));
-        assert_eq!(
-            program
-                .to_rendered_mlir(
-                    "main",
-                    &ProgramLoweringOptions::new()
-                        .without_pruning()
-                        .with_input_types(&vec![input_type])
-                        .with_output_types(&Vec::<ArrayType>::new())
-                        .without_boundary_shardings()
-                        .with_exact_input_shardings(vec![Some(Sharding::replicated(manual, 1))])
-                )
-                .unwrap(),
-            indoc! {"
-                module {
-                  sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>
-                  func.func @main(%arg0: tensor<4xf32> \
-                      {sdy.sharding = #sdy.sharding<@mesh, [{}], replicated={\"x\", \"y\"}>}) {
-                    %0 = stablehlo.reshape %arg0 : (tensor<4xf32>) -> tensor<2x2xf32>
-                    %1 = sdy.sharding_constraint %0 <@mesh, [{}, {}], replicated={\"x\", \"y\"}> : tensor<2x2xf32>
-                    return
-                  }
-                }
-            "},
-        );
-    }
-
-    #[test]
-    fn test_program_nested_sharding_mesh_skips_bodies_that_the_target_replaces() {
-        // A named composite call whose body places its input on another mesh contributes that mesh where lowering
-        // emits the body, and nothing on a target whose backend implementation replaces the whole call
-        // (`ryft.tests.xla_named_square` version 1 on CUDA, refer to `omits_regions`), which never lowers the body,
-        // as the validation of placements skips it.
-        let vector_type = ArrayType::new_static(DataType::F32, [4]);
-        let other = LogicalMesh::new(vec![MeshAxis::new("other", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let other_devices = DeviceMesh::new(other.clone(), vec![Device::new(2, 0), Device::new(3, 0)]).unwrap();
-        let placement = Placement::new(other_devices, Sharding::replicated(other.clone(), 1)).unwrap();
-        let body = {
-            let mut builder = ProgramBuilder::<Constant, Operation>::new();
-            let input = builder.add_input(vector_type.clone().into());
-            let operation = PlaceOperation::new(PlacementRequest::from(placement), None);
-            let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
-            Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
-        };
-        let key = CompositeKey::new("ryft.tests.xla_named_square".to_string(), 1);
-        let named = NamedComposite::new(key, |types: &[Type]| Ok(types.to_vec()), |inputs| Ok(vec![inputs[0].clone()]));
-        let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("placing").with_named_composite(named));
-        let mut builder = ProgramBuilder::<Constant, Operation>::new();
-        let input = builder.add_input(vector_type.into());
-        let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
-        let regions = vec![builder.intern_callee(&body, None).unwrap()];
-        let output = builder.add_instruction(operation, regions, vec![input], None).unwrap()[0];
-        let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder]);
-        let program = program.unwrap();
-        let mesh = |target_platform| program.nested_sharding_mesh(None, target_platform).unwrap();
-        assert_eq!(mesh(Some("cuda")), None);
-        assert_eq!(mesh(Some("cpu")), Some(other));
-    }
-
-    #[test]
-    fn test_program_nested_sharding_mesh_includes_call_boundaries() {
-        // A call constrains its output to the override of the boundary of its callee, which no type records because the
-        // override is over an auto mesh axis, so the module declares the mesh of the override even when it is lowered
-        // without signature shardings, both for a static program and for one with a bounded dynamic value. The call
-        // also constrains its input replicated over that mesh, as an execution of its callee, whose input type has no
-        // sharding, places its input (refer to `CallOperation::boundary_input_sharding`).
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
-        let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
-        let replicated = Sharding::replicated(mesh.clone(), 1);
-        let lower = |array_type: ArrayType| {
-            let callee = {
-                let mut builder = ProgramBuilder::<Constant, Operation>::new();
-                let input = builder.add_input(array_type.clone().into());
-                Arc::new(
-                    builder
-                        .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
-                        .unwrap(),
-                )
-            };
-            let mut builder = ProgramBuilder::<Constant, Operation>::new();
-            let input = builder.add_input(array_type.clone().into());
-            let callee_region = builder.intern_callee(&callee, None).unwrap();
-            let call =
-                CallOperation::new(0).with_boundary(Some(&device_mesh), Vec::new(), vec![Some(replicated.clone())]);
-            let output =
-                builder.add_instruction(Operation::Call(call), vec![callee_region], vec![input], None).unwrap()[0];
-            let program = builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap();
-            assert_eq!(program.nested_sharding_mesh(None, None).unwrap(), Some(mesh.clone()));
-            let types = vec![array_type];
-            program
-                .to_rendered_mlir(
-                    "main",
-                    &ProgramLoweringOptions::new()
-                        .with_input_types(&types)
-                        .with_output_types(&types)
-                        .without_boundary_shardings(),
-                )
-                .unwrap()
-        };
-        assert_eq!(
-            lower(test_vector_type(4)),
-            indoc! {r#"
-                module {
-                  sdy.mesh @mesh = <["x"=2]>
-                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
-                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}]> : tensor<4xf32>
-                    %1 = sdy.sharding_constraint %0 <@mesh, [{}]> : tensor<4xf32>
-                    return %1 : tensor<4xf32>
-                  }
-                }
-            "#},
-        );
-        let length = DimensionVariable::new("length", DimensionBounds::new(1, Some(4)).unwrap());
-        assert_eq!(
-            lower(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(length)]))),
-            indoc! {r#"
-                module {
-                  sdy.mesh @mesh = <["x"=2]>
-                  func.func @main(%arg0: tensor<3xf32>, %arg1: tensor<i32>) -> (tensor<?xf32, #stablehlo.bounds<3>>, tensor<i64>) {
-                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<3xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<3>>
-                    %1 = sdy.sharding_constraint %0 <@mesh, [{}]> : tensor<?xf32, #stablehlo.bounds<3>>
-                    %2 = sdy.sharding_constraint %1 <@mesh, [{}]> : tensor<?xf32, #stablehlo.bounds<3>>
-                    %3 = stablehlo.get_dimension_size %2, dim = 0 : (tensor<?xf32, #stablehlo.bounds<3>>) -> tensor<i32>
-                    %4 = stablehlo.convert %3 : (tensor<i32>) -> tensor<i64>
-                    return %2, %4 : tensor<?xf32, #stablehlo.bounds<3>>, tensor<i64>
-                  }
-                }
-            "#},
-        );
     }
 
     #[test]
