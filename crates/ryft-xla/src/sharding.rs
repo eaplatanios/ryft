@@ -3,10 +3,7 @@
 //! [`OpShardingExtension`] recovers the [`Sharding`] that an XLA [`OpSharding`] describes (e.g., for executable
 //! outputs whose placement the compiler chose).
 
-use ryft_core::{
-    DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProgramError, Sharding, ShardingDimension, ShardingError,
-    UnreducedKind,
-};
+use ryft_core::{LogicalMesh, MeshAxisType, ProgramError, Sharding, ShardingDimension, ShardingError, UnreducedKind};
 use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, BlockRef, Location, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 use ryft_pjrt::protos::{OpSharding, OpShardingType};
@@ -277,45 +274,6 @@ impl OpShardingExtension for OpSharding {
     }
 }
 
-/// Derives device meshes for XLA placement decisions.
-pub(crate) trait DeviceMeshExtension: Sized {
-    /// Returns the mesh of the devices of this mesh at coordinate zero along its axes at `axis_indices`, in the order
-    /// of this mesh, whose logical mesh is that of this mesh with those axes of size one. Every sharding over this
-    /// mesh that neither splits a dimension along those axes nor reduces over them therefore places a value on the
-    /// returned mesh as it does on those devices of this mesh. It is this mesh itself when those axes have size one
-    /// already.
-    fn at_coordinate_zero(&self, axis_indices: &[usize]) -> Result<Self, Error>;
-}
-
-impl DeviceMeshExtension for DeviceMesh {
-    fn at_coordinate_zero(&self, axis_indices: &[usize]) -> Result<Self, Error> {
-        let axes = self
-            .logical_mesh()
-            .axes()
-            .iter()
-            .enumerate()
-            .map(|(index, axis)| {
-                if axis_indices.contains(&index) {
-                    MeshAxis::new(axis.name(), 1, axis.r#type())
-                } else {
-                    Ok(axis.clone())
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let devices = self
-            .devices()
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| {
-                self.device_coordinates(*index)
-                    .is_some_and(|coordinates| axis_indices.iter().all(|&axis| coordinates[axis] == 0))
-            })
-            .map(|(_, device)| *device)
-            .collect();
-        Ok(Self::new(LogicalMesh::new(axes)?, devices)?)
-    }
-}
-
 /// Dimensions of a lowered Shardy tensor sharding that the compiler may still shard along the
 /// [`Auto`](MeshAxisType::Auto) axes of its mesh. Refer to [`ShardingExtension::lower`] for more information.
 #[derive(Copy, Clone, Debug)]
@@ -526,11 +484,11 @@ impl ShardingExtension for Sharding {
 pub(crate) mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_core::{ArrayType, DataType, Device, MeshAxis};
+    use ryft_core::{ArrayType, DataType, MeshAxis};
     use ryft_mlir::Context as MlirContext;
 
     use crate::lowering::types::ArrayTypeLoweringExtension;
-    use crate::tests::{device_mesh_2x2, logical_mesh_2x2, logical_mesh_3x2x1};
+    use crate::tests::{logical_mesh_2x2, logical_mesh_3x2x1};
 
     use super::*;
 
@@ -713,29 +671,6 @@ pub(crate) mod tests {
             ..tiled_op_sharding(vec![4], vec![], false)
         };
         assert_eq!(op_sharding.to_sharding(&mesh, 1), None);
-    }
-
-    #[test]
-    fn test_device_mesh_at_coordinate_zero() {
-        // The devices of a mesh are in row-major order, so device `2 * x + y` is at `(x, y)`.
-        let mesh = device_mesh_2x2();
-        let devices = mesh.devices();
-        let axis = |name: &str, size: usize| MeshAxis::new(name, size, MeshAxisType::Auto).unwrap();
-        let expected = |axes: Vec<MeshAxis>, devices: Vec<Device>| {
-            Ok(DeviceMesh::new(LogicalMesh::new(axes).unwrap(), devices).unwrap())
-        };
-        assert_eq!(
-            mesh.at_coordinate_zero(&[0]),
-            expected(vec![axis("x", 1), axis("y", 2)], vec![devices[0], devices[1]]),
-        );
-        assert_eq!(
-            mesh.at_coordinate_zero(&[1]),
-            expected(vec![axis("x", 2), axis("y", 1)], vec![devices[0], devices[2]]),
-        );
-        assert_eq!(mesh.at_coordinate_zero(&[0, 1]), expected(vec![axis("x", 1), axis("y", 1)], vec![devices[0]]));
-
-        // A mesh is unchanged when no axis is restricted.
-        assert_eq!(mesh.at_coordinate_zero(&[]), Ok(mesh.clone()));
     }
 
     #[test]

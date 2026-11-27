@@ -463,6 +463,49 @@ impl DeviceMesh {
             coordinates
         })
     }
+
+    /// Returns a mesh containing the devices at coordinate zero along the axes in `axis_indices`, in their original
+    /// order. The selected axes have size one in the returned mesh, and all axis names and types are preserved.
+    /// Repeated indices select the same axis. An empty list or a list of axes already of size one returns an
+    /// equivalent mesh.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardingError::MeshAxisIndexOutOfBounds`] if an index is greater than or equal to the rank of this
+    /// mesh.
+    pub fn at_coordinate_zero(&self, axis_indices: &[usize]) -> Result<Self, ShardingError> {
+        let rank = self.rank();
+        if let Some(index) = axis_indices.iter().copied().find(|&index| index >= rank) {
+            return Err(ShardingError::MeshAxisIndexOutOfBounds { index, rank });
+        }
+
+        let axes = self
+            .logical_mesh()
+            .axes()
+            .iter()
+            .enumerate()
+            .map(|(index, axis)| {
+                if axis_indices.contains(&index) {
+                    MeshAxis::new(axis.name(), 1, axis.r#type())
+                } else {
+                    Ok(axis.clone())
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let devices = self
+            .devices()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                self.device_coordinates(*index)
+                    .is_some_and(|coordinates| axis_indices.iter().all(|&axis| coordinates[axis] == 0))
+            })
+            .map(|(_, device)| *device)
+            .collect();
+
+        Self::new(LogicalMesh::new(axes)?, devices)
+    }
 }
 
 /// Renders a [`MeshAxis`] name inside single quotes, escaping it with Rust's character escaping. [`MeshAxis::new`] only
@@ -737,5 +780,34 @@ mod tests {
             ),
             Err(ShardingError::DuplicateDeviceId { id }) if id == 0,
         ));
+    }
+
+    #[test]
+    fn test_device_mesh_at_coordinate_zero() {
+        let x = |size| MeshAxis::new("x", size, MeshAxisType::Explicit).unwrap();
+        let y = |size| MeshAxis::new("y", size, MeshAxisType::Manual).unwrap();
+        let devices = [Device::new(3, 0), Device::new(2, 0), Device::new(1, 1), Device::new(0, 1)];
+        let mesh = DeviceMesh::new(LogicalMesh::new(vec![x(2), y(2)]).unwrap(), devices.to_vec()).unwrap();
+
+        assert_eq!(
+            mesh.at_coordinate_zero(&[0]),
+            DeviceMesh::new(LogicalMesh::new(vec![x(1), y(2)]).unwrap(), vec![devices[0], devices[1]]),
+        );
+        assert_eq!(
+            mesh.at_coordinate_zero(&[1]),
+            DeviceMesh::new(LogicalMesh::new(vec![x(2), y(1)]).unwrap(), vec![devices[0], devices[2]]),
+        );
+        let single_device = DeviceMesh::new(LogicalMesh::new(vec![x(1), y(1)]).unwrap(), vec![devices[0]]);
+        assert_eq!(mesh.at_coordinate_zero(&[0, 1]), single_device);
+        assert_eq!(mesh.at_coordinate_zero(&[1, 0, 1]), single_device);
+        assert_eq!(mesh.at_coordinate_zero(&[]), Ok(mesh.clone()));
+    }
+
+    #[test]
+    fn test_device_mesh_at_coordinate_zero_rejects_out_of_bounds_axes() {
+        let mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![Device::new(0, 0)]).unwrap();
+        let error = ShardingError::MeshAxisIndexOutOfBounds { index: 1, rank: 1 };
+        assert_eq!(mesh.at_coordinate_zero(&[0, 1]), Err(error.clone()));
+        assert_eq!(error.to_string(), "mesh axis index 1 is out of bounds for a mesh of rank 1");
     }
 }

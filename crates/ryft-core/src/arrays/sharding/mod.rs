@@ -21,6 +21,9 @@ pub enum ShardingError {
     #[error("unknown mesh axis name: `{name}`")]
     UnknownMeshAxisName { name: String },
 
+    #[error("mesh axis index {index} is out of bounds for a mesh of rank {rank}")]
+    MeshAxisIndexOutOfBounds { index: usize, rank: usize },
+
     #[error("mesh axis name `{name}` appears more than once")]
     DuplicateMeshAxisName { name: String },
 

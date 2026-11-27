@@ -834,6 +834,7 @@ where
     }
 }
 
+// TODO(eaplatanios): Should we merge the two functions of this trait into `ShardingExtension`?
 /// Converts core shardings to the form in which runtime arrays store them.
 pub(crate) trait ShardingLoweringExtension {
     /// Returns this sharding with its unconstrained dimensions replicated (refer to

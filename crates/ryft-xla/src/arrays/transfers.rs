@@ -209,7 +209,6 @@ use crate::arrays::shards::{
 use crate::arrays::{Array, ArrayError};
 use crate::devices::{PjrtDeviceExtension, devices_span_processes};
 use crate::sessions::synchronization::WorkReservation;
-use crate::sharding::DeviceMeshExtension;
 use crate::types::DataTypeExtension;
 use crate::{
     CompiledFunction, Constant, Error, FromPjrt, LoweringError, Operation, Options, Session, ToPjrt, Type, stage,
@@ -2410,12 +2409,11 @@ impl Array {
     }
 
     /// Returns this array restricted to `mesh`, whose devices are devices of this array and whose logical mesh is that
-    /// of this array with some axes of size one (refer to [`DeviceMeshExtension::at_coordinate_zero`]), along which
-    /// this array must be replicated, so that the shards of those devices hold its whole value. The result has the
-    /// sharding of this array over `mesh` and keeps the fences, the commitment, and the locally assigned devices of
-    /// this array. It shares the buffers of those devices, and a device of this process without its own buffer receives
-    /// a copy of another local replica of its contribution, or a new empty buffer for a shard without elements (refer
-    /// to [`Self::buffer_for_local_contribution`]), whose readiness the execution fence of the result joins, and the
+    /// of this array with some axes of size one, along which this array must be replicated, so that the shards of those
+    /// devices hold its whole value. The result has the sharding of this array over `mesh` and keeps the fences, the
+    /// commitment, and the locally assigned devices of this array. It shares the buffers of those devices, and a device
+    /// of this process without its own buffer receives a copy of another local replica of its contribution, or a new
+    /// empty buffer for a shard without elements, whose readiness the execution fence of the result joins, and the
     /// restriction fails when no such replica exists. The execution fence of the result also joins the readiness of
     /// every buffer of this array whose shard has no elements (refer to
     /// [`PlacementCompletion::track_empty_shard_buffers`]).
@@ -3101,8 +3099,7 @@ enum DevicePlacementStrategy {
     /// [`PlacementPlanningView::strategy`] and [`Array::place_with_strategy`] for more information.
     IntroducedSums {
         /// Mesh of the first step, which is the mesh of the devices at coordinate zero along the introduced axes (refer
-        /// to [`DeviceMeshExtension::at_coordinate_zero`]), or the target mesh when the array cannot be placed
-        /// there directly.
+        /// to [`DeviceMesh::at_coordinate_zero`]), or the target mesh when the array cannot be placed there directly.
         mesh: DeviceMesh,
 
         /// Target sharding without the pending sums that the target introduces, over `mesh`.
@@ -4217,9 +4214,9 @@ fn gathered_sharding(input: &Sharding, output: &Sharding, mesh: &LogicalMesh, ra
 
 /// Returns `sharding` over `mesh`, a logical mesh with the axes of the mesh of `sharding` in the same
 /// order and with the same names and types, some of which may have another size (e.g., the logical mesh of
-/// [`DeviceMeshExtension::at_coordinate_zero`]), with the same placement, reduction state, and manual variation.
-/// Unlike [`Sharding::with_mesh`], which requires the same topology, this lets a sharding that splits no dimension
-/// along a resized axis describe the same shards on the devices that remain.
+/// [`DeviceMesh::at_coordinate_zero`]), with the same placement, reduction state, and manual variation. Unlike
+/// [`Sharding::with_mesh`], which requires the same topology, this lets a sharding that splits no dimension along
+/// a resized axis describe the same shards on the devices that remain.
 fn sharding_on_mesh(sharding: &Sharding, mesh: &LogicalMesh) -> Result<Sharding, Error> {
     Ok(Sharding::new(mesh.clone(), sharding.dimensions().to_vec())?
         .with_unreduced_axes(sharding.unreduced_axes().clone())?
