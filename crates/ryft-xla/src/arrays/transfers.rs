@@ -4326,6 +4326,7 @@ fn validate_reduction_transition(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -4628,6 +4629,19 @@ mod tests {
         assert_eq!(buffer.on_device_size_in_bytes().unwrap(), 4096);
         assert_eq!(buffer.specification().unwrap().layout, ryft_pjrt::Layout::dense_major_to_minor(1));
         padded
+    }
+
+    /// Returns the move of the elements `[0, 2)` from the first source shard on `source` to the first target shard on
+    /// `target` with the transfer key `transfer_key`.
+    fn shard_move(source: Device, target: Device, transfer_key: CrossHostTransferKey) -> ShardMove {
+        ShardMove {
+            source_shard_index: 0,
+            source_device: source,
+            target_shard_index: 0,
+            target_device: target,
+            slice: vec![0..2],
+            transfer_key,
+        }
     }
 
     #[test]
@@ -7561,6 +7575,43 @@ mod tests {
     }
 
     #[test]
+    fn test_array_local_replica_shard() {
+        // A replicated array that holds only its replica on the second device serves the first shard from that
+        // replica, whichever target the move has, and the second shard from its own buffer.
+        let client = cpu_client(2);
+        let session = Session::builder().client(client).build().unwrap();
+        let client_devices = client.addressable_devices().unwrap();
+        let process_index = client.process_index().unwrap();
+        let mesh = two_device_mesh(client, MeshAxisType::Explicit);
+        let devices = mesh.devices().to_vec();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let values = values_to_bytes(&[1f32, 2.]);
+        let buffer = client.buffer(values.as_slice(), BufferType::F32, [2u64], None, client_devices[1].clone(), None);
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let source =
+            Array::from_addressable_buffers(&session, r#type, mesh.clone(), Some(replicated), vec![buffer.unwrap()]);
+        let source = source.unwrap();
+        let held = source.shards()[1].buffer().unwrap();
+        let replicas = LocalReplicas::new(process_index);
+        let selected = |preferred, target| {
+            let selected = source.local_replica_shard(&replicas, preferred, target);
+            selected.map(|(shard, buffer)| (shard.index(), Arc::ptr_eq(buffer, held)))
+        };
+        assert_eq!(selected(0, devices[0]), Ok((1, true)));
+        assert_eq!(selected(0, devices[1]), Ok((1, true)));
+        assert_eq!(selected(1, devices[1]), Ok((1, true)));
+
+        // A shard whose contribution has no replica with a buffer on this process cannot be served.
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let buffer = client.buffer([7u8].as_slice(), BufferType::U8, [1u64], None, client_devices[0].clone(), None);
+        let r#type = ArrayType::new_static(DataType::U8, [2]);
+        let source = Array::from_addressable_buffers(&session, r#type, mesh, Some(sharded), vec![buffer.unwrap()]);
+        let source = source.unwrap();
+        let error = Error::from(ArrayError::MissingShardBuffer { shard_index: 1, device_id: devices[1].id() });
+        assert_eq!(source.local_replica_shard(&LocalReplicas::new(process_index), 1, devices[1]).err(), Some(error));
+    }
+
+    #[test]
     fn test_array_buffer_on_send_device() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
@@ -7774,7 +7825,7 @@ mod tests {
     #[test]
     fn test_array_buffer_for_shard_region_sends_bounded_dynamic_shards_as_static_buffers() {
         // A whole shard of a bounded-dynamic result that a region sends is sent as a static buffer of the shape of the
-        // shard, as the receiver allocates it (refer to `test_array_buffer_for_cross_host_send_drops_dynamic_trailers`).
+        // shard, which is what the receiver allocates (refer to `Array::buffer_for_cross_host_send`).
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
@@ -8281,16 +8332,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let regions = |name| (name, Ok("shard regions".to_string()), Ok(0));
+        let introduced = Ok("shard regions with additive identities".to_string());
         assert_eq!(
             outcomes,
             [
                 regions("manual even split"),
                 regions("explicit uneven split"),
-                (
-                    "uneven split with an introduced sum",
-                    Ok("shard regions with additive identities".to_string()),
-                    Ok(2)
-                ),
+                ("uneven split with an introduced sum", introduced, Ok(2)),
             ],
         );
 
@@ -8867,10 +8915,38 @@ mod tests {
     }
 
     #[test]
+    fn test_placement_planning_view_contribution_missing_from() {
+        let mesh = explicit_mesh(&[Device::new(0, 0), Device::new(1, 1)]);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let sum = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let missing = |size: usize, sharding: &Sharding, process_index: ProcessIndex| {
+            let r#type = ArrayType::new_static(DataType::F32, [size]);
+            let (metadata, shards) = ArrayMetadata::new(r#type, Some(sharding.clone()), mesh.clone(), None).unwrap();
+            let view = PlacementPlanningView::new(&metadata, shards.iter());
+            view.contribution_missing_from(process_index).map(|shard| shard.index())
+        };
+
+        // Every process holds a replica of a replicated value, while each process misses the contribution of the
+        // other one to a pending sum. A shard without elements holds no contribution.
+        assert_eq!(missing(2, &replicated, 0), None);
+        assert_eq!(missing(2, &sum, 0), Some(1));
+        assert_eq!(missing(2, &sum, 1), Some(0));
+        assert_eq!(missing(0, &sum, 0), None);
+    }
+
+    #[test]
     fn test_placement_planning_view_shard_region_plan() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
         let devices = session.addressable_devices().unwrap();
+        let moves = |source: &Array, mesh: &DeviceMesh, sharding: &Sharding| {
+            let view = source.placement_planning_view();
+            let (plan, _) = view.shard_region_plan(&simulated_cross_host_layout, mesh, sharding).unwrap().unwrap();
+            let moves = plan.moves.into_iter();
+            let moves =
+                moves.map(|movement| (movement.source_shard_index, movement.target_shard_index, movement.slice));
+            moves.collect::<Vec<_>>()
+        };
 
         // A `[4, 6]` grid of four tiles of `[2, 3]` is placed in rows of `[1, 6]` on another mesh of the same devices.
         // Each row intersects the two tiles of its half of the rows, which it joins in the order of their columns.
@@ -8892,18 +8968,8 @@ mod tests {
             vec![ShardingDimension::sharded(["z"]), ShardingDimension::replicated()],
         )
         .unwrap();
-        let (plan, _) = source
-            .placement_planning_view()
-            .shard_region_plan(&simulated_cross_host_layout, &rows_mesh, &rows)
-            .unwrap()
-            .unwrap();
-        let moves = plan
-            .moves
-            .iter()
-            .map(|movement| (movement.source_shard_index, movement.target_shard_index, movement.slice.clone()))
-            .collect::<Vec<_>>();
         assert_eq!(
-            moves,
+            moves(&source, &rows_mesh, &rows),
             vec![
                 (0, 0, vec![0..1, 0..3]),
                 (1, 0, vec![0..1, 3..6]),
@@ -8925,17 +8991,10 @@ mod tests {
         let source =
             Array::from_addressable_buffers(&session, r#type, replicated_mesh, Some(replicated), Vec::new()).unwrap();
         let split = Sharding::new(rows_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["z"])]).unwrap();
-        let (plan, _) = source
-            .placement_planning_view()
-            .shard_region_plan(&simulated_cross_host_layout, &rows_mesh, &split)
-            .unwrap()
-            .unwrap();
-        let moves = plan
-            .moves
-            .iter()
-            .map(|movement| (movement.source_shard_index, movement.target_shard_index, movement.slice.clone()))
-            .collect::<Vec<_>>();
-        assert_eq!(moves, vec![(0, 0, vec![0..2]), (1, 1, vec![2..3]), (2, 2, vec![3..4]), (3, 3, vec![4..5])]);
+        assert_eq!(
+            moves(&source, &rows_mesh, &split),
+            vec![(0, 0, vec![0..2]), (1, 1, vec![2..3]), (2, 2, vec![3..4]), (3, 3, vec![4..5])],
+        );
 
         // The boundaries of a split of six elements over four devices (i.e., `[0, 2)`, `[2, 4)`, `[4, 5)`, and
         // `[5, 6)`) are offset from those of a split over two devices (i.e., `[0, 3)` and `[3, 6)`), so each
@@ -8949,20 +9008,203 @@ mod tests {
         .unwrap();
         let halves =
             Sharding::new(halves_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["w"])]).unwrap();
-        let (plan, _) = source
-            .placement_planning_view()
-            .shard_region_plan(&simulated_cross_host_layout, &halves_mesh, &halves)
-            .unwrap()
-            .unwrap();
-        let moves = plan
-            .moves
-            .iter()
-            .map(|movement| (movement.source_shard_index, movement.target_shard_index, movement.slice.clone()))
-            .collect::<Vec<_>>();
         assert_eq!(
-            moves,
+            moves(&source, &halves_mesh, &halves),
             vec![(0, 0, vec![0..2]), (1, 0, vec![2..3]), (1, 1, vec![3..4]), (2, 1, vec![4..5]), (3, 1, vec![5..6])],
         );
+    }
+
+    #[test]
+    fn test_placement_planning_view_shard_region_plan_declines_changes_of_contributions() {
+        // Completing a pending sum combines its contributions, which no region of a source shard holds.
+        let mesh = explicit_mesh(&[Device::new(0, 0), Device::new(1, 0)]);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let sum = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [4]);
+        let (metadata, shards) = ArrayMetadata::new(r#type, Some(sum), mesh.clone(), None).unwrap();
+        let view = PlacementPlanningView::new(&metadata, shards.iter());
+        assert_eq!(view.shard_region_plan(&simulated_cross_host_layout, &mesh, &replicated), Ok(None));
+    }
+
+    #[test]
+    fn test_device_placement_strategy_communicates() {
+        // Only moves between processes and programs on the devices of several processes communicate.
+        let exact = |target: Device| {
+            let plan = ShardMovePlan::new(BufferType::F32, vec![shard_move(Device::new(0, 0), target, 0)]).unwrap();
+            DevicePlacementStrategy::ExactShards { plan, cross_host_layouts: HashMap::new() }
+        };
+        let compiled = |devices: &[Device]| {
+            let mesh = explicit_mesh(devices);
+            let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+            let program = ReshardProgram { mesh, input: replicated.clone(), output: replicated };
+            DevicePlacementStrategy::CompiledReshard { program }
+        };
+        let introduced = |first: Option<DevicePlacementStrategy>| {
+            let mesh = explicit_mesh(&[Device::new(0, 0)]);
+            let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+            let (first, axis_indices) = (first.map(Box::new), vec![0]);
+            DevicePlacementStrategy::IntroducedSums { mesh, sharding, restrict_source: false, first, axis_indices }
+        };
+        let strategies = [
+            DevicePlacementStrategy::Bufferless,
+            DevicePlacementStrategy::ProcessLocalValue,
+            introduced(None),
+            introduced(Some(exact(Device::new(1, 1)))),
+            exact(Device::new(1, 1)),
+            exact(Device::new(1, 0)),
+            compiled(&[Device::new(0, 0), Device::new(1, 0)]),
+            compiled(&[Device::new(0, 0), Device::new(1, 1)]),
+        ];
+        assert_eq!(
+            strategies.iter().map(DevicePlacementStrategy::communicates).collect::<Vec<_>>(),
+            [false, false, false, true, true, false, false, true],
+        );
+    }
+
+    #[test]
+    fn test_device_placement_strategy_host_round_trip_cause() {
+        // A host round trip reports its cause, also as the strategy of an owner or as the first step of an introduced
+        // sum, and any other strategy reports none.
+        let round_trip = || {
+            let cause = HostRoundTripCause::Reduction { transition: "t".to_string(), remedy: "r" };
+            DevicePlacementStrategy::HostRoundTrip { cause, process_index: None }
+        };
+        let mesh = explicit_mesh(&[Device::new(0, 0)]);
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let on_owner = DevicePlacementStrategy::OnOwner { strategy: Box::new(round_trip()) };
+        let introduced = DevicePlacementStrategy::IntroducedSums {
+            mesh,
+            sharding,
+            restrict_source: false,
+            first: Some(Box::new(round_trip())),
+            axis_indices: vec![0],
+        };
+        for strategy in [round_trip(), on_owner, introduced] {
+            assert!(matches!(
+                strategy.host_round_trip_cause(),
+                Some(HostRoundTripCause::Reduction { transition, .. }) if transition == "t",
+            ));
+        }
+        let plan = ShardMovePlan::new(BufferType::F32, vec![shard_move(Device::new(0, 0), Device::new(1, 0), 0)]);
+        let exact = DevicePlacementStrategy::ExactShards { plan: plan.unwrap(), cross_host_layouts: HashMap::new() };
+        assert!(exact.host_round_trip_cause().is_none());
+    }
+
+    #[test]
+    fn test_shard_move_plan_new() {
+        // Only the moves that cross processes need device identifiers that PJRT cross-host transfers can represent.
+        let invalid_id = i32::MAX as usize + 1;
+        let local = shard_move(Device::new(invalid_id, 0), Device::new(0, 0), 0);
+        let plan = ShardMovePlan::new(BufferType::F32, vec![local.clone()]);
+        assert_eq!(plan, Ok(ShardMovePlan { element_type: BufferType::F32, moves: vec![local] }));
+        let remote = shard_move(Device::new(invalid_id, 0), Device::new(0, 1), 0);
+        let message =
+            format!("cross-host transfer device ID {invalid_id} exceeds the maximum allowed value of {}", i32::MAX);
+        assert_eq!(ShardMovePlan::new(BufferType::F32, vec![remote]), Err(Error::SizeLimitExceeded { message }));
+    }
+
+    #[test]
+    fn test_shard_move_plan_moves_with_role() {
+        let copy = shard_move(Device::new(0, 0), Device::new(1, 0), 0);
+        let send = shard_move(Device::new(0, 0), Device::new(2, 1), 1);
+        let receive = shard_move(Device::new(3, 1), Device::new(1, 0), 2);
+        let elsewhere = shard_move(Device::new(3, 1), Device::new(4, 2), 3);
+        let moves = vec![copy.clone(), send.clone(), receive.clone(), elsewhere.clone()];
+        let plan = ShardMovePlan::new(BufferType::F32, moves).unwrap();
+        let moves = |process_index, role| plan.moves_with_role(process_index, role).collect::<Vec<_>>();
+        assert_eq!(moves(0, MoveRole::Copy), [&copy]);
+        assert_eq!(moves(0, MoveRole::Send), [&send]);
+        assert_eq!(moves(0, MoveRole::Receive), [&receive]);
+        assert_eq!(moves(1, MoveRole::Copy), Vec::<&ShardMove>::new());
+        assert_eq!(moves(1, MoveRole::Send), [&receive, &elsewhere]);
+        assert_eq!(moves(1, MoveRole::Receive), [&send]);
+        assert_eq!(moves(2, MoveRole::Receive), [&elsewhere]);
+    }
+
+    #[test]
+    fn test_shard_move_plan_cross_host_moves() {
+        // Every move between two processes crosses processes, whichever processes they are, in the order of the plan.
+        let copy = shard_move(Device::new(0, 0), Device::new(1, 0), 0);
+        let send = shard_move(Device::new(0, 0), Device::new(2, 1), 1);
+        let receive = shard_move(Device::new(3, 1), Device::new(1, 0), 2);
+        let elsewhere = shard_move(Device::new(3, 1), Device::new(4, 2), 3);
+        let moves = vec![copy, send.clone(), receive.clone(), elsewhere.clone()];
+        let plan = ShardMovePlan::new(BufferType::F32, moves).unwrap();
+        assert_eq!(plan.cross_host_moves().collect::<Vec<_>>(), [&send, &receive, &elsewhere]);
+    }
+
+    #[test]
+    fn test_shard_move_shape() {
+        let movement = ShardMove { slice: vec![0..2, 3..6], ..shard_move(Device::new(0, 0), Device::new(1, 0), 0) };
+        assert_eq!(movement.shape(), StaticShape::new(vec![2, 3]));
+    }
+
+    #[test]
+    fn test_shard_move_role() {
+        let copy = shard_move(Device::new(0, 0), Device::new(1, 0), 0);
+        let transfer = shard_move(Device::new(0, 0), Device::new(1, 1), 0);
+        assert_eq!(copy.role(0), Some(MoveRole::Copy));
+        assert_eq!(transfer.role(0), Some(MoveRole::Send));
+        assert_eq!(transfer.role(1), Some(MoveRole::Receive));
+        assert_eq!(transfer.role(2), None);
+    }
+
+    #[test]
+    fn test_reshard_program_runs_on() {
+        let mesh = explicit_mesh(&[Device::new(0, 0), Device::new(1, 1)]);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let program = ReshardProgram { mesh, input: replicated.clone(), output: replicated };
+        assert_eq!([0, 1, 2].map(|process_index| program.runs_on(process_index)), [true, true, false]);
+    }
+
+    #[test]
+    fn test_reshard_program_compilation_mesh() {
+        let devices = [Device::new(0, 0), Device::new(1, 0)];
+        let mesh = |axis_type| {
+            let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            DeviceMesh::new(logical_mesh, devices.to_vec()).unwrap()
+        };
+        let program =
+            |mesh: DeviceMesh, input: &dyn Fn(Sharding) -> Sharding, output: &dyn Fn(Sharding) -> Sharding| {
+                let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+                ReshardProgram { input: input(replicated.clone()), output: output(replicated), mesh }
+            };
+        let sum = |sharding: Sharding| sharding.with_unreduced_axes(["x"]).unwrap();
+        let split = |sharding: Sharding| {
+            Sharding::new(sharding.mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()
+        };
+        let same = |sharding: Sharding| sharding;
+
+        // An explicit axis along which the program completes a pending sum is typed as auto, an auto axis along which
+        // it keeps one is typed as explicit, and any other axis keeps its type.
+        let completion = program(mesh(MeshAxisType::Explicit), &sum, &same);
+        assert_eq!(completion.compilation_mesh(), Ok(mesh(MeshAxisType::Auto)));
+        let kept = program(mesh(MeshAxisType::Auto), &sum, &sum);
+        assert_eq!(kept.compilation_mesh(), Ok(mesh(MeshAxisType::Explicit)));
+        let resplit = program(mesh(MeshAxisType::Explicit), &same, &split);
+        assert_eq!(resplit.compilation_mesh(), Ok(resplit.mesh.clone()));
+    }
+
+    #[test]
+    fn test_reshard_program_compile() {
+        let client = cpu_client(1);
+        let local = first_device(client);
+        let remote = Device::new(local.id() + 1, 1);
+        let session = session_with_remote_devices(client, [remote]);
+        let mesh = explicit_mesh(&[local]);
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let values = values_to_bytes(&[1f32, 2.]);
+        let array = Array::from_host_buffer(&session, r#type, mesh.clone(), Some(replicated.clone()), values).unwrap();
+
+        // The process that owns a device of the mesh compiles the program, and any other process compiles nothing.
+        let program = ReshardProgram { mesh, input: replicated.clone(), output: replicated };
+        assert!(matches!(program.compile(&array, false), Ok(Some(_))));
+        let remote_mesh = explicit_mesh(&[remote]);
+        let replicated = Sharding::replicated(remote_mesh.logical_mesh().clone(), 1);
+        let program = ReshardProgram { mesh: remote_mesh, input: replicated.clone(), output: replicated };
+        assert!(matches!(program.compile(&array, false), Ok(None)));
+        assert_eq!(session.cached_program_count(), 1);
     }
 
     #[test]
@@ -9063,6 +9305,74 @@ mod tests {
     }
 
     #[test]
+    fn test_reduction_state_of() {
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("z", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 1)
+            .with_unreduced_axes(["x"])
+            .unwrap()
+            .with_unreduced_kind(UnreducedKind::Max)
+            .unwrap()
+            .with_reduced_axes(["y"])
+            .unwrap();
+        assert_eq!(
+            ["x", "y", "z"].map(|axis| ReductionState::of(&sharding, axis)),
+            [ReductionState::Unreduced(UnreducedKind::Max), ReductionState::Reduced, ReductionState::Free],
+        );
+    }
+
+    #[test]
+    fn test_reduction_state_display() {
+        assert_eq!(ReductionState::Unreduced(UnreducedKind::Max).to_string(), "a pending `max` reduction");
+        assert_eq!(ReductionState::Reduced.to_string(), "a completed reduction");
+        assert_eq!(ReductionState::Free.to_string(), "no reduction state");
+    }
+
+    #[test]
+    fn test_host_round_trip_cause_across_processes() {
+        let cause = HostRoundTripCause::Reduction { transition: "cannot take x".to_string(), remedy: "do y" };
+        let message = "cannot take x, and the host round trip that makes it exactly needs one process that owns every \
+                       device of the target and can read the source back from its own devices; do y";
+        let message = message.to_string();
+        assert_eq!(cause.across_processes(), Error::from(ProgramError::UnsupportedOperation { message }));
+        let error = Error::SizeLimitExceeded { message: "too large".to_string() };
+        assert_eq!(HostRoundTripCause::Device(error.clone()).across_processes(), error);
+    }
+
+    #[test]
+    fn test_host_round_trip_cause_without_host_route() {
+        let cause = HostRoundTripCause::Reduction { transition: "cannot take x".to_string(), remedy: "do y" };
+        let message = "cannot take x, and the preparation of the arguments of a program has no host round trip; place \
+                       the argument with `Array::to_placement` first, which makes the change with a host round trip \
+                       where one process owns every device of the target and a device of every source contribution \
+                       with elements";
+        let message = message.to_string();
+        assert_eq!(cause.without_host_route(), Error::from(ProgramError::UnsupportedOperation { message }));
+        let error = Error::SizeLimitExceeded { message: "too large".to_string() };
+        assert_eq!(HostRoundTripCause::Device(error.clone()).without_host_route(), error);
+    }
+
+    #[test]
+    fn test_placement_completion_join() {
+        // Without recorded work and without a fence, there is nothing to wait for. Otherwise, the joined fence reports
+        // the failure of the work that it waits for.
+        assert!(PlacementCompletion::default().join(None).is_none());
+        let client = cpu_client(1);
+        let (event, producer) = client.event(()).unwrap();
+        let fence = PlacementCompletion::default().join(Some(ExecutionFence::new(vec![event]))).unwrap();
+        assert_eq!(fence.is_ready(), Ok(false));
+        producer.set(Some(PjrtError::aborted("producer failed"))).unwrap();
+        assert!(matches!(
+            fence.block_until_ready(),
+            Err(PjrtError::Aborted { message, .. }) if message == "producer failed",
+        ));
+    }
+
+    #[test]
     fn test_source_replicas_by_contribution() {
         let logical_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
@@ -9138,6 +9448,18 @@ mod tests {
     }
 
     #[test]
+    fn test_addressable_devices_get() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let local = first_device(client);
+        let array = Array::from_host_buffer(&session, ArrayType::scalar(DataType::U8), None, None, [3u8]).unwrap();
+        let devices = array.addressable_devices_by_id(0).unwrap();
+        assert_eq!(devices.get(local.id()).map(|device| Device::from_pjrt(device).unwrap()), Ok(local));
+        let error = ArrayError::NonAddressableDevice { device_id: local.id() + 1, process_index: 0 };
+        assert_eq!(devices.get(local.id() + 1).err(), Some(Error::from(error)));
+    }
+
+    #[test]
     fn test_plan_exact_shard_moves() {
         // Process 0 holds the first half of an `f32[4]` and process 1 the second half, and the target swaps them.
         let (local, remote) = (Device::new(0, 0), Device::new(1, 1));
@@ -9167,16 +9489,7 @@ mod tests {
             transfer_key: 3,
         };
         let plan = plan.unwrap().unwrap();
-        assert_eq!(plan, ShardMovePlan::new(BufferType::F32, vec![send.clone(), receive.clone()]).unwrap());
-
-        // Every process derives the same plan and performs the moves of its own devices, so the send of process 0 is
-        // the receive of process 1, and the other way around.
-        assert_eq!(plan.cross_host_moves().collect::<Vec<_>>(), [&send, &receive]);
-        assert_eq!(plan.moves_with_role(0, MoveRole::Copy).count(), 0);
-        assert_eq!(plan.moves_with_role(0, MoveRole::Send).collect::<Vec<_>>(), [&send]);
-        assert_eq!(plan.moves_with_role(0, MoveRole::Receive).collect::<Vec<_>>(), [&receive]);
-        assert_eq!(plan.moves_with_role(1, MoveRole::Send).collect::<Vec<_>>(), [&receive]);
-        assert_eq!(plan.moves_with_role(1, MoveRole::Receive).collect::<Vec<_>>(), [&send]);
+        assert_eq!(plan, ShardMovePlan::new(BufferType::F32, vec![send, receive]).unwrap());
     }
 
     #[test]
@@ -9225,6 +9538,39 @@ mod tests {
         let message =
             format!("cross-host transfer device ID {invalid_id} exceeds the maximum allowed value of {}", i32::MAX);
         assert_eq!(plan, Err(Error::SizeLimitExceeded { message }));
+    }
+
+    #[test]
+    fn test_corresponding_shards() {
+        // Shards correspond by their elements when both ends hold one value per slice, by their elements and
+        // contribution members when the placement only moves contributions, and not at all otherwise.
+        let xy = logical_mesh_2x2();
+        let yx = LogicalMesh::new(vec![
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let replicated = Sharding::replicated(xy.clone(), 1);
+        let split = Sharding::new(xy.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let sum = |mesh: &LogicalMesh| Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        assert_eq!(corresponding_shards(&replicated, &split), Some(None));
+        assert_eq!(corresponding_shards(&sum(&xy), &sum(&yx)), Some(Some(ContributionAxes::default())));
+        assert_eq!(corresponding_shards(&sum(&xy), &replicated), None);
+    }
+
+    #[test]
+    fn test_contribution_axes() {
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 1).with_unreduced_axes(["x"]).unwrap();
+        let sharding = sharding.with_varying_manual_axes(["m"]).unwrap();
+        let (unreduced, varying_manual) = contribution_axes(&sharding);
+        let names = |axes: &[&MeshAxis]| axes.iter().map(|axis| axis.name().to_string()).collect::<Vec<_>>();
+        assert_eq!(names(&unreduced), ["x"]);
+        assert_eq!(names(&varying_manual), ["m"]);
     }
 
     #[test]
@@ -9354,6 +9700,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_keeps_contributions() {
+        // A value that holds one value per slice has no contributions to keep, and a value with a pending sum keeps
+        // them when the placement only moves them.
+        let xy = logical_mesh_2x2();
+        let yx = LogicalMesh::new(vec![
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let replicated = Sharding::replicated(xy.clone(), 1);
+        let sum = |mesh: &LogicalMesh| Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        assert!(!keeps_contributions(&replicated, &replicated));
+        assert!(keeps_contributions(&sum(&xy), &sum(&yx)));
+        assert!(!keeps_contributions(&sum(&xy), &replicated));
+    }
+
+    #[test]
+    fn test_keeps_some_contributions() {
+        // Keeping a pending sum along an axis of size two while completing it along another keeps some contributions
+        // apart, while along an axis of size one it keeps a single contribution, as does a complete reduction.
+        let sum = |mesh: &LogicalMesh, axes: &[&str]| {
+            Sharding::replicated(mesh.clone(), 1)
+                .with_unreduced_axes(axes.iter().map(|axis| axis.to_string()))
+                .unwrap()
+        };
+        let xy = logical_mesh_2x2();
+        let narrow = LogicalMesh::new(vec![
+            MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        assert!(keeps_some_contributions(&sum(&xy, &["x", "y"]), &sum(&xy, &["x"])));
+        assert!(!keeps_some_contributions(&sum(&narrow, &["x", "y"]), &sum(&narrow, &["x"])));
+        assert!(!keeps_some_contributions(&sum(&xy, &["x", "y"]), &sum(&xy, &[])));
+    }
+
+    #[test]
+    fn test_kept_unreduced_axes() {
+        // An axis is kept when both ends reduce along it alike and both meshes give it the same size.
+        let sum = |mesh: &LogicalMesh, axes: &[&str]| {
+            Sharding::replicated(mesh.clone(), 1)
+                .with_unreduced_axes(axes.iter().map(|axis| axis.to_string()))
+                .unwrap()
+        };
+        let xy = logical_mesh_2x2();
+        let wide = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Auto).unwrap()]).unwrap();
+        let maximum = sum(&xy, &["x"]).with_unreduced_kind(UnreducedKind::Max).unwrap();
+        assert_eq!(kept_unreduced_axes(&sum(&xy, &["x", "y"]), &sum(&xy, &["x"])), ["x"]);
+        assert_eq!(kept_unreduced_axes(&sum(&xy, &["x"]), &maximum), Vec::<&str>::new());
+        assert_eq!(kept_unreduced_axes(&sum(&xy, &["x"]), &sum(&wide, &["x"])), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn test_validate_kept_contributions() {
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying = Sharding::replicated(logical_mesh, 1).with_varying_manual_axes(["m"]).unwrap();
+        assert_eq!(validate_kept_contributions(&varying, true), Ok(()));
+        let message = "cannot place an array that varies along the manual mesh axes `m` onto this sharding, because \
+                       the placement would discard values that differ along those axes";
+        let message = message.to_string();
+        assert_eq!(
+            validate_kept_contributions(&varying, false),
+            Err(Error::from(ProgramError::InvalidArgument { message })),
+        );
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_cross_host_shape() {
@@ -9396,6 +9809,40 @@ mod tests {
     }
 
     #[test]
+    fn test_cross_host_layouts() {
+        // Each distinct shape is resolved once, with the index of the first shard of that shape.
+        let calls = Cell::new(Vec::new());
+        let resolver = |_: BufferType, shard_index: ShardIndex, shape: &StaticShape| {
+            let mut indices = calls.take();
+            indices.push(shard_index);
+            calls.set(indices);
+            simulated_cross_host_layout(BufferType::F32, shard_index, shape)
+        };
+        let (two, three) = (StaticShape::new(vec![2]), StaticShape::new(vec![3]));
+        let shards = [(0, two.clone()), (1, two.clone()), (2, three.clone())];
+        let layout = |shape: &StaticShape| simulated_cross_host_layout(BufferType::F32, 0, shape).unwrap().unwrap();
+        let expected = HashMap::from([(two.clone(), layout(&two)), (three.clone(), layout(&three))]);
+        assert_eq!(cross_host_layouts(&resolver, BufferType::F32, shards.clone().into_iter()), Ok(Some(expected)));
+        assert_eq!(calls.take(), [0, 2]);
+
+        // A layout that the plugin cannot report, or a plugin without cross-host transfers, rules out the layouts of
+        // every shard, while any other error is returned as it is. Without shards, nothing is resolved.
+        let unreported = cross_host_layouts(&|_, _, _| Ok(None), BufferType::F32, shards.clone().into_iter());
+        assert_eq!(unreported, Ok(None));
+        let unimplemented =
+            |_: BufferType, _: ShardIndex, _: &StaticShape| -> Result<Option<ryft_pjrt::Layout>, Error> {
+                Err(Error::Pjrt(PjrtError::unimplemented("the cross-host transfers extension is missing")))
+            };
+        assert_eq!(cross_host_layouts(&unimplemented, BufferType::F32, shards.clone().into_iter()), Ok(None));
+        let failing = |_: BufferType, _: ShardIndex, _: &StaticShape| -> Result<Option<ryft_pjrt::Layout>, Error> {
+            Err(Error::SizeLimitExceeded { message: "too large".to_string() })
+        };
+        let error = Error::SizeLimitExceeded { message: "too large".to_string() };
+        assert_eq!(cross_host_layouts(&failing, BufferType::F32, shards.into_iter()), Err(error));
+        assert_eq!(cross_host_layouts(&failing, BufferType::F32, std::iter::empty()), Ok(Some(HashMap::new())));
+    }
+
+    #[test]
     fn test_exact_shard_transfer_key() {
         assert_eq!(exact_shard_transfer_key(2, 1, 3), Ok(7));
         let message = format!(
@@ -9426,6 +9873,64 @@ mod tests {
         let message =
             format!("cross-host transfer device ID {device_id} exceeds the maximum allowed value of {}", i32::MAX);
         assert_eq!(cross_host_global_device_id(device_id), Err(Error::SizeLimitExceeded { message }));
+    }
+
+    #[test]
+    fn test_issue_cross_host_transfers() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        assert!(matches!(
+            issue_cross_host_transfers(&session, Vec::new(), Memory::Device),
+            Ok((None, received)) if received.is_empty(),
+        ));
+
+        // The device identifiers of every transfer are validated before the first one is issued.
+        let devices = client.addressable_devices().unwrap();
+        let invalid_id = i32::MAX as usize + 1;
+        let receive = CrossHostTransfer::Receive {
+            source: invalid_id,
+            target: first_device(client).id(),
+            transfer_key: 0,
+            device: &devices[0],
+            element_type: BufferType::F32,
+            dimensions: vec![2],
+        };
+        let message =
+            format!("cross-host transfer device ID {invalid_id} exceeds the maximum allowed value of {}", i32::MAX);
+        assert_eq!(
+            issue_cross_host_transfers(&session, vec![receive], Memory::Device).err(),
+            Some(Error::SizeLimitExceeded { message }),
+        );
+    }
+
+    #[test]
+    fn test_gathered_sharding() {
+        // The gathered value keeps only the pending reductions that the target keeps, with their kind.
+        let mesh = logical_mesh_2x2();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let pending = |kind| replicated.clone().with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap();
+        let (sum, maximum) = (pending(UnreducedKind::Sum), pending(UnreducedKind::Max));
+        let split = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
+        let split_sum = split.clone().with_unreduced_axes(["x"]).unwrap();
+        assert_eq!(gathered_sharding(&sum, &split_sum, &mesh, 1), Ok(sum.clone()));
+        assert_eq!(gathered_sharding(&sum, &split, &mesh, 1), Ok(replicated));
+        let split_maximum = split_sum.with_unreduced_kind(UnreducedKind::Max).unwrap();
+        assert_eq!(gathered_sharding(&maximum, &split_maximum, &mesh, 1), Ok(maximum));
+    }
+
+    #[test]
+    fn test_sharding_on_mesh() {
+        // The placement, the reduction state, and the manual variation carry over to a mesh with resized axes.
+        let narrow = LogicalMesh::new(vec![
+            MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let split = |mesh: &LogicalMesh| {
+            let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
+            sharding.with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(UnreducedKind::Max).unwrap()
+        };
+        assert_eq!(sharding_on_mesh(&split(&logical_mesh_2x2()), &narrow), Ok(split(&narrow)));
     }
 
     #[test]
