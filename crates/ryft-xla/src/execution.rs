@@ -3987,7 +3987,7 @@ mod tests {
         assert_eq!(read_first_shard::<f32>(client, &holder.read().unwrap()), vec![1.0]);
         let message = "public input #0 is unreduced along the mesh axes [\"x\"], which the executable cannot receive \
                        because a staged type does not record a pending reduction over auto mesh axes; reduce the \
-                       argument (e.g., with `Array::to_placement` onto a sharding without unreduced axes), or place it \
+                       input (e.g., with `Array::to_placement` onto a sharding without unreduced axes), or place it \
                        over explicit mesh axes, before passing it to a compiled function or an eager operation";
         let error = ExecutionError::UnreducedAutoAxisInput { index: 0, axes: vec!["x".to_string()] };
         assert_eq!(error.to_string(), message);

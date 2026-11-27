@@ -25,7 +25,7 @@ use crate::{Error, Session};
 /// captured. Importing such an array through [`ThroughSession`](crate::ThroughSession) retains it and stages it as an
 /// immediate [`Constant::Session`](crate::Constant::Session), which can appear in any region of any program, including
 /// lazily traced derivative rules. Lifting that constant in a [`Session`] turns it back into an [`Array`], and lowering
-/// turns every distinct retained array of a program into a hidden executable argument that follows the captures of the
+/// turns every distinct retained array of a program into a hidden executable input that follows the captures of the
 /// program, so that compiled executables depend only on the array's type and never on its data.
 ///
 /// # Differences from [`Array`]
@@ -39,11 +39,11 @@ use crate::{Error, Session};
 ///   - **Usable as a Key:** A retained array implements [`Eq`] and [`Hash`] by its storage identity, declared type,
 ///     and commitment. Retaining the same array twice yields equal constants. Handles with different commitment
 ///     remain distinct because an eager operation whose regions use the constant (e.g., an eager `condition`) runs
-///     where a committed constant is, as it runs where a committed operand is, whereas a call of a compiled function
-///     never runs where the arrays that its callee captures are, nor commits its results because of them, committed or
+///     where a committed constant is, as it runs where a committed input is, whereas a call of a compiled function
+///     never runs where the arrays that its callee captures are, nor commits its outputs because of them, committed or
 ///     not. Commitment is therefore part of the identity of a program that holds the constant and of its cache keys,
 ///     so two programs that differ only in the commitment of a constant compile separately, which costs compilations
-///     but never changes results.
+///     but never changes outputs.
 ///
 /// The first difference is what makes it safe to store in a program. Programs live in the caches of a session, so
 /// a program that held an [`Array`] would keep alive the session whose caches keep the program alive, and neither
@@ -53,11 +53,11 @@ use crate::{Error, Session};
 ///
 /// Two retained arrays are equal when they retain the same logical array with the same declared type and the same
 /// commitment. The same array imported twice into one function with one type is one constant, and therefore one hidden
-/// argument, whereas the same array declared with two types (e.g., imported by a function that is compiled for a mesh
-/// of another topology than the mesh of the array, which declares it over its own mesh, and by one that is not) is two
+/// input, whereas the same array declared with two types (e.g., imported by a function that is compiled for a mesh of
+/// another topology than the mesh of the array, which declares it over its own mesh, and by one that is not) is two
 /// constants, each of which its executable receives with its own type. The declared type depends on the type and the
 /// mesh topology of the array alone, which every process shares. Lowering passes each distinct retained array of a
-/// program as one hidden argument of its executable, and the identity of a program and its cache keys include its
+/// program as one hidden input of its executable, and the identity of a program and its cache keys include its
 /// constants, so every process of a distributed program must decide alike whether two retained arrays are equal. The
 /// logical identity of an array is therefore decided by the operation that produced it, never by whether this process
 /// held buffers to copy or to reuse, and every function that returns an array from another array follows these rules
@@ -76,15 +76,15 @@ use crate::{Error, Session};
 ///     holds every one of them alone, a placement of an array with locally assigned devices on a destination that
 ///     names devices, also on a process whose devices already hold that destination, every other placement (e.g., one
 ///     that changes the devices, the sharding, the memory, or the layout, whether it shares, copies, transfers, or
-///     uploads buffers, and on a process that holds no buffer of its result), the move of an input to the devices that
+///     uploads buffers, and on a process that holds no buffer of its output), the move of an input to the devices that
 ///     an operation runs on, and an array that a retained array is turned back into ([`RetainedArray::to_array`]) are
 ///     new arrays.
 ///   - **New Array with Shared Placements:** An array with an additional execution dependency (i.e., one that also
 ///     waits for the completion of another execution) has its own capture identity and shares placements of the
 ///     underlying buffers. Each capture observes the completion of its own producer.
 ///
-/// Donation never changes these rules, because it only consumes the input. An operation whose result is a new array
-/// but that would return the storage of its input on some process gives that result storage of its own instead, on
+/// Donation never changes these rules, because it only consumes the input. An operation whose output is a new array
+/// but that would return the storage of its input on some process gives that output storage of its own instead, on
 /// every process.
 ///
 /// # Ownership
@@ -235,7 +235,7 @@ impl RetainedArray {
     /// type is part of the identity of a retained array, so two retentions of one array with different declared types
     /// are different constants. A function that is compiled for a mesh of another topology than the mesh of an array
     /// that it imports declares that array with the type with which the function receives it on its own mesh (refer
-    /// to `imported_constant`). Lowering binds its hidden argument slot to the array placed on that mesh.
+    /// to `imported_constant`). Lowering binds its hidden input slot to the array placed on that mesh.
     #[inline]
     pub(crate) fn with_declared_type(&self, declared_type: ArrayType) -> Self {
         Self { declared_type, ..self.clone() }
@@ -1158,7 +1158,7 @@ mod tests {
     fn test_retained_array_eq_follows_the_producing_operation_on_every_process() {
         // Two single-device clients stand for two processes. Each places a scalar on the device of process 0, so that
         // only process 0 holds a buffer of it, and derives arrays from it with every function that returns an array
-        // from an array. Whether a result is the same retained array as its input must follow from the function alone.
+        // from an array. Whether an output is the same retained array as its input must follow from the function alone.
         let clients = [0, 1].map(|process| {
             let options = CpuClientOptions { device_count: Some(1), process_id: Some(process) };
             let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(options)).unwrap();
@@ -1177,7 +1177,7 @@ mod tests {
             let donated_copy = PlacementOptions::default().with_donate(true).with_may_alias(false);
 
             // Commitment is part of the identity of a retained array but not of the logical array, so the input is
-            // compared with the commitment of each result.
+            // compared with the commitment of each output.
             let same = |input: &Array, output: &Array| {
                 RetainedArray::new(output) == RetainedArray::new(&input.clone().with_committed(output.is_committed()))
             };

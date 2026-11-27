@@ -42,7 +42,7 @@ use ryft_mlir::{
     Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
 
-use crate::compilation::domains::{relocated_input_type, commits_public_outputs};
+use crate::compilation::domains::{commits_public_outputs, relocated_input_type};
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::EffectTokens;
 use crate::lowering::emissions::{omits_regions, partition_session_constants, unread_call_captures};

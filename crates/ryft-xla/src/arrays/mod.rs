@@ -29,7 +29,7 @@
 //! its clones, so cloning and dropping array handles involves no bookkeeping. Only the buffers of live arrays are
 //! counted, so a buffer that only the placement index of a captured array holds (i.e., a copy of the array that a
 //! function which captures it received on other devices, refer to `RetainedArray::placed`) is not, and the statistics
-//! can then understate the memory that is resident on a device (e.g., zero bytes on the device of a dropped result of
+//! can then understate the memory that is resident on a device (e.g., zero bytes on the device of a dropped output of
 //! a lift whose copy the index of the captured array still holds).
 
 use std::borrow::Cow;
@@ -54,7 +54,7 @@ use crate::arrays::metadata::{ArrayMetadata, ArrayOutputPlan};
 use crate::arrays::retained::PlacementIndex;
 use crate::arrays::shards::validate_addressable_buffer;
 use crate::arrays::statistics::ArrayRegistration;
-use crate::compilation::domains::argument_type;
+use crate::compilation::domains::relocated_input_type;
 use crate::types::ArrayTypeExtension;
 use crate::{Error, Session, Type};
 
@@ -216,7 +216,7 @@ pub struct Array {
 
     /// Whole-execution completion fence for arrays produced by an asynchronous PJRT launch. This is separate from
     /// each shard buffer's ready event because it also retains errors from zero-output effects and other device work
-    /// associated with the launch. Cloned output arrays share the same fence. The result of a placement joins the
+    /// associated with the launch. Cloned output arrays share the same fence. The output of a placement joins the
     /// fence of its source with the readiness of every buffer that the placement created and with the fences of the
     /// programs that it ran, because readbacks wait for this fence but read only one replica of each tile. Plain host
     /// uploads leave it empty, because every replica receives the same host bytes. The uploads of placements set it
@@ -231,7 +231,7 @@ pub struct Array {
     /// failure on the sending process. A send completes only once its receiver has issued the matching receive, so
     /// the placement must not wait for it, and only those explicit readiness functions do. Clones of this array share
     /// the same fence. Dropping every handle of the fence neither cancels nor waits for the sends, and their errors
-    /// are then no longer observed by this process. Derived arrays (e.g., the results of operations on this array)
+    /// are then no longer observed by this process. Derived arrays (e.g., the outputs of operations on this array)
     /// do not inherit the fence.
     send_fence: Option<ExecutionFence>,
 
@@ -522,7 +522,7 @@ impl Array {
         }
     }
 
-    /// Attaches the whole-execution completion fence that produced this array without waiting. When the result
+    /// Attaches the whole-execution completion fence that produced this array without waiting. When the output
     /// aliases an existing array, it has a distinct capture identity because its readiness can differ from the
     /// existing array's. Both arrays can still share physical placements of their buffers.
     #[inline]
@@ -567,10 +567,10 @@ impl Array {
 
     /// Returns this [`Array`], which an eager operation, an eager reshard, or a host upload produced, committed to its
     /// devices when `committed` is `true` or when it lives on more than one device, and uncommitted otherwise (refer to
-    /// [`Self::is_committed`]). `committed` is the commitment that its operands give it (i.e., the result of
+    /// [`Self::is_committed`]). `committed` is the commitment that its inputs give it (i.e., the result of
     /// [`Session::commits_placement`] and the commitment of the captured arrays for an eager operation, the commitment
     /// of the source for a reshard, and whether a mesh was chosen for an upload through [`Self::from_host_buffer`]).
-    /// This is the one rule that decides the commitment of eager results and uploads, and it keeps every uncommitted
+    /// This is the one rule that decides the commitment of eager outputs and uploads, and it keeps every uncommitted
     /// one on a single device, as in JAX, where an uncommitted array always lives on one device. The outputs of
     /// compiled functions that run on more than one device are committed for the same reason.
     #[inline]
@@ -605,7 +605,7 @@ impl Array {
 
     /// Returns this array as a new logical array (refer to the identity rules of [`RetainedArray`]), with its type,
     /// placement, buffers, completion fences, commitment, and locally assigned devices. Any new storage is registered
-    /// as one logical array with the array's [session](Self::session). An operation whose result is a new array calls
+    /// as one logical array with the array's [session](Self::session). An operation whose output is a new array calls
     /// this function wherever it would otherwise return the storage of its input on this process (e.g., a forced copy
     /// on a process that holds no buffer to copy). Storage that no other handle refers to (i.e., that has no clone and
     /// no [`RetainedArray`]) is kept once its placements (refer to [`RetainedArray::placed`]) are cleared. Whether
@@ -667,7 +667,7 @@ impl Array {
     ///     [`Self::from_addressable_buffers`], [`Self::from_host_shards`], or [`Self::from_host_buffer`] with a mesh).
     ///   - **Session Mesh:** It was created without a mesh and without array inputs by a [`Session`] that has a
     ///     [default mesh](Session::device_mesh), which then decides its placement. This covers
-    ///     [`Self::from_host_buffer`] without a mesh, literal constants, and the results of eager operations without
+    ///     [`Self::from_host_buffer`] without a mesh, literal constants, and the outputs of eager operations without
     ///     array inputs (e.g., zeros, ones, fills, and `iota`). Without a default mesh, or with a default device
     ///     (refer to [`Session::with_default_device`]), such arrays are uncommitted, unless they live on more than one
     ///     device (e.g., when [`Self::from_host_buffer`] without a mesh lays the logical mesh of a sharding out over
@@ -677,23 +677,23 @@ impl Array {
     ///     target. A host value that [`Session::place`] uploads without a destination is uncommitted, and it goes to
     ///     the default device of the session or, without one, to the first addressable device of the client whether
     ///     or not the session has a default mesh.
-    ///   - **Committed Inputs:** It is the result of an eager operation with a committed array input or a committed
-    ///     array that the operation captures, or an output of a compiled function with a committed public argument.
-    ///     The arrays that a compiled function captures never commit its outputs, whether it is executed directly or
+    ///   - **Committed Inputs:** It is the output of an eager operation with a committed array input or a committed
+    ///     array that the operation captures, or an output of a compiled function with a committed public input. The
+    ///     arrays that a compiled function captures never commit its outputs, whether it is executed directly or
     ///     called through [`CompiledFunction::call`](crate::CompiledFunction::call).
-    ///   - **Eager Results on Several Devices:** It is the result of an eager operation, of a host upload through
+    ///   - **Eager Outputs on Several Devices:** It is the output of an eager operation, of a host upload through
     ///     [`Self::from_host_buffer`], or of a reshard that moves an array to the devices that an eager operation runs
-    ///     on, and it lives on more than one device. An uncommitted eager result or upload therefore always lives on a
+    ///     on, and it lives on more than one device. An uncommitted eager output or upload therefore always lives on a
     ///     single device.
     ///   - **Compiled Functions:** It is an output of a compiled function that was compiled for more than one device,
     ///     or a public output of a compiled function that requests a placement explicitly anywhere (i.e., through a
     ///     sharding override, a [`PlaceOperation`](ryft_core::PlaceOperation) with a target, or a sharding constraint),
     ///     whether or not that request produces the output. The outputs of a function that was compiled for a single
-    ///     device without such requests are committed only when the function has a committed public argument. The
-    ///     same holds for the results of an eager operation with regions (e.g., a condition, a scan, or a loop), which
-    ///     are committed when a region requests a placement explicitly, as the results of a compiled function with that
+    ///     device without such requests are committed only when the function has a committed public input. The same
+    ///     holds for the outputs of an eager operation with regions (e.g., a condition, a scan, or a loop), which are
+    ///     committed when a region requests a placement explicitly, as the outputs of a compiled function with that
     ///     region would be. An eager operation without regions that is itself such a request (e.g., a sharding
-    ///     constraint) leaves the commitment of its results to its inputs.
+    ///     constraint) leaves the commitment of its outputs to its inputs.
     ///
     /// Clones keep the commitment of their array, and so do the arrays that keep the storage of an array or
     /// copy it (e.g., a [`Session::place`] without a destination, also when it must not alias its input, and
@@ -703,15 +703,15 @@ impl Array {
     /// inputs follow committed ones, so when all committed inputs live on the same devices, the operation moves its
     /// uncommitted inputs to the mesh of the committed inputs and runs there. When inputs on different devices are
     /// all uncommitted, the operation moves them to the [default mesh](Session::device_mesh) of the session (or,
-    /// without one, to the first addressable device), as JAX does, and its result stays uncommitted when it lives on a
+    /// without one, to the first addressable device), as JAX does, and its output stays uncommitted when it lives on a
     /// single device. A moved input keeps its sharding when that sharding is over the logical mesh of its destination,
     /// and it is replicated over that mesh when it is replicated. A move shares the buffers of the shards that stay on
     /// their devices. The operation still fails when two committed inputs live on different devices and when an
     /// uncommitted input cannot be moved (i.e., when it is sharded over another logical mesh, or when it or its
     /// destination is not fully addressable from this process). Compiled functions always run on the devices that
-    /// they were compiled for. They move their captures and their uncommitted public arguments there, and they reject a
-    /// public argument that is committed to other devices (i.e., to other physical devices or to the same ones in
-    /// another order) with
+    /// they were compiled for. They move their captures and their uncommitted public inputs there, and they reject a
+    /// public input that is committed to other devices (i.e., to other physical devices or to the same ones in another
+    /// order) with
     /// [`ExecutionError::CommittedInputDeviceMismatch`](crate::ExecutionError::CommittedInputDeviceMismatch).
     ///
     /// [jax-placement]: https://docs.jax.dev/en/latest/faq.html#controlling-data-and-computation-placement-on-devices
@@ -733,14 +733,14 @@ impl Array {
     ///     uploaded without a destination or with a destination that names only a memory or a layout, which lands on
     ///     that default device or, without one, on the first addressable device of the client whether or not the
     ///     session has a default mesh.
-    ///   - **Storage Placements:** It is the result of a placement of such an array that names only a memory or a
+    ///   - **Storage Placements:** It is the output of a placement of such an array that names only a memory or a
     ///     layout, or a copy of such an array on its own devices.
-    ///   - **Eager Results:** It is the result of an eager operation whose array inputs are all locally assigned,
+    ///   - **Eager Outputs:** It is the output of an eager operation whose array inputs are all locally assigned,
     ///     or of one without array inputs that runs where such an upload would.
     ///
     /// A placement onto a device, a mesh, or a sharding, a construction on a mesh that the caller provides (e.g.,
     /// through [`Self::from_addressable_buffers`]), and direct execution of a compiled function all produce arrays
-    /// whose devices every process knows. A call with no placement request follows its public arguments. Clones and
+    /// whose devices every process knows. A call with no placement request follows its public inputs. Clones and
     /// [`RetainedArray`]s preserve local assignment. It is excluded from retained-array identity.
     ///
     /// Every process of a distributed program that applies the same functions to the same kinds of inputs therefore
@@ -1043,10 +1043,10 @@ impl Value for Array {
 
     #[inline]
     fn relocatable_type(&self) -> Option<Self::Type> {
-        // An array is relocatable by the rule of the session for the arguments of its transforms, which the
+        // An array is relocatable by the rule of the session for the inputs of its transforms, which the
         // `Value::Array` representation of the same array also follows, so both representations of one input
         // accept the same tangents and seeds.
-        argument_type(self, &self.r#type())
+        relocated_input_type(self, &self.r#type())
     }
 }
 
@@ -1187,8 +1187,8 @@ impl ShapeChangingCollectiveValue for Array {
 impl WhilePredicate for Array {
     // The batched while predicate semantics for `Array`, mirror the reference semantics of `ryft_core::Array`.
     // `WhilePredicate::any_true` reduces the whole Boolean payload with `or` by reading every shard back to the host,
-    // and `WhilePredicate::select` broadcasts the predicate against the operands along its leading prefix axes on
-    // device before selecting.
+    // and `WhilePredicate::select` broadcasts the predicate against the inputs along its leading prefix axes on device
+    // before selecting.
 
     fn any_true(&self) -> Result<bool, ProgramError> {
         if !self.data_type().is_boolean() {
@@ -1258,8 +1258,8 @@ impl WhilePredicate for Array {
             });
         }
 
-        // Broadcast a predicate whose shape is a prefix of the operand shape up to that full shape, mapping its axes
-        // to the leading output axes, so that the staged select receives operands with congruent shapes.
+        // Broadcast a predicate whose shape is a prefix of the input shape up to that full shape, mapping its axes to
+        // the leading output axes, so that the staged select receives inputs with congruent shapes.
         let condition = if self.r#type().shape() == on_true.r#type().shape() {
             self.clone()
         } else {
@@ -1604,7 +1604,7 @@ mod tests {
     /// Renders the placements that two processes make of one value, those of process 0 first and each through two
     /// entry points, as the bytes of the shards that each process holds or as `error: <message>`. Asserts that the
     /// entry points of each process agree and that both processes return the same metadata when both succeed, so
-    /// that a process that owns no device of the target still returns the result of the owner without buffers.
+    /// that a process that owns no device of the target still returns the output of the owner without buffers.
     /// Returns the outcomes of process 0 and of process 1.
     pub(super) fn process_outcomes(placements: &[Result<Array, String>], context: &str) -> (String, String) {
         let rendered = placements
@@ -3143,7 +3143,7 @@ mod tests {
         let on_true = replicated_array(&session, &mesh, DataType::F32, &[2, 2], &values_to_bytes(&[1f32, 2., 3., 4.]));
         let on_false = replicated_array(&session, &mesh, DataType::F32, &[2, 2], &values_to_bytes(&[5f32, 6., 7., 8.]));
 
-        // The predicate, whose shape is a prefix of the operand shape, broadcasts along its leading axes. Item 0 keeps
+        // The predicate, whose shape is a prefix of the input shape, broadcasts along its leading axes. Item 0 keeps
         // the first row of `on_false` and item 1 takes the second row of `on_true`.
         let selected = WhilePredicate::select(&mixed, &on_true, &on_false).unwrap();
         assert_eq!(selected.copy_to_host().unwrap().elements::<f32>().unwrap(), vec![5f32, 6., 3., 4.]);

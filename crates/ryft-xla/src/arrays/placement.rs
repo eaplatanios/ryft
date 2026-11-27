@@ -57,7 +57,7 @@ use sealed::PlaceableParameter;
 ///     implement [`SessionPlacementRequestParameter`]. A consumed [`Sharding`](ryft_core::Sharding) resolves against
 ///     the session's default mesh. To mix resolved placements and explicit requests in a prefix, use
 ///     [`PlacementRequest::from`].
-///   - `Donate` has `bool` leaves. A `true` leaf permits reusing the input array's buffers for the result when donation
+///   - `Donate` has `bool` leaves. A `true` leaf permits reusing the input array's buffers for the output when donation
 ///     is possible.
 ///   - `MayAlias` has leaves that convert into `Option<bool>`. A `false` or `Some(false)` leaf requests a copy, `true`
 ///     or `Some(true)` permits sharing, and `None` leaves the policy unspecified for that branch.
@@ -90,7 +90,7 @@ pub struct PlacementOptions<Target = PlacementRequest, Source = PlacementRequest
     /// source is validated for [`Array`] leaves and ignored for eager host leaves.
     source: Option<Source>,
 
-    /// Donation tree prefix. A donated [`Array`] leaf lets a compiled reshard reuse its buffers for the result. The
+    /// Donation tree prefix. A donated [`Array`] leaf lets a compiled reshard reuse its buffers for the output. The
     /// donation only takes effect when the leaf is the only handle of its buffers. Only concrete [`Array`] leaves
     /// apply it, and host leaves and traced leaves ignore it. A leaf cannot be donated while its aliasing option is
     /// `Some(true)`, and a donated leaf ignores an aliasing option of `Some(false)`, because donation gives the leaf
@@ -229,7 +229,7 @@ impl Default for PlacementOptions {
 /// place (refer to [`Session::place`]), which covers the host values and the locally assigned [`Array`]s. Both need
 /// to know every kind of leaf, so this trait is sealed (i.e., only this crate implements it). A type that is made of
 /// these leaves is placed as a [`Parameterized`] tree of them.
-#[expect(private_bounds, reason = "the sealed supertrait handles arguments internal to placement")]
+#[expect(private_bounds, reason = "the sealed supertrait handles inputs internal to placement")]
 pub trait Placeable: Parameter + PlaceableParameter<<Self as Placeable>::Output> {
     /// Leaf type that placing this leaf produces, which is [`Array`] for host values and runtime arrays, and the leaf
     /// type itself for traced values.
@@ -250,8 +250,8 @@ pub trait Placeable: Parameter + PlaceableParameter<<Self as Placeable>::Output>
     ///     the session of concrete arrays that a traced leaf may wrap.
     ///   - `target`: Requested placement for this leaf, if one was specified.
     ///   - `source`: Source placement for this leaf, if one was specified.
-    ///   - `donate`: Whether a compiled reshard may reuse the buffers of this leaf for the result.
-    ///   - `may_alias`: Whether the result may share buffers with other arrays. `Some(false)` forbids it, unless
+    ///   - `donate`: Whether a compiled reshard may reuse the buffers of this leaf for the output.
+    ///   - `may_alias`: Whether the output may share buffers with other arrays. `Some(false)` forbids it, unless
     ///     `donate` is `true`, which gives this leaf up (refer to [`Session::place`]).
     ///
     /// # Errors
@@ -341,7 +341,7 @@ impl<T: HostValue + Parameter> Placeable for T {
         let bytes = dense_host_value_bytes(&host)?;
 
         // An in-place target names no devices, so it uploads the value to the same device as an upload without a
-        // target, in the storage that it names, and it commits the result like every other target. A value without
+        // target, in the storage that it names, and it commits the output like every other target. A value without
         // a target, or with one that names only its storage, lives on a device that this process chose on its own
         // (refer to `Array::is_locally_assigned`).
         let committed = target.is_some();
@@ -375,7 +375,7 @@ mod sealed {
     use crate::arrays::Array;
     use crate::{Error, Session};
 
-    use super::{PlacementArgument, validate_parameter_options};
+    use super::{PlacementInput, validate_parameter_options};
 
     /// What [`Session::place`] asks of a leaf that it places as an `Output` before it places any leaf of a tree. Every
     /// [`Placeable`](super::Placeable) implements this trait for its output, which seals that trait, because only this
@@ -419,7 +419,7 @@ mod sealed {
 
         /// Returns the comparison metadata of a concrete leaf. A host value or locally assigned [`Array`] provides a
         /// digest when the session compares its value across processes. The decision to compare is independent of the
-        /// value's shape or bytes. The session owns the comparison and attaches its verdict to compared results. The
+        /// value's shape or bytes. The session owns the comparison and attaches its verdict to compared outputs. The
         /// default implementation returns [`None`], for a leaf whose value is never compared.
         #[inline]
         fn process_value(&self) -> Option<ProcessValue<'_, Output>> {
@@ -439,24 +439,24 @@ mod sealed {
             true
         }
 
-        /// Prepares the parameters of `arguments` in place after [`Session::place`] validates every leaf and before
-        /// placing any leaf. A replacement must satisfy its argument's validated options. For example, a mixed
+        /// Prepares the parameters of `inputs` in place after [`Session::place`] validates every leaf and before
+        /// placing any leaf. A replacement must satisfy its input's validated options. For example, a mixed
         /// [`PlaceInput`](super::PlaceInput) tree lifts host values into its compilation trace. `path` returns the
-        /// path of a leaf by its index. The default implementation leaves the arguments unchanged.
+        /// path of a leaf by its index. The default implementation leaves the inputs unchanged.
         ///
         /// # Errors
         ///
         /// Returns the error of the first leaf that cannot be prepared, or an error of the whole tree.
         #[inline]
-        fn prepare_arguments(
-            arguments: &mut [PlacementArgument<Self>],
+        fn prepare_inputs(
+            inputs: &mut [PlacementInput<Self>],
             session: &Session,
             path: &dyn Fn(usize) -> ParameterPath,
         ) -> Result<(), Error>
         where
             Self: Sized,
         {
-            let _ = (arguments, session, path);
+            let _ = (inputs, session, path);
             Ok(())
         }
     }
@@ -519,7 +519,7 @@ mod sealed {
         /// Checks an unshared leaf before placement. Host values are always checked before their upload.
         validate: Box<dyn FnOnce(ArrayReadiness) -> Result<(), Error> + 'a>,
 
-        /// Attaches the comparison verdict to the result of placement.
+        /// Attaches the comparison verdict to the output of placement.
         join: fn(Output, ExecutionFence) -> Output,
     }
 
@@ -641,18 +641,18 @@ impl Array {
     /// Moves or copies this array to the provided placement without donating the source buffers, so the original
     /// [`Array`] remains fully usable after the call returns.
     ///
-    /// When the placement and storage already match, the result is this array (i.e., the same logical array, refer to
+    /// When the placement and storage already match, the output is this array (i.e., the same logical array, refer to
     /// the identity rules of [`RetainedArray`](crate::RetainedArray)). If each process chose the devices of this array
     /// on its own, a target that names devices gives a new array on every process instead, which shares the buffers of
     /// this array where they already are, so that independent placements remain distinct when captured. Every other
     /// placement gives a new array. A change of devices or sharding takes the first device strategy that applies of
     /// those that [`crate::arrays::transfers`] describes (i.e., moves of exact shards, shard regions, or a compiled
     /// reshard) and otherwise the host fallback. A source with [locally assigned devices](Self::is_locally_assigned)
-    /// (e.g., the result of [`Array::from_host_buffer`] without a mesh) takes none of them, and every process places
+    /// (e.g., the output of [`Array::from_host_buffer`] without a mesh) takes none of them, and every process places
     /// its own such array on its own target devices with local work only, as that module describes.
     ///
     /// The host fallback copies the global array to the host as [`Array::copy_to_host`] does and uploads it again as
-    /// [`Array::from_host_buffer`] does, so the result has the shards that a host upload of the same values with the
+    /// [`Array::from_host_buffer`] does, so the output has the shards that a host upload of the same values with the
     /// target sharding has. It is used only when the device work fails or is skipped (e.g., when no strategy supports
     /// a manual target, or when a compiled reshard would change the value of an array whose reduction state the
     /// placement changes), when the target mesh is fully addressable from this process, and when this process can
@@ -665,7 +665,7 @@ impl Array {
     /// or of manual variation within a tile requires a device strategy, because the host fallback combines
     /// contributions. The readback and the upload continue in the background, and a failure of that work, whose error
     /// also describes the failure of the device work, surfaces through the readiness functions and the readbacks of the
-    /// result and through [`Session::synchronize`].
+    /// output and through [`Session::synchronize`].
     ///
     /// When the target is shared across processes and this array is locally assigned, every process must hold the same
     /// value, because each process places its own value on the devices that it owns. For uncommitted inputs, a mesh or
@@ -685,15 +685,15 @@ impl Array {
     /// contributions along that axis. With [`UnreducedKind::Sum`], the devices at coordinate zero along it hold the
     /// whole value and the others hold the additive identity. With [`UnreducedKind::Max`] or [`UnreducedKind::Min`],
     /// every device along it holds the whole value, which is its own extremum. The logical value is the same, but the
-    /// shards of the result can then differ from those that a device strategy would produce.
+    /// shards of the output can then differ from those that a device strategy would produce.
     ///
-    /// The result always belongs to `session`, even when it is this array or shares its buffers. An array of another
+    /// The output always belongs to `session`, even when it is this array or shares its buffers. An array of another
     /// PJRT client (e.g., of another backend) is read back and uploaded onto the devices that `target` names, because
     /// PJRT copies buffers only within one client, as JAX places an array onto the devices of another backend. That
     /// uses the host path directly. For an array with bytes, the placement must keep no distinct contributions apart,
     /// each target owner must be able to read the value back, and the target must lie on the devices of one process
     /// unless this array is locally assigned. The memory follows the same rule as a transfer within one client.
-    /// The request must name the target devices, and the result is [committed](Self::is_committed) to them.
+    /// The request must name the target devices, and the output is [committed](Self::is_committed) to them.
     ///
     /// When the host fallback also cannot satisfy the request, typically because some source shards that the value
     /// needs live on a remote process or because the source varies along manual mesh axes, the original error of the
@@ -703,7 +703,7 @@ impl Array {
     /// single device (i.e., a [`PlacementRequest::Device`]) uses the default memory of that device for every source,
     /// including one in pinned host memory, and a mesh or sharding target keeps the memory of the source. PJRT
     /// cross-host receives land in device memory and can then be copied to the requested memory on that device. An
-    /// explicit [`Layout`](ryft_core::Layout) applies to each target shard. When the layout is omitted, the result
+    /// explicit [`Layout`](ryft_core::Layout) applies to each target shard. When the layout is omitted, the output
     /// keeps the layout of the source only while that layout still describes each target shard (e.g., the strides of a
     /// column shard do not describe the whole value that a gather produces), and declares no layout otherwise. Layout
     /// changes use a compiled conversion on each shard's device when supported. Otherwise, each affected local shard is
@@ -760,13 +760,13 @@ impl Array {
     /// [`Self::resolve_placement_request`]) and placed with [`Self::place_within_client`], or with
     /// [`Self::place_across_clients`] for an array of another PJRT client than that of `session`. Only a request
     /// that names neither devices nor a sharding (i.e., an [`PlacementRequest::InPlace`] request, which names only a
-    /// memory or a layout) leaves the result on the devices that this process chose on its own when this array has such
-    /// devices, because every other request names the devices of the result (refer to [`Self::is_locally_assigned`]).
+    /// memory or a layout) leaves the output on the devices that this process chose on its own when this array has such
+    /// devices, because every other request names the devices of the output (refer to [`Self::is_locally_assigned`]).
     ///
     /// Every process places its own value of such an array, so when `comparison` applies to `request` (refer to
     /// [`ValueComparison::applies`]), this function submits one comparison before executing the placement. It submits
     /// the digest of the value or a poison contribution if the local request is invalid or the readback fails. Each
-    /// process participates before returning its local error, and the result joins the verdict. [`Session::place`]
+    /// process participates before returning its local error, and the output joins the verdict. [`Session::place`]
     /// places its leaves with `comparison` set to [`None`], because it compares the values of all of them at once.
     ///
     /// # Parameters
@@ -823,7 +823,7 @@ impl Array {
             _ if std::ptr::eq(self.client(), session.client()) => self.validate_session_placement(session),
             Some(PlacementRequest::InPlace { .. }) => Err(PjrtError::invalid_argument(
                 "cannot place an array of another PJRT client without naming the devices of the target, \
-                 because the result must live on devices of the client of the session",
+                 because the output must live on devices of the client of the session",
             )
             .into()),
             Some(_) => Ok(()),
@@ -844,7 +844,7 @@ impl Array {
     ) -> Result<Option<PlacementRequest>, Error> {
         // Reject the options that no leaf accepts, as `Session::place` does before it looks at any leaf, and then a
         // foreign PJRT client before validating either placement request, unless the target names the devices onto
-        // which such an array is transferred. Dispatch binds the result to `session` when there is a target.
+        // which such an array is transferred. Dispatch binds the output to `session` when there is a target.
         validate_parameter_options(ParameterPath::root, target.as_ref(), source.as_ref(), donate, may_alias)?;
         self.validate_placement_client(session, target.as_ref())?;
 
@@ -870,7 +870,7 @@ impl Array {
         may_alias: Option<bool>,
     ) -> Result<Array, Error> {
         // Donation takes precedence over a copy requested by `may_alias`. A forced copy must avoid every input
-        // buffer, including buffers that only the result holds once placement consumes the leaf. The weak handles
+        // buffer, including buffers that only the output holds once placement consumes the leaf. The weak handles
         // let buffers that the placement releases drop normally.
         let copies = may_alias == Some(false) && !donate;
         let buffers: Vec<_> = match copies {
@@ -885,7 +885,7 @@ impl Array {
             None => self.with_session(session)?.without_send_fence(),
         };
 
-        // The result is this leaf when the placement does not change, and it otherwise shares the buffers of the
+        // The output is this leaf when the placement does not change, and it otherwise shares the buffers of the
         // shards that stay on their devices. Holding the buffers of this leaf that are still alive makes them shared,
         // so that `into_unaliased` copies exactly those, and not the buffers that the placement created.
         if copies {
@@ -1229,7 +1229,7 @@ impl PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
         }
 
         // One leaf does not see the trace that its tree joins, so this check assumes the capture placement of a
-        // compiled function. `Self::prepare_arguments` checks the leaves again for a trace that preserves it.
+        // compiled function. `Self::prepare_inputs` checks the leaves again for a trace that preserves it.
         self.validate_placement_in_trace(session, target, source, CapturePlacement::FollowCall)
     }
 
@@ -1242,18 +1242,18 @@ impl PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
         }
     }
 
-    fn prepare_arguments(
-        arguments: &mut [PlacementArgument<Self>],
+    fn prepare_inputs(
+        inputs: &mut [PlacementInput<Self>],
         session: &Session,
         path: &dyn Fn(usize) -> ParameterPath,
     ) -> Result<(), Error> {
-        if arguments.is_empty() {
+        if inputs.is_empty() {
             return Ok(());
         }
 
         // The first tracer supplies the context into which the host and concrete leaves are imported.
         // Every other tracer must share its builder so that all leaves belong to one program.
-        let mut traced = arguments.iter().filter_map(|argument| match &argument.parameter {
+        let mut traced = inputs.iter().filter_map(|input| match &input.parameter {
             Self::Host(_) | Self::Concrete(_) => None,
             Self::Runtime(value) => Some(value),
         });
@@ -1277,14 +1277,14 @@ impl PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
         // which the check of each leaf did not assume, so a placement that this type rejects is reported before any
         // leaf is uploaded or enters the trace, where a failed placement would stay recorded.
         if context.capture_placement() == CapturePlacement::Preserve {
-            for (index, argument) in arguments.iter().enumerate() {
-                if matches!(argument.parameter, Self::Host(_) | Self::Concrete(_)) {
-                    argument
+            for (index, input) in inputs.iter().enumerate() {
+                if matches!(input.parameter, Self::Host(_) | Self::Concrete(_)) {
+                    input
                         .parameter
                         .validate_placement_in_trace(
                             session,
-                            argument.target.as_ref(),
-                            argument.source.as_ref(),
+                            input.target.as_ref(),
+                            input.source.as_ref(),
                             CapturePlacement::Preserve,
                         )
                         .map_err(|error| error.with_placement_parameter_path(|| path(index)))?;
@@ -1294,14 +1294,14 @@ impl PlaceableParameter<CompileTracer> for PlaceInput<CompileTracer> {
 
         // Upload each host leaf on the default device and bind concrete arrays to the session before adding
         // them as captures in the existing compilation trace.
-        for (index, argument) in arguments.iter_mut().enumerate() {
-            let array = match &argument.parameter {
+        for (index, input) in inputs.iter_mut().enumerate() {
+            let array = match &input.parameter {
                 Self::Host(value) => value.clone().place_parameter(session, None, None, false, None),
                 Self::Concrete(value) => value.clone().place_parameter(session, None, None, false, None),
                 Self::Runtime(_) => continue,
             };
 
-            argument.parameter = Self::Runtime(
+            input.parameter = Self::Runtime(
                 array
                     .and_then(|array| {
                         Ok(ImportingContext::<Session, ThroughParent<ThroughCapture>>::import(
@@ -1369,15 +1369,15 @@ impl From<CompileTracer> for PlaceInput<CompileTracer> {
 impl Array {
     /// Returns a new array (refer to the identity rules of [`RetainedArray`](crate::RetainedArray)) with the type, the
     /// placement, and the commitment of this array whose addressable shard buffers no other handle holds. This is how
-    /// a placement whose result must not alias its input (i.e., a placement with `may_alias` set to `false` and without
-    /// donation) gives that result buffers of its own. The result is a new array on every process, including a process
+    /// a placement whose output must not alias its input (i.e., a placement with `may_alias` set to `false` and without
+    /// donation) gives that output buffers of its own. The output is a new array on every process, including a process
     /// that holds no buffer of this array or holds each of them alone, because it then has no buffer to copy (refer to
     /// [`Self::with_new_identity`]). A buffer shared with another handle is copied on the same device and in the same
     /// memory (e.g., when a shard stays on its device and the caller still holds the input). Buffers held only by this
     /// array, such as those created by placement, are kept. A clone holds all of this array's buffers, so it makes
     /// this function copy every buffer. A caller that consumed the only handle of the input must therefore hold the
-    /// buffers of that input while it calls this function, or the result could return them. The copies are made by
-    /// [`Self::with_copied_shard_buffers`], so the execution fence of the result joins the readiness of every copy with
+    /// buffers of that input while it calls this function, or the output could return them. The copies are made by
+    /// [`Self::with_copied_shard_buffers`], so the execution fence of the output joins the readiness of every copy with
     /// the fence of this array, because a readback reads only one replica of each tile and would otherwise succeed with
     /// a replica whose copy did not fail.
     pub(crate) fn into_unaliased(self) -> Result<Self, Error> {
@@ -1435,7 +1435,7 @@ impl Session {
     /// batch). That session cannot be replaced. A traced leaf whose arrays belong to another PJRT client is therefore
     /// rejected, with or without a target, with the error of such an [`Array`] leaf without a target, and one whose
     /// arrays belong to another session of the same client is rejected with a [`ryft_pjrt::Error::InvalidArgument`]
-    /// error. Other handles of this session (e.g., one with another default mesh) are accepted, and the results of
+    /// error. Other handles of this session (e.g., one with another default mesh) are accepted, and the outputs of
     /// a traced leaf stay attached to the handles of the arrays that it wraps.
     ///
     /// A [`PlacementRequest::Device`] target leaves every leaf wholly on that device. A single-device [`Array`] keeps
@@ -1443,10 +1443,10 @@ impl Session {
     /// device unless it is unreduced over an axis larger than one, since a placement cannot combine the contributions
     /// of several devices. A bare device also selects the device's default memory. A mesh or sharding target without a
     /// memory keeps the leaf's memory (refer to [`PlacementRequest::target_memory`]). A target without a layout keeps
-    /// the leaf's layout only if it still describes each result shard.
+    /// the leaf's layout only if it still describes each output shard.
     ///
     /// A [`PlacementRequest::InPlace`] target changes only memory or layout, even when the devices and sharding are
-    /// unknown during tracing (e.g., how a compiled input is split along auto mesh axes). It commits eager results
+    /// unknown during tracing (e.g., how a compiled input is split along auto mesh axes). It commits eager outputs
     /// to their current devices and commits all public outputs of a compiled program that retains the placement.
     /// Use [`transfer_to_memory`](ryft_core::TransferToMemory) for memory-only moves. With that operation, commitment
     /// depends on the inputs and the surrounding program. Use [`constrain_sharding`](ryft_core::ConstrainSharding)
@@ -1489,7 +1489,7 @@ impl Session {
     /// placement executes on a concrete array instead (e.g., when a traced program is evaluated on arrays), the device
     /// resolves against that array as it does for an [`Array`] leaf. A bare device source of a traced leaf whose
     /// devices are not known stages a [`PlacementRequest::Device`] source, so that reverse mode differentiation moves
-    /// the cotangent back to that device, and transposing the result again moves it to the target once more. Inside a
+    /// the cotangent back to that device, and transposing the output again moves it to the target once more. Inside a
     /// compiled function, a target must lie on the mesh that the function is compiled for, whereas a source only states
     /// where the input lives, which the type rule checks against the type of the input, and it is not checked against
     /// that mesh, because the function moves nothing to it. The reverse mode of such a function moves the cotangent to
@@ -1506,15 +1506,15 @@ impl Session {
     ///
     /// The donation option is only applied to concrete [`Array`] leaves, and it is ignored for host leaves and traced
     /// leaves. Each aliasing option leaf converts into `Option<bool>`, so `false` means `Some(false)` and `true` means
-    /// `Some(true)`. When placing a concrete [`Array`] leaf with `Some(false)` and without donation, the result holds
+    /// `Some(true)`. When placing a concrete [`Array`] leaf with `Some(false)` and without donation, the output holds
     /// no buffer of the leaf, even when the leaf was the only handle of its buffers. The buffers that the placement
     /// creates are used directly. A traced leaf with `Some(false)` and without donation stages its placement with a
     /// forced copy (refer to [`PlaceOperation::with_may_alias`]), so that when a batched or differentiated function
-    /// is evaluated on concrete arrays, its result shares no buffer with any other array. A compiled function has no
+    /// is evaluated on concrete arrays, its output shares no buffer with any other array. A compiled function has no
     /// observable buffer identity, so the option has no effect inside one. Host leaves ignore the option, because their
     /// uploads never share buffers. Donation decides when both options are given. A donated leaf with `Some(false)` is
     /// placed as a donated leaf without an aliasing option, because the caller gives the leaf up, so there is no alias
-    /// for `Some(false)` to forbid, and its result may hold the buffers of the leaf (e.g., the leaf itself when it
+    /// for `Some(false)` to forbid, and its output may hold the buffers of the leaf (e.g., the leaf itself when it
     /// already lives at its target). A leaf cannot be donated while its `may_alias` option is `Some(true)`, which
     /// this function reports with [`ArrayError::DonatedArrayMayAlias`] before it places any leaf.
     ///
@@ -1562,7 +1562,7 @@ impl Session {
     /// every process with [`ryft_pjrt::Error::FailedPrecondition`] when the values differ, including in data type or
     /// shape, when a process cannot digest one of its values (e.g., one whose bytes do not encode its data type) or
     /// fails its checks, or when the processes compare at different positions. Readiness, readbacks, and operations
-    /// that read a result of a compared leaf report a failed comparison.
+    /// that read an output of a compared leaf report a failed comparison.
     ///
     /// Whole-call admission covers the tree presented to one placement call. An error on a rank before that call
     /// reaches admission is reported on that rank only. For example, an enclosing transform can reject a local
@@ -1632,7 +1632,7 @@ impl Session {
     /// (e.g., a PJRT transfer, compiled reshard, or allocation), unsupported memory or layout, a move that no strategy
     /// of [`crate::arrays::transfers`] supports (e.g., one that would have to combine the contributions of a pending
     /// reduction), the bytes of a host array that do not encode valid elements, and the errors of the type rule for a
-    /// traced leaf, which the context that records or executes its placement applies. Placement drops the results of
+    /// traced leaf, which the context that records or executes its placement applies. Placement drops the outputs of
     /// the preceding leaves and leaves their submitted transfers and donations to complete, so only such a failure can
     /// have consumed the donated inputs of the leaves that precede the failing one. Every error of a leaf other than
     /// the root of `x` is wrapped in [`ArrayError::FailedParameterPlacement`] with the path of that leaf, except an
@@ -1692,7 +1692,7 @@ impl Session {
         // so distributed admission can still determine whether this call would otherwise communicate.
         let path = |index: usize| structure.parameter_paths().nth(index).unwrap();
         let mut checked = Ok(());
-        let mut arguments = x
+        let mut inputs = x
             .into_parameters()
             .enumerate()
             .map(|(index, parameter)| {
@@ -1713,7 +1713,7 @@ impl Session {
                     checked =
                         validate_parameter_options(|| path(index), target.as_ref(), source.as_ref(), donate, may_alias);
                 }
-                PlacementArgument { parameter, context: (), target, source, donate, may_alias }
+                PlacementInput { parameter, context: (), target, source, donate, may_alias }
             })
             .collect::<Vec<_>>();
 
@@ -1721,35 +1721,27 @@ impl Session {
         // preparation can upload host values or import them into a trace.
         let checked = checked
             .and_then(|()| {
-                arguments.iter().enumerate().try_for_each(|(index, argument)| {
-                    argument
+                inputs.iter().enumerate().try_for_each(|(index, input)| {
+                    input
                         .parameter
                         .validate_placement(
                             self,
-                            argument.target.as_ref(),
-                            argument.source.as_ref(),
-                            argument.donate,
-                            argument.may_alias,
+                            input.target.as_ref(),
+                            input.source.as_ref(),
+                            input.donate,
+                            input.may_alias,
                         )
                         .map_err(|error| error.with_placement_parameter_path(|| path(index)))
                 })
             })
-            .and_then(|()| P::prepare_arguments(&mut arguments, self, &path));
+            .and_then(|()| P::prepare_inputs(&mut inputs, self, &path));
 
-        let output_parameters = admit_and_place_arguments(
+        let output_parameters = admit_and_place_inputs(
             self,
             comparison,
-            arguments,
+            inputs,
             checked,
-            |_, argument| {
-                argument.parameter.place_parameter(
-                    self,
-                    argument.target,
-                    argument.source,
-                    argument.donate,
-                    argument.may_alias,
-                )
-            },
+            |_, input| input.parameter.place_parameter(self, input.target, input.source, input.donate, input.may_alias),
             |index, error| error.with_placement_parameter_path(|| path(index)),
         )?;
 
@@ -1878,12 +1870,12 @@ impl<V> PlacementOptionValues<V> {
 }
 
 /// One input parameter and its expanded placement options. [`place_operation_bindings`] keeps the binding's session
-/// in `context`, while [`Session::place`] shares its session across the arguments and uses `()` here.
-struct PlacementArgument<P, C = ()> {
+/// in `context`, while [`Session::place`] shares its session across the inputs and uses `()` here.
+struct PlacementInput<P, C = ()> {
     /// Input parameter to place.
     parameter: P,
 
-    /// Session that places `parameter` when the arguments of a call do not share one (i.e., the session of the binding
+    /// Session that places `parameter` when the inputs of a call do not share one (i.e., the session of the binding
     /// of a core placement operation), and `()` otherwise.
     context: C,
 
@@ -1893,10 +1885,10 @@ struct PlacementArgument<P, C = ()> {
     /// Expected source placement of `parameter`, if one was specified.
     source: Option<PlacementRequest>,
 
-    /// Whether a compiled reshard may reuse the buffers of `parameter` for the result.
+    /// Whether a compiled reshard may reuse the buffers of `parameter` for the output.
     donate: bool,
 
-    /// Whether the result may share buffers with other arrays. `Some(false)` forbids it, unless `donate` is `true`,
+    /// Whether the output may share buffers with other arrays. `Some(false)` forbids it, unless `donate` is `true`,
     /// which gives `parameter` up.
     may_alias: Option<bool>,
 }
@@ -1999,7 +1991,7 @@ pub(crate) fn place_operation_bindings(
         ValueComparison::of_session(&session)?
     } else {
         // Each binding keeps its own context. Independent placements can use different contexts.
-        // A call that needs agreement requires one comparison sequence shared by all its arguments.
+        // A call that needs agreement requires one comparison sequence shared by all its inputs.
         let communicates =
             bindings.iter().any(|(context, array, operation)| array.communicates(context, operation.target()));
         for (context, array, operation) in &bindings {
@@ -2016,9 +2008,9 @@ pub(crate) fn place_operation_bindings(
         None
     };
 
-    let arguments = bindings
+    let inputs = bindings
         .into_iter()
-        .map(|(context, parameter, operation)| PlacementArgument {
+        .map(|(context, parameter, operation)| PlacementInput {
             parameter,
             context,
             target: operation.target().cloned(),
@@ -2028,61 +2020,61 @@ pub(crate) fn place_operation_bindings(
         })
         .collect::<Vec<_>>();
 
-    let checked = arguments.iter().try_for_each(|argument| {
-        let array = &argument.parameter;
-        let context = &argument.context;
+    let checked = inputs.iter().try_for_each(|input| {
+        let array = &input.parameter;
+        let context = &input.context;
         let rank = array.r#type().rank();
-        let target = argument.target.clone().map(|target| target.padded(rank)).transpose()?;
-        let source = argument.source.clone().map(|source| source.padded(rank)).transpose()?;
+        let target = input.target.clone().map(|target| target.padded(rank)).transpose()?;
+        let source = input.source.clone().map(|source| source.padded(rank)).transpose()?;
         PlaceOperation::new(target.clone(), source).infer_output_type_of_value(array, Some(array.sharding()), true)?;
         context.validate_input_placement(std::slice::from_ref(array), &[])?;
         array.validate_placement_client(context, target.as_ref())?;
         array.validate_array_target(context, target)
     });
 
-    admit_and_place_arguments(
+    admit_and_place_inputs(
         &session,
         comparison,
-        arguments,
+        inputs,
         checked,
-        |_, argument| {
-            let rank = argument.parameter.r#type().rank();
-            let target = argument.target.map(|target| target.padded(rank)).transpose()?;
-            argument.parameter.place_validated(&argument.context, target, false, argument.may_alias)
+        |_, input| {
+            let rank = input.parameter.r#type().rank();
+            let target = input.target.map(|target| target.padded(rank)).transpose()?;
+            input.parameter.place_validated(&input.context, target, false, input.may_alias)
         },
         |_, error| error,
     )
     .map_err(Into::into)
 }
 
-/// Coordinates any required distributed admission, then places the arguments on every participating process.
-fn admit_and_place_arguments<P: Placeable, C>(
+/// Coordinates any required distributed admission, then places the inputs on every participating process.
+fn admit_and_place_inputs<P: Placeable, C>(
     session: &Session,
     comparison: Option<&ValueComparison>,
-    arguments: Vec<PlacementArgument<P, C>>,
+    inputs: Vec<PlacementInput<P, C>>,
     checked: Result<(), Error>,
-    place: impl Fn(usize, PlacementArgument<P, C>) -> Result<P::Output, Error>,
+    place: impl Fn(usize, PlacementInput<P, C>) -> Result<P::Output, Error>,
     map_error: impl Fn(usize, Error) -> Error,
 ) -> Result<Vec<P::Output>, Error> {
     let Some(comparison) = comparison else {
         checked?;
-        return arguments
+        return inputs
             .into_iter()
             .enumerate()
-            .map(|(index, argument)| place(index, argument).map_err(|error| map_error(index, error)))
+            .map(|(index, input)| place(index, input).map_err(|error| map_error(index, error)))
             .collect();
     };
 
     // Ranks decide whether work communicates from shared placement metadata before a local validation can fail.
-    let process_values = arguments.iter().map(|argument| argument.parameter.process_value()).collect::<Vec<_>>();
-    let admits = arguments.len() > 1
-        && arguments.iter().any(|argument| argument.parameter.communicates(session, argument.target.as_ref()));
-    let compared = arguments
+    let process_values = inputs.iter().map(|input| input.parameter.process_value()).collect::<Vec<_>>();
+    let admits =
+        inputs.len() > 1 && inputs.iter().any(|input| input.parameter.communicates(session, input.target.as_ref()));
+    let compared = inputs
         .iter()
         .zip(&process_values)
-        .map(|(argument, value)| value.is_some() && comparison.applies(argument.target.as_ref()))
+        .map(|(input, value)| value.is_some() && comparison.applies(input.target.as_ref()))
         .collect::<Vec<_>>();
-    let mut joins = vec![None; arguments.len()];
+    let mut joins = vec![None; inputs.len()];
     let verdict = if admits || compared.iter().any(|compared| *compared) {
         let collective = match comparison.collective(session) {
             Ok(collective) => collective,
@@ -2100,12 +2092,12 @@ fn admit_and_place_arguments<P: Placeable, C>(
                 joins[index] = Some(value.join());
                 digests.push(if checked.is_ok() { value.digest() } else { None });
             } else if admits && checked.is_ok() {
-                let argument = &arguments[index];
+                let input = &inputs[index];
 
                 // A forced copy requires ready buffers even when the caller supplies no target.
-                let copies = argument.may_alias == Some(false) && !argument.donate;
+                let copies = input.may_alias == Some(false) && !input.donate;
 
-                let readiness = if argument.target.is_some() || copies {
+                let readiness = if input.target.is_some() || copies {
                     sealed::ArrayReadiness::Required
                 } else {
                     sealed::ArrayReadiness::Unneeded
@@ -2131,11 +2123,11 @@ fn admit_and_place_arguments<P: Placeable, C>(
         None
     };
 
-    arguments
+    inputs
         .into_iter()
         .enumerate()
-        .map(|(index, argument)| {
-            let output = place(index, argument).map_err(|error| map_error(index, error))?;
+        .map(|(index, input)| {
+            let output = place(index, input).map_err(|error| map_error(index, error))?;
             Ok(match (&verdict, joins[index]) {
                 (Some(verdict), Some(join)) => join(output, verdict.clone()),
                 _ => output,
@@ -2465,10 +2457,10 @@ mod tests {
     type ShardObservation = (Vec<Range<usize>>, String, Vec<f32>);
 
     /// Places `source` on `target` with [`Array::to_placement`] for the step `step` of a test that both ranks of a
-    /// CUDA job run, waits for the result, and returns a [`ShardObservation`] of every shard of the result that this
-    /// rank addresses. Asserts that the result is committed with the mesh and the sharding of `target` and that its
+    /// CUDA job run, waits for the output, and returns a [`ShardObservation`] of every shard of the output that this
+    /// rank addresses. Asserts that the output is committed with the mesh and the sharding of `target` and that its
     /// type renders as `expected_type`, which both ranks must agree on whichever of them holds the shards of the
-    /// result. A failed placement, readiness check, readback, or assertion panics with the rank and the step, which the
+    /// output. A failed placement, readiness check, readback, or assertion panics with the rank and the step, which the
     /// report of [`run_cuda_rank_pair`] shows for both ranks.
     #[cfg(feature = "cuda-13")]
     fn place_step(
@@ -2486,7 +2478,7 @@ mod tests {
         assert_eq!(placed.r#type().to_string(), expected_type, "rank {rank}, step `{step}`");
         assert_eq!(placed.mesh(), target.mesh(), "rank {rank}, step `{step}`");
         assert_eq!(placed.sharding(), target.sharding(), "rank {rank}, step `{step}`");
-        assert!(placed.is_committed(), "rank {rank} placed an uncommitted result in the step `{step}`");
+        assert!(placed.is_committed(), "rank {rank} placed an uncommitted output in the step `{step}`");
         placed
             .addressable_shards()
             .map(|shard| {
@@ -2848,7 +2840,7 @@ mod tests {
         // changes nothing. Neither does a declared layout that the buffers already have, nor a memory other than device
         // memory, which each process stages its replica out of and moves its shard back into on its own devices, nor a
         // column-major `u8[5, 2]` split along its rows, whose shards are converted to the dense row-major layout on
-        // their devices. The result keeps the memory and the layout of the source.
+        // their devices. The output keeps the memory and the layout of the source.
         let client = cpu_client(1);
         let local = first_device(client);
         let remote = Device::new(local.id() + 1, local.process_index() + 1);
@@ -2983,13 +2975,13 @@ mod tests {
         }
 
         // `Session::place` admits and transfers the same arrays, while an in-place target and no target keep
-        // rejecting them, because a result of this session cannot live on the devices of the other client.
+        // rejecting them, because an output of this session cannot live on the devices of the other client.
         let placed = session.place(source.clone(), PlacementOptions::to(devices[0])).unwrap();
         assert_eq!((placed.mesh().devices(), placed.is_committed()), (&devices[..1], true));
         assert_eq!(shard_values(&placed), vec![vec![1f32, 2., 3., 4.]]);
         let in_place = PlacementRequest::InPlace { memory: Some(Memory::Device), layout: None };
         let in_place_message = "cannot place an array of another PJRT client without naming the devices of the \
-                                target, because the result must live on devices of the client of the session";
+                                target, because the output must live on devices of the client of the session";
         for result in [
             source.to_placement(&session, in_place.clone()),
             session.place(source.clone(), PlacementOptions::to(in_place.clone())),
@@ -3038,7 +3030,7 @@ mod tests {
         }
 
         // The upload waits for the work that produces the source on the other client and reports its failure through
-        // the readiness and the readback of the result.
+        // the readiness and the readback of the output.
         let (failing, managers) = pending_replicated_vector(&other_session, &other_mesh);
         let placed = failing.to_placement(&session, devices[0]).unwrap();
         managers[0].set_error(0, PjrtError::aborted("first replica failed")).unwrap();
@@ -3294,7 +3286,7 @@ mod tests {
     fn test_array_to_placement_reports_failed_sources_without_buffers_across_clients() {
         // A source of another client is replicated over a device of process 0 and a device of process 1, and its
         // replica on process 0 is the buffer of a transfer manager. Process 0 owns no device of the target on
-        // process 1, so it reads nothing back, and its result without buffers reports the failure of that replica
+        // process 1, so it reads nothing back, and its output without buffers reports the failure of that replica
         // through each entry point.
         let other_client = other_cpu_client(1);
         let remote_device = first_device(process_one_cpu_client(1));
@@ -3323,9 +3315,9 @@ mod tests {
     }
 
     #[test]
-    fn test_array_to_placement_from_another_client_returns_bufferless_results_without_waiting() {
+    fn test_array_to_placement_from_another_client_returns_bufferless_outputs_without_waiting() {
         // A `DataType::Zero` array has no bytes to read back or upload, so placing it onto another client returns
-        // before the work that produces it completes, without reading it back on the calling thread, and the result
+        // before the work that produces it completes, without reading it back on the calling thread, and the output
         // reports that work, through each entry point.
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
@@ -3403,7 +3395,7 @@ mod tests {
         let own_mesh = source.mesh().clone();
         let pinned = Memory::Host { pinned: true };
 
-        // A target that names only a memory or a layout commits the result, as in JAX, but leaves it on the
+        // A target that names only a memory or a layout commits the output, as in JAX, but leaves it on the
         // devices that this process chose on its own.
         for placed in [
             source.to_placement(&session, pinned).unwrap(),
@@ -3423,7 +3415,7 @@ mod tests {
             assert!(placed.is_locally_assigned());
         }
 
-        // A target that names devices or a sharding names the devices of the result, even when they are the
+        // A target that names devices or a sharding names the devices of the output, even when they are the
         // devices of the source, and commits it, while the source stays uncommitted.
         let devices = session.addressable_devices().unwrap();
         let same_devices = Placement::new(own_mesh.clone(), source.sharding().clone()).unwrap();
@@ -3590,8 +3582,8 @@ mod tests {
             assert_eq!(placed.block_until_ready().map_err(|error| error.to_string()), Ok(()));
             assert_eq!(placed.layout(), Some(&column_major));
             assert_eq!(shard_values(&placed), [vec![1., 2.], vec![3., 4.]]);
-            // The programs include one storage conversion for each device that prepares an argument in another layout
-            // than the one it is held in, which is cached for that device and not repeated by later placements.
+            // The programs include one storage conversion for each device that prepares an input in another layout than
+            // the one it is held in, which is cached for that device and not repeated by later placements.
             assert_eq!(session.cached_program_count(), 5, "the device work must place a source with replicas {held:?}");
         }
 
@@ -4103,7 +4095,7 @@ mod tests {
         // (negative zero for `f32`), uploaded on their own. A source that already holds the value there with the
         // target placement along the other axes (e.g., replicated, or with a pending sum along `x` that the
         // target keeps) needs no move and no program, so those devices keep the buffers of the source and the
-        // placement creates only its result.
+        // placement creates only its output.
         let client = cpu_client(4);
         let devices = client
             .addressable_devices()
@@ -4447,7 +4439,7 @@ mod tests {
     fn test_array_to_placement_admits_process_local_values_alike_on_every_process() {
         // Two processes, each with eight devices, upload the same value without naming a mesh, so that each places it
         // on its own first devices, and place it on devices of process 0. Process 1 owns no target device and
-        // returns the metadata of the result, and both processes return the same result or the same error, which
+        // returns the metadata of the output, and both processes return the same result or the same error, which
         // every process derives from metadata alone:
         //   - `u8[n] = [3; n]` with a pending sum along `x` and `y` onto a target that keeps `x` and splits the
         //     value along `y`, which needs a compiled reshard that cannot produce uneven shards, while a host round
@@ -4584,7 +4576,7 @@ mod tests {
     fn test_array_to_placement_reports_failed_sources_without_buffers_across_processes() {
         // Process 1 holds the only buffer of a replica of an `f32` scalar with a pending maximum along `x`, which a
         // PJRT transfer manager has not filled yet, and places it on a device of process 0, which completes the maximum
-        // with a host round trip. Process 1 takes no part and returns the metadata of the result, which must still
+        // with a host round trip. Process 1 takes no part and returns the metadata of the output, which must still
         // report that its source upload failed, although the source has no execution fence.
         let remote_client = process_one_cpu_client(2);
         let (local_devices, remote_devices) =
@@ -4701,7 +4693,7 @@ mod tests {
         let tiles = vec![vec![1f32], vec![2.], vec![3.], vec![4.]];
 
         // Each row places a source on a mesh, replicated or split along `x`, onto a mesh, replicated or split along
-        // `x`, in every memory, with and without donating the source, and the result keeps the memory of the source.
+        // `x`, in every memory, with and without donating the source, and the output keeps the memory of the source.
         // Whole shards that move to other devices are copied to the same memory of those devices, while the shard
         // that stays on its device shares its buffer, and no program is compiled for them. The compiled reshard on
         // one mesh, with auto or explicit axes, declares its input and its output in the memory of the source. A
@@ -4842,7 +4834,7 @@ mod tests {
 
         // A move to pinned host memory copies each replica on its device, as a change of storage on the same mesh and
         // as a copy of whole shards to another mesh of the same devices. Only the copy of the second replica fails,
-        // and a readback reads one replica of each tile, so the result must report the failure through its fence.
+        // and a readback reads one replica of each tile, so the output must report the failure through its fence.
         for target_mesh in [mesh.clone(), other_mesh] {
             let (source, managers) = pending_replicated_vector(&session, &mesh);
             let replicated = Sharding::replicated(target_mesh.logical_mesh().clone(), 1);
@@ -4882,10 +4874,10 @@ mod tests {
         // The source is in pinned host memory in a declared column-major layout, which rules out shard regions, and its
         // second replica comes from a copy that fails. A compiled reshard to a split over another mesh of the same
         // devices copies each replica to the device memory of its own device and reads each copy on its device, so
-        // the failed replica fails both its copy and the program that reads that copy. The fence of the result reports
+        // the failed replica fails both its copy and the program that reads that copy. The fence of the output reports
         // the first failure that it observes, which is either of the two, so the readiness and the readback of the
-        // result both fail with the cause of the failed replica, as the copy reports it or as the program reports it.
-        // A failed replica never yields a result that is ready or a readback that succeeds.
+        // output both fail with the cause of the failed replica, as the copy reports it or as the program reports it.
+        // A failed replica never yields an output that is ready or a readback that succeeds.
         let failure = |result: Result<(), Error>| match result {
             Err(Error::Pjrt(PjrtError::Aborted { message, .. })) => Some(("aborted", message)),
             Err(Error::Pjrt(PjrtError::Internal { message, .. })) => Some(("internal", message)),
@@ -4910,8 +4902,8 @@ mod tests {
             vec![ShardingDimension::sharded(["y"]), ShardingDimension::replicated()],
         )
         .unwrap();
-        // The compiled reshard keeps the column-major layout of its input, and the result is requested in the row-major
-        // layout, so a conversion on each device reads the result of the reshard.
+        // The compiled reshard keeps the column-major layout of its input, and the output is requested in the row-major
+        // layout, so a conversion on each device reads the output of the reshard.
         let row_major = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
         let target = Placement::new(other_mesh.clone(), sharded.clone())
             .unwrap()
@@ -4933,14 +4925,14 @@ mod tests {
             Err(Error::Pjrt(PjrtError::Aborted { message, .. })) if message == "second replica failed",
         ));
         let ready = failure(placed.block_until_ready());
-        assert!(replica_failures.contains(&ready), "unexpected readiness of the result: {ready:?}");
+        assert!(replica_failures.contains(&ready), "unexpected readiness of the output: {ready:?}");
         let readback = failure(placed.copy_to_host_bytes().map(|_| ()));
-        assert!(replica_failures.contains(&readback), "unexpected readback of the result: {readback:?}");
+        assert!(replica_failures.contains(&readback), "unexpected readback of the output: {readback:?}");
 
         // The session also reports the failed replica, once for each failed submission in registration order. The
         // copies that read the failed replica report its cause as the copy reports it, the execution of the reshard
         // that reads those copies reports it as the failed execution reports it, and the conversions that read the
-        // failed result of the reshard wrap that report once more.
+        // failed output of the reshard wrap that report once more.
         let Err(Error::Execution(ExecutionError::SynchronizationFailures { failures })) = session.synchronize() else {
             panic!("expected the session to report the failed replica");
         };
@@ -5079,7 +5071,7 @@ mod tests {
             assert_eq!(error.to_string(), message);
         }
 
-        // A layout of the right rank is recorded on the bufferless result.
+        // A layout of the right rank is recorded on the bufferless output.
         let layout = Layout::Tiled(TiledLayout::new(vec![0], Vec::new()));
         let target = Placement::new(mesh.clone(), source.sharding().clone()).unwrap().with_layout(layout.clone());
         let placed = source.to_placement(&session, target).unwrap();
@@ -5197,7 +5189,7 @@ mod tests {
 
         // Both replicas of the source are readable, but the execution that produced it fails afterwards (e.g., a copy
         // of a replica that an earlier placement made and joined into its fence). The compiled reshard reads only the
-        // readable buffers, so its result must carry the fence of the source across the launch, with and without
+        // readable buffers, so its output must carry the fence of the source across the launch, with and without
         // donating the source.
         for donate in [false, true] {
             let (producer_event, producer) = client.event(()).unwrap();
@@ -5593,7 +5585,7 @@ mod tests {
         };
 
         // The value of this process goes through a host upload along the unreduced target axis, and no
-        // target device belongs to this process. The result still waits for and reports the producer of the
+        // target device belongs to this process. The output still waits for and reports the producer of the
         // source, which the uploads of the processes that hold the target devices wait for.
         let (source, producer) = pending_source();
         let placed = source.to_placement(&session, target.clone()).unwrap();
@@ -5616,7 +5608,7 @@ mod tests {
 
         // Along a replicated target, the value of this process is shared or copied on devices, and no target
         // device belongs to this process. A source whose only completion is the readiness of its pending buffer (e.g.,
-        // a host upload) has no execution fence, so the result waits for and reports that buffer.
+        // a host upload) has no execution fence, so the output waits for and reports that buffer.
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let target = Placement::new(mesh.clone(), replicated.clone()).unwrap();
         let manager = transfer_managers(client, BufferSpecification::new(BufferType::F32, [2u64])).remove(0);
@@ -5783,7 +5775,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_to_placement_host_fallback_poisons_result_on_readback_failure() {
+    fn test_array_to_placement_host_fallback_poisons_output_on_readback_failure() {
         let client = cpu_client(2);
         let session = Session::builder().client(client).build().unwrap();
         let mesh = two_device_mesh(client, MeshAxisType::Manual);
@@ -5808,7 +5800,7 @@ mod tests {
         // also carries the failure of the device work.
         producer.set(Some(PjrtError::aborted("producer failed"))).unwrap();
         let Err(Error::Pjrt(PjrtError::Internal { message, .. })) = placed.block_until_ready() else {
-            panic!("the result of a failed host fallback must be poisoned");
+            panic!("the output of a failed host fallback must be poisoned");
         };
         assert_eq!(
             message,
@@ -6000,7 +5992,7 @@ mod tests {
     fn test_array_to_placement_cuda_process_helper() {
         // Places arrays of `[1, 2, 3, 4]` across the two ranks of a CUDA job, whose devices are `devices`, with
         // `place`, which calls `Array::to_placement` or `Array::into_placement`, and returns the outcome of each
-        // placement, labeled with its name, as the elements of the shards that this rank addresses once the result is
+        // placement, labeled with its name, as the elements of the shards that this rank addresses once the output is
         // ready, or as the first line of the error of the placement or of its readiness check. Every rank of the job
         // must call this function, because each placement transfers shards between the ranks or executes a compiled
         // reshard over the devices of both.
@@ -6293,7 +6285,7 @@ mod tests {
             // swap between the same devices read stale halves. Both memories exist on CUDA devices, so this does not
             // exercise such a failure, and a rank that failed so would not reach the transfers of a later placement of
             // a tree. Each swap returns the memory kind and the elements of every shard that this rank addresses once
-            // the result is ready, or the first line of the error of the placement or of its readiness check.
+            // the output is ready, or the first line of the error of the placement or of its readiness check.
             let pinned = Memory::Host { pinned: true };
             let unpinned = Memory::Host { pinned: false };
             let swaps = [pinned, unpinned, Memory::Device]
@@ -6365,7 +6357,7 @@ mod tests {
             // placement that left a transfer unmatched would make the next one between the same devices read stale
             // values. Each step lists its name, the memory of the source, whether the source declares a column-major
             // layout, the memory that the target requests, if any (i.e., none when the target keeps the memory of the
-            // source), and the type of the result that both ranks record.
+            // source), and the type of the output that both ranks record.
             let pinned = Memory::Host { pinned: true };
             let unpinned = Memory::Host { pinned: false };
             let steps = [
@@ -6515,8 +6507,8 @@ mod tests {
             let target_mesh = explicit_mesh(&devices[1..]);
             let replicated = Sharding::replicated(source_mesh.logical_mesh().clone(), 1);
 
-            // Rank 0 runs a bounded-dynamic identity whose result buffer is allocated for the bound of its dimension
-            // with a trailer that records its extent, and rank 1 holds only the metadata of that result. The CUDA
+            // Rank 0 runs a bounded-dynamic identity whose output buffer is allocated for the bound of its dimension
+            // with a trailer that records its extent, and rank 1 holds only the metadata of that output. The CUDA
             // plugin sends as many bytes as the allocation of the sender holds, while the receiver allocates a static
             // buffer of the shard, so rank 0 must send a static copy of exactly that size. This holds for an extent
             // below the bound, where the physical dimensions of the dynamic buffer differ from the shape of the shard,
@@ -7139,7 +7131,7 @@ mod tests {
         // choice of this process alone (i.e., locally assigned). It is uncommitted without a target, and committed in
         // the memory that a target names. The default mesh of a session is the analogue of `jax.set_mesh`,
         // under which JAX 0.12.0.1 keeps such a value on its default device, uncommitted, for a mesh of one device and
-        // of two (`(Explicit,) device_put: SingleDeviceSharding(device=CpuDevice(id=0)) False`), while eager results
+        // of two (`(Explicit,) device_put: SingleDeviceSharding(device=CpuDevice(id=0)) False`), while eager outputs
         // without array inputs go to the mesh, committed, as `Array::from_host_buffer` without a mesh does here.
         // Uploading onto the default mesh would treat the value of each process (e.g., its own data batch) as one
         // global value that every process supplied.
@@ -7523,7 +7515,7 @@ mod tests {
         };
 
         // A bare memory leaves an array that is split over two devices on its mesh with its sharding and its values,
-        // and moves its buffers to that memory. The result is committed, as JAX commits the result of `device_put`
+        // and moves its buffers to that memory. The output is committed, as JAX commits the result of `device_put`
         // onto a memory space.
         let sharded = Array::from_host_buffer(
             &session,
@@ -7676,7 +7668,7 @@ mod tests {
         let committed = uncommitted.clone().with_committed(true);
         assert!(session.place(committed, options(None, Some(false))).unwrap().is_committed());
 
-        // A target commits the result, even one that leaves the leaf where it is.
+        // A target commits the output, even one that leaves the leaf where it is.
         let device = uncommitted.mesh().devices()[0];
         let placed = session.place(uncommitted.clone(), options(Some(PlacementRequest::from(device)), None)).unwrap();
         assert_eq!(placed.mesh(), uncommitted.mesh());
@@ -7703,7 +7695,7 @@ mod tests {
 
         // A device names neither a mesh nor a sharding, so the array keeps its logical mesh over the target device,
         // whether it already lives on that device or not. Its pending reduction along `x`, which has size one, is
-        // complete there, so the result is an ordinary replicated array to which `exp` applies. That is the type that
+        // complete there, so the output is an ordinary replicated array to which `exp` applies. That is the type that
         // the type rule of a staged device target records.
         for device in [devices[0], devices[1]] {
             let placed = session.place(array.clone(), PlacementOptions::to(device)).unwrap();
@@ -8325,7 +8317,7 @@ mod tests {
             PlacementOptions::new(target, Option::<PlacementRequest>::None, Some(donate), Some(may_alias))
         };
 
-        // Without a new placement, the result is the leaf itself unless aliasing is forbidden.
+        // Without a new placement, the output is the leaf itself unless aliasing is forbidden.
         let unchanged = session.place(source.clone(), options(None, false, None)).unwrap();
         assert_eq!(shares_source_buffer(&unchanged), vec![true]);
         let copied = session.place(source.clone(), options(None, false, Some(false))).unwrap();
@@ -8665,7 +8657,7 @@ mod tests {
             assert_eq!(error.take(), rejection);
         }
 
-        // Another handle of the session of the arrays (e.g., one with a default mesh) places the leaf, whose result
+        // Another handle of the session of the arrays (e.g., one with a default mesh) places the leaf, whose output
         // stays attached to the handle of those arrays.
         let input = upload(&session);
         let meshed_session = session.with_device_mesh(mesh);
@@ -8731,7 +8723,7 @@ mod tests {
         // A traced input of a function that is compiled for a mesh of two devices has no concrete placement, and its
         // type does not say how it is split along the auto axis `x`, which only the boundary of the compiled function
         // states, so the traced function cannot name its placement, and a bare memory stages an in-place target. The
-        // result lives on the devices of the input, with the distribution of the input, in that memory.
+        // output lives on the devices of the input, with the distribution of the input, in that memory.
         let client = cpu_client(2);
         let mesh = two_device_mesh(client, MeshAxisType::Auto);
         let session = Session::builder().client(client).build().unwrap();
@@ -9409,7 +9401,7 @@ mod tests {
         )
         .unwrap();
 
-        // The target resolves for the rank of each batch item, and the packed result lives on the target device,
+        // The target resolves for the rank of each batch item, and the packed output lives on the target device,
         // committed to it, with the type of the input.
         let output: Array = batch(
             |x| Ok(session.place(x, PlacementOptions::to(device)).unwrap()),
@@ -9505,7 +9497,7 @@ mod tests {
         assert_eq!(shard_values(&output), vec![vec![1., 2., 3., 4.]]);
 
         // The caller keeps a live handle of the input, so a placement that leaves each batch item where it is returns
-        // the buffer of the input by default and a copy of it when the result must not alias the input.
+        // the buffer of the input by default and a copy of it when the output must not alias the input.
         for (may_alias, shares_buffer) in [(None, true), (Some(false), false)] {
             let output: Array = batch(
                 |x| Ok(session.place(x, options(may_alias)).unwrap()),
@@ -10088,7 +10080,7 @@ mod tests {
     }
 
     #[test]
-    fn test_session_place_prepares_arguments_before_placing_leaves() {
+    fn test_session_place_prepares_inputs_before_placing_leaves() {
         struct Leaf(u8);
 
         impl Parameter for Leaf {}
@@ -10110,14 +10102,14 @@ mod tests {
         }
 
         impl PlaceableParameter<u8> for Leaf {
-            fn prepare_arguments(
-                arguments: &mut [PlacementArgument<Self>],
+            fn prepare_inputs(
+                inputs: &mut [PlacementInput<Self>],
                 session: &Session,
                 path: &dyn Fn(usize) -> ParameterPath,
             ) -> Result<(), Error> {
                 let _ = (session, path);
-                for argument in arguments {
-                    argument.parameter.0 += 1;
+                for input in inputs {
+                    input.parameter.0 += 1;
                 }
                 Ok(())
             }
@@ -10200,7 +10192,7 @@ mod tests {
                     "in-place target of a foreign array leaf",
                     failed(
                         "cannot place an array of another PJRT client without naming the devices of the target, \
-                         because the result must live on devices of the client of the session",
+                         because the output must live on devices of the client of the session",
                     ),
                     0,
                 ),
@@ -10632,7 +10624,7 @@ mod tests {
 
                     // A function compiled for the mesh of the input, where the decisions allow the target (i.e., one
                     // that moves no value to other devices, or a device target on the sole device of that mesh),
-                    // returns the eager result. A source on other devices is admitted there too, because the function
+                    // returns the eager output. A source on other devices is admitted there too, because the function
                     // moves nothing to it.
                     let is_sole_device = *target_name == "own device" && mesh.devices().len() == 1;
                     if matches!(*target_name, "memory" | "none" | "unconstrained") || is_sole_device {
@@ -12321,7 +12313,7 @@ mod tests {
 
             // The core `Place` of an array whose shape differs between the ranks reaches concrete dispatch on both.
             // Rank 0 rejects its scalar for the split target, but it still takes part in the two value comparisons of
-            // admission before it returns its error, so rank 1 sees the mismatch when its result is ready.
+            // admission before it returns its error, so rank 1 sees the mismatch when its output is ready.
             let shape = if rank == 0 { vec![] } else { vec![2] };
             let input = Array::from_host_buffer(
                 &session,
@@ -12369,7 +12361,7 @@ mod tests {
     }
 
     #[test]
-    fn test_admit_and_place_arguments_checks_only_data_needed_by_an_unshared_leaf() {
+    fn test_admit_and_place_inputs_checks_only_data_needed_by_an_unshared_leaf() {
         let client = cpu_client(2);
         let remote = Device::new(1000, 1);
         let session = session_with_remote_devices(client, [remote]);
@@ -12384,9 +12376,9 @@ mod tests {
         assert!(unshared.is_locally_assigned());
 
         let run = |parameter: PlaceInput<Array>, target, may_alias| {
-            let arguments = vec![
-                PlacementArgument { parameter, context: (), target, source: None, donate: false, may_alias },
-                PlacementArgument {
+            let inputs = vec![
+                PlacementInput { parameter, context: (), target, source: None, donate: false, may_alias },
+                PlacementInput {
                     parameter: PlaceInput::from(committed.clone()),
                     context: (),
                     target: Some(PlacementRequest::from(remote)),
@@ -12395,14 +12387,14 @@ mod tests {
                     may_alias: None,
                 },
             ];
-            admit_and_place_arguments(
+            admit_and_place_inputs(
                 &session,
                 Some(&comparison),
-                arguments,
+                inputs,
                 Ok(()),
-                // The declared peer cannot receive native sends in this test. Stop at dispatch of its argument.
-                |index, argument| match index {
-                    0 => argument.parameter.place_parameter(&session, argument.target, None, false, argument.may_alias),
+                // The declared peer cannot receive native sends in this test. Stop at dispatch of its input.
+                |index, input| match index {
+                    0 => input.parameter.place_parameter(&session, input.target, None, false, input.may_alias),
                     _ => Ok(committed.clone()),
                 },
                 |_, error| error,
@@ -12411,7 +12403,7 @@ mod tests {
 
         // A leaf that this process placed on its own and that stays where it is needs none of its data, so the
         // failure of its producer does not stop admission, which takes its two value comparisons, and surfaces only
-        // when the result is ready. A copy of that leaf needs its data, so the failure is the error of the call.
+        // when the output is ready. A copy of that leaf needs its data, so the failure is the error of the call.
         let position = session.next_value_comparison();
         let placed = run(PlaceInput::from(unshared.clone()), None, None).unwrap();
         assert_eq!(session.next_value_comparison(), position + 2);

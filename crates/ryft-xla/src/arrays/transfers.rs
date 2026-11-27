@@ -6633,7 +6633,7 @@ mod tests {
             let returned = returned.map(|source| values_from_bytes::<f32>(&source.copy_to_host_bytes().unwrap()));
             outcomes.push(format!("{name}: {returned:?}"));
             drop(clone);
-            let expected = ExecutionError::UnreducedAutoAxisArgument { index: 0, axes: vec!["x".to_string()] };
+            let expected = ExecutionError::UnreducedAutoAxisInput { index: 0, axes: vec!["x".to_string()] };
             assert_eq!(error, Error::Execution(expected), "{name}");
         }
         assert_eq!(

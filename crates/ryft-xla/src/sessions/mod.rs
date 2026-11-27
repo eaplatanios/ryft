@@ -1883,16 +1883,16 @@ impl Context for Session {
         };
 
         // An uncommitted input that cannot move onto the mesh of this handle (refer to
-        // `Self::place_uncommitted_inputs`) is rejected like an input committed elsewhere, rather than run where it
-        // is. So is an uncommitted input or captured array that stays over another named mesh that the rule above does
-        // not admit (e.g., one that is split along an axis of another mesh on the same devices), which would otherwise
+        // `Self::place_uncommitted_inputs`) is rejected like an input committed elsewhere, rather than run where it is.
+        // So is an uncommitted input or captured array that stays over another named mesh that the rule above does not
+        // admit (e.g., one that is split along an axis of another mesh on the same devices), which would otherwise
         // commit the output to that mesh. An uncommitted input whose type records nothing beyond replication, whatever
         // logical mesh that replication names, follows the computation instead, by the one rule of relocatable values
-        // (refer to `argument_type`), as an uncommitted input moves onto `mesh` replicated and as execution places a
-        // captured array on the mesh of its program (e.g., a capture uploaded replicated over another named mesh of
-        // the same device), so that operations without regions, region inputs, and captures agree, as under
-        // `jax.set_mesh`. An input that cannot move leaves every input where it is, so nothing of the
-        // operation has been submitted when either is rejected.
+        // (refer to `relocated_input_type`), as an uncommitted input moves onto `mesh` replicated and as execution
+        // places a captured array on the mesh of its program (e.g., a capture uploaded replicated over another named
+        // mesh of the same device), so that operations without regions, region inputs, and captures agree, as under
+        // `jax.set_mesh`. An input that cannot move leaves every input where it is, so nothing of the operation has
+        // been submitted when either is rejected.
         if let Some(mesh) = session_mesh {
             let placed = moved_array_inputs.as_deref().unwrap_or(array_inputs.as_slice());
             if let Some(target) = session_target
@@ -5127,9 +5127,9 @@ pub(crate) mod tests {
             // its inputs at the entry of its own program").
             let rejected = |index: usize| {
                 Err(format!(
-                    "public argument #{index} is unreduced along the mesh axes [\"x\"], which the executable cannot \
+                    "public input #{index} is unreduced along the mesh axes [\"x\"], which the executable cannot \
                      receive because a staged type does not record a pending reduction over auto mesh axes; reduce the \
-                     argument (e.g., with `Array::to_placement` onto a sharding without unreduced axes), or place it \
+                     input (e.g., with `Array::to_placement` onto a sharding without unreduced axes), or place it \
                      over explicit mesh axes, before passing it to a compiled function or an eager operation"
                 ))
             };

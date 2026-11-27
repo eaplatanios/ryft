@@ -2592,8 +2592,7 @@ mod tests {
             (UnreducedOperation::Add, UnreducedInputs::VectorAndScalar, UnreducedKind::Sum),
             (UnreducedOperation::Add, UnreducedInputs::VectorAndF64Vector, UnreducedKind::Sum),
         ] {
-            let lowering =
-                lower_unreduced_application(&UnreducedRow(operation, inputs), &inputs.inputs(kind)).unwrap();
+            let lowering = lower_unreduced_application(&UnreducedRow(operation, inputs), &inputs.inputs(kind)).unwrap();
             assert_eq!(lowering.outcomes, lowering.expected_outcomes, "{operation:?} of {inputs:?} with {kind}");
             modules.push(lowering.module);
         }

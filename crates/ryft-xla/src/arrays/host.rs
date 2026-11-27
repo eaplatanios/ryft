@@ -55,17 +55,17 @@
 //! narrower formats, and the data type itself otherwise), so a readback and a placement of the same array agree there,
 //! while a compiled `reduce` of the same values, which accumulates every format narrower than `f32` in `f32`, can
 //! differ for `f16` and the narrower formats. A compiled program that completes the same reduction (e.g., a sum of an
-//! unreduced argument) computes what the device placement computes. A device placement that completes a pending sum
-//! along some of its axes and keeps it along the others (a partial completion) fixes the association of the sum: the
+//! unreduced input) computes what the device placement computes. A device placement that completes a pending sum along
+//! some of its axes and keeps it along the others (a partial completion) fixes the association of the sum: the
 //! contributions along the completed axes are summed first, into partial sums in the data type, and a readback of the
-//! result then sums those partial sums in ascending order of their coordinates along the kept axes (e.g., the `f32`
+//! output then sums those partial sums in ascending order of their coordinates along the kept axes (e.g., the `f32`
 //! contributions `2^24`, `1`, `-2^24`, and `1` at the coordinates `(0, 0)`, `(0, 1)`, `(1, 0)`, and `(1, 1)` read back
 //! as `1`, and as `2` after completing the first axis). That is an order of accumulation that this clause allows only
 //! for the data types that accumulate their sums in themselves, so a device placement declines a partial completion of
 //! `bf16` values and of the narrower formats, whose partial sums would round to the data type (and can overflow), and
 //! takes a host round trip for it where one process can read the value back, which gives this meaning bit for bit, or
 //! returns the same error on every process otherwise. (iv) A pending maximum or minimum of floating point values that a
-//! compiled program completes (e.g., an argument whose input sharding states one over auto mesh axes) follows the
+//! compiled program completes (e.g., an input whose input sharding states one over auto mesh axes) follows the
 //! treatment of NaN values and zeros of the collective of its platform (the CPU plugin drops NaN values), because no
 //! compiled program has an exact alternative, whereas a device placement takes a host round trip for it. Every other
 //! change gives this meaning bit for bit, where all NaN encodings of a format count as one value, because the
@@ -90,7 +90,7 @@
 //! [`Array::from_host_buffer`] and [`Array::from_host_shards`] give the array no execution fence, so a readback does
 //! not report the failed upload of a replica that it skips. Every replica of an upload receives the same host bytes,
 //! so such a failure never changes the value that the readback returns, and the other observations report it. The
-//! uploads that a placement makes join their readiness into the execution fence of its result instead (e.g., the
+//! uploads that a placement makes join their readiness into the execution fence of its output instead (e.g., the
 //! uploads of its host fallback, in the background or on the calling thread), because the replicas of a placement
 //! can come from different sources, so its readbacks also report a failed replica that they skip.
 //!
@@ -99,7 +99,7 @@
 //! of the session, which a failure of that work poisons. Such a placement blocks on the readback only when the PJRT
 //! plugin lacks host to device transfer managers or their literal transfers. A process that holds no target buffer
 //! of such a placement has no upload to report the work that produces the value, so the execution fence of its
-//! result is the fence of that work instead.
+//! output is the fence of that work instead.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -147,7 +147,7 @@ impl Array {
     /// Without sharding, the first addressable device forms the canonical mesh of one device, whose only axis is named
     /// `device` (refer to [`LogicalMesh::single_device`]). The result is [committed](Self::is_committed) to its devices
     /// when `mesh` or the mesh of `session` selected them, or when it lives on more than one device, like every eager
-    /// result. It is uncommitted only when its devices are this default and it lives on a single device, so an
+    /// output. It is uncommitted only when its devices are this default and it lives on a single device, so an
     /// uncommitted array always lives on a single device. Whether committed or not, devices that neither `mesh` nor the
     /// mesh of `session` selected are ones that this process chose on its own, which a later placement onto devices of
     /// several processes takes into account (refer to [`crate::arrays::transfers`]).
@@ -384,7 +384,7 @@ impl Array {
 
         // A process without target buffers has nothing to upload, so it submits no job, which would only retain
         // `readback` (and whatever it reads) until `sources` completes. No target buffer could report the work
-        // that produces the value either, so the result waits for and reports `sources` instead.
+        // that produces the value either, so the output waits for and reports `sources` instead.
         if buffers.is_empty() {
             let output = Self::from_addressable_buffers_internal(
                 session,
@@ -431,9 +431,9 @@ impl Array {
             .submit(sources, move || run_host_uploads(pending_uploads, prepare, poison))?;
 
         // Attach the target buffers to the reservation only once the job that completes them has been handed over,
-        // and only then join their readiness into the fence of the result, so that every readback of the result reports
+        // and only then join their readiness into the fence of the output, so that every readback of the output reports
         // a failed upload, even a readback that reads only one replica of each tile or no bytes at all. A failure to
-        // build the result leaves the buffers tracked by the session until the job has filled or poisoned them.
+        // build the output leaves the buffers tracked by the session until the job has filled or poisoned them.
         for buffer in &buffers {
             work.track_buffer(buffer);
         }
@@ -2247,7 +2247,7 @@ const PROCESS_AXIS: &str = "processes";
 /// Number of `u32` words of a SHA-256 digest.
 const DIGEST_WORDS: usize = 8;
 
-/// Message of the failed precondition error that the result of a placement, or an admitted placement call, reports
+/// Message of the failed precondition error that the output of a placement, or an admitted placement call, reports
 /// when the processes of a run placed different values onto a target that all of them share, or when another
 /// process rejected the same call. Refer to [`ValueComparison`] and [`Session::place`] for more information.
 pub(crate) const DIFFERENT_VALUES_MESSAGE: &str = "the processes of the run placed different values onto a \
@@ -2437,7 +2437,7 @@ pub(crate) struct ComparisonCollective {
 impl ComparisonCollective {
     /// Submits the comparison of `digest` (or of a poison contribution when it is [`None`], refer to
     /// [`Array::digest_maximum`]) with the digests of the other processes, at the next position of the sequence of
-    /// comparisons of `session`, and returns the [`ExecutionFence`] of its verdict, which every result of the placement
+    /// comparisons of `session`, and returns the [`ExecutionFence`] of its verdict, which every output of the placement
     /// that compares joins into its own, or for which a placement call that is admitted as a whole waits before it
     /// places anything (refer to [`Session::place`]). The contributed digest is the SHA-256 digest of the session's
     /// sequence position and the words of `digest`, so contributions at different session positions disagree. The
@@ -3735,7 +3735,7 @@ mod tests {
         let sharding = Sharding::replicated(logical_mesh, 1);
 
         // No device of the mesh belongs to this process, so there is nothing to upload. No job retains the readback
-        // (and whatever it reads) until the sources complete, and the result waits for and reports those sources.
+        // (and whatever it reads) until the sources complete, and the output waits for and reports those sources.
         let (event, producer) = client.event(()).unwrap();
         let retained = Arc::new(());
         let readback_retained = Arc::clone(&retained);
@@ -3883,7 +3883,7 @@ mod tests {
         };
 
         // This process holds no target shard, so no upload of its own can report the producer of the value. The
-        // result waits for the sources instead, as the uploads of the processes that hold the shards do.
+        // output waits for the sources instead, as the uploads of the processes that hold the shards do.
         let (event, producer) = client.event(()).unwrap();
         let array = upload(ExecutionFence::new(vec![event]));
         assert_eq!(array.mesh(), &mesh);
@@ -3901,7 +3901,7 @@ mod tests {
             ),
         ));
 
-        // A failed producer fails the readiness of the result.
+        // A failed producer fails the readiness of the output.
         let (event, producer) = client.event(()).unwrap();
         let array = upload(ExecutionFence::new(vec![event]));
         producer.set(Some(PjrtError::aborted("producer failed"))).unwrap();
@@ -5815,7 +5815,7 @@ mod tests {
         assert_eq!(values_from_bytes::<f32>(&placed.copy_to_host_bytes().unwrap()), vec![3f32, 4.]);
 
         // Different digests and a missing digest fail the readiness, the readback, and every operation that reads the
-        // result alike.
+        // output alike.
         let is_rejected = |result: Result<(), Error>| {
             matches!(
                 result,
@@ -5841,7 +5841,7 @@ mod tests {
     #[test]
     fn test_array_compare_values_across_processes_skips_runs_of_one_process() {
         // A client of one process compares nothing, with or without the check, so a session with the check creates
-        // exactly the arrays that one without it creates (a host leaf creates only its result) and joins no fence of a
+        // exactly the arrays that one without it creates (a host leaf creates only its output) and joins no fence of a
         // comparison.
         let client = cpu_client(2);
         let mesh = domain_mesh(client, "x", 2);
