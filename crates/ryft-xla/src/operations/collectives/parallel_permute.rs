@@ -31,40 +31,47 @@ impl LowerableOperation for ParallelPermuteOperation {
                 operation.infer_output_types(input_types, &[])
             },
         )?;
-        lower_parallel_permute_to_mlir(
-            self,
-            &collective_state,
-            input_values[0],
-            &mut lowerer.block(),
-            lowerer.location(),
-        )
+        self.lower_to_mlir(&collective_state, input_values[0], &mut lowerer.block(), lowerer.location())
     }
 }
 
-/// Lowers one traced `parallel_permute` to a channeled `stablehlo.collective_permute`, expanding the axis-local
-/// `(source, target)` pairs to global device pairs across the named mesh axis's replica groups.
-fn lower_parallel_permute_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &ParallelPermuteOperation,
-    collective_state: &CollectiveLoweringState,
-    input_value: ValueRef<'b, 'c, 't>,
-    block: &mut BlockRef<'b, 'c, 't>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let (replica_groups, _) = collective_state.replica_groups(operation.axes(), operation.axis_size(), None)?;
-    let mut source_target_pairs = Vec::with_capacity(replica_groups.len() * operation.source_target_pairs().len());
-    for group in &replica_groups {
-        for (source, target) in operation.source_target_pairs() {
-            source_target_pairs.push((group[*source], group[*target]));
+/// Lowering of a [`ParallelPermuteOperation`] for one value.
+trait ParallelPermuteOperationLoweringExtension {
+    /// Lowers one traced `parallel_permute` to a channeled `stablehlo.collective_permute`, expanding the axis-local
+    /// `(source, target)` pairs to global device pairs across the named mesh axis's replica groups.
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_value: ValueRef<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl ParallelPermuteOperationLoweringExtension for ParallelPermuteOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_value: ValueRef<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let (replica_groups, _) = collective_state.replica_groups(self.axes(), self.axis_size(), None)?;
+        let mut source_target_pairs = Vec::with_capacity(replica_groups.len() * self.source_target_pairs().len());
+        for group in &replica_groups {
+            for (source, target) in self.source_target_pairs() {
+                source_target_pairs.push((group[*source], group[*target]));
+            }
         }
+        let result = block.append_operation(stable_hlo::collective_permute(
+            input_value,
+            source_target_pairs.as_slice(),
+            Some(collective_state.next_channel_id()),
+            Some(stable_hlo::ChannelHandleType::DeviceToDevice),
+            location,
+        )?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
-    let result = block.append_operation(stable_hlo::collective_permute(
-        input_value,
-        source_target_pairs.as_slice(),
-        Some(collective_state.next_channel_id()),
-        Some(stable_hlo::ChannelHandleType::DeviceToDevice),
-        location,
-    )?)?;
-    Ok(vec![result.result(0).unwrap().as_ref()])
 }
 
 #[cfg(test)]

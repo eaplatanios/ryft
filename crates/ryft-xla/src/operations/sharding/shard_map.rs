@@ -16,12 +16,11 @@ use ryft_mlir::{
 
 use crate::lowering::regions::lower_program_outputs_with_inputs;
 use crate::lowering::states::CollectiveLoweringState;
-use crate::lowering::types::{annotate_output_memory, lower_tensor_type};
+use crate::lowering::types::{ArrayTypeLoweringExtension, annotate_output_memory};
 use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::control_flow::lowered_effect_classes;
-use crate::{
-    Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, SHARDY_MESH_SYMBOL_NAME, ToMlir, Type,
-};
+use crate::sharding::UnreducedKindExtension;
+use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, SHARDY_MESH_SYMBOL_NAME, Type};
 
 impl LowerableOperation for ShardMapOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -170,11 +169,11 @@ where
     let threaded_effects = token_threaded_effects(lowered_effect_classes(program)?).collect::<Vec<_>>();
     let mut local_input_tensor_types = local_input_types
         .iter()
-        .map(|array_type| lower_tensor_type(array_type, context, location).map(|r#type| r#type.as_ref()))
+        .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let mut global_output_tensor_types = global_output_types
         .iter()
-        .map(|array_type| lower_tensor_type(array_type, context, location).map(|r#type| r#type.as_ref()))
+        .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let mut manual_inputs = outer_inputs.to_vec();
     let enclosing_manual_axes = collective_state.bound_manual_axes();
@@ -321,7 +320,7 @@ fn manual_computation_tensor_sharding<'c, 't>(
         dimension_shardings.as_slice(),
         replicated_axes.as_slice(),
         unreduced_axes.as_slice(),
-        sharding.unreduced_kind().to_mlir(context.unknown_location())?,
+        sharding.unreduced_kind().lower(),
     )?)
 }
 

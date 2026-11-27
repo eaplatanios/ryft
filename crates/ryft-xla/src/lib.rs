@@ -25,7 +25,6 @@ pub mod errors;
 pub mod execution;
 pub mod kernels;
 pub mod lowering;
-pub mod mlir;
 pub mod operations;
 pub mod pjrt;
 pub mod sessions;
@@ -74,7 +73,6 @@ pub use lowering::{
     LowerableProgram, LoweredModule, Lowerer, LoweringError, MemberLowerableOperation, ProgramLoweringOptions,
     RaggedDotLoweringStrategy, lower_projected_operation,
 };
-pub use mlir::ToMlir;
 pub use operations::{
     Operation, PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE, ensure_print_handler_registered, with_captured_prints,
 };
@@ -85,7 +83,10 @@ pub use sessions::{
     RuntimeRequirement, Session, SessionBuilder, SessionError, Target, TargetDevice, ThroughSession, Tracer,
     normalize_runtime_requirements,
 };
-pub use sharding::{OpShardingExtension, SHARDY_MESH_SYMBOL_NAME};
+pub use sharding::{
+    LogicalMeshExtension, OpShardingExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension,
+    UnreducedKindExtension,
+};
 pub use tracing::{ArrayTracer, TracedProgram, trace, trace_with_context};
 pub use values::{ArrayConstant, Constant, Dimension, Reference, Type, Value};
 

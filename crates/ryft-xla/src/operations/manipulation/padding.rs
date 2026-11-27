@@ -10,9 +10,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::EffectTokens;
-use crate::lowering::types::{
-    lower_physical_bound_value_with_padding, lower_runtime_dimension_size_i64, lower_tensor_type, physical_bound_type,
-};
+use crate::lowering::types::{ArrayTypeLoweringExtension, lower_runtime_dimension_size_i64, physical_bound_type};
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE, ASSERT_PAD_KIND,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
@@ -27,8 +25,7 @@ impl LowerableOperation for PadOperation<ArrayType> {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        lower_pad_to_mlir(
-            self,
+        self.lower_to_mlir(
             input_values,
             input_types,
             output_types,
@@ -65,8 +62,7 @@ impl LowerableOperation for PadOperation<Type> {
         if self.effects().classes().contains(EffectClass::OrderedAssertion) {
             for axis in 0..output_type.rank() {
                 let input_extent = lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?;
-                lower_pad_extent_assertion(
-                    self,
+                self.lower_extent_assertion(
                     axis,
                     input_extent,
                     input_values[axis + 2],
@@ -77,8 +73,7 @@ impl LowerableOperation for PadOperation<Type> {
                 )?;
             }
         }
-        let results = lower_pad_to_mlir(
-            self,
+        let results = self.lower_to_mlir(
             &input_values[..2],
             &input_types[..2]
                 .iter()
@@ -95,192 +90,209 @@ impl LowerableOperation for PadOperation<Type> {
     }
 }
 
-/// Lowers a [`PadOperation`] to StableHLO for both `PadOperation<ArrayType>`, which passes no `output_extents`, and
-/// `PadOperation<Type>`, which passes its explicit first-class output extents in `output_extents`.
-#[allow(clippy::too_many_arguments)]
-fn lower_pad_to_mlir<'b, 'c: 'b, 't: 'c, T: CoreType, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
-    operation: &PadOperation<T>,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-    output_extents: Option<&[ValueRef<'b, 'c, 't>]>,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    check_count!("input", input_values, 2, ProgramError);
-    check_count!("input", input_types, 2, ProgramError);
-    check_count!("output", output_types, 1, ProgramError);
-    let rank = input_types[0].rank();
-    if let Some(extents) = output_extents {
-        // The explicit result extents are operands of the instruction.
-        check_count!("input", extents, rank, ProgramError);
-    }
-    if operation.interior_padding().len() != rank {
-        return Err(ProgramError::from(TypeError::invalid(
-            "`pad` padding configuration must match the input rank".to_string(),
-        ))
-        .into());
-    }
-    let output_type = &output_types[0];
-    // Keep ordinary static padding in its canonical native form. Interior amounts on axes with zero or one element are
-    // unobservable and need not fit a native attribute. Extreme opposing edges require the safe cropped form below.
-    let interior_padding = operation
-        .interior_padding()
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(axis, interior)| {
-            if input_types[0].shape().dimensions()[axis].value().is_some_and(|extent| extent <= 1) {
-                0
-            } else {
-                interior
-            }
-        })
-        .collect::<Vec<_>>();
-    let ordinary_static_padding = input_types[0].static_shape().is_some()
-        && output_type.static_shape().is_some()
-        && input_types[0].shape().dimensions().iter().enumerate().all(|(axis, dimension)| {
-            let extent = dimension.value().unwrap() as i128;
-            let expanded = extent
-                + (extent - 1).max(0) * interior_padding[axis] as i128
-                + i128::from(operation.edge_padding_low()[axis].max(0))
-                + i128::from(operation.edge_padding_high()[axis].max(0));
-            expanded <= i128::from(i64::MAX)
-                && operation.edge_padding_low()[axis] != i64::MIN
-                && operation.edge_padding_high()[axis] != i64::MIN
-        });
-    if ordinary_static_padding {
-        interior_padding.iter().copied().try_for_each(validate_pad_interior_padding)?;
-        let result = block.append_operation(stable_hlo::pad(
-            input_values[0],
-            input_values[1],
-            operation.edge_padding_low(),
-            operation.edge_padding_high(),
-            &interior_padding,
-            location,
-        )?)?;
-        return Ok(vec![result.result(0).unwrap().as_ref()]);
-    }
+/// Lowering of a [`PadOperation`] in any of its type universes.
+trait PadOperationLoweringExtension {
+    /// Lowers a [`PadOperation`] to StableHLO for both `PadOperation<ArrayType>`, which passes no `output_extents`, and
+    /// `PadOperation<Type>`, which passes its explicit first-class output extents in `output_extents`.
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        output_extents: Option<&[ValueRef<'b, 'c, 't>]>,
+        block: &mut B,
+        context: &'c MlirContext<'t>,
+        location: L,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
 
-    let physical_input_type = physical_bound_type(&input_types[0])?;
-    let physical_output_type = physical_bound_type(output_type)?;
-    let mut starts = Vec::with_capacity(rank);
-    let mut limits = Vec::with_capacity(rank);
-    let mut low_padding = Vec::with_capacity(rank);
-    let mut high_padding = Vec::with_capacity(rank);
-    let mut retained_interior = Vec::with_capacity(rank);
-    let mut entirely_padding = false;
-    for axis in 0..rank {
-        let input_extent = physical_input_type.shape().dimensions()[axis].value().unwrap() as i128;
-        let output_extent = physical_output_type.shape().dimensions()[axis].value().unwrap() as i128;
-        let low = i128::from(operation.edge_padding_low()[axis]);
-        let stride = operation.interior_padding()[axis] as i128 + 1;
-        // Input position k lands at low + k * stride. Intersect those positions with the output capacity before
-        // constructing a native pad, so neither huge interior gaps nor opposing edges create oversized temporaries.
-        let first = if low < 0 { (-low + stride - 1) / stride } else { 0 };
-        let limit = if output_extent <= low { 0 } else { ((output_extent - 1 - low) / stride + 1).min(input_extent) };
-        if first >= limit || output_extent == 0 {
-            entirely_padding = true;
-            break;
+impl<T: CoreType> PadOperationLoweringExtension for PadOperation<T> {
+    #[allow(clippy::too_many_arguments)]
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        output_extents: Option<&[ValueRef<'b, 'c, 't>]>,
+        block: &mut B,
+        context: &'c MlirContext<'t>,
+        location: L,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        check_count!("input", input_values, 2, ProgramError);
+        check_count!("input", input_types, 2, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        let rank = input_types[0].rank();
+        if let Some(extents) = output_extents {
+            // The explicit result extents are operands of the instruction.
+            check_count!("input", extents, rank, ProgramError);
         }
-        let retained = limit - first;
-        let first_position = low + first * stride;
-        let last_position = first_position + (retained - 1) * stride;
-        starts.push(first as usize);
-        limits.push(limit as usize);
-        low_padding.push(first_position as i64);
-        high_padding.push((output_extent - last_position - 1) as i64);
-        retained_interior.push(if retained <= 1 { 0 } else { operation.interior_padding()[axis] });
-    }
-    let mut block = block.as_ref();
-    let location = location.as_ref();
-    let mut result = if entirely_padding {
-        block
-            .append_operation(stable_hlo::broadcast(
+        if self.interior_padding().len() != rank {
+            return Err(ProgramError::from(TypeError::invalid(
+                "`pad` padding configuration must match the input rank".to_string(),
+            ))
+            .into());
+        }
+        let output_type = &output_types[0];
+        // Keep ordinary static padding in its canonical native form. Interior amounts on axes with zero or one element
+        // are unobservable and need not fit a native attribute. Extreme opposing edges require the safe cropped form
+        // below.
+        let interior_padding = self
+            .interior_padding()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(axis, interior)| {
+                if input_types[0].shape().dimensions()[axis].value().is_some_and(|extent| extent <= 1) {
+                    0
+                } else {
+                    interior
+                }
+            })
+            .collect::<Vec<_>>();
+        let ordinary_static_padding = input_types[0].static_shape().is_some()
+            && output_type.static_shape().is_some()
+            && input_types[0].shape().dimensions().iter().enumerate().all(|(axis, dimension)| {
+                let extent = dimension.value().unwrap() as i128;
+                let expanded = extent
+                    + (extent - 1).max(0) * interior_padding[axis] as i128
+                    + i128::from(self.edge_padding_low()[axis].max(0))
+                    + i128::from(self.edge_padding_high()[axis].max(0));
+                expanded <= i128::from(i64::MAX)
+                    && self.edge_padding_low()[axis] != i64::MIN
+                    && self.edge_padding_high()[axis] != i64::MIN
+            });
+        if ordinary_static_padding {
+            interior_padding.iter().copied().try_for_each(validate_pad_interior_padding)?;
+            let result = block.append_operation(stable_hlo::pad(
+                input_values[0],
                 input_values[1],
-                lower_tensor_type(&physical_output_type, context, location)?,
-                &[],
+                self.edge_padding_low(),
+                self.edge_padding_high(),
+                &interior_padding,
                 location,
-            )?)?
-            .result(0)
-            .unwrap()
-            .as_ref()
-    } else {
-        // Inactive input elements must contain the actual padding scalar, not a converted approximation or zero. This
-        // makes every retained output prefix correct even when the runtime input is smaller than its capacity.
-        let input = lower_physical_bound_value_with_padding(
-            input_values[0],
-            &input_types[0],
-            0.0,
-            Some(input_values[1]),
-            &mut block,
-            context,
-            location,
-        )?;
-        let input = if starts.iter().any(|start| *start != 0)
-            || limits
-                .iter()
-                .enumerate()
-                .any(|(axis, limit)| *limit != physical_input_type.shape().dimensions()[axis].value().unwrap())
-        {
+            )?)?;
+            return Ok(vec![result.result(0).unwrap().as_ref()]);
+        }
+
+        let physical_input_type = physical_bound_type(&input_types[0])?;
+        let physical_output_type = physical_bound_type(output_type)?;
+        let mut starts = Vec::with_capacity(rank);
+        let mut limits = Vec::with_capacity(rank);
+        let mut low_padding = Vec::with_capacity(rank);
+        let mut high_padding = Vec::with_capacity(rank);
+        let mut retained_interior = Vec::with_capacity(rank);
+        let mut entirely_padding = false;
+        for axis in 0..rank {
+            let input_extent = physical_input_type.shape().dimensions()[axis].value().unwrap() as i128;
+            let output_extent = physical_output_type.shape().dimensions()[axis].value().unwrap() as i128;
+            let low = i128::from(self.edge_padding_low()[axis]);
+            let stride = self.interior_padding()[axis] as i128 + 1;
+            // Input position k lands at low + k * stride. Intersect those positions with the output capacity before
+            // constructing a native pad, so neither huge interior gaps nor opposing edges create oversized temporaries.
+            let first = if low < 0 { (-low + stride - 1) / stride } else { 0 };
+            let limit =
+                if output_extent <= low { 0 } else { ((output_extent - 1 - low) / stride + 1).min(input_extent) };
+            if first >= limit || output_extent == 0 {
+                entirely_padding = true;
+                break;
+            }
+            let retained = limit - first;
+            let first_position = low + first * stride;
+            let last_position = first_position + (retained - 1) * stride;
+            starts.push(first as usize);
+            limits.push(limit as usize);
+            low_padding.push(first_position as i64);
+            high_padding.push((output_extent - last_position - 1) as i64);
+            retained_interior.push(if retained <= 1 { 0 } else { self.interior_padding()[axis] });
+        }
+        let mut block = block.as_ref();
+        let location = location.as_ref();
+        let mut result = if entirely_padding {
             block
-                .append_operation(stable_hlo::slice(input, &starts, &limits, &vec![1; rank], location)?)?
+                .append_operation(stable_hlo::broadcast(
+                    input_values[1],
+                    physical_output_type.lower(context, location)?,
+                    &[],
+                    location,
+                )?)?
                 .result(0)
                 .unwrap()
                 .as_ref()
         } else {
-            input
-        };
-        retained_interior.iter().copied().try_for_each(validate_pad_interior_padding)?;
-        block
-            .append_operation(stable_hlo::pad(
-                input,
-                input_values[1],
-                &low_padding,
-                &high_padding,
-                &retained_interior,
+            // Inactive input elements must contain the actual padding scalar, not a converted approximation or zero.
+            // This makes every retained output prefix correct even when the runtime input is smaller than its capacity.
+            let input = input_types[0].lower_physical_bound_value_with_padding(
+                input_values[0],
+                0.0,
+                Some(input_values[1]),
+                &mut block,
+                context,
                 location,
-            )?)?
-            .result(0)
-            .unwrap()
-            .as_ref()
-    };
-    let mut refined_type = physical_output_type;
-    for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
-        if matches!(dimension, Dimension::Static(_)) {
-            continue;
+            )?;
+            let input = if starts.iter().any(|start| *start != 0)
+                || limits
+                    .iter()
+                    .enumerate()
+                    .any(|(axis, limit)| *limit != physical_input_type.shape().dimensions()[axis].value().unwrap())
+            {
+                block
+                    .append_operation(stable_hlo::slice(input, &starts, &limits, &vec![1; rank], location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref()
+            } else {
+                input
+            };
+            retained_interior.iter().copied().try_for_each(validate_pad_interior_padding)?;
+            block
+                .append_operation(stable_hlo::pad(
+                    input,
+                    input_values[1],
+                    &low_padding,
+                    &high_padding,
+                    &retained_interior,
+                    location,
+                )?)?
+                .result(0)
+                .unwrap()
+                .as_ref()
+        };
+        let mut refined_type = physical_output_type;
+        for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
+            if matches!(dimension, Dimension::Static(_)) {
+                continue;
+            }
+            let extent = match output_extents {
+                Some(extents) => extents[axis],
+                // Homogeneous padding retains a dynamic axis only when its size is unchanged.
+                None => lower_runtime_dimension_size_i64(input_values[0], axis, &mut block, context, location)?,
+            };
+            let extent = block
+                .append_operation(stable_hlo::convert(
+                    extent,
+                    ArrayType::scalar(DataType::I32).lower(context, location)?,
+                    location,
+                )?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
+            let mut dimensions = refined_type.shape().dimensions().to_vec();
+            dimensions[axis] = dimension.clone();
+            refined_type = refined_type.with_shape(Shape::new(dimensions));
+            result = block
+                .append_operation(stable_hlo::set_dimension_size(
+                    result,
+                    extent,
+                    refined_type.lower(context, location)?,
+                    axis,
+                    location,
+                )?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
         }
-        let extent = match output_extents {
-            Some(extents) => extents[axis],
-            // Homogeneous padding retains a dynamic axis only when its size is unchanged.
-            None => lower_runtime_dimension_size_i64(input_values[0], axis, &mut block, context, location)?,
-        };
-        let extent = block
-            .append_operation(stable_hlo::convert(
-                extent,
-                lower_tensor_type(&ArrayType::scalar(DataType::I32), context, location)?,
-                location,
-            )?)?
-            .result(0)
-            .unwrap()
-            .as_ref();
-        let mut dimensions = refined_type.shape().dimensions().to_vec();
-        dimensions[axis] = dimension.clone();
-        refined_type = refined_type.with_shape(Shape::new(dimensions));
-        result = block
-            .append_operation(stable_hlo::set_dimension_size(
-                result,
-                extent,
-                lower_tensor_type(&refined_type, context, location)?,
-                axis,
-                location,
-            )?)?
-            .result(0)
-            .unwrap()
-            .as_ref();
+        Ok(vec![result])
     }
-    Ok(vec![result])
 }
 
 /// Validates that one pad interior amount can be represented by StableHLO's signed 64-bit attribute storage.
@@ -290,40 +302,60 @@ fn validate_pad_interior_padding(value: usize) -> Result<(), Error> {
     })
 }
 
-/// Checks the padding of a [`PadOperation`] along `axis` against the actual `input` and `output` extents using wide
-/// host arithmetic before native dimension narrowing.
-#[allow(clippy::too_many_arguments)]
-fn lower_pad_extent_assertion<'b, 'c: 'b, 't: 'c>(
-    operation: &PadOperation<Type>,
-    axis: usize,
-    input: ValueRef<'b, 'c, 't>,
-    output: ValueRef<'b, 'c, 't>,
-    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<(), Error> {
-    let predicate = lower_deliberately_false_assertion_predicate(output, block, context, location)?;
-    let detail = format!(
-        "{axis}:{}:{}:{}",
-        operation.edge_padding_low()[axis],
-        operation.edge_padding_high()[axis],
-        operation.interior_padding()[axis],
-    );
-    let backend_configuration = context.dictionary_attribute(&[
-        context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute("pad")),
-        context.named_attribute(context.identifier(ASSERT_KIND_ATTRIBUTE), context.string_attribute(ASSERT_PAD_KIND)),
-        context.named_attribute(context.identifier(ASSERT_DETAIL_ATTRIBUTE), context.string_attribute(detail.as_str())),
-    ]);
-    lower_assertion_custom_call(
-        predicate,
-        &[input, output],
-        backend_configuration,
-        effect_tokens,
-        block,
-        context,
-        location,
-    )
+/// Lowering of the runtime checks of an array IR [`PadOperation`].
+trait PadOperationAssertionLoweringExtension {
+    /// Checks the padding of a [`PadOperation`] along `axis` against the actual `input` and `output` extents using wide
+    /// host arithmetic before native dimension narrowing.
+    fn lower_extent_assertion<'b, 'c: 'b, 't: 'c>(
+        &self,
+        axis: usize,
+        input: ValueRef<'b, 'c, 't>,
+        output: ValueRef<'b, 'c, 't>,
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<(), Error>;
+}
+
+impl PadOperationAssertionLoweringExtension for PadOperation<Type> {
+    #[allow(clippy::too_many_arguments)]
+    fn lower_extent_assertion<'b, 'c: 'b, 't: 'c>(
+        &self,
+        axis: usize,
+        input: ValueRef<'b, 'c, 't>,
+        output: ValueRef<'b, 'c, 't>,
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<(), Error> {
+        let predicate = lower_deliberately_false_assertion_predicate(output, block, context, location)?;
+        let detail = format!(
+            "{axis}:{}:{}:{}",
+            self.edge_padding_low()[axis],
+            self.edge_padding_high()[axis],
+            self.interior_padding()[axis],
+        );
+        let backend_configuration = context.dictionary_attribute(&[
+            context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute("pad")),
+            context
+                .named_attribute(context.identifier(ASSERT_KIND_ATTRIBUTE), context.string_attribute(ASSERT_PAD_KIND)),
+            context.named_attribute(
+                context.identifier(ASSERT_DETAIL_ATTRIBUTE),
+                context.string_attribute(detail.as_str()),
+            ),
+        ]);
+        lower_assertion_custom_call(
+            predicate,
+            &[input, output],
+            backend_configuration,
+            effect_tokens,
+            block,
+            context,
+            location,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -464,107 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_pad_to_mlir() {
-        let context = MlirContext::new();
-        let location = context.unknown_location();
-        let input_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(1)]));
-        let padding_type = ArrayType::scalar(DataType::I64);
-        let output_type = input_type.clone().with_shape(Shape::new(vec![Dimension::Static(3)]));
-        let input_tensor = lower_tensor_type(&input_type, &context, location).unwrap();
-        let padding_tensor = lower_tensor_type(&padding_type, &context, location).unwrap();
-        let mut block = context.block(&[(input_tensor, location), (padding_tensor, location)]);
-        let input = block.argument(0).unwrap().as_ref();
-        let padding = block.argument(1).unwrap().as_ref();
-        assert!(matches!(
-            lower_pad_to_mlir(
-                &PadOperation::<ArrayType>::new(vec![1], vec![1], vec![usize::MAX]).unwrap(),
-                &[input, padding],
-                &[input_type.clone(), padding_type.clone()],
-                std::slice::from_ref(&output_type),
-                Some(&[]),
-                &mut block,
-                &context,
-                location,
-            )
-            .unwrap_err(),
-            Error::Core(core_error) if matches!(
-                core_error.as_ref(),
-                CoreError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-            ),
-        ));
-        // Interior padding is unobservable on a one-element axis, so it need not fit the native attribute type.
-        let results = lower_pad_to_mlir(
-            &PadOperation::<ArrayType>::new(vec![1], vec![1], vec![usize::MAX]).unwrap(),
-            &[input, padding],
-            &[input_type, padding_type],
-            std::slice::from_ref(&output_type),
-            None,
-            &mut block,
-            &context,
-            location,
-        )
-        .unwrap();
-        assert_eq!(results[0].r#type().unwrap(), lower_tensor_type(&output_type, &context, location).unwrap().as_ref());
-    }
-
-    #[test]
-    fn test_lower_pad_to_mlir_reconciles_requested_dynamic_bound() {
-        let context = MlirContext::new();
-        let location = context.unknown_location();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("input", Some(5))]));
-        let padding_value_type = ArrayType::scalar(DataType::F32);
-        let requested_output_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("output", Some(12))]));
-        let input_tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
-        let padding_value_tensor_type = lower_tensor_type(&padding_value_type, &context, location).unwrap();
-        let mut block = context.block(&[(input_tensor_type, location), (padding_value_tensor_type, location)]);
-        let input = block.argument(0).unwrap().as_ref();
-        let padding_value = block.argument(1).unwrap().as_ref();
-
-        let output_extent =
-            lower_static_index_constants(&[6], &mut block.as_ref(), &context, location.as_ref()).unwrap()[0];
-        let results = lower_pad_to_mlir(
-            &PadOperation::<ArrayType>::new(vec![1], vec![2], vec![1]).unwrap(),
-            &[input, padding_value],
-            &[input_type, padding_value_type],
-            std::slice::from_ref(&requested_output_type),
-            Some(&[output_extent]),
-            &mut block,
-            &context,
-            location,
-        )
-        .unwrap();
-
-        assert_eq!(
-            results[0].r#type().unwrap(),
-            lower_tensor_type(&requested_output_type, &context, location).unwrap().as_ref(),
-        );
-        let operation_names = block
-            .operations()
-            .unwrap()
-            .map(|operation| operation.unwrap().name().as_str().unwrap().to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            operation_names,
-            vec![
-                "stablehlo.constant",
-                "stablehlo.get_dimension_size",
-                "stablehlo.constant",
-                "stablehlo.set_dimension_size",
-                "stablehlo.iota",
-                "stablehlo.broadcast_in_dim",
-                "stablehlo.compare",
-                "stablehlo.broadcast_in_dim",
-                "stablehlo.select",
-                "stablehlo.pad",
-                "stablehlo.convert",
-                "stablehlo.set_dimension_size",
-            ],
-        );
-    }
-
-    #[test]
-    fn test_lower_pad_to_mlir_extreme_edge_padding() {
+    fn test_pad_operation_lower_extreme_edge_padding() {
         let client = execution_client();
         for (size, low, high, interior, expected) in [
             (1usize, i64::MIN, i64::MAX, 0usize, Vec::new()),
@@ -637,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_pad_to_mlir_execution() {
+    fn test_pad_operation_lower_execution() {
         let client = execution_client();
         crate::operations::assertions::ensure_assertion_handler_registered(client).unwrap();
         // Exact bits survive interior insertion, cropping by negative edges, empty inputs, and changes to allocation
@@ -806,8 +738,9 @@ mod tests {
                             )
                             .and_then(|execution| execution.block_until_ready());
                         if actual_size != size {
-                            // The assertion recomputes the result extent from the actual input extent in wide arithmetic
-                            // and rejects it when it differs from the requested extent or leaves the native `i32` range.
+                            // The assertion recomputes the result extent from the actual input extent in wide
+                            // arithmetic and rejects it when it differs from the requested extent or leaves the native
+                            // `i32` range.
                             let actual_size = i128::from(actual_size);
                             let required_extent = i128::from(low)
                                 + i128::from(high)
@@ -833,6 +766,103 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_pad_operation_lower_to_mlir() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let input_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(1)]));
+        let padding_type = ArrayType::scalar(DataType::I64);
+        let output_type = input_type.clone().with_shape(Shape::new(vec![Dimension::Static(3)]));
+        let input_tensor = input_type.lower(&context, location).unwrap();
+        let padding_tensor = padding_type.lower(&context, location).unwrap();
+        let mut block = context.block(&[(input_tensor, location), (padding_tensor, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let padding = block.argument(1).unwrap().as_ref();
+        let operation = PadOperation::<ArrayType>::new(vec![1], vec![1], vec![usize::MAX]).unwrap();
+        assert!(matches!(
+            operation.lower_to_mlir(
+                &[input, padding],
+                &[input_type.clone(), padding_type.clone()],
+                std::slice::from_ref(&output_type),
+                Some(&[]),
+                &mut block,
+                &context,
+                location,
+            ),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+            ),
+        ));
+        // Interior padding is unobservable on a one-element axis, so it need not fit the native attribute type.
+        let results = operation
+            .lower_to_mlir(
+                &[input, padding],
+                &[input_type, padding_type],
+                std::slice::from_ref(&output_type),
+                None,
+                &mut block,
+                &context,
+                location,
+            )
+            .unwrap();
+        assert_eq!(results[0].r#type().unwrap(), output_type.lower(&context, location).unwrap().as_ref());
+    }
+
+    #[test]
+    fn test_pad_operation_lower_to_mlir_reconciles_requested_dynamic_bound() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("input", Some(5))]));
+        let padding_value_type = ArrayType::scalar(DataType::F32);
+        let requested_output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("output", Some(12))]));
+        let input_tensor_type = input_type.lower(&context, location).unwrap();
+        let padding_value_tensor_type = padding_value_type.lower(&context, location).unwrap();
+        let mut block = context.block(&[(input_tensor_type, location), (padding_value_tensor_type, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let padding_value = block.argument(1).unwrap().as_ref();
+
+        let output_extent =
+            lower_static_index_constants(&[6], &mut block.as_ref(), &context, location.as_ref()).unwrap()[0];
+        let results = PadOperation::<ArrayType>::new(vec![1], vec![2], vec![1])
+            .unwrap()
+            .lower_to_mlir(
+                &[input, padding_value],
+                &[input_type, padding_value_type],
+                std::slice::from_ref(&requested_output_type),
+                Some(&[output_extent]),
+                &mut block,
+                &context,
+                location,
+            )
+            .unwrap();
+
+        assert_eq!(results[0].r#type().unwrap(), requested_output_type.lower(&context, location).unwrap().as_ref());
+        let operation_names = block
+            .operations()
+            .unwrap()
+            .map(|operation| operation.unwrap().name().as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operation_names,
+            vec![
+                "stablehlo.constant",
+                "stablehlo.get_dimension_size",
+                "stablehlo.constant",
+                "stablehlo.set_dimension_size",
+                "stablehlo.iota",
+                "stablehlo.broadcast_in_dim",
+                "stablehlo.compare",
+                "stablehlo.broadcast_in_dim",
+                "stablehlo.select",
+                "stablehlo.pad",
+                "stablehlo.convert",
+                "stablehlo.set_dimension_size",
+            ],
+        );
     }
 
     #[test]

@@ -21,12 +21,11 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    lower_f64_constant_splat, lower_physical_bound_value, lower_restore_dynamic_dimensions, lower_tensor_type,
-    physical_bound_type, static_dimensions,
+    ArrayTypeLoweringExtension, lower_f64_constant_splat, physical_bound_type, static_dimensions,
 };
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::extrema::FloatExtremumForm;
-use crate::operations::reductions::lower_reduce_to_mlir;
+use crate::operations::reductions::ReductionKindLoweringExtension;
 use crate::{Error, LoweringError, Type};
 
 /// Seed of the dropout masks of the fused attention kernels. Calls with dropout but without a dropout state, which
@@ -140,474 +139,500 @@ pub(crate) fn select_attention_implementation(
     }
 }
 
-/// Lowers one call of the forward attention definition with the provided configuration, input structure, and
-/// residual request to cuDNN's fused ABI, for a boundary that [`fused_attention_eligibility`] accepts.
-///
-/// An eligible `bf16`/`f16` CUDA call emits `__cudnn$fmha[ScaleBias]Softmax[Dropout]` with physical `BNTH` inputs and
-/// restores the logical rank and dynamic dimensions of its outputs. Optional bias and sequence length inputs retain the
-/// canonical [`AttentionInputs`] order until the final ABI assembly.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
-    configuration: AttentionConfiguration,
-    input_structure: AttentionInputs<Placeholder>,
-    return_residual: bool,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let input_count = input_structure.parameter_count();
-    if input_values.len() != input_count || input_values.len() != input_types.len() {
-        return Err(ProgramError::InvalidInputCount { expected: input_count, actual: input_values.len() }.into());
-    }
-    let expected_output_count = if return_residual { 2 } else { 1 };
-    check_count!("output", output_types, expected_output_count, ProgramError);
-    let indices = attention_input_indices(input_structure);
-    let uses_sequence_lengths =
-        input_structure.query_sequence_lengths.is_some() || input_structure.key_value_sequence_lengths.is_some();
-    let data_type = input_types[0].data_type();
-    let [batch, query_sequence, heads, head_dimension] = attention_dimensions(&input_types[0])?;
-    let [_, key_value_sequence, _, _] = attention_dimensions(&input_types[1])?;
-    let heads = heads.value().ok_or_else(|| {
-        Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME.to_string(),
-            reason: "the heads dimension must be static".to_string(),
-        })
-    })?;
-    let head_dimension = head_dimension.value().ok_or_else(|| {
-        Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME.to_string(),
-            reason: "the head dimension must be static".to_string(),
-        })
-    })?;
-    let physical_batch = attention_physical_extent(&batch)?;
-    let physical_query_sequence = attention_physical_extent(&query_sequence)?;
-    let physical_key_value_sequence = attention_physical_extent(&key_value_sequence)?;
-    {
-        let mut physical_inputs = input_values
-            .iter()
-            .zip(input_types)
-            .map(|(value, r#type)| lower_physical_bound_value(*value, r#type, 0.0, block, context, location))
-            .collect::<Result<Vec<_>, _>>()?;
-        for index in 0..3 {
-            let physical_type = physical_bound_type(&input_types[index])?;
-            physical_inputs[index] =
-                normalize_fused_attention_operand(physical_inputs[index], &physical_type, block, location)?;
-        }
-        let score_type = attention_array_type(
-            data_type,
-            &[physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
-        );
-        let bias = prepare_fused_attention_bias(
-            &indices,
-            physical_inputs.as_slice(),
-            input_types,
-            &score_type,
-            block,
-            context,
-            location,
-        )?;
-        let sequence_lengths = if uses_sequence_lengths {
-            let query_lengths = match indices.query_sequence_lengths {
-                Some(index) => physical_inputs[index],
-                None => synthesize_fused_attention_sequence_lengths(
-                    input_values[0],
-                    input_types[0].rank() - 3,
-                    &batch,
-                    physical_batch,
-                    block,
-                    context,
-                    location,
-                )?,
-            };
-            let key_value_lengths = match indices.key_value_sequence_lengths {
-                Some(index) => physical_inputs[index],
-                None => synthesize_fused_attention_sequence_lengths(
-                    input_values[1],
-                    input_types[1].rank() - 3,
-                    &batch,
-                    physical_batch,
-                    block,
-                    context,
-                    location,
-                )?,
-            };
-            Some((query_lengths, key_value_lengths))
-        } else {
-            None
-        };
-        let element_type = if data_type == DataType::BF16 { "BF16" } else { "F16" };
-        let backend_config = fused_attention_backend_config(
-            element_type,
-            [physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
-            configuration.scale_for(head_dimension),
-            fused_attention_mask_type(fused_attention_is_causal(configuration), sequence_lengths.is_some()),
-            FMHA_FORWARD_DOT_DIMENSION_NUMBERS,
-            configuration.dropout(),
-            fused_attention_sliding_window_length(configuration),
-        );
-        // The operand order matches the operand order of the boundary exactly, so the bias sits after the value and
-        // the `i32[batch]` sequence lengths trail. The workspace result is declared at size zero, because the
-        // compiler resizes it as needed, and the training form inserts the `f32[b, n, t]` log-sum-exp residual
-        // before it.
-        let mut operands = physical_inputs[..3].to_vec();
-        if let Some(bias) = bias {
-            operands.push(bias);
-        }
-        if let Some((query_lengths, key_value_lengths)) = sequence_lengths {
-            operands.extend([query_lengths, key_value_lengths]);
-        }
-        let mut operand_layouts = vec![vec![3, 2, 1, 0]; if bias.is_some() { 4 } else { 3 }];
-        if sequence_lengths.is_some() {
-            operand_layouts.extend([vec![0], vec![0]]);
-        }
-        let attended_type =
-            attention_array_type(data_type, &[physical_batch, heads, physical_query_sequence, head_dimension]);
-        let mut custom_call_output_types = vec![lower_tensor_type(&attended_type, context, location)?];
-        let mut result_layouts = vec![vec![3, 1, 2, 0]];
-        if return_residual {
-            let residual_type = attention_array_type(DataType::F32, &[physical_batch, heads, physical_query_sequence]);
-            custom_call_output_types.push(lower_tensor_type(&residual_type, context, location)?);
-            result_layouts.push(vec![2, 1, 0]);
-        }
-        custom_call_output_types.push(lower_tensor_type(&attention_array_type(DataType::U8, &[0]), context, location)?);
-        result_layouts.push(vec![0]);
-        let custom_call = block.append_operation(stable_hlo::custom_call(
-            operands.as_slice(),
-            fused_attention_target_name(bias.is_some(), configuration.dropout().is_some(), false).as_str(),
-            false,
-            Some(context.string_attribute(backend_config.as_str()).as_ref()),
-            CustomCallApiVersion::StatusReturning,
-            &[],
-            Some(CustomCallMemoryLayouts { operands: operand_layouts, results: result_layouts }),
-            &[],
-            None,
-            &custom_call_output_types,
-            location,
-        )?)?;
-        let attended = custom_call.result(0).unwrap().as_ref();
-        let result = block.append_operation(stable_hlo::transpose(attended, &[0, 2, 1, 3], location)?)?;
-        let mut result = result.result(0).unwrap().as_ref();
-        if input_types[0].rank() == 3 {
-            let reshaped = block.append_operation(stable_hlo::reshape(
-                result,
-                &[physical_query_sequence, heads, head_dimension],
-                location,
-            )?)?;
-            result = reshaped.result(0).unwrap().as_ref();
-        }
-        let output_sources = (0..input_types[0].rank()).map(|axis| (input_values[0], axis)).collect::<Vec<_>>();
-        let result = lower_restore_dynamic_dimensions(
-            result,
-            &output_types[0],
-            output_sources.as_slice(),
-            block,
-            context,
-            location,
-        )?;
-        let mut results = vec![result];
-        if return_residual {
-            let residual = custom_call.result(1).unwrap().as_ref();
-            // The kernels return the residual in `f32`, which is the data type of the residual of the definition for
-            // every query data type, so it only moves from the `BNT` form of the kernels to the `BTN` form. It is
-            // never rounded to the query data type, because the backward kernels consume it exactly as returned.
-            let residual = block.append_operation(stable_hlo::transpose(residual, &[0, 2, 1], location)?)?;
-            let mut residual = residual.result(0).unwrap().as_ref();
-            if input_types[0].rank() == 3 {
-                let reshaped = block.append_operation(stable_hlo::reshape(
-                    residual,
-                    &[physical_query_sequence, heads],
-                    location,
-                )?)?;
-                residual = reshaped.result(0).unwrap().as_ref();
-            }
-            let residual_sources = (0..output_types[1].rank()).map(|axis| (input_values[0], axis)).collect::<Vec<_>>();
-            results.push(lower_restore_dynamic_dimensions(
-                residual,
-                &output_types[1],
-                residual_sources.as_slice(),
-                block,
-                context,
-                location,
-            )?);
-        }
-        Ok(results)
-    }
+/// Lowering of fused attention with an [`AttentionConfiguration`].
+pub(crate) trait AttentionConfigurationLoweringExtension {
+    /// Lowers one call of the forward attention definition with the provided configuration, input structure, and
+    /// residual request to cuDNN's fused ABI, for a boundary that [`fused_attention_eligibility`] accepts.
+    ///
+    /// An eligible `bf16`/`f16` CUDA call emits `__cudnn$fmha[ScaleBias]Softmax[Dropout]` with physical `BNTH` inputs
+    /// and restores the logical rank and dynamic dimensions of its outputs. Optional bias and sequence length inputs
+    /// retain the canonical [`AttentionInputs`] order until the final ABI assembly.
+    fn lower_fused<'b, 'c: 'b, 't: 'c>(
+        self,
+        input_structure: AttentionInputs<Placeholder>,
+        return_residual: bool,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+
+    /// Lowers one call of the backward attention definition with the provided configuration and input structure
+    /// to cuDNN's fused backward ABI, for a boundary that [`fused_attention_eligibility`] accepts.
+    ///
+    /// The canonical input boundary is reordered into cuDNN's `(Q, K, V, residual, dO[, bias], O[, query lengths,
+    /// key/value lengths])` ABI, the call emits `__cudnn$fmha[ScaleBias]Softmax[Dropout]Backward`, and each cotangent's
+    /// logical layout, data type, and dynamic dimensions are restored. This function does not reproduce the analytical
+    /// backward pass. It owns only the fused kernel's physical padding, input ordering, backend configuration, and
+    /// output refinement, while the portable mathematics remain exclusively in the core backward body.
+    fn lower_fused_backward<'b, 'c: 'b, 't: 'c>(
+        self,
+        input_structure: AttentionInputs<Placeholder>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
 
-/// Lowers one call of the backward attention definition with the provided configuration and input structure
-/// to cuDNN's fused backward ABI, for a boundary that [`fused_attention_eligibility`] accepts.
-///
-/// The canonical input boundary is reordered into cuDNN's `(Q, K, V, residual, dO[, bias], O[, query lengths,
-/// key/value lengths])` ABI, the call emits `__cudnn$fmha[ScaleBias]Softmax[Dropout]Backward`, and each cotangent's
-/// logical layout, data type, and dynamic dimensions are restored. This function does not reproduce the analytical
-/// backward pass. It owns only the fused kernel's physical padding, input ordering, backend configuration, and output
-/// refinement, while the portable mathematics remain exclusively in the core backward body.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
-    configuration: AttentionConfiguration,
-    input_structure: AttentionInputs<Placeholder>,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let input_count = input_structure.parameter_count() + 3;
-    if input_values.len() != input_count || input_values.len() != input_types.len() {
-        return Err(ProgramError::InvalidInputCount { expected: input_count, actual: input_values.len() }.into());
-    }
-    let indices = attention_input_indices(input_structure);
-    let uses_sequence_lengths =
-        input_structure.query_sequence_lengths.is_some() || input_structure.key_value_sequence_lengths.is_some();
-    if output_types.len() < 3 || output_types.len() > 3 + usize::from(input_structure.bias.is_some()) {
-        return Err(ProgramError::InvalidOutputCount {
-            expected: 3 + usize::from(input_structure.bias.is_some()),
-            actual: output_types.len(),
+impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
+    #[allow(clippy::too_many_arguments)]
+    fn lower_fused<'b, 'c: 'b, 't: 'c>(
+        self,
+        input_structure: AttentionInputs<Placeholder>,
+        return_residual: bool,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let input_count = input_structure.parameter_count();
+        if input_values.len() != input_count || input_values.len() != input_types.len() {
+            return Err(ProgramError::InvalidInputCount { expected: input_count, actual: input_values.len() }.into());
         }
-        .into());
-    }
-    let data_type = input_types[0].data_type();
-    let [batch, query_sequence, heads, head_dimension] = attention_dimensions(&input_types[0])?;
-    let [_, key_value_sequence, key_value_heads, _] = attention_dimensions(&input_types[1])?;
-    let heads = heads.value().ok_or_else(|| {
-        Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME.to_string(),
-            reason: "the heads dimension must be static".to_string(),
-        })
-    })?;
-    let key_value_heads = key_value_heads.value().ok_or_else(|| {
-        Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME.to_string(),
-            reason: "the key/value heads dimension must be static".to_string(),
-        })
-    })?;
-    let head_dimension = head_dimension.value().ok_or_else(|| {
-        Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME.to_string(),
-            reason: "the head dimension must be static".to_string(),
-        })
-    })?;
-    let physical_batch = attention_physical_extent(&batch)?;
-    let physical_query_sequence = attention_physical_extent(&query_sequence)?;
-    let physical_key_value_sequence = attention_physical_extent(&key_value_sequence)?;
-    let offset = input_structure.parameter_count();
-    {
-        let mut physical_inputs = input_values
-            .iter()
-            .zip(input_types)
-            .map(|(value, r#type)| lower_physical_bound_value(*value, r#type, 0.0, block, context, location))
-            .collect::<Result<Vec<_>, _>>()?;
-        for index in [0, 1, 2, offset, offset + 2] {
-            let physical_type = physical_bound_type(&input_types[index])?;
-            physical_inputs[index] =
-                normalize_fused_attention_operand(physical_inputs[index], &physical_type, block, location)?;
-        }
-        let score_type = attention_array_type(
-            data_type,
-            &[physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
-        );
-        let bias = prepare_fused_attention_bias(
-            &indices,
-            physical_inputs.as_slice(),
-            input_types,
-            &score_type,
-            block,
-            context,
-            location,
-        )?;
-        let sequence_lengths = if uses_sequence_lengths {
-            let query_lengths = match indices.query_sequence_lengths {
-                Some(index) => physical_inputs[index],
-                None => synthesize_fused_attention_sequence_lengths(
-                    input_values[0],
-                    input_types[0].rank() - 3,
-                    &batch,
-                    physical_batch,
-                    block,
-                    context,
-                    location,
-                )?,
+        let expected_output_count = if return_residual { 2 } else { 1 };
+        check_count!("output", output_types, expected_output_count, ProgramError);
+        let indices = attention_input_indices(input_structure);
+        let uses_sequence_lengths =
+            input_structure.query_sequence_lengths.is_some() || input_structure.key_value_sequence_lengths.is_some();
+        let data_type = input_types[0].data_type();
+        let [batch, query_sequence, heads, head_dimension] = attention_dimensions(&input_types[0])?;
+        let [_, key_value_sequence, _, _] = attention_dimensions(&input_types[1])?;
+        let heads = heads.value().ok_or_else(|| {
+            Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME.to_string(),
+                reason: "the heads dimension must be static".to_string(),
+            })
+        })?;
+        let head_dimension = head_dimension.value().ok_or_else(|| {
+            Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME.to_string(),
+                reason: "the head dimension must be static".to_string(),
+            })
+        })?;
+        let physical_batch = attention_physical_extent(&batch)?;
+        let physical_query_sequence = attention_physical_extent(&query_sequence)?;
+        let physical_key_value_sequence = attention_physical_extent(&key_value_sequence)?;
+        {
+            let mut physical_inputs = input_values
+                .iter()
+                .zip(input_types)
+                .map(|(value, r#type)| r#type.lower_physical_bound_value(*value, 0.0, block, context, location))
+                .collect::<Result<Vec<_>, _>>()?;
+            for index in 0..3 {
+                let physical_type = physical_bound_type(&input_types[index])?;
+                physical_inputs[index] =
+                    normalize_fused_attention_operand(physical_inputs[index], &physical_type, block, location)?;
+            }
+            let score_type = attention_array_type(
+                data_type,
+                &[physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
+            );
+            let bias = prepare_fused_attention_bias(
+                &indices,
+                physical_inputs.as_slice(),
+                input_types,
+                &score_type,
+                block,
+                context,
+                location,
+            )?;
+            let sequence_lengths = if uses_sequence_lengths {
+                let query_lengths = match indices.query_sequence_lengths {
+                    Some(index) => physical_inputs[index],
+                    None => synthesize_fused_attention_sequence_lengths(
+                        input_values[0],
+                        input_types[0].rank() - 3,
+                        &batch,
+                        physical_batch,
+                        block,
+                        context,
+                        location,
+                    )?,
+                };
+                let key_value_lengths = match indices.key_value_sequence_lengths {
+                    Some(index) => physical_inputs[index],
+                    None => synthesize_fused_attention_sequence_lengths(
+                        input_values[1],
+                        input_types[1].rank() - 3,
+                        &batch,
+                        physical_batch,
+                        block,
+                        context,
+                        location,
+                    )?,
+                };
+                Some((query_lengths, key_value_lengths))
+            } else {
+                None
             };
-            let key_value_lengths = match indices.key_value_sequence_lengths {
-                Some(index) => physical_inputs[index],
-                None => synthesize_fused_attention_sequence_lengths(
-                    input_values[1],
-                    input_types[1].rank() - 3,
-                    &batch,
-                    physical_batch,
-                    block,
-                    context,
-                    location,
-                )?,
-            };
-            Some((query_lengths, key_value_lengths))
-        } else {
-            None
-        };
-        let element_type = if data_type == DataType::BF16 { "BF16" } else { "F16" };
-        let backend_config = fused_attention_backend_config(
-            element_type,
-            [physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
-            configuration.scale_for(head_dimension),
-            fused_attention_mask_type(fused_attention_is_causal(configuration), sequence_lengths.is_some()),
-            FMHA_BACKWARD_DOT_DIMENSION_NUMBERS,
-            configuration.dropout(),
-            fused_attention_sliding_window_length(configuration),
-        );
-        let residual_input = if input_types[0].rank() == 3 {
-            let reshaped = block.append_operation(stable_hlo::reshape(
-                physical_inputs[offset + 1],
-                &[1, physical_query_sequence, heads],
+            let element_type = if data_type == DataType::BF16 { "BF16" } else { "F16" };
+            let backend_config = fused_attention_backend_config(
+                element_type,
+                [physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
+                self.scale_for(head_dimension),
+                fused_attention_mask_type(fused_attention_is_causal(self), sequence_lengths.is_some()),
+                FMHA_FORWARD_DOT_DIMENSION_NUMBERS,
+                self.dropout(),
+                fused_attention_sliding_window_length(self),
+            );
+            // The operand order matches the operand order of the boundary exactly, so the bias sits after the value and
+            // the `i32[batch]` sequence lengths trail. The workspace result is declared at size zero, because the
+            // compiler resizes it as needed, and the training form inserts the `f32[b, n, t]` log-sum-exp residual
+            // before it.
+            let mut operands = physical_inputs[..3].to_vec();
+            if let Some(bias) = bias {
+                operands.push(bias);
+            }
+            if let Some((query_lengths, key_value_lengths)) = sequence_lengths {
+                operands.extend([query_lengths, key_value_lengths]);
+            }
+            let mut operand_layouts = vec![vec![3, 2, 1, 0]; if bias.is_some() { 4 } else { 3 }];
+            if sequence_lengths.is_some() {
+                operand_layouts.extend([vec![0], vec![0]]);
+            }
+            let attended_type =
+                attention_array_type(data_type, &[physical_batch, heads, physical_query_sequence, head_dimension]);
+            let mut custom_call_output_types = vec![attended_type.lower(context, location)?];
+            let mut result_layouts = vec![vec![3, 1, 2, 0]];
+            if return_residual {
+                let residual_type =
+                    attention_array_type(DataType::F32, &[physical_batch, heads, physical_query_sequence]);
+                custom_call_output_types.push(residual_type.lower(context, location)?);
+                result_layouts.push(vec![2, 1, 0]);
+            }
+            custom_call_output_types.push(attention_array_type(DataType::U8, &[0]).lower(context, location)?);
+            result_layouts.push(vec![0]);
+            let custom_call = block.append_operation(stable_hlo::custom_call(
+                operands.as_slice(),
+                fused_attention_target_name(bias.is_some(), self.dropout().is_some(), false).as_str(),
+                false,
+                Some(context.string_attribute(backend_config.as_str()).as_ref()),
+                CustomCallApiVersion::StatusReturning,
+                &[],
+                Some(CustomCallMemoryLayouts { operands: operand_layouts, results: result_layouts }),
+                &[],
+                None,
+                &custom_call_output_types,
                 location,
             )?)?;
-            reshaped.result(0).unwrap().as_ref()
-        } else {
-            physical_inputs[offset + 1]
-        };
-        // The residual of the definition has the `f32` data type that the kernels consume, so it only returns from
-        // the `BTN` form to the `BNT` form of the kernels.
-        let residual = block.append_operation(stable_hlo::transpose(residual_input, &[0, 2, 1], location)?)?;
-        let residual = residual.result(0).unwrap().as_ref();
-        // The kernel call order `(Q, K, V, residual, dO[, bias], O[, q_seqlen, kv_seqlen])` differs from the operand
-        // order of the boundary, and places the bias between the output cotangent and the forward output.
-        let mut operands =
-            vec![physical_inputs[0], physical_inputs[1], physical_inputs[2], residual, physical_inputs[offset + 2]];
-        let mut operand_layouts =
-            vec![vec![3, 2, 1, 0], vec![3, 2, 1, 0], vec![3, 2, 1, 0], vec![2, 1, 0], vec![3, 2, 1, 0]];
-        if let Some(bias) = bias {
-            operands.push(bias);
-            operand_layouts.push(vec![3, 2, 1, 0]);
-        }
-        operands.push(physical_inputs[offset]);
-        operand_layouts.push(vec![3, 2, 1, 0]);
-        if let Some((query_lengths, key_value_lengths)) = sequence_lengths {
-            operands.extend([query_lengths, key_value_lengths]);
-            operand_layouts.extend([vec![0], vec![0]]);
-        }
-        let query_gradient_type =
-            attention_array_type(data_type, &[physical_batch, heads, physical_query_sequence, head_dimension]);
-        let key_value_gradient_type = attention_array_type(
-            data_type,
-            &[physical_batch, key_value_heads, physical_key_value_sequence, head_dimension],
-        );
-        let mut custom_call_output_types = vec![
-            lower_tensor_type(&query_gradient_type, context, location)?,
-            lower_tensor_type(&key_value_gradient_type, context, location)?,
-            lower_tensor_type(&key_value_gradient_type, context, location)?,
-        ];
-        let mut result_layouts = vec![vec![3, 1, 2, 0], vec![3, 1, 2, 0], vec![3, 1, 2, 0]];
-        if bias.is_some() {
-            custom_call_output_types.push(lower_tensor_type(&score_type, context, location)?);
-            result_layouts.push(vec![3, 2, 1, 0]);
-        }
-        custom_call_output_types.push(lower_tensor_type(&attention_array_type(DataType::U8, &[0]), context, location)?);
-        result_layouts.push(vec![0]);
-        let custom_call = block.append_operation(stable_hlo::custom_call(
-            operands.as_slice(),
-            fused_attention_target_name(bias.is_some(), configuration.dropout().is_some(), true).as_str(),
-            false,
-            Some(context.string_attribute(backend_config.as_str()).as_ref()),
-            CustomCallApiVersion::StatusReturning,
-            &[],
-            Some(CustomCallMemoryLayouts { operands: operand_layouts, results: result_layouts }),
-            &[],
-            None,
-            &custom_call_output_types,
-            location,
-        )?)?;
-        // Each gradient comes back in the physical `[b, n, seq, h]` layout and transposes to the logical
-        // `BTNH`/`BSNH` layout, which is a pure bitcast given the declared result layouts. The bias cotangent keeps
-        // its own shape.
-        let mut results = Vec::with_capacity(output_types.len());
-        for index in 0..3 {
-            let gradient = custom_call.result(index).unwrap();
-            let transposed =
-                block.append_operation(stable_hlo::transpose(gradient.as_ref(), &[0, 2, 1, 3], location)?)?;
-            let transposed = transposed.result(0).unwrap().as_ref();
-            let mut transposed = transposed;
-            if input_types[index].rank() == 3 {
-                let dimensions = static_dimensions(&physical_bound_type(&output_types[index])?)?;
-                let reshaped =
-                    block.append_operation(stable_hlo::reshape(transposed, dimensions.as_slice(), location)?)?;
-                transposed = reshaped.result(0).unwrap().as_ref();
+            let attended = custom_call.result(0).unwrap().as_ref();
+            let result = block.append_operation(stable_hlo::transpose(attended, &[0, 2, 1, 3], location)?)?;
+            let mut result = result.result(0).unwrap().as_ref();
+            if input_types[0].rank() == 3 {
+                let reshaped = block.append_operation(stable_hlo::reshape(
+                    result,
+                    &[physical_query_sequence, heads, head_dimension],
+                    location,
+                )?)?;
+                result = reshaped.result(0).unwrap().as_ref();
             }
-            let sources = (0..input_types[index].rank()).map(|axis| (input_values[index], axis)).collect::<Vec<_>>();
-            results.push(lower_restore_dynamic_dimensions(
-                transposed,
-                &output_types[index],
-                sources.as_slice(),
+            let output_sources = (0..input_types[0].rank()).map(|axis| (input_values[0], axis)).collect::<Vec<_>>();
+            let result = output_types[0].lower_restore_dynamic_dimensions(
+                result,
+                output_sources.as_slice(),
                 block,
                 context,
                 location,
-            )?);
-        }
-        if let Some(bias_index) = indices.bias
-            && output_types.len() == 4
-        {
-            let bias_type = &input_types[bias_index];
-            let physical_bias_type = physical_bound_type(bias_type)?;
-            let mut normalized_bias_dimensions = static_dimensions(&physical_bias_type)?;
-            normalized_bias_dimensions.splice(0..0, std::iter::repeat_n(1, 4 - bias_type.rank()));
-            let score_dimensions = static_dimensions(&score_type)?;
-            let reduced_axes = normalized_bias_dimensions
-                .iter()
-                .zip(&score_dimensions)
-                .enumerate()
-                .filter_map(|(axis, (bias, score))| (*bias == 1 && score != bias).then_some(axis))
-                .collect::<Vec<_>>();
-            let mut bias_cotangent = custom_call.result(3).unwrap().as_ref();
-            if !reduced_axes.is_empty() {
-                let reduced_dimensions = score_dimensions
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(axis, dimension)| (!reduced_axes.contains(&axis)).then_some(*dimension))
-                    .collect::<Vec<_>>();
-                let reduced_type = attention_array_type(data_type, reduced_dimensions.as_slice());
-                bias_cotangent = lower_reduce_to_mlir(
-                    ReductionKind::Sum,
-                    reduced_axes.as_slice(),
-                    bias_cotangent,
-                    &reduced_type,
-                    FloatExtremumForm::TotalOrder,
+            )?;
+            let mut results = vec![result];
+            if return_residual {
+                let residual = custom_call.result(1).unwrap().as_ref();
+                // The kernels return the residual in `f32`, which is the data type of the residual of the definition
+                // for every query data type, so it only moves from the `BNT` form of the kernels to the `BTN` form. It
+                // is never rounded to the query data type, because the backward kernels consume it exactly as returned.
+                let residual = block.append_operation(stable_hlo::transpose(residual, &[0, 2, 1], location)?)?;
+                let mut residual = residual.result(0).unwrap().as_ref();
+                if input_types[0].rank() == 3 {
+                    let reshaped = block.append_operation(stable_hlo::reshape(
+                        residual,
+                        &[physical_query_sequence, heads],
+                        location,
+                    )?)?;
+                    residual = reshaped.result(0).unwrap().as_ref();
+                }
+                let residual_sources =
+                    (0..output_types[1].rank()).map(|axis| (input_values[0], axis)).collect::<Vec<_>>();
+                results.push(output_types[1].lower_restore_dynamic_dimensions(
+                    residual,
+                    residual_sources.as_slice(),
                     block,
                     context,
                     location,
-                )?;
+                )?);
             }
-            // The reduced cotangent returns to the shape of the bias before it is converted to the data type of the
-            // bias, because a conversion keeps the shape of its input.
-            bias_cotangent = block
-                .append_operation(stable_hlo::reshape(
-                    bias_cotangent,
-                    static_dimensions(&physical_bias_type)?.as_slice(),
-                    location,
-                )?)?
-                .result(0)
-                .unwrap()
-                .as_ref();
-            if bias_type.data_type() != data_type {
-                let converted = block.append_operation(stable_hlo::convert(
-                    bias_cotangent,
-                    lower_tensor_type(&physical_bias_type, context, location)?,
-                    location,
-                )?)?;
-                bias_cotangent = converted.result(0).unwrap().as_ref();
+            Ok(results)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_fused_backward<'b, 'c: 'b, 't: 'c>(
+        self,
+        input_structure: AttentionInputs<Placeholder>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let input_count = input_structure.parameter_count() + 3;
+        if input_values.len() != input_count || input_values.len() != input_types.len() {
+            return Err(ProgramError::InvalidInputCount { expected: input_count, actual: input_values.len() }.into());
+        }
+        let indices = attention_input_indices(input_structure);
+        let uses_sequence_lengths =
+            input_structure.query_sequence_lengths.is_some() || input_structure.key_value_sequence_lengths.is_some();
+        if output_types.len() < 3 || output_types.len() > 3 + usize::from(input_structure.bias.is_some()) {
+            return Err(ProgramError::InvalidOutputCount {
+                expected: 3 + usize::from(input_structure.bias.is_some()),
+                actual: output_types.len(),
             }
-            let sources = (0..bias_type.rank()).map(|axis| (input_values[bias_index], axis)).collect::<Vec<_>>();
-            results.push(lower_restore_dynamic_dimensions(
-                bias_cotangent,
-                output_types.last().unwrap(),
-                sources.as_slice(),
+            .into());
+        }
+        let data_type = input_types[0].data_type();
+        let [batch, query_sequence, heads, head_dimension] = attention_dimensions(&input_types[0])?;
+        let [_, key_value_sequence, key_value_heads, _] = attention_dimensions(&input_types[1])?;
+        let heads = heads.value().ok_or_else(|| {
+            Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME.to_string(),
+                reason: "the heads dimension must be static".to_string(),
+            })
+        })?;
+        let key_value_heads = key_value_heads.value().ok_or_else(|| {
+            Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME.to_string(),
+                reason: "the key/value heads dimension must be static".to_string(),
+            })
+        })?;
+        let head_dimension = head_dimension.value().ok_or_else(|| {
+            Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME.to_string(),
+                reason: "the head dimension must be static".to_string(),
+            })
+        })?;
+        let physical_batch = attention_physical_extent(&batch)?;
+        let physical_query_sequence = attention_physical_extent(&query_sequence)?;
+        let physical_key_value_sequence = attention_physical_extent(&key_value_sequence)?;
+        let offset = input_structure.parameter_count();
+        {
+            let mut physical_inputs = input_values
+                .iter()
+                .zip(input_types)
+                .map(|(value, r#type)| r#type.lower_physical_bound_value(*value, 0.0, block, context, location))
+                .collect::<Result<Vec<_>, _>>()?;
+            for index in [0, 1, 2, offset, offset + 2] {
+                let physical_type = physical_bound_type(&input_types[index])?;
+                physical_inputs[index] =
+                    normalize_fused_attention_operand(physical_inputs[index], &physical_type, block, location)?;
+            }
+            let score_type = attention_array_type(
+                data_type,
+                &[physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
+            );
+            let bias = prepare_fused_attention_bias(
+                &indices,
+                physical_inputs.as_slice(),
+                input_types,
+                &score_type,
                 block,
                 context,
                 location,
-            )?);
+            )?;
+            let sequence_lengths = if uses_sequence_lengths {
+                let query_lengths = match indices.query_sequence_lengths {
+                    Some(index) => physical_inputs[index],
+                    None => synthesize_fused_attention_sequence_lengths(
+                        input_values[0],
+                        input_types[0].rank() - 3,
+                        &batch,
+                        physical_batch,
+                        block,
+                        context,
+                        location,
+                    )?,
+                };
+                let key_value_lengths = match indices.key_value_sequence_lengths {
+                    Some(index) => physical_inputs[index],
+                    None => synthesize_fused_attention_sequence_lengths(
+                        input_values[1],
+                        input_types[1].rank() - 3,
+                        &batch,
+                        physical_batch,
+                        block,
+                        context,
+                        location,
+                    )?,
+                };
+                Some((query_lengths, key_value_lengths))
+            } else {
+                None
+            };
+            let element_type = if data_type == DataType::BF16 { "BF16" } else { "F16" };
+            let backend_config = fused_attention_backend_config(
+                element_type,
+                [physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
+                self.scale_for(head_dimension),
+                fused_attention_mask_type(fused_attention_is_causal(self), sequence_lengths.is_some()),
+                FMHA_BACKWARD_DOT_DIMENSION_NUMBERS,
+                self.dropout(),
+                fused_attention_sliding_window_length(self),
+            );
+            let residual_input = if input_types[0].rank() == 3 {
+                let reshaped = block.append_operation(stable_hlo::reshape(
+                    physical_inputs[offset + 1],
+                    &[1, physical_query_sequence, heads],
+                    location,
+                )?)?;
+                reshaped.result(0).unwrap().as_ref()
+            } else {
+                physical_inputs[offset + 1]
+            };
+            // The residual of the definition has the `f32` data type that the kernels consume, so it only returns from
+            // the `BTN` form to the `BNT` form of the kernels.
+            let residual = block.append_operation(stable_hlo::transpose(residual_input, &[0, 2, 1], location)?)?;
+            let residual = residual.result(0).unwrap().as_ref();
+            // The kernel call order `(Q, K, V, residual, dO[, bias], O[, q_seqlen, kv_seqlen])` differs from the
+            // operand order of the boundary, and places the bias between the output cotangent and the forward output.
+            let mut operands =
+                vec![physical_inputs[0], physical_inputs[1], physical_inputs[2], residual, physical_inputs[offset + 2]];
+            let mut operand_layouts =
+                vec![vec![3, 2, 1, 0], vec![3, 2, 1, 0], vec![3, 2, 1, 0], vec![2, 1, 0], vec![3, 2, 1, 0]];
+            if let Some(bias) = bias {
+                operands.push(bias);
+                operand_layouts.push(vec![3, 2, 1, 0]);
+            }
+            operands.push(physical_inputs[offset]);
+            operand_layouts.push(vec![3, 2, 1, 0]);
+            if let Some((query_lengths, key_value_lengths)) = sequence_lengths {
+                operands.extend([query_lengths, key_value_lengths]);
+                operand_layouts.extend([vec![0], vec![0]]);
+            }
+            let query_gradient_type =
+                attention_array_type(data_type, &[physical_batch, heads, physical_query_sequence, head_dimension]);
+            let key_value_gradient_type = attention_array_type(
+                data_type,
+                &[physical_batch, key_value_heads, physical_key_value_sequence, head_dimension],
+            );
+            let mut custom_call_output_types = vec![
+                query_gradient_type.lower(context, location)?,
+                key_value_gradient_type.lower(context, location)?,
+                key_value_gradient_type.lower(context, location)?,
+            ];
+            let mut result_layouts = vec![vec![3, 1, 2, 0], vec![3, 1, 2, 0], vec![3, 1, 2, 0]];
+            if bias.is_some() {
+                custom_call_output_types.push(score_type.lower(context, location)?);
+                result_layouts.push(vec![3, 2, 1, 0]);
+            }
+            custom_call_output_types.push(attention_array_type(DataType::U8, &[0]).lower(context, location)?);
+            result_layouts.push(vec![0]);
+            let custom_call = block.append_operation(stable_hlo::custom_call(
+                operands.as_slice(),
+                fused_attention_target_name(bias.is_some(), self.dropout().is_some(), true).as_str(),
+                false,
+                Some(context.string_attribute(backend_config.as_str()).as_ref()),
+                CustomCallApiVersion::StatusReturning,
+                &[],
+                Some(CustomCallMemoryLayouts { operands: operand_layouts, results: result_layouts }),
+                &[],
+                None,
+                &custom_call_output_types,
+                location,
+            )?)?;
+            // Each gradient comes back in the physical `[b, n, seq, h]` layout and transposes to the logical
+            // `BTNH`/`BSNH` layout, which is a pure bitcast given the declared result layouts. The bias cotangent keeps
+            // its own shape.
+            let mut results = Vec::with_capacity(output_types.len());
+            for index in 0..3 {
+                let gradient = custom_call.result(index).unwrap();
+                let transposed =
+                    block.append_operation(stable_hlo::transpose(gradient.as_ref(), &[0, 2, 1, 3], location)?)?;
+                let transposed = transposed.result(0).unwrap().as_ref();
+                let mut transposed = transposed;
+                if input_types[index].rank() == 3 {
+                    let dimensions = static_dimensions(&physical_bound_type(&output_types[index])?)?;
+                    let reshaped =
+                        block.append_operation(stable_hlo::reshape(transposed, dimensions.as_slice(), location)?)?;
+                    transposed = reshaped.result(0).unwrap().as_ref();
+                }
+                let sources =
+                    (0..input_types[index].rank()).map(|axis| (input_values[index], axis)).collect::<Vec<_>>();
+                results.push(output_types[index].lower_restore_dynamic_dimensions(
+                    transposed,
+                    sources.as_slice(),
+                    block,
+                    context,
+                    location,
+                )?);
+            }
+            if let Some(bias_index) = indices.bias
+                && output_types.len() == 4
+            {
+                let bias_type = &input_types[bias_index];
+                let physical_bias_type = physical_bound_type(bias_type)?;
+                let mut normalized_bias_dimensions = static_dimensions(&physical_bias_type)?;
+                normalized_bias_dimensions.splice(0..0, std::iter::repeat_n(1, 4 - bias_type.rank()));
+                let score_dimensions = static_dimensions(&score_type)?;
+                let reduced_axes = normalized_bias_dimensions
+                    .iter()
+                    .zip(&score_dimensions)
+                    .enumerate()
+                    .filter_map(|(axis, (bias, score))| (*bias == 1 && score != bias).then_some(axis))
+                    .collect::<Vec<_>>();
+                let mut bias_cotangent = custom_call.result(3).unwrap().as_ref();
+                if !reduced_axes.is_empty() {
+                    let reduced_dimensions = score_dimensions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(axis, dimension)| (!reduced_axes.contains(&axis)).then_some(*dimension))
+                        .collect::<Vec<_>>();
+                    let reduced_type = attention_array_type(data_type, reduced_dimensions.as_slice());
+                    bias_cotangent = ReductionKind::Sum.lower(
+                        reduced_axes.as_slice(),
+                        bias_cotangent,
+                        &reduced_type,
+                        FloatExtremumForm::TotalOrder,
+                        block,
+                        context,
+                        location,
+                    )?;
+                }
+                // The reduced cotangent returns to the shape of the bias before it is converted to the data type of the
+                // bias, because a conversion keeps the shape of its input.
+                bias_cotangent = block
+                    .append_operation(stable_hlo::reshape(
+                        bias_cotangent,
+                        static_dimensions(&physical_bias_type)?.as_slice(),
+                        location,
+                    )?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref();
+                if bias_type.data_type() != data_type {
+                    let converted = block.append_operation(stable_hlo::convert(
+                        bias_cotangent,
+                        physical_bias_type.lower(context, location)?,
+                        location,
+                    )?)?;
+                    bias_cotangent = converted.result(0).unwrap().as_ref();
+                }
+                let sources = (0..bias_type.rank()).map(|axis| (input_values[bias_index], axis)).collect::<Vec<_>>();
+                results.push(output_types.last().unwrap().lower_restore_dynamic_dimensions(
+                    bias_cotangent,
+                    sources.as_slice(),
+                    block,
+                    context,
+                    location,
+                )?);
+            }
+            Ok(results)
         }
-        Ok(results)
     }
 }
 
@@ -839,7 +864,7 @@ fn broadcast_fused_attention_score_operand<'b, 'c: 'b, 't: 'c>(
     };
     let broadcast = block.append_operation(stable_hlo::broadcast(
         value,
-        lower_tensor_type(score_type, context, location)?,
+        score_type.lower(context, location)?,
         &[0, 1, 2, 3],
         location,
     )?)?;
@@ -882,8 +907,7 @@ fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
             // infinite biases and NaNs convert as they are. The saturation runs in the data type of an `f64` bias
             // and in `f32` for every other bias data type.
             let working_data_type = if bias_data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
-            let working_tensor_type =
-                lower_tensor_type(&score_type.clone().with_data_type(working_data_type), context, location)?;
+            let working_tensor_type = score_type.clone().with_data_type(working_data_type).lower(context, location)?;
             let bias = if bias_data_type == working_data_type {
                 bias
             } else {
@@ -892,7 +916,7 @@ fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
             };
             let limit = if score_type.data_type() == DataType::F16 { 65_504.0 } else { 3.389_531_389_251_535_5e38 };
             let scalar_type = ArrayType::scalar(working_data_type);
-            let scalar_tensor_type = lower_tensor_type(&scalar_type, context, location)?;
+            let scalar_tensor_type = scalar_type.lower(context, location)?;
             let lower = lower_f64_constant_splat(-limit, &scalar_type, scalar_tensor_type, block, context, location)?;
             let upper = lower_f64_constant_splat(limit, &scalar_type, scalar_tensor_type, block, context, location)?;
             let saturated = block.append_operation(stable_hlo::clamp(lower, bias, upper, location)?)?;
@@ -901,11 +925,8 @@ fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
             let finite = finite.result(0).unwrap().as_ref();
             let bias = block.append_operation(stable_hlo::select(finite, saturated, bias, location)?)?;
             let bias = bias.result(0).unwrap().as_ref();
-            let converted = block.append_operation(stable_hlo::convert(
-                bias,
-                lower_tensor_type(score_type, context, location)?,
-                location,
-            )?)?;
+            let converted =
+                block.append_operation(stable_hlo::convert(bias, score_type.lower(context, location)?, location)?)?;
             Ok::<_, Error>(converted.result(0).unwrap().as_ref())
         })
         .transpose()?;
@@ -920,7 +941,7 @@ fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
                 context,
                 location,
             )?;
-            let tensor_type = lower_tensor_type(score_type, context, location)?;
+            let tensor_type = score_type.lower(context, location)?;
             let zero = lower_f64_constant_splat(0.0, score_type, tensor_type, block, context, location)?;
             // These are the pinned JAX/cuDNN wrapper's deliberately conservative finite mask sentinels. They avoid
             // a cuDNN subtraction bug that can surface when two values sit at the element type's extreme finite
@@ -956,12 +977,8 @@ fn synthesize_fused_attention_sequence_lengths<'b, 'c: 'b, 't: 'c>(
     let size = block.append_operation(stable_hlo::get_dimension_size(source, source_axis, location)?)?;
     let size = size.result(0).unwrap().as_ref();
     let physical_type = attention_array_type(DataType::I32, &[physical_batch]);
-    let lengths = block.append_operation(stable_hlo::broadcast(
-        size,
-        lower_tensor_type(&physical_type, context, location)?,
-        &[],
-        location,
-    )?)?;
+    let lengths =
+        block.append_operation(stable_hlo::broadcast(size, physical_type.lower(context, location)?, &[], location)?)?;
     let mut lengths = lengths.result(0).unwrap().as_ref();
     if matches!(batch, Dimension::Dynamic(_)) {
         let batch_size = block.append_operation(stable_hlo::get_dimension_size(source, 0, location)?)?;
@@ -970,12 +987,12 @@ fn synthesize_fused_attention_sequence_lengths<'b, 'c: 'b, 't: 'c>(
         let dynamic = block.append_operation(stable_hlo::set_dimension_size(
             lengths,
             batch_size,
-            lower_tensor_type(&logical_type, context, location)?,
+            logical_type.lower(context, location)?,
             0,
             location,
         )?)?;
         lengths = dynamic.result(0).unwrap().as_ref();
-        lengths = lower_physical_bound_value(lengths, &logical_type, 0.0, block, context, location)?;
+        lengths = logical_type.lower_physical_bound_value(lengths, 0.0, block, context, location)?;
     }
     Ok(lengths)
 }
@@ -1387,7 +1404,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_fused_attention() {
+    fn test_attention_configuration_lower_fused() {
         // Qualifying causal BF16 attention uses the cuDNN fMHA ABI and preserves the causal mask, while the unmasked
         // F16 form uses the same target with `NO_MASK`.
         for (data_type, causal, mask_type, element_type) in
@@ -1571,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_fused_attention_backward() {
+    fn test_attention_configuration_lower_fused_backward() {
         // Fused training stages the forward kernels with their residual and the backward kernels, which restore the
         // input cotangents and sum the score-shaped bias cotangent to the bias shape.
         let (input_structure, input_types) = extended_input_types(DataType::BF16, 2, 2, true, false);

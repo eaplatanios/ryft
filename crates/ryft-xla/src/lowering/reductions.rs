@@ -21,7 +21,7 @@ use crate::arrays::host::{
 use crate::lowering::LoweringError;
 use crate::lowering::extensions::ShardingLoweringExtension;
 use crate::lowering::states::CollectiveLoweringState;
-use crate::sharding::{OpenDimensions, lower_sharding_constraint};
+use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Error, Type};
 
 // TODO(eaplatanios): Review this module.
@@ -175,8 +175,9 @@ fn tensor_shape(value: ValueRef<'_, '_, '_>) -> Result<Option<Vec<Option<usize>>
 /// auto mesh axes, which no type records, or [`None`] when `value` is not the result of such a constraint or the
 /// constraint partitions a dimension along a part of an axis. An empty dimension is replicated when it is closed and
 /// unconstrained when it is open. This is what the program states about the placement of a value along auto mesh axes
-/// (e.g., the constraint that [`lower_pending_reduction_constraint`] emits for an argument that enters with a pending
-/// reduction, or for the result of an earlier instruction), so it is read from the program rather than reconstructed.
+/// (e.g., the constraint that [`ShardingReductionExtension::lower_pending_reduction_constraint`] emits for an argument
+/// that enters with a pending reduction, or for the result of an earlier instruction), so it is read from the program
+/// rather than reconstructed.
 fn constrained_dimensions(value: ValueRef<'_, '_, '_>) -> Result<Option<Rc<[ShardingDimension]>>, Error> {
     let Some(result) = value.cast::<OperationResultRef>() else {
         return Ok(None);
@@ -307,34 +308,47 @@ fn merged_dimensions(operands: &[Rc<[ShardingDimension]>], mesh: &LogicalMesh) -
     Some(dimensions)
 }
 
-/// Lowers the sharding constraint of `value` to `sharding`, a tracked sharding that declares (or completes) a pending
-/// reduction, and returns the constrained value. Every dimension of the constraint is closed, its unconstrained
-/// dimensions as replicated, so that the constraint states the whole placement of the value, including along auto mesh
-/// axes. Over a mesh with auto axes, an ordinary constraint leaves its dimensions open over them (refer to
-/// [`OpenDimensions::All`]), and Shardy's propagation then gives the operation that produces the value an operand
-/// without the pending reduction: for `y = x + x; y + y` of an input split along an auto axis `d` and unreduced along
-/// an explicit axis `m`, with the split dimension open (`{"d", ?}`), the optimized program reduces each operand over
-/// `m` with an all-reduce and restores the declared state with a select that keeps the sum on one coordinate of `m`
-/// and zeroes it on the others, and a replicated dimension left open (`{?}`) made `x + x` of the contributions 1 and
-/// 2 read back 12 rather than 6, as it does in JAX 0.12.0.1, whose constraints are open there too. A dimension that is
-/// split along auto axes keeps that split (refer to [`constrain_unreduced_intermediates`]), so a closed constraint
-/// adds no communication for a value whose placement the program states. Over a mesh without auto axes, the two
-/// constraints are the same.
-/// Inside a manual region, the constraint is the same, without the bound manual axes (refer to
-/// [`lower_sharding_constraint`]): with a split dimension left open there, `y = x + x; y + y` of a value split
-/// along an auto axis and unreduced along an explicit axis in a `shard_map` body all-reduced each operand over the
-/// explicit axis and restored the pending state with a select.
-pub(super) fn lower_pending_reduction_constraint<'b, 'c: 'b, 't: 'c>(
-    value: ValueRef<'b, 'c, 't>,
-    sharding: &Sharding,
-    bound_manual_axes: &[String],
-    block: &mut BlockRef<'b, 'c, 't>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let closed = sharding
-        .with_dimensions(sharding.dimensions_with_unconstrained_replicated().to_vec())
-        .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
-    lower_sharding_constraint(value, &closed, OpenDimensions::None, bound_manual_axes, block, location)
+/// Lowering of the pending reduction of a [`Sharding`] to Shardy.
+pub(super) trait ShardingReductionExtension {
+    /// Lowers the sharding constraint of `value` to this sharding, a tracked sharding that declares (or completes) a
+    /// pending reduction, and returns the constrained value. Every dimension of the constraint is closed, its
+    /// unconstrained dimensions as replicated, so that the constraint states the whole placement of the value,
+    /// including along auto mesh axes. Over a mesh with auto axes, an ordinary constraint leaves its dimensions open
+    /// over them (refer to [`OpenDimensions::All`]), and Shardy's propagation then gives the operation that produces
+    /// the value an operand without the pending reduction: for `y = x + x; y + y` of an input split along an auto axis
+    /// `d` and unreduced along an explicit axis `m`, with the split dimension open (`{"d", ?}`), the optimized program
+    /// reduces each operand over `m` with an all-reduce and restores the declared state with a select that keeps the
+    /// sum on one coordinate of `m` and zeroes it on the others, and a replicated dimension left open (`{?}`) made `x +
+    /// x` of the contributions 1 and 2 read back 12 rather than 6, as it does in JAX 0.12.0.1, whose constraints are
+    /// open there too. A dimension that is split along auto axes keeps that split (refer to
+    /// [`constrain_unreduced_intermediates`]), so a closed constraint adds no communication for a value whose placement
+    /// the program states. Over a mesh without auto axes, the two constraints are the same. Inside a manual region, the
+    /// constraint is the same, without the bound manual axes (refer to [`ShardingExtension::lower_sharding_constraint`]): with a
+    /// split dimension left open there, `y = x + x; y + y` of a value split along an auto axis and unreduced along an
+    /// explicit axis in a `shard_map` body all-reduced each operand over the explicit axis and restored the pending
+    /// state with a select.
+    fn lower_pending_reduction_constraint<'b, 'c: 'b, 't: 'c>(
+        &self,
+        value: ValueRef<'b, 'c, 't>,
+        bound_manual_axes: &[String],
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+}
+
+impl ShardingReductionExtension for Sharding {
+    fn lower_pending_reduction_constraint<'b, 'c: 'b, 't: 'c>(
+        &self,
+        value: ValueRef<'b, 'c, 't>,
+        bound_manual_axes: &[String],
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        let closed = self
+            .with_dimensions(self.dimensions_with_unconstrained_replicated().to_vec())
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        closed.lower_sharding_constraint(value, OpenDimensions::None, bound_manual_axes, block, location)
+    }
 }
 
 /// Validates `declared`, a sharding that the lowering declares on a value of `data_type` (i.e., a result sharding of
@@ -557,11 +571,12 @@ pub(super) fn validate_pending_reduction_change<'a, I: IntoIterator<Item = &'a S
 /// whose operands and results have the same shape: forward from the inputs to the results, and backward from the
 /// outputs to the operands, which covers the intermediates of a reduction that an elementwise operation turns into an
 /// output (e.g., the sum of a mean before its division). Every other operation may permute or drop dimensions, so its
-/// results take only the dimension shardings that reach them backward from an output, and an intermediate that
-/// neither reaches is replicated in every dimension, which is the placement that its type records. Its placement along
-/// auto mesh axes is then unknown, and a dimension left open would let Shardy drop the pending reduction (refer to
-/// [`lower_pending_reduction_constraint`]), so the dimensions are always closed. The dimension shardings that reach
-/// each output forward are returned, in the order of `outputs`, for [`constrain_unreduced_outputs`].
+/// results take only the dimension shardings that reach them backward from an output, and an intermediate that neither
+/// reaches is replicated in every dimension, which is the placement that its type records. Its placement along auto
+/// mesh axes is then unknown, and a dimension left open would let Shardy drop the pending reduction (refer to
+/// [`ShardingReductionExtension::lower_pending_reduction_constraint`]), so the dimensions are always closed. The
+/// dimension shardings that reach each output forward are returned, in the order of `outputs`, for
+/// [`constrain_unreduced_outputs`].
 #[allow(clippy::too_many_arguments)]
 pub(super) fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
     anchor: OperationRef<'b, 'c, 't>,
@@ -738,7 +753,7 @@ pub(super) fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
             };
             let sharding = reduction.sharding(mesh, rank, dimensions.as_deref())?;
             let constrained =
-                lower_pending_reduction_constraint(result, &sharding, bound_manual_axes, block, location)?;
+                sharding.lower_pending_reduction_constraint(result, bound_manual_axes, block, location)?;
             let constraint = constrained.cast::<OperationResultRef>().unwrap().operation()?;
             // The constraint is appended to the block, and moved right after the operation that produces its operand
             // (or after the constraint of the previous result), so that it dominates every later use of that operand.
@@ -798,7 +813,7 @@ pub(super) fn constrain_unreduced_outputs<'b, 'c: 'b, 't: 'c>(
                 }
                 _ => sharding,
             };
-            *output = lower_pending_reduction_constraint(*output, sharding, bound_manual_axes, block, location)?;
+            *output = sharding.lower_pending_reduction_constraint(*output, bound_manual_axes, block, location)?;
         }
     }
     Ok(())
@@ -819,6 +834,7 @@ mod tests {
         WhileOptions, scan, r#while,
     };
 
+    use ryft_mlir::{Context as MlirContext, Location};
     use ryft_pjrt::BufferType;
 
     use crate::arrays::host::ReductionChange;
@@ -828,11 +844,13 @@ mod tests {
     };
 
     use crate::lowering::LoweringError;
+    use crate::lowering::types::ArrayTypeLoweringExtension;
 
     use crate::lowering::tests::{
         UnreducedApplication, UnreducedInput, lower_unreduced_application, test_matrix_type, test_vector_type,
     };
 
+    use crate::sharding::tests::test_mesh;
     use crate::tests::{cpu_client, values_to_bytes};
 
     use super::*;
@@ -1566,6 +1584,41 @@ mod tests {
                   }
                 }
             "#},
+        );
+    }
+
+    #[test]
+    fn test_sharding_lower_pending_reduction_constraint() {
+        // The constraints are rendered outside any function, so their detached inputs print as unknown SSA values.
+        let sharding =
+            Sharding::new(test_mesh(), vec![ShardingDimension::unconstrained(), ShardingDimension::replicated()])
+                .unwrap()
+                .with_unreduced_axes(["x"])
+                .unwrap();
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = test_matrix_type(4, 2).lower(&context, location).unwrap();
+        let block = context.block(&[(tensor_type, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let mut block_ref = block.as_ref();
+        let location = location.as_ref();
+
+        // Every dimension is closed, even over a mesh with the auto axis `y`, and an unconstrained one is replicated.
+        let output = sharding.lower_pending_reduction_constraint(input, &[], &mut block_ref, location).unwrap();
+
+        // An axis that an enclosing manual region binds is left out of the constraint.
+        let bound = ["m".to_string()];
+        sharding.lower_pending_reduction_constraint(input, &bound, &mut block_ref, location).unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output, operations[0].result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{}, {}], replicated={\"m\"}, \
+                 unreduced={\"x\"}> : tensor<4x2xf32>",
+                "%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{}, {}], unreduced={\"x\"}> : \
+                 tensor<4x2xf32>",
+            ],
         );
     }
 

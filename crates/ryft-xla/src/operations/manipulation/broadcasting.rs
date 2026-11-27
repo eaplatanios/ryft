@@ -4,24 +4,21 @@ use ryft_core::{
     ProgramError,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
-use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Type as MlirType,
-    Value as MlirValue, ValueRef,
-};
+use ryft_mlir::{Block, Operation as MlirOperation, Type as MlirType, Value as MlirValue, ValueRef};
 
 use crate::lowering::modules::broadcast_changes_explicit_sharding;
 use crate::lowering::types::{
-    dimension_extent_i64, lower_explicit_shape, lower_physical_bound_value, lower_physical_storage,
-    lower_restore_dynamic_dimensions, lower_runtime_dimension_size_i64, lower_static_index_constants,
-    lower_tensor_type, physical_bound_type,
+    ArrayTypeLoweringExtension, dimension_extent_i64, lower_explicit_shape, lower_runtime_dimension_size_i64,
+    lower_static_index_constants, physical_bound_type,
 };
 use crate::operations::constants::{
-    dynamic_constructor_types, lower_layout_constraint, refine_dynamic_constructor_result,
+    ArrayTypeLayoutConstraintLoweringExtension, dynamic_constructor_types, refine_dynamic_constructor_result,
 };
-use crate::sharding::{OpenDimensions, lower_sharding_constraint};
+use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for BroadcastOperation {
+    /// Lowers a [`BroadcastOperation`] and explicitly constrains any placement transition over an explicit mesh axis.
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
@@ -29,16 +26,105 @@ impl LowerableOperation for BroadcastOperation {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        lower_broadcast_to_mlir(
-            self,
-            input_values,
-            input_types,
-            output_types,
-            lowerer.collective_state().bound_manual_axes(),
-            &mut lowerer.block(),
-            lowerer.context(),
-            lowerer.location(),
-        )
+        let bound_manual_axes = lowerer.collective_state().bound_manual_axes();
+        let block = &mut lowerer.block();
+        let (context, location) = (lowerer.context(), lowerer.location());
+        check_count!("input", input_values, 1, ProgramError);
+        check_count!("input", input_types, 1, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        let output_type = &output_types[0];
+        let input = input_values[0];
+        // A static result can refine exact symbolic input axes. Expose their proved physical sizes so that XLA does not
+        // retain a dynamic unit axis that would prevent a subsequent singleton expansion.
+        let input = if output_type.static_shape().is_some() {
+            input_types[0].lower_physical_storage(input, block, context, location)?
+        } else {
+            input
+        };
+        let result = if output_type.static_shape().is_none() && physical_bound_type(output_type).is_err() {
+            if output_type.layout().is_some() {
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: self.name().to_string(),
+                    reason: "dynamic broadcast with explicit output layout needs finite allocation bounds".to_owned(),
+                }));
+            }
+            // Every dynamic result axis is a passthrough of a mapped input axis, so obtain its runtime extent there.
+            let extents = output_type
+                .shape()
+                .dimensions()
+                .iter()
+                .enumerate()
+                .map(|(axis, dimension)| {
+                    if let Dimension::Static(extent) = dimension {
+                        dimension_extent_i64(*extent)?;
+                        Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0))
+                    } else {
+                        let input_axis =
+                            self.output_axes().iter().position(|output_axis| *output_axis == axis).unwrap();
+                        lower_runtime_dimension_size_i64(input, input_axis, block, context, location)
+                    }
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            let shape = lower_explicit_shape(&extents, block, context, location)?;
+            let broadcast = block.append_operation(stable_hlo::dynamic_broadcast(
+                input,
+                shape,
+                self.output_axes(),
+                None,
+                None,
+                location,
+            )?)?;
+            let result = broadcast.result(0).unwrap().as_ref();
+            let expected_type = output_type.lower(context, location)?;
+            if result.r#type()? == expected_type.as_ref() {
+                result
+            } else {
+                block.append_operation(tensor::cast(result, expected_type, location)?)?.result(0).unwrap().as_ref()
+            }
+        } else if output_type.static_shape().is_none()
+            && (output_type.layout().is_some()
+                || output_type
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
+                    .count()
+                    > 1)
+        {
+            // `stablehlo.broadcast_in_dim` results admit at most one bounded dynamic axis. Broadcast the physical
+            // allocation for multiple dynamic axes or an explicit layout, then restore every logical size from its
+            // mapped input axis.
+            let physical_type = physical_bound_type(output_type)?;
+            let physical_input = input_types[0].lower_physical_bound_value(input, 0.0, block, context, location)?;
+            let broadcast = block.append_operation(stable_hlo::broadcast(
+                physical_input,
+                physical_type.lower(context, location)?,
+                self.output_axes(),
+                location,
+            )?)?;
+            let result =
+                physical_type.lower_layout_constraint(broadcast.result(0).unwrap().as_ref(), block, location)?;
+            let mut sources = vec![(input, 0); output_type.rank()];
+            for (input_axis, output_axis) in self.output_axes().iter().enumerate() {
+                sources[*output_axis] = (input, input_axis);
+            }
+            output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)?
+        } else {
+            let broadcast = block.append_operation(stable_hlo::broadcast(
+                input,
+                output_type.lower(context, location)?,
+                self.output_axes(),
+                location,
+            )?)?;
+            output_type.lower_layout_constraint(broadcast.result(0).unwrap().as_ref(), block, location)?
+        };
+        let result = if broadcast_changes_explicit_sharding(&input_types[0], &output_types[0], self.output_axes()) {
+            let sharding = output_types[0].sharding().unwrap();
+            sharding.lower_sharding_constraint(result, OpenDimensions::All, bound_manual_axes, block, location)?
+        } else {
+            result
+        };
+        Ok(vec![result])
     }
 }
 
@@ -61,21 +147,20 @@ impl LowerableOperation for BroadcastLikeOperation {
         // allocation, where a stretched unit axis has a static extent even when its output axis is dynamic, and
         // every logical size is then restored from the exemplar.
         let physical_type = physical_bound_type(output_type)?;
-        let value = lower_physical_bound_value(input_values[0], &input_types[0], 0.0, block, context, location)?;
+        let value = input_types[0].lower_physical_bound_value(input_values[0], 0.0, block, context, location)?;
         let broadcast = block.append_operation(stable_hlo::broadcast(
             value,
-            lower_tensor_type(&physical_type, context, location)?,
+            physical_type.lower(context, location)?,
             self.output_axes(),
             location,
         )?)?;
         let result = broadcast.result(0).unwrap().as_ref();
-        let result = lower_layout_constraint(result, &physical_type, block, location)?;
+        let result = physical_type.lower_layout_constraint(result, block, location)?;
         let sources = (0..output_type.rank()).map(|axis| (input_values[1], axis)).collect::<Vec<_>>();
-        let result = lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)?;
+        let result = output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)?;
         let result = if broadcast_changes_explicit_sharding(&input_types[0], output_type, self.output_axes()) {
-            lower_sharding_constraint(
+            output_type.sharding().unwrap().lower_sharding_constraint(
                 result,
-                output_type.sharding().unwrap(),
                 OpenDimensions::All,
                 lowerer.collective_state().bound_manual_axes(),
                 block,
@@ -114,8 +199,8 @@ impl LowerableOperation for DynamicBroadcastOperation {
         let result = if output_type.static_shape().is_some() {
             // Exact symbolic axes have no inactive storage, and must lose their dynamic bit before a static result
             // is consumed as singleton broadcast storage by a later operation.
-            let input = lower_physical_storage(*input, input_type, block, context, location)?;
-            let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+            let input = input_type.lower_physical_storage(*input, block, context, location)?;
+            let output_tensor_type = output_type.lower(context, location)?;
             let broadcast = block.append_operation(stable_hlo::broadcast(
                 input,
                 output_tensor_type,
@@ -123,7 +208,7 @@ impl LowerableOperation for DynamicBroadcastOperation {
                 location,
             )?)?;
             let result = broadcast.result(0).unwrap().as_ref();
-            lower_layout_constraint(result, output_type, block, location)?
+            output_type.lower_layout_constraint(result, block, location)?
         } else if physical_bound_type(input_type).is_ok() && physical_bound_type(output_type).is_ok() {
             // Finite bounded inputs can be materialized at their physical shape, broadcast statically, and then
             // refined from the explicit result extents. This avoids `dynamic_broadcast_in_dim`, which the XLA
@@ -137,8 +222,8 @@ impl LowerableOperation for DynamicBroadcastOperation {
                 .collect::<Vec<_>>();
             let (declared_type, physical_type) =
                 dynamic_constructor_types(self.name(), dynamic_extents.len(), output_types)?;
-            let input = lower_physical_bound_value(*input, input_type, 0.0, block, context, location)?;
-            let output_tensor_type = lower_tensor_type(&physical_type, context, location)?;
+            let input = input_type.lower_physical_bound_value(*input, 0.0, block, context, location)?;
+            let output_tensor_type = physical_type.lower(context, location)?;
             let broadcast = block.append_operation(stable_hlo::broadcast(
                 input,
                 output_tensor_type,
@@ -173,7 +258,7 @@ impl LowerableOperation for DynamicBroadcastOperation {
                 location,
             )?)?;
             let result = broadcast.result(0).unwrap().as_ref();
-            let expected_type = lower_tensor_type(output_type, context, location)?;
+            let expected_type = output_type.lower(context, location)?;
             if result.r#type()? == expected_type.as_ref() {
                 result
             } else {
@@ -182,9 +267,8 @@ impl LowerableOperation for DynamicBroadcastOperation {
             }
         };
         let result = if broadcast_changes_explicit_sharding(input_type, output_type, self.output_axes()) {
-            lower_sharding_constraint(
+            output_type.sharding().unwrap().lower_sharding_constraint(
                 result,
-                output_type.sharding().unwrap(),
                 OpenDimensions::All,
                 collective_state.bound_manual_axes(),
                 block,
@@ -195,115 +279,6 @@ impl LowerableOperation for DynamicBroadcastOperation {
         };
         Ok(vec![result])
     }
-}
-
-/// Lowers a [`BroadcastOperation`] and explicitly constrains any placement transition over an explicit mesh axis.
-#[allow(clippy::too_many_arguments)]
-fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &BroadcastOperation,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-    bound_manual_axes: &[String],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    check_count!("input", input_values, 1, ProgramError);
-    check_count!("input", input_types, 1, ProgramError);
-    check_count!("output", output_types, 1, ProgramError);
-    let output_type = &output_types[0];
-    let input = input_values[0];
-    // A static result can refine exact symbolic input axes. Expose their proved physical sizes so that XLA does not
-    // retain a dynamic unit axis that would prevent a subsequent singleton expansion.
-    let input = if output_type.static_shape().is_some() {
-        lower_physical_storage(input, &input_types[0], block, context, location)?
-    } else {
-        input
-    };
-    let result = if output_type.static_shape().is_none() && physical_bound_type(output_type).is_err() {
-        if output_type.layout().is_some() {
-            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                operation: operation.name().to_string(),
-                reason: "dynamic broadcast with explicit output layout needs finite allocation bounds".to_owned(),
-            }));
-        }
-        // Every dynamic result axis is a passthrough of a mapped input axis, so obtain its runtime extent there.
-        let extents = output_type
-            .shape()
-            .dimensions()
-            .iter()
-            .enumerate()
-            .map(|(axis, dimension)| {
-                if let Dimension::Static(extent) = dimension {
-                    dimension_extent_i64(*extent)?;
-                    Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0))
-                } else {
-                    let input_axis =
-                        operation.output_axes().iter().position(|output_axis| *output_axis == axis).unwrap();
-                    lower_runtime_dimension_size_i64(input, input_axis, block, context, location)
-                }
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        let shape = lower_explicit_shape(&extents, block, context, location)?;
-        let broadcast = block.append_operation(stable_hlo::dynamic_broadcast(
-            input,
-            shape,
-            operation.output_axes(),
-            None,
-            None,
-            location,
-        )?)?;
-        let result = broadcast.result(0).unwrap().as_ref();
-        let expected_type = lower_tensor_type(output_type, context, location)?;
-        if result.r#type()? == expected_type.as_ref() {
-            result
-        } else {
-            block.append_operation(tensor::cast(result, expected_type, location)?)?.result(0).unwrap().as_ref()
-        }
-    } else if output_type.static_shape().is_none()
-        && (output_type.layout().is_some()
-            || output_type
-                .shape()
-                .dimensions()
-                .iter()
-                .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
-                .count()
-                > 1)
-    {
-        // `stablehlo.broadcast_in_dim` results admit at most one bounded dynamic axis. Broadcast the physical
-        // allocation for multiple dynamic axes or an explicit layout, then restore every logical size from its
-        // mapped input axis.
-        let physical_type = physical_bound_type(output_type)?;
-        let physical_input = lower_physical_bound_value(input, &input_types[0], 0.0, block, context, location)?;
-        let broadcast = block.append_operation(stable_hlo::broadcast(
-            physical_input,
-            lower_tensor_type(&physical_type, context, location)?,
-            operation.output_axes(),
-            location,
-        )?)?;
-        let result = lower_layout_constraint(broadcast.result(0).unwrap().as_ref(), &physical_type, block, location)?;
-        let mut sources = vec![(input, 0); output_type.rank()];
-        for (input_axis, output_axis) in operation.output_axes().iter().enumerate() {
-            sources[*output_axis] = (input, input_axis);
-        }
-        lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)?
-    } else {
-        let broadcast = block.append_operation(stable_hlo::broadcast(
-            input,
-            lower_tensor_type(output_type, context, location)?,
-            operation.output_axes(),
-            location,
-        )?)?;
-        lower_layout_constraint(broadcast.result(0).unwrap().as_ref(), output_type, block, location)?
-    };
-    let result = if broadcast_changes_explicit_sharding(&input_types[0], &output_types[0], operation.output_axes()) {
-        let sharding = output_types[0].sharding().unwrap();
-        lower_sharding_constraint(result, sharding, OpenDimensions::All, bound_manual_axes, block, location)?
-    } else {
-        result
-    };
-    Ok(vec![result])
 }
 
 #[cfg(test)]

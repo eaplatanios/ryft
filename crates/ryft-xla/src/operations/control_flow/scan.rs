@@ -32,11 +32,11 @@ use ryft_mlir::{
 };
 
 use crate::lowering::EffectTokens;
-use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{
-    lower_array_ir_type, lower_compare_to_mlir, lower_constant_output, lower_static_index_constants, lower_tensor_type,
-    stable_hlo_dynamic_dimension_bound, static_dimensions,
+    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, TypeLoweringExtension, lower_constant_output,
+    lower_static_index_constants, stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 use crate::operations::call::CallFunctionMap;
 use crate::operations::control_flow::{
@@ -384,7 +384,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
             let refined = block.append_operation(stable_hlo::set_dimension_size(
                 accumulator,
                 converted.result(0).unwrap().as_ref(),
-                lower_tensor_type(stack_type, context, location)?,
+                stack_type.lower(context, location)?,
                 0,
                 location,
             )?)?;
@@ -442,7 +442,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
         let mut state_types = self
             .state_types
             .iter()
-            .map(|r#type| lower_array_ir_type(r#type, context, location).map(|tensor_type| tensor_type.as_ref()))
+            .map(|r#type| r#type.lower(context, location).map(|tensor_type| tensor_type.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         append_loop_effect_tokens(
             self.threaded_effects,
@@ -482,8 +482,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
                     condition_block_ref.append_operation(stable_hlo::subtract(length_value, offset, location)?)?;
                 subtraction.result(0).unwrap().as_ref()
             };
-            let predicate = lower_compare_to_mlir(
-                ComparisonDirection::LessThan,
+            let predicate = ComparisonDirection::LessThan.lower_comparison(
                 counter,
                 counter_limit,
                 &mut condition_block_ref,
@@ -613,8 +612,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
             iteration_inputs.push(squeezed.result(0).unwrap().as_ref());
         }
 
-        let mut body_outputs = lower_nested_program_inline(
-            self.body,
+        let mut body_outputs = self.body.lower_inline(
             iteration_inputs.as_slice(),
             block,
             self.context,
@@ -928,7 +926,7 @@ mod tests {
         let block = context.block(
             &input_types
                 .iter()
-                .map(|r#type| (lower_array_ir_type(r#type, &context, location).unwrap(), location))
+                .map(|r#type| (r#type.lower(&context, location).unwrap(), location))
                 .collect::<Vec<_>>(),
         );
         let input_values = (0..2).map(|index| block.as_ref().argument(index).unwrap().as_ref()).collect::<Vec<_>>();
@@ -1030,7 +1028,7 @@ mod tests {
         let location = context.unknown_location().as_ref();
         let block_arguments = state_types
             .iter()
-            .map(|r#type| (lower_array_ir_type(r#type, &context, location).unwrap(), location))
+            .map(|r#type| (r#type.lower(&context, location).unwrap(), location))
             .collect::<Vec<_>>();
         let block = context.block(&block_arguments);
         let collective_state = CollectiveLoweringState::new();

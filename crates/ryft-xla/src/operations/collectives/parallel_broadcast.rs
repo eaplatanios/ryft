@@ -7,7 +7,7 @@ use ryft_core::{
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::lowering::states::CollectiveLoweringState;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer, Type};
 
@@ -71,8 +71,7 @@ impl LowerableOperation for ParallelBroadcastOperation {
                 axes,
             )?;
             let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-            return lower_nested_program_inline(
-                &program.to_flat_program(),
+            return program.to_flat_program().lower_inline(
                 input_values,
                 &mut block,
                 context,
@@ -84,65 +83,72 @@ impl LowerableOperation for ParallelBroadcastOperation {
                 lowerer.effect_tokens_mut(),
             );
         }
-        lower_static_parallel_broadcast_to_mlir(
-            self,
-            &collective_state,
-            input_values[0],
-            &mut lowerer.block(),
-            lowerer.location(),
-        )
+        self.lower_static_to_mlir(&collective_state, input_values[0], &mut lowerer.block(), lowerer.location())
     }
 }
 
-/// Lowers one traced `parallel_broadcast` to a channeled `stablehlo.collective_broadcast`. The operation broadcasts
-/// from the first member of every replica group, so each group of the named mesh axes is reordered to start with its
-/// member at the source position, followed by the remaining members in axis order, as JAX's GPU lowering of
-/// `pbroadcast` does. The channel handle and global device IDs in the groups make XLA interpret the devices as
-/// partitions of one replica, which is how `shard_map` regions execute.
-///
-/// A broadcast over a single participant is the identity and emits nothing. Otherwise, the XLA CPU backend cannot
-/// compile `collective-broadcast` because its thunk emitter rejects the opcode, so a lowering whose target platform is
-/// known to be the CPU fails here with a precise error, while a lowering without target information emits the
-/// operation and leaves the rejection to XLA's compiler. JAX registers its lowering for GPUs only.
-fn lower_static_parallel_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &ParallelBroadcastOperation,
-    collective_state: &CollectiveLoweringState,
-    input_value: ValueRef<'b, 'c, 't>,
-    block: &mut BlockRef<'b, 'c, 't>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    if operation.axis_size() == 1 {
-        return Ok(vec![input_value]);
-    }
-    if collective_state.target_platform().is_some_and(|platform| platform.eq_ignore_ascii_case("cpu")) {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` is not supported by the XLA CPU backend"),
+/// Lowering of a [`ParallelBroadcastOperation`] with static shapes.
+trait ParallelBroadcastOperationLoweringExtension {
+    /// Lowers one traced `parallel_broadcast` to a channeled `stablehlo.collective_broadcast`. The operation broadcasts
+    /// from the first member of every replica group, so each group of the named mesh axes is reordered to start with
+    /// its member at the source position, followed by the remaining members in axis order, as JAX's GPU lowering of
+    /// `pbroadcast` does. The channel handle and global device IDs in the groups make XLA interpret the devices as
+    /// partitions of one replica, which is how `shard_map` regions execute.
+    ///
+    /// A broadcast over a single participant is the identity and emits nothing. Otherwise, the XLA CPU backend cannot
+    /// compile `collective-broadcast` because its thunk emitter rejects the opcode, so a lowering whose target platform
+    /// is known to be the CPU fails here with a precise error, while a lowering without target information emits the
+    /// operation and leaves the rejection to XLA's compiler. JAX registers its lowering for GPUs only.
+    fn lower_static_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_value: ValueRef<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl ParallelBroadcastOperationLoweringExtension for ParallelBroadcastOperation {
+    fn lower_static_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_value: ValueRef<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        if self.axis_size() == 1 {
+            return Ok(vec![input_value]);
         }
-        .into());
+        if collective_state.target_platform().is_some_and(|platform| platform.eq_ignore_ascii_case("cpu")) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` is not supported by the XLA CPU backend"),
+            }
+            .into());
+        }
+        let (replica_groups, _) = collective_state.replica_groups(self.axes(), self.axis_size(), None)?;
+        let ParallelBroadcastSource::Static(source) = self.source() else {
+            unreachable!();
+        };
+        let replica_groups = replica_groups
+            .iter()
+            .map(|group| {
+                std::iter::once(group[source])
+                    .chain(group[..source].iter().copied())
+                    .chain(group[source + 1..].iter().copied())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let replica_groups = replica_groups.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let result = block.append_operation(stable_hlo::collective_broadcast(
+            &[input_value],
+            None,
+            stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
+            Some(collective_state.next_channel_id()),
+            Some(stable_hlo::ChannelHandleType::DeviceToDevice),
+            location,
+        )?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
-    let (replica_groups, _) = collective_state.replica_groups(operation.axes(), operation.axis_size(), None)?;
-    let ParallelBroadcastSource::Static(source) = operation.source() else {
-        unreachable!();
-    };
-    let replica_groups = replica_groups
-        .iter()
-        .map(|group| {
-            std::iter::once(group[source])
-                .chain(group[..source].iter().copied())
-                .chain(group[source + 1..].iter().copied())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let replica_groups = replica_groups.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    let result = block.append_operation(stable_hlo::collective_broadcast(
-        &[input_value],
-        None,
-        stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-        Some(collective_state.next_channel_id()),
-        Some(stable_hlo::ChannelHandleType::DeviceToDevice),
-        location,
-    )?)?;
-    Ok(vec![result.result(0).unwrap().as_ref()])
 }
 
 #[cfg(test)]

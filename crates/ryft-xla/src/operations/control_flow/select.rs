@@ -15,11 +15,8 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::types::{
-    lower_physical_bound_value, lower_restore_dynamic_dimensions, lower_signed_one_bit_to_mlir, lower_tensor_type,
-    physical_bound_type,
-};
-use crate::operations::constants::lower_layout_constraint;
+use crate::lowering::types::{ArrayTypeLoweringExtension, lower_signed_one_bit_to_mlir, physical_bound_type};
+use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::operations::normalize_elementwise_operand;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
@@ -66,7 +63,7 @@ where
     check_count!("input", input_types, 3, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
     let output_type = &output_types[0];
-    let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+    let output_tensor_type = output_type.lower(context, location)?;
     let multiple_dynamic_axes = output_type
         .shape()
         .dimensions()
@@ -113,9 +110,8 @@ where
             // expose its physical capacity, broadcast that capacity, then restore the composed logical extents.
             let converted_type = input_types[index].clone().with_data_type(target_type.data_type());
             let converted = normalize_elementwise_operand(inputs[index], &converted_type, block, context, location)?;
-            let physical_input = lower_physical_bound_value(
+            let physical_input = converted_type.lower_physical_bound_value(
                 converted,
-                &converted_type,
                 0.0,
                 &mut block.as_ref(),
                 context,
@@ -135,19 +131,17 @@ where
             let output_axes = (first_axis..target_type.rank()).collect::<Vec<_>>();
             let broadcast = block.append_operation(stable_hlo::broadcast(
                 physical_input,
-                lower_tensor_type(&physical_type, context, location)?,
+                physical_type.lower(context, location)?,
                 &output_axes,
                 location,
             )?)?;
-            let result = lower_layout_constraint(
+            let result = physical_type.lower_layout_constraint(
                 broadcast.result(0).unwrap().as_ref(),
-                &physical_type,
                 &mut block.as_ref(),
                 location.as_ref(),
             )?;
-            inputs[index] = lower_restore_dynamic_dimensions(
+            inputs[index] = target_type.lower_restore_dynamic_dimensions(
                 result,
-                &target_type,
                 &sources,
                 &mut block.as_ref(),
                 context,
@@ -351,7 +345,7 @@ mod tests {
             let block = context.block(
                 &input_types
                     .iter()
-                    .map(|r#type| (lower_tensor_type(r#type, &context, location).unwrap(), location))
+                    .map(|r#type| (r#type.lower(&context, location).unwrap(), location))
                     .collect::<Vec<_>>(),
             );
             let input_values = (0..3).map(|index| block.as_ref().argument(index).unwrap().as_ref()).collect::<Vec<_>>();

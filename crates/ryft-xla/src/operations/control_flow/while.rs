@@ -21,19 +21,18 @@ use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{Block, Operation as MlirOperation, Region, Type as MlirType, Value as MlirValue, ValueRef};
 
 use crate::lowering::EffectTokens;
-use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::lowering::types::{
-    lower_array_ir_type, lower_compare_to_mlir, lower_explicit_shape, lower_physical_bound_value,
-    lower_restore_dynamic_dimensions, lower_runtime_dimension_size_i64, lower_static_index_constants,
-    lower_tensor_type, physical_bound_type,
+    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, TypeLoweringExtension, lower_explicit_shape,
+    lower_runtime_dimension_size_i64, lower_static_index_constants, physical_bound_type,
 };
 use crate::operations::control_flow::{
-    append_loop_effect_tokens, lower_control_flow_region, lower_explicit_sharding_constraints,
+    ControlFlowRegionLoweringExtension, append_loop_effect_tokens, lower_explicit_sharding_constraints,
     lower_refined_region_input, lower_refined_region_outputs, lower_region_guard, lowered_effect_classes,
     set_threaded_effect_tokens, threaded_effect_token_values, validate_unthreaded_effect_tokens,
 };
 use crate::operations::extrema::FloatExtremumForm;
-use crate::operations::reductions::lower_reduce_to_mlir;
+use crate::operations::reductions::ReductionKindLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
 
 impl LowerableOperation for WhileOperation<ArrayType> {
@@ -165,7 +164,7 @@ impl LowerableOperation for WhileOperation<Type> {
         }
         let mut lowered_state_types = full_state_types
             .iter()
-            .map(|r#type| lower_array_ir_type(r#type, context, location).map(|tensor_type| tensor_type.as_ref()))
+            .map(|r#type| r#type.lower(context, location).map(|tensor_type| tensor_type.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
 
         // Seed the loop state. A threaded predicate is evaluated once on the entry state in the enclosing block. For an
@@ -176,8 +175,7 @@ impl LowerableOperation for WhileOperation<Type> {
         }
         state_values.extend_from_slice(input_values);
         if threaded_predicate {
-            let initial_predicate = lower_nested_program_inline(
-                condition,
+            let initial_predicate = condition.lower_inline(
                 input_values,
                 block,
                 context,
@@ -212,8 +210,7 @@ impl LowerableOperation for WhileOperation<Type> {
             let loop_predicate = if threaded_predicate {
                 let carried_predicate = condition_block_ref.argument(predicate_index).unwrap().as_ref();
                 if batched_predicate {
-                    lower_reduce_to_mlir(
-                        ReductionKind::Any,
+                    ReductionKind::Any.lower(
                         predicate_dimensions.as_slice(),
                         carried_predicate,
                         &ArrayType::scalar(DataType::Boolean),
@@ -234,8 +231,7 @@ impl LowerableOperation for WhileOperation<Type> {
                     condition_block_ref.argument(token_start_index + offset).unwrap().as_ref()
                 });
                 let entry_effect_tokens = condition_effect_tokens;
-                let condition_outputs = lower_nested_program_inline(
-                    condition,
+                let condition_outputs = condition.lower_inline(
                     condition_inputs.as_slice(),
                     &mut condition_block_ref,
                     context,
@@ -255,8 +251,7 @@ impl LowerableOperation for WhileOperation<Type> {
                     let counter = condition_block_ref.argument(0).unwrap().as_ref();
                     let bound_constant =
                         lower_static_index_constants(&[bound], &mut condition_block_ref, context, location)?[0];
-                    let counter_predicate = lower_compare_to_mlir(
-                        ComparisonDirection::LessThan,
+                    let counter_predicate = ComparisonDirection::LessThan.lower_comparison(
                         counter,
                         bound_constant,
                         &mut condition_block_ref,
@@ -287,8 +282,7 @@ impl LowerableOperation for WhileOperation<Type> {
                 body_block_ref.argument(token_start_index + offset).unwrap().as_ref()
             });
             let entry_effect_tokens = body_effect_tokens;
-            let body_outputs = lower_nested_program_inline(
-                body,
+            let body_outputs = body.lower_inline(
                 body_inputs.as_slice(),
                 &mut body_block_ref,
                 context,
@@ -325,7 +319,7 @@ impl LowerableOperation for WhileOperation<Type> {
                             if state_type.static_shape().is_some() {
                                 let broadcast = body_block_ref.append_operation(stable_hlo::broadcast(
                                     carried_predicate,
-                                    lower_tensor_type(&mask_type, context, location)?,
+                                    mask_type.lower(context, location)?,
                                     predicate_dimensions.as_slice(),
                                     location,
                                 )?)?;
@@ -334,9 +328,8 @@ impl LowerableOperation for WhileOperation<Type> {
                                 // Broadcast bounded storage, then restore every logical extent from the carry. A
                                 // predicate cannot supply the dynamic sizes of trailing state axes, and native bounded
                                 // broadcast results admit at most one dynamic axis.
-                                let predicate = lower_physical_bound_value(
+                                let predicate = predicate_type.lower_physical_bound_value(
                                     carried_predicate,
-                                    &predicate_type,
                                     0.0,
                                     &mut body_block_ref,
                                     context,
@@ -344,14 +337,13 @@ impl LowerableOperation for WhileOperation<Type> {
                                 )?;
                                 let broadcast = body_block_ref.append_operation(stable_hlo::broadcast(
                                     predicate,
-                                    lower_tensor_type(&physical_type, context, location)?,
+                                    physical_type.lower(context, location)?,
                                     predicate_dimensions.as_slice(),
                                     location,
                                 )?)?;
                                 let sources = (0..state_type.rank()).map(|axis| (*carried, axis)).collect::<Vec<_>>();
-                                lower_restore_dynamic_dimensions(
+                                mask_type.lower_restore_dynamic_dimensions(
                                     broadcast.result(0).unwrap().as_ref(),
-                                    &mask_type,
                                     &sources,
                                     &mut body_block_ref,
                                     context,
@@ -379,7 +371,7 @@ impl LowerableOperation for WhileOperation<Type> {
                                     location,
                                 )?)?;
                                 let result = broadcast.result(0).unwrap().as_ref();
-                                let expected_type = lower_tensor_type(&mask_type, context, location)?;
+                                let expected_type = mask_type.lower(context, location)?;
                                 if result.r#type()? == expected_type.as_ref() {
                                     result
                                 } else {
@@ -420,15 +412,13 @@ impl LowerableOperation for WhileOperation<Type> {
                 if let Some(bound) = iteration_bound {
                     let bound_constant =
                         lower_static_index_constants(&[bound], &mut body_block_ref, context, location)?[0];
-                    let evaluate_condition = lower_compare_to_mlir(
-                        ComparisonDirection::LessThan,
+                    let evaluate_condition = ComparisonDirection::LessThan.lower_comparison(
                         next_counter.unwrap(),
                         bound_constant,
                         &mut body_block_ref,
                         location,
                     )?;
-                    let condition_region = lower_control_flow_region(
-                        condition,
+                    let condition_region = condition.lower_control_flow_region(
                         next_state_values.as_slice(),
                         &condition_output_types,
                         context,
@@ -460,8 +450,7 @@ impl LowerableOperation for WhileOperation<Type> {
                     });
                     Some(guarded_condition.result(0).unwrap().as_ref())
                 } else {
-                    let next_predicate = lower_nested_program_inline(
-                        condition,
+                    let next_predicate = condition.lower_inline(
                         next_state_values.as_slice(),
                         &mut body_block_ref,
                         context,

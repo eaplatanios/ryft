@@ -50,9 +50,9 @@ use crate::lowering::reductions::{
     constrain_unreduced_intermediates, constrain_unreduced_outputs, validate_declared_pending_reduction,
     validate_pending_reductions_across_regions,
 };
-use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::lowering::states::CollectiveLoweringState;
-use crate::lowering::types::{lower_captured_constant, lower_literal_value};
+use crate::lowering::types::CaptureReferenceLoweringExtension;
 use crate::operations::call::CallFunctionMap;
 use crate::{ArrayConstant, Constant, Error, Operation, RuntimeRequirement, Type};
 
@@ -188,12 +188,11 @@ pub use admission::DataDependentPaddingDiscipline;
 pub use extensions::{EntryShardingOverride, LowerableProgram, ProgramLoweringOptions};
 pub use modules::LoweredModule;
 pub use types::{
-    annotate_output_memory, dimension_extent_i32, dimension_extent_i64, lower_array_ir_type, lower_compare_to_mlir,
-    lower_constant_elements_attribute, lower_constant_output, lower_element_type, lower_explicit_shape,
-    lower_f64_constant_splat, lower_physical_bound_value, lower_physical_storage, lower_restore_dynamic_dimensions,
-    lower_runtime_dimension_size_i64, lower_signed_one_bit_to_mlir, lower_static_index_constants, lower_tensor_type,
-    lower_transfer_to_memory, lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type,
-    stable_hlo_dynamic_dimension_bound, static_dimensions,
+    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, DataTypeLoweringExtension,
+    MemoryLoweringExtension, TypeLoweringExtension, annotate_output_memory, dimension_extent_i32, dimension_extent_i64,
+    lower_constant_output, lower_explicit_shape, lower_f64_constant_splat, lower_runtime_dimension_size_i64,
+    lower_signed_one_bit_to_mlir, lower_static_index_constants, lower_u64_scalar_constant,
+    lower_unplaced_constant_output, physical_bound_type, stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 
 /// Per-class StableHLO tokens owned by one lowering scope.
@@ -439,7 +438,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     /// Returns [`LoweringError::UnsupportedElementType`] when an element type has no StableHLO tensor representation,
     /// and propagates native construction failures through [`Error::Mlir`].
     pub fn lower_tensor_type(&self, array_type: &ArrayType) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, Error> {
-        lower_tensor_type(array_type, self.context, self.location)
+        array_type.lower(self.context, self.location)
     }
 
     /// Returns the current token of the `effect_class` chain of the enclosing lowering scope, creating that chain with
@@ -494,8 +493,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
             ))
             .into());
         };
-        lower_nested_program_inline(
-            region,
+        region.lower_inline(
             input_values,
             &mut self.block,
             self.context,
@@ -798,6 +796,25 @@ pub(crate) trait MlirLowerableValue: 'static + Value<Type = ArrayType> {
         context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, Error>;
 
+    /// Lowers this concrete value to a StableHLO constant operation and applies its declared memory placement.
+    fn lower_literal<'b, 'c: 'b, 't: 'c, B, L>(
+        &self,
+        block: &mut B,
+        context: &'c MlirContext<'t>,
+        location: L,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>
+    where
+        B: Block<'b, 'c, 't>,
+        L: Copy + Location<'c, 't>,
+    {
+        let value_type = self.r#type();
+        let tensor_type = value_type.lower(context, location)?;
+        let elements = self.to_dense_elements_attribute(tensor_type, context)?;
+        let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
+        let constant = constant.result(0).unwrap().as_ref();
+        annotate_output_memory(constant, &value_type, block, context, location)
+    }
+
     /// Lowers this program constant inside a function body.
     #[inline]
     fn lower_constant_value<'b, 'c: 'b, 't: 'c, B, L>(
@@ -812,7 +829,7 @@ pub(crate) trait MlirLowerableValue: 'static + Value<Type = ArrayType> {
         L: Copy + Location<'c, 't>,
     {
         let _ = captured_values;
-        lower_literal_value(self, block, context, location)
+        self.lower_literal(block, context, location)
     }
 }
 
@@ -850,11 +867,11 @@ impl MlirLowerableValue for ArrayConstant {
         L: Copy + Location<'c, 't>,
     {
         match self {
-            Self::Captured(value) => lower_captured_constant(value, captured_values),
+            Self::Captured(value) => value.lower(captured_values),
             Self::Session(value) => {
                 Err(Error::Lowering(LoweringError::UnreachableSessionConstant { constant: value.to_string() }))
             }
-            Self::Boolean(_) => lower_literal_value(self, block, context, location),
+            Self::Boolean(_) => self.lower_literal(block, context, location),
         }
     }
 }
@@ -885,7 +902,7 @@ impl MlirLowerableValue for Array {
     ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
         let data_type = self.r#type().data_type();
         if data_type == DataType::Zero {
-            return types::lower_f64_scalar_elements_attribute(data_type, tensor_type, 0.0, context);
+            return data_type.lower_f64_scalar_elements_attribute(tensor_type, 0.0, context);
         }
         if data_type == DataType::Token {
             return Err(Error::Lowering(LoweringError::UnsupportedElementType {
@@ -1091,7 +1108,7 @@ pub(crate) fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperat
 /// `bound_manual_axes` of the enclosing manual regions. Manual dimension ownership belongs to region boundaries. Local
 /// operations may change manual variation through collectives, but must not manufacture a global placement, which
 /// lowered sharding constraints would otherwise silently strip (refer to
-/// `lower_sharding_constraint`).
+/// `ShardingExtension::lower_constraint`).
 /// First-class dimensions and references carry no placement of their own.
 pub(crate) fn validate_local_output_placement(
     operation_name: &str,
@@ -1150,9 +1167,10 @@ pub(crate) mod tests {
     use ryft_pjrt::protos::{OptionOverride, OptionValue, ShapeChecks};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
+    use crate::sharding::LogicalMeshExtension;
     use crate::{
         ArrayConstant, ArrayTracer, CompileTracer, CompiledFunction, Constant, Error, FromPjrt, LowerableProgram,
-        Operation, Options, Session, ToMlir, Type, compile, trace_with_context,
+        Operation, Options, Session, Type, compile, trace_with_context,
     };
 
     use crate::devices::MemoryExtension;
@@ -1164,7 +1182,7 @@ pub(crate) mod tests {
     use crate::lowering::regions::tests::lower_plain_program_outputs;
 
     use crate::lowering::states::CollectiveLoweringState;
-    use crate::lowering::types::lower_tensor_type;
+    use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::operations::assertions::ensure_assertion_handler_registered;
 
     use crate::tests::{cpu_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes};
@@ -1232,7 +1250,7 @@ pub(crate) mod tests {
             }
         }
         if let Some(mesh) = mesh {
-            module.body()?.append_operation(mesh.to_mlir(location)?)?;
+            module.body()?.append_operation(mesh.lower(location)?)?;
         }
 
         let input_tensor_types = program
@@ -1240,7 +1258,7 @@ pub(crate) mod tests {
             .iter()
             .map(|atom_id| {
                 let input_atom = &program.atoms()[atom_id.index()];
-                lower_tensor_type(input_atom.r#type().as_ref(), &context, location)
+                input_atom.r#type().as_ref().lower(&context, location)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let output_tensor_types = program
@@ -1248,7 +1266,7 @@ pub(crate) mod tests {
             .iter()
             .map(|atom_id| {
                 let output_atom = &program.atoms()[atom_id.index()];
-                lower_tensor_type(output_atom.r#type().as_ref(), &context, location)
+                output_atom.r#type().as_ref().lower(&context, location)
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -1824,7 +1842,7 @@ pub(crate) mod tests {
     fn literal_dense_bytes(literal: &Array, byte_count: usize) -> Vec<u8> {
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let tensor_type = lower_tensor_type(literal.r#type().as_ref(), &context, location).unwrap();
+        let tensor_type = literal.r#type().as_ref().lower(&context, location).unwrap();
         let attribute = literal.to_dense_elements_attribute(tensor_type, &context).unwrap();
         unsafe { std::slice::from_raw_parts(attribute.raw_data().cast::<u8>(), byte_count).to_vec() }
     }
@@ -1924,7 +1942,7 @@ pub(crate) mod tests {
         let boolean = Array::vector(vec![true, false, true]).unwrap();
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let tensor_type = lower_tensor_type(boolean.r#type().as_ref(), &context, location).unwrap();
+        let tensor_type = boolean.r#type().as_ref().lower(&context, location).unwrap();
         let attribute = boolean.to_dense_elements_attribute(tensor_type, &context).unwrap();
         assert_eq!(
             unsafe { attribute.bool_elements().collect::<Result<Vec<_>, _>>().unwrap() },
@@ -1942,7 +1960,7 @@ pub(crate) mod tests {
                 vec![true, false, true],
             ),
         ] {
-            let tensor_type = lower_tensor_type(literal.r#type().as_ref(), &context, location).unwrap();
+            let tensor_type = literal.r#type().as_ref().lower(&context, location).unwrap();
             let attribute = literal.to_dense_elements_attribute(tensor_type, &context).unwrap();
             assert_eq!(unsafe { attribute.bool_elements().collect::<Result<Vec<_>, _>>().unwrap() }, expected);
         }
@@ -2075,7 +2093,7 @@ pub(crate) mod tests {
 
         // Empty tensors remain valid dense constants and carry no raw payload bytes.
         let empty = Array::vector(Vec::<i32>::new()).unwrap();
-        let tensor_type = lower_tensor_type(empty.r#type().as_ref(), &context, location).unwrap();
+        let tensor_type = empty.r#type().as_ref().lower(&context, location).unwrap();
         let attribute = empty.to_dense_elements_attribute(tensor_type, &context).unwrap();
         assert_eq!(attribute.elements_count(), 0);
 
@@ -2101,7 +2119,7 @@ pub(crate) mod tests {
     fn test_mlir_lowerable_value_to_dense_elements_attribute_rejects_symbolic_values() {
         let context = MlirContext::new();
         let array_type = ArrayType::scalar(DataType::F32);
-        let tensor_type = lower_tensor_type(&array_type, &context, context.unknown_location()).unwrap();
+        let tensor_type = array_type.lower(&context, context.unknown_location()).unwrap();
         assert!(matches!(
             array_type.to_dense_elements_attribute(tensor_type, &context),
             Err(Error::Core(core_error)) if matches!(
@@ -2119,6 +2137,33 @@ pub(crate) mod tests {
                     if *message == "captured constant #3 cannot be materialized as a literal without capture bindings",
             ),
         ));
+    }
+
+    #[test]
+    fn test_mlir_lowerable_value_lower_literal() {
+        // A literal that is placed in host memory is annotated with that placement.
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let block = context.block_with_no_arguments();
+        let mut block_ref = block.as_ref();
+        let device = Array::vector(vec![1.0f32, 2.0]).unwrap();
+        let host_type = ArrayType::new_static(DataType::F32, [2]).with_memory(Memory::Host { pinned: true });
+        let host = Array::from_elements(host_type, &[3.0f32, 4.0]).unwrap();
+        let device = device.lower_literal(&mut block_ref, &context, location).unwrap();
+        let host = host.lower_literal(&mut block_ref, &context, location).unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(device, operations[0].result(0).unwrap().as_ref());
+        assert_eq!(host, operations[2].result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "%cst = stablehlo.constant dense<[1.000000e+00, 2.000000e+00]> : tensor<2xf32>",
+                "%cst = stablehlo.constant dense<[3.000000e+00, 4.000000e+00]> : tensor<2xf32>",
+                "%0 = stablehlo.custom_call @annotate_device_placement(<<UNKNOWN SSA VALUE>>) {backend_config = \"\", \
+                 has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = \"pinned_host\"}} : \
+                 (tensor<2xf32>) -> tensor<2xf32>",
+            ],
+        );
     }
 
     /// Operation family whose operations borrow their configuration, which lowering admits for any lifetime of the

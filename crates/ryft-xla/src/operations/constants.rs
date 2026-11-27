@@ -11,63 +11,75 @@ use ryft_mlir::{
 
 use crate::lowering::MlirLowerableValue;
 use crate::lowering::types::{
-    annotate_output_memory, lower_constant_output, lower_restore_dynamic_dimensions, lower_tensor_type,
-    physical_bound_type, stable_hlo_dynamic_dimension_bound,
+    ArrayTypeLoweringExtension, annotate_output_memory, lower_constant_output, physical_bound_type,
+    stable_hlo_dynamic_dimension_bound,
 };
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::sharding::{OpenDimensions, lower_sharding_constraint};
+use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{
     Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation, Type,
 };
 
-/// Constrains the layout of a statically shaped physical buffer before attaching its runtime dimensions.
-pub(crate) fn lower_layout_constraint<'b, 'c: 'b, 't: 'c>(
-    value: ValueRef<'b, 'c, 't>,
-    r#type: &ArrayType,
-    block: &mut BlockRef<'b, 'c, 't>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let Some(layout) = r#type.layout() else {
-        return Ok(value);
-    };
-    let Layout::Tiled(tiled) = layout else {
-        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: "lower_layout_constraint".to_string(),
-            reason: format!("strided output layout `{layout}`"),
-        }));
-    };
-    if !tiled.tiles().is_empty() {
-        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: "lower_layout_constraint".to_string(),
-            reason: format!("tiled output layout `{layout}`"),
-        }));
+/// Lowering of the layout of an [`ArrayType`] to a constraint on a value.
+pub(crate) trait ArrayTypeLayoutConstraintLoweringExtension {
+    /// Constrains the layout of a statically shaped physical buffer before attaching its runtime dimensions.
+    fn lower_layout_constraint<'b, 'c: 'b, 't: 'c>(
+        &self,
+        value: ValueRef<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+}
+
+impl ArrayTypeLayoutConstraintLoweringExtension for ArrayType {
+    fn lower_layout_constraint<'b, 'c: 'b, 't: 'c>(
+        &self,
+        value: ValueRef<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        let Some(layout) = self.layout() else {
+            return Ok(value);
+        };
+        let Layout::Tiled(tiled) = layout else {
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: "layout constraint".to_string(),
+                reason: format!("strided output layout `{layout}`"),
+            }));
+        };
+        if !tiled.tiles().is_empty() {
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: "layout constraint".to_string(),
+                reason: format!("tiled output layout `{layout}`"),
+            }));
+        }
+        let axes = tiled.minor_to_major();
+        if axes.len() != self.rank()
+            || axes.iter().any(|axis| *axis >= self.rank())
+            || axes.iter().collect::<std::collections::HashSet<_>>().len() != self.rank()
+        {
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: "layout constraint".to_string(),
+                reason: format!("invalid output layout `{layout}` for type `{self}`"),
+            }));
+        }
+        // XLA recognizes this custom call as a physical layout constraint. Apply it to the allocation's static shape,
+        // because runtime extents are attached afterward, so the call needs no separate dynamic result shape arguments.
+        let constrained = block.append_operation(stable_hlo::custom_call(
+            &[value],
+            "LayoutConstraint",
+            false,
+            None,
+            stable_hlo::CustomCallApiVersion::Original,
+            &[],
+            Some(stable_hlo::CustomCallMemoryLayouts { operands: vec![axes.to_vec()], results: vec![axes.to_vec()] }),
+            &[],
+            None,
+            &[value.r#type()?],
+            location,
+        )?)?;
+        Ok(constrained.result(0).unwrap().as_ref())
     }
-    let axes = tiled.minor_to_major();
-    if axes.len() != r#type.rank()
-        || axes.iter().any(|axis| *axis >= r#type.rank())
-        || axes.iter().collect::<std::collections::HashSet<_>>().len() != r#type.rank()
-    {
-        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: "lower_layout_constraint".to_string(),
-            reason: format!("invalid output layout `{layout}` for type `{type}`"),
-        }));
-    }
-    // XLA recognizes this custom call as a physical layout constraint. Apply it to the allocation's static shape,
-    // because runtime extents are attached afterward, so the call needs no separate dynamic result shape arguments.
-    let constrained = block.append_operation(stable_hlo::custom_call(
-        &[value],
-        "LayoutConstraint",
-        false,
-        None,
-        stable_hlo::CustomCallApiVersion::Original,
-        &[],
-        Some(stable_hlo::CustomCallMemoryLayouts { operands: vec![axes.to_vec()], results: vec![axes.to_vec()] }),
-        &[],
-        None,
-        &[value.r#type()?],
-        location,
-    )?)?;
-    Ok(constrained.result(0).unwrap().as_ref())
 }
 
 /// Derives the declared and statically bounded physical types shared by dynamic array constructors.
@@ -128,7 +140,7 @@ pub(crate) fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    result = lower_layout_constraint(result, &refined_type, block, location)?;
+    result = refined_type.lower_layout_constraint(result, block, location)?;
     let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
     // The dimension operands are compact (i.e., one per dynamic axis, in axis order), so advance the operand iterator
     // only when a dynamic axis is encountered rather than indexing by the physical axis number.
@@ -143,7 +155,7 @@ pub(crate) fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
         let mut dimensions = refined_type.shape().dimensions().to_vec();
         dimensions[axis] = dimension;
         refined_type = refined_type.with_shape(Shape::new(dimensions));
-        let refined_tensor_type = lower_tensor_type(&refined_type, context, location)?;
+        let refined_tensor_type = refined_type.lower(context, location)?;
         let operation = block.append_operation(stable_hlo::set_dimension_size(
             result,
             extent,
@@ -439,7 +451,7 @@ impl MemberLowerableOperation<Type> for IotaOperation<ArrayType> {
             dynamic_constructor_inputs(self.name(), self.r#type(), input_values, input_types, output_types, lowerer)?;
         let block = &mut lowerer.block();
         let (output_type, physical_type) = dynamic_constructor_types(self.name(), input_values.len(), output_types)?;
-        let tensor_type = lower_tensor_type(&physical_type, context, location)?;
+        let tensor_type = physical_type.lower(context, location)?;
         let iota = block.append_operation(stable_hlo::iota(tensor_type, self.dimension(), location)?)?;
         let result = iota.result(0).unwrap().as_ref();
         // The declared memory applies to the allocation at the bounds, like for the other dynamic constructors.
@@ -521,7 +533,7 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
     };
     check_count!("input", result, 1, ProgramError);
     let result =
-        lower_sharding_constraint(result[0], sharding, OpenDimensions::All, bound_manual_axes, block, location)?;
+        sharding.lower_sharding_constraint(result[0], OpenDimensions::All, bound_manual_axes, block, location)?;
     Ok(vec![result])
 }
 
@@ -540,12 +552,12 @@ fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let physical_type = physical_bound_type(output_type)?;
     let result = annotate_output_memory(result, &physical_type, block, context, location)?;
-    let result = lower_layout_constraint(result, &physical_type, block, location)?;
+    let result = physical_type.lower_layout_constraint(result, block, location)?;
     let sources = (0..output_type.rank()).map(|axis| (exemplar, axis)).collect::<Vec<_>>();
-    let result = lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)?;
+    let result = output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)?;
     let result = match output_type.sharding() {
         Some(sharding) => {
-            lower_sharding_constraint(result, sharding, OpenDimensions::All, bound_manual_axes, block, location)?
+            sharding.lower_sharding_constraint(result, OpenDimensions::All, bound_manual_axes, block, location)?
         }
         None => result,
     };
@@ -569,7 +581,7 @@ fn lower_constructor_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     };
     check_count!("input", result, 1, ProgramError);
     let result =
-        lower_sharding_constraint(result[0], sharding, OpenDimensions::All, bound_manual_axes, block, location)?;
+        sharding.lower_sharding_constraint(result[0], OpenDimensions::All, bound_manual_axes, block, location)?;
     Ok(vec![result])
 }
 
@@ -655,15 +667,17 @@ mod tests {
         ArrayIrOperation, ArrayOperation, Complex, Context, DimensionBounds, DimensionType, DimensionValue,
         DimensionVariable, Error as CoreError, Fill, LogicalMesh, Memory, MeshAxis, MeshAxisType, OneLikeOperation,
         OneOperation, Placeholder, ProgramBuilder as CoreProgramBuilder, ProjectedContext, Sharding, ShardingDimension,
-        StaticShape, TiledLayout, TracingContext, Typed, TypedProgram, ZeroLikeOperation, ZeroOperation, i1, i2, i4,
-        u1, u2, u4,
+        StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, TracingContext, Typed, TypedProgram,
+        ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
+    use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, test_vector_type,
         to_mlir_module_for_plain_program,
     };
+    use crate::lowering::types::lower_f64_constant_splat;
     use crate::operations::Operation;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::sessions::tests::read_first_shard;
@@ -671,6 +685,55 @@ mod tests {
     use crate::{ArrayConstant, Constant, LowerableProgram, ProgramLoweringOptions, Session};
 
     use super::*;
+
+    #[test]
+    fn test_array_type_lower_layout_constraint() {
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let array_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let module = context.module(location).unwrap();
+        let mut block = module.body().unwrap();
+        let tensor_type = array_type.lower(&context, location).unwrap();
+        let input = lower_f64_constant_splat(1.0, &array_type, tensor_type, &mut block, &context, location).unwrap();
+
+        // A type without a layout leaves its value unconstrained.
+        assert_eq!(array_type.lower_layout_constraint(input, &mut block, location).unwrap(), input);
+        let column_major_type = array_type.clone().with_layout(Some(TiledLayout::new(vec![0, 1], Vec::new()).into()));
+        column_major_type.lower_layout_constraint(input, &mut block, location).unwrap();
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                  %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<2x3xf32>
+                  %1 = stablehlo.custom_call @LayoutConstraint(%0) {operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+                }
+            "},
+        );
+
+        // The `LayoutConstraint` custom call takes its layouts as permutations of the axes.
+        let strided_type = array_type.clone().with_layout(Some(StridedLayout::new(vec![12, 4]).into()));
+        assert!(matches!(
+            strided_type.lower_layout_constraint(input, &mut block, location),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "layout constraint" && reason == "strided output layout `strided{12,4}`",
+        ));
+        let tiled_type = array_type
+            .clone()
+            .with_layout(Some(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(2)])]).into()));
+        assert!(matches!(
+            tiled_type.lower_layout_constraint(input, &mut block, location),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "layout constraint" && reason == "tiled output layout `tiled{1,0:T(2)}`",
+        ));
+        let invalid_permutation_type = array_type.with_layout(Some(TiledLayout::new(vec![0, 0], Vec::new()).into()));
+        assert!(matches!(
+            invalid_permutation_type.lower_layout_constraint(input, &mut block, location),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "layout constraint"
+                    && reason == "invalid output layout `tiled{0,0}` for type `f32[2, 3][layout=tiled{0,0}]`",
+        ));
+    }
 
     #[test]
     fn test_dynamic_constructor_types() {

@@ -97,7 +97,7 @@ pub(crate) fn emitted_regions<'r, V: Value<Type = Type>, O: LowerableOperationFa
 /// Returns the regions of [`emitted_regions`], without the callees of the `call`s among them and the regions below
 /// those callees unless `enters_calls` is set. Without them, these are the regions of one capture scope: a constant of
 /// one of them that names capture `k` names capture `k` of `entry`, whereas the same constant in a callee names its own
-/// input `k` (refer to `lower_call`), which the call receives as its operand `k`.
+/// input `k` (refer to `CallProgramLoweringExtension::lower_call`), which the call receives as its operand `k`.
 pub(crate) fn emitted_regions_entering_calls<'r, V: Value<Type = Type>, O: LowerableOperationFamily>(
     entry: RegionRef<'r, V, O>,
     target_platform: Option<&'r str>,

@@ -3,8 +3,8 @@ use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::Accuracy;
 use ryft_mlir::{Block, Context as MlirContext, Location, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
-use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};
+use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat};
+use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_operands};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for SinOperation<ArrayType> {
@@ -28,7 +28,7 @@ impl LowerableOperation for SinOperation<ArrayType> {
         }
         let result = lowerer.block().append_operation(stable_hlo::sine(
             input_values[0],
-            lower_accuracy(self.accuracy()),
+            self.accuracy().lower(),
             lowerer.location(),
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])
@@ -56,7 +56,7 @@ impl LowerableOperation for CosOperation<ArrayType> {
         }
         let result = lowerer.block().append_operation(stable_hlo::cosine(
             input_values[0],
-            lower_accuracy(self.accuracy()),
+            self.accuracy().lower(),
             lowerer.location(),
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])
@@ -74,7 +74,7 @@ impl LowerableOperation for TanOperation<ArrayType> {
         let _ = (input_types, output_types);
         let result = lowerer.block().append_operation(stable_hlo::tan(
             input_values[0],
-            lower_accuracy(self.accuracy()),
+            self.accuracy().lower(),
             lowerer.location(),
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])
@@ -113,7 +113,7 @@ impl LowerableOperation for TanhOperation<ArrayType> {
         let _ = (input_types, output_types);
         let result = lowerer.block().append_operation(stable_hlo::tanh(
             input_values[0],
-            lower_accuracy(self.accuracy()),
+            self.accuracy().lower(),
             lowerer.location(),
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])
@@ -152,7 +152,7 @@ where
         _ => unreachable!(),
     };
     let part_type = ArrayType::new(part_data_type, output_type.shape().clone());
-    let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+    let part_tensor_type = part_type.lower(context, location)?;
     let zero = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
     let two = lower_f64_constant_splat(2.0, &part_type, part_tensor_type, block, context, location)?;
 

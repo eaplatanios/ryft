@@ -10,13 +10,13 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    lower_compare_to_mlir, lower_explicit_shape, lower_physical_bound_value, lower_restore_dynamic_dimensions,
-    lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type, lower_unplaced_constant_output,
+    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, lower_explicit_shape,
+    lower_runtime_dimension_size_i64, lower_static_index_constants, lower_unplaced_constant_output,
     physical_bound_type,
 };
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::operations::reductions::build_reduce_body_region;
-use crate::sharding::{OpenDimensions, lower_sharding_constraint};
+use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 impl LowerableOperation for ScatterOperation {
@@ -27,8 +27,7 @@ impl LowerableOperation for ScatterOperation {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let values = lower_scatter_to_mlir(
-            self,
+        let values = self.lower_to_mlir(
             input_values,
             input_types,
             output_types,
@@ -41,9 +40,8 @@ impl LowerableOperation for ScatterOperation {
             return Ok(values);
         }
         check_count!("input", values, 1, ProgramError);
-        let value = lower_sharding_constraint(
+        let value = output_types[0].sharding().unwrap().lower_sharding_constraint(
             values[0],
-            output_types[0].sharding().unwrap(),
             OpenDimensions::All,
             lowerer.collective_state().bound_manual_axes(),
             &mut lowerer.block(),
@@ -53,163 +51,115 @@ impl LowerableOperation for ScatterOperation {
     }
 }
 
-/// Lowers a [`ScatterOperation`] by clipping explicit starts or dropping complete out-of-bounds windows. Native
-/// scatter already drops windows outside static allocation bounds, whereas dynamic input bounds require an additional
-/// check against the logical size.
-fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &ScatterOperation,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-    target_platform: Option<&str>,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    check_count!("input", input_values, 3, ProgramError);
-    check_count!("input", input_types, 3, ProgramError);
-    check_count!("output", output_types, 1, ProgramError);
-    let dimensions = operation.dimensions();
-    let window_axes = (0..input_types[0].rank())
-        .filter(|axis| {
-            !dimensions.inserted_window_dimensions().contains(axis)
-                && !dimensions.input_batching_dimensions().contains(axis)
-        })
-        .collect::<Vec<_>>();
-    for (&axis, &update_axis) in window_axes.iter().zip(dimensions.update_window_dimensions()) {
-        let update_dimension = input_types[2].dimension(update_axis);
-        if matches!(update_dimension, Dimension::Dynamic(_)) && update_dimension != input_types[0].dimension(axis) {
-            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                operation: operation.name().to_string(),
-                reason: format!(
-                    "`scatter` dynamic update window axis {update_axis} must match input axis {axis}; independently \
-                     sized dynamic windows are unsupported by XLA",
-                ),
-            }));
-        }
-    }
-    let index_vector_dimension = input_types[1].rank() - 1;
-    let index_data_type = if input_types[1].data_type().is_unsigned() { DataType::U64 } else { DataType::I64 };
-    let indices_type = input_types[1].clone().with_data_type(index_data_type);
-    let mut indices = block
-        .append_operation(stable_hlo::convert(
-            input_values[1],
-            lower_tensor_type(&indices_type, context, location)?,
-            location,
-        )?)?
-        .result(0)
-        .unwrap()
-        .as_ref();
-    if input_types[1].data_type() == DataType::I1 {
-        indices = block.append_operation(stable_hlo::negate(indices, location)?)?.result(0).unwrap().as_ref();
-    }
-    let adjust_indices = operation.mode() == ScatterMode::Clip
-        || (operation.mode() == ScatterMode::Drop && input_types[0].static_shape().is_none());
-    if adjust_indices && !dimensions.scatter_dimensions_to_operand_dimensions().is_empty() {
-        let shape_source = indices_type.static_shape().is_none().then_some(input_values[1]);
-        let mut upper_bounds = Vec::new();
-        let mut sentinels = Vec::new();
-        for &axis in dimensions.scatter_dimensions_to_operand_dimensions() {
-            let extent = lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?;
-            let window = match window_axes.iter().position(|window_axis| *window_axis == axis) {
-                Some(position) => lower_runtime_dimension_size_i64(
-                    input_values[2],
-                    dimensions.update_window_dimensions()[position],
-                    block,
-                    context,
-                    location,
-                )?,
-                None => lower_static_index_constants(&[1], block, context, location)?[0],
-            };
+/// Lowering of a [`ScatterOperation`] for its values.
+trait ScatterOperationLoweringExtension {
+    /// Lowers a [`ScatterOperation`] by clipping explicit starts or dropping complete out-of-bounds windows. Native
+    /// scatter already drops windows outside static allocation bounds, whereas dynamic input bounds require an
+    /// additional check against the logical size.
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        target_platform: Option<&str>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
 
-            // The bound is never negative on a nonempty axis, so it does not wrap when converted to an unsigned index
-            // type, because type inference requires every static update window to fit the input extent, or the
-            // guaranteed minimum extent of a dynamic input axis, and a dynamic update window must equal its input
-            // extent (see above). An inserted axis takes a window of one, which exceeds only an empty axis, whose
-            // output has no elements.
-            upper_bounds.push(
-                block.append_operation(stable_hlo::subtract(extent, window, location)?)?.result(0).unwrap().as_ref(),
-            );
-            if operation.mode() == ScatterMode::Drop {
-                let Dimension::Static(capacity) = physical_bound_type(&input_types[0])?.shape().dimensions()[axis]
-                else {
-                    unreachable!()
-                };
-                sentinels.push(lower_static_index_constants(&[capacity], block, context, location)?[0]);
+impl ScatterOperationLoweringExtension for ScatterOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        target_platform: Option<&str>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        check_count!("input", input_values, 3, ProgramError);
+        check_count!("input", input_types, 3, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        let dimensions = self.dimensions();
+        let window_axes = (0..input_types[0].rank())
+            .filter(|axis| {
+                !dimensions.inserted_window_dimensions().contains(axis)
+                    && !dimensions.input_batching_dimensions().contains(axis)
+            })
+            .collect::<Vec<_>>();
+        for (&axis, &update_axis) in window_axes.iter().zip(dimensions.update_window_dimensions()) {
+            let update_dimension = input_types[2].dimension(update_axis);
+            if matches!(update_dimension, Dimension::Dynamic(_)) && update_dimension != input_types[0].dimension(axis) {
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: self.name().to_string(),
+                    reason: format!(
+                        "`scatter` dynamic update window axis {update_axis} must match input axis {axis}; independently \
+                         sized dynamic windows are unsupported by XLA",
+                    ),
+                }));
             }
         }
-        let bound_type = ArrayType::new_static(index_data_type, [upper_bounds.len()]);
-        let upper_bounds = lower_explicit_shape(&upper_bounds, block, context, location)?;
-        let upper_bounds = block
-            .append_operation(stable_hlo::convert(
-                upper_bounds,
-                lower_tensor_type(&bound_type, context, location)?,
-                location,
-            )?)?
+        let index_vector_dimension = input_types[1].rank() - 1;
+        let index_data_type = if input_types[1].data_type().is_unsigned() { DataType::U64 } else { DataType::I64 };
+        let indices_type = input_types[1].clone().with_data_type(index_data_type);
+        let mut indices = block
+            .append_operation(stable_hlo::convert(input_values[1], indices_type.lower(context, location)?, location)?)?
             .result(0)
             .unwrap()
             .as_ref();
-        let upper_bounds = lower_index_broadcast(
-            upper_bounds,
-            &indices_type,
-            shape_source,
-            &[index_vector_dimension],
-            block,
-            context,
-            location,
-        )?;
-        let zero =
-            lower_unplaced_constant_output(&[ArrayType::scalar(index_data_type)], 0, block, context, location)?[0];
-        let zero = lower_index_broadcast(zero, &indices_type, shape_source, &[], block, context, location)?;
-        if operation.mode() == ScatterMode::Clip {
-            indices =
-                block.append_operation(stable_hlo::maximum(indices, zero, location)?)?.result(0).unwrap().as_ref();
-            indices = block
-                .append_operation(stable_hlo::minimum(indices, upper_bounds, location)?)?
+        if input_types[1].data_type() == DataType::I1 {
+            indices = block.append_operation(stable_hlo::negate(indices, location)?)?.result(0).unwrap().as_ref();
+        }
+        let adjust_indices = self.mode() == ScatterMode::Clip
+            || (self.mode() == ScatterMode::Drop && input_types[0].static_shape().is_none());
+        if adjust_indices && !dimensions.scatter_dimensions_to_operand_dimensions().is_empty() {
+            let shape_source = indices_type.static_shape().is_none().then_some(input_values[1]);
+            let mut upper_bounds = Vec::new();
+            let mut sentinels = Vec::new();
+            for &axis in dimensions.scatter_dimensions_to_operand_dimensions() {
+                let extent = lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?;
+                let window = match window_axes.iter().position(|window_axis| *window_axis == axis) {
+                    Some(position) => lower_runtime_dimension_size_i64(
+                        input_values[2],
+                        dimensions.update_window_dimensions()[position],
+                        block,
+                        context,
+                        location,
+                    )?,
+                    None => lower_static_index_constants(&[1], block, context, location)?[0],
+                };
+
+                // The bound is never negative on a nonempty axis, so it does not wrap when converted to an unsigned
+                // index type, because type inference requires every static update window to fit the input extent, or
+                // the guaranteed minimum extent of a dynamic input axis, and a dynamic update window must equal its
+                // input extent (see above). An inserted axis takes a window of one, which exceeds only an empty axis,
+                // whose output has no elements.
+                upper_bounds.push(
+                    block
+                        .append_operation(stable_hlo::subtract(extent, window, location)?)?
+                        .result(0)
+                        .unwrap()
+                        .as_ref(),
+                );
+                if self.mode() == ScatterMode::Drop {
+                    let Dimension::Static(capacity) = physical_bound_type(&input_types[0])?.shape().dimensions()[axis]
+                    else {
+                        unreachable!()
+                    };
+                    sentinels.push(lower_static_index_constants(&[capacity], block, context, location)?[0]);
+                }
+            }
+            let bound_type = ArrayType::new_static(index_data_type, [upper_bounds.len()]);
+            let upper_bounds = lower_explicit_shape(&upper_bounds, block, context, location)?;
+            let upper_bounds = block
+                .append_operation(stable_hlo::convert(upper_bounds, bound_type.lower(context, location)?, location)?)?
                 .result(0)
                 .unwrap()
                 .as_ref();
-        } else {
-            let lower = lower_compare_to_mlir(ComparisonDirection::GreaterThanOrEqual, indices, zero, block, location)?;
-            let upper =
-                lower_compare_to_mlir(ComparisonDirection::LessThanOrEqual, indices, upper_bounds, block, location)?;
-            let mask = block.append_operation(stable_hlo::and(lower, upper, location)?)?.result(0).unwrap().as_ref();
-            let initial =
-                lower_unplaced_constant_output(&[ArrayType::scalar(DataType::Boolean)], 1, block, context, location)?
-                    [0];
-            let body = build_reduce_body_region(
-                ReductionKind::All,
-                DataType::Boolean,
-                FloatExtremumForm::TotalOrder,
-                context,
-                location,
-            )?;
-            let mask = block
-                .append_operation(stable_hlo::reduce(&[mask], &[initial], &[index_vector_dimension], body, location)?)?
-                .result(0)
-                .unwrap()
-                .as_ref();
-            let mask = lower_index_broadcast(
-                mask,
-                &indices_type.clone().with_data_type(DataType::Boolean),
-                shape_source,
-                &(0..index_vector_dimension).collect::<Vec<_>>(),
-                block,
-                context,
-                location,
-            )?;
-            let sentinels = lower_explicit_shape(&sentinels, block, context, location)?;
-            let sentinels = block
-                .append_operation(stable_hlo::convert(
-                    sentinels,
-                    lower_tensor_type(&bound_type, context, location)?,
-                    location,
-                )?)?
-                .result(0)
-                .unwrap()
-                .as_ref();
-            let sentinels = lower_index_broadcast(
-                sentinels,
+            let upper_bounds = lower_index_broadcast(
+                upper_bounds,
                 &indices_type,
                 shape_source,
                 &[index_vector_dimension],
@@ -217,79 +167,147 @@ fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
                 context,
                 location,
             )?;
-            indices = block
-                .append_operation(stable_hlo::select(mask, indices, sentinels, location)?)?
-                .result(0)
-                .unwrap()
-                .as_ref();
-        }
-    }
-    let attribute = context.stable_hlo_scatter_dimensions(
-        dimensions.update_window_dimensions(),
-        dimensions.inserted_window_dimensions(),
-        dimensions.input_batching_dimensions(),
-        dimensions.scatter_indices_batching_dimensions(),
-        dimensions.scatter_dimensions_to_operand_dimensions(),
-        index_vector_dimension,
-    )?;
-    if target_platform == Some("cuda")
-        && output_types[0].data_type() == DataType::C128
-        && operation.kind() == ScatterReductionKind::Add
-    {
-        // GPU scatter with addition lacks a native complex128 atomic update. Accumulate its independent real components
-        // using floating-point atomics, then reconstruct the complex result.
-        let mut components = Vec::with_capacity(2);
-        for imaginary in [false, true] {
-            let input = if imaginary {
-                block.append_operation(stable_hlo::imag(input_values[0], location)?)?.result(0).unwrap().as_ref()
+            let zero =
+                lower_unplaced_constant_output(&[ArrayType::scalar(index_data_type)], 0, block, context, location)?[0];
+            let zero = lower_index_broadcast(zero, &indices_type, shape_source, &[], block, context, location)?;
+            if self.mode() == ScatterMode::Clip {
+                indices =
+                    block.append_operation(stable_hlo::maximum(indices, zero, location)?)?.result(0).unwrap().as_ref();
+                indices = block
+                    .append_operation(stable_hlo::minimum(indices, upper_bounds, location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref();
             } else {
-                block.append_operation(stable_hlo::real(input_values[0], location)?)?.result(0).unwrap().as_ref()
-            };
-            let updates = if imaginary {
-                block.append_operation(stable_hlo::imag(input_values[2], location)?)?.result(0).unwrap().as_ref()
-            } else {
-                block.append_operation(stable_hlo::real(input_values[2], location)?)?.result(0).unwrap().as_ref()
-            };
-            let combiner = build_scatter_combiner_region(ScatterReductionKind::Add, DataType::F64, context, location)?;
-            components.push(
-                block
-                    .append_operation(stable_hlo::scatter(
-                        &[input],
-                        indices,
-                        &[updates],
-                        attribute,
-                        combiner,
-                        !adjust_indices && operation.indices_are_sorted(),
-                        !adjust_indices && operation.unique_indices(),
+                let lower = ComparisonDirection::GreaterThanOrEqual.lower_comparison(indices, zero, block, location)?;
+                let upper =
+                    ComparisonDirection::LessThanOrEqual.lower_comparison(indices, upper_bounds, block, location)?;
+                let mask =
+                    block.append_operation(stable_hlo::and(lower, upper, location)?)?.result(0).unwrap().as_ref();
+                let initial = lower_unplaced_constant_output(
+                    &[ArrayType::scalar(DataType::Boolean)],
+                    1,
+                    block,
+                    context,
+                    location,
+                )?[0];
+                let body = build_reduce_body_region(
+                    ReductionKind::All,
+                    DataType::Boolean,
+                    FloatExtremumForm::TotalOrder,
+                    context,
+                    location,
+                )?;
+                let mask = block
+                    .append_operation(stable_hlo::reduce(
+                        &[mask],
+                        &[initial],
+                        &[index_vector_dimension],
+                        body,
                         location,
                     )?)?
                     .result(0)
                     .unwrap()
-                    .as_ref(),
-            );
+                    .as_ref();
+                let mask = lower_index_broadcast(
+                    mask,
+                    &indices_type.clone().with_data_type(DataType::Boolean),
+                    shape_source,
+                    &(0..index_vector_dimension).collect::<Vec<_>>(),
+                    block,
+                    context,
+                    location,
+                )?;
+                let sentinels = lower_explicit_shape(&sentinels, block, context, location)?;
+                let sentinels = block
+                    .append_operation(stable_hlo::convert(sentinels, bound_type.lower(context, location)?, location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref();
+                let sentinels = lower_index_broadcast(
+                    sentinels,
+                    &indices_type,
+                    shape_source,
+                    &[index_vector_dimension],
+                    block,
+                    context,
+                    location,
+                )?;
+                indices = block
+                    .append_operation(stable_hlo::select(mask, indices, sentinels, location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref();
+            }
         }
-        return Ok(vec![
-            block
-                .append_operation(stable_hlo::complex(components[0], components[1], location)?)?
-                .result(0)
-                .unwrap()
-                .as_ref(),
-        ]);
+        let attribute = context.stable_hlo_scatter_dimensions(
+            dimensions.update_window_dimensions(),
+            dimensions.inserted_window_dimensions(),
+            dimensions.input_batching_dimensions(),
+            dimensions.scatter_indices_batching_dimensions(),
+            dimensions.scatter_dimensions_to_operand_dimensions(),
+            index_vector_dimension,
+        )?;
+        if target_platform == Some("cuda")
+            && output_types[0].data_type() == DataType::C128
+            && self.kind() == ScatterReductionKind::Add
+        {
+            // GPU scatter with addition lacks a native complex128 atomic update. Accumulate its independent real
+            // components using floating-point atomics, then reconstruct the complex result.
+            let mut components = Vec::with_capacity(2);
+            for imaginary in [false, true] {
+                let input = if imaginary {
+                    block.append_operation(stable_hlo::imag(input_values[0], location)?)?.result(0).unwrap().as_ref()
+                } else {
+                    block.append_operation(stable_hlo::real(input_values[0], location)?)?.result(0).unwrap().as_ref()
+                };
+                let updates = if imaginary {
+                    block.append_operation(stable_hlo::imag(input_values[2], location)?)?.result(0).unwrap().as_ref()
+                } else {
+                    block.append_operation(stable_hlo::real(input_values[2], location)?)?.result(0).unwrap().as_ref()
+                };
+                let combiner =
+                    build_scatter_combiner_region(ScatterReductionKind::Add, DataType::F64, context, location)?;
+                components.push(
+                    block
+                        .append_operation(stable_hlo::scatter(
+                            &[input],
+                            indices,
+                            &[updates],
+                            attribute,
+                            combiner,
+                            !adjust_indices && self.indices_are_sorted(),
+                            !adjust_indices && self.unique_indices(),
+                            location,
+                        )?)?
+                        .result(0)
+                        .unwrap()
+                        .as_ref(),
+                );
+            }
+            return Ok(vec![
+                block
+                    .append_operation(stable_hlo::complex(components[0], components[1], location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref(),
+            ]);
+        }
+        let combiner = build_scatter_combiner_region(self.kind(), output_types[0].data_type(), context, location)?;
+        // Clipping can merge formerly unique indices and change their lexicographic order, and masked sentinels
+        // likewise introduce duplicates. Do not propagate either promise through that normalization.
+        let result = block.append_operation(stable_hlo::scatter(
+            &[input_values[0]],
+            indices,
+            &[input_values[2]],
+            attribute,
+            combiner,
+            !adjust_indices && self.indices_are_sorted(),
+            !adjust_indices && self.unique_indices(),
+            location,
+        )?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
-    let combiner = build_scatter_combiner_region(operation.kind(), output_types[0].data_type(), context, location)?;
-    // Clipping can merge formerly unique indices and change their lexicographic order, and masked sentinels likewise
-    // introduce duplicates. Do not propagate either promise through that normalization.
-    let result = block.append_operation(stable_hlo::scatter(
-        &[input_values[0]],
-        indices,
-        &[input_values[2]],
-        attribute,
-        combiner,
-        !adjust_indices && operation.indices_are_sorted(),
-        !adjust_indices && operation.unique_indices(),
-        location,
-    )?)?;
-    Ok(vec![result.result(0).unwrap().as_ref()])
 }
 
 /// Builds the scalar combiner region of a `stablehlo.scatter` for the given [`ScatterReductionKind`], modeled on
@@ -303,7 +321,7 @@ fn build_scatter_combiner_region<'c, 't>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ryft_mlir::DetachedRegion<'c, 't>, Error> {
-    let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(element_type), context, location)?;
+    let scalar_tensor_type = ArrayType::scalar(element_type).lower(context, location)?;
     let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
     let mut region = context.region();
     let mut block_ref = region.append_block(block)?;
@@ -372,28 +390,18 @@ fn lower_index_broadcast<'b, 'c: 'b, 't: 'c>(
             output_type.data_type(),
             Shape::new(axes.iter().map(|axis| output_type.shape().dimensions()[*axis].clone()).collect()),
         );
-        let value = lower_physical_bound_value(value, &input_type, 0.0, block, context, location)?;
+        let value = input_type.lower_physical_bound_value(value, 0.0, block, context, location)?;
         let physical_type = physical_bound_type(output_type)?;
         let result = block
-            .append_operation(stable_hlo::broadcast(
-                value,
-                lower_tensor_type(&physical_type, context, location)?,
-                axes,
-                location,
-            )?)?
+            .append_operation(stable_hlo::broadcast(value, physical_type.lower(context, location)?, axes, location)?)?
             .result(0)
             .unwrap()
             .as_ref();
         let sources = (0..output_type.rank()).map(|axis| (exemplar, axis)).collect::<Vec<_>>();
-        lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)
+        output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)
     } else {
         Ok(block
-            .append_operation(stable_hlo::broadcast(
-                value,
-                lower_tensor_type(output_type, context, location)?,
-                axes,
-                location,
-            )?)?
+            .append_operation(stable_hlo::broadcast(value, output_type.lower(context, location)?, axes, location)?)?
             .result(0)
             .unwrap()
             .as_ref())

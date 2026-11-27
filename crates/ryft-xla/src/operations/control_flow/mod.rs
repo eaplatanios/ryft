@@ -14,16 +14,15 @@ use ryft_mlir::{
 };
 
 use crate::lowering::emissions::emitted_regions;
-use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{
-    dimension_extent_i64, lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output,
-    physical_bound_type,
+    ArrayTypeLoweringExtension, dimension_extent_i64, lower_unplaced_constant_output, physical_bound_type,
 };
 use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::call::CallFunctionMap;
-use crate::sharding::{OpenDimensions, lower_sharding_constraint};
+use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Constant, Error, LowerableOperationFamily, Type};
 
 pub(crate) mod condition;
@@ -217,7 +216,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
         });
     }
 
-    let physical_value = lower_physical_storage(value, input_type, block, context, location)?;
+    let physical_value = input_type.lower_physical_storage(value, block, context, location)?;
     let physical_input_type = physical_bound_type(input_type)?;
     let physical_type = physical_bound_type(declared_type)?;
     let rank = declared_type.rank();
@@ -252,7 +251,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
         let refined = block.append_operation(stable_hlo::set_dimension_size(
             value,
             size,
-            lower_tensor_type(&refined_type, context, location)?,
+            refined_type.lower(context, location)?,
             axis,
             location,
         )?)?;
@@ -302,7 +301,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
             });
         }
 
-        let physical_value = lower_physical_storage(value, declared_type, block, context, location)?;
+        let physical_value = declared_type.lower_physical_storage(value, block, context, location)?;
         let physical_type = physical_bound_type(declared_type)?;
         let limits = physical_type
             .shape()
@@ -328,7 +327,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
             let refined = block.append_operation(stable_hlo::set_dimension_size(
                 value,
                 size,
-                lower_tensor_type(&refined_type, context, location)?,
+                refined_type.lower(context, location)?,
                 axis,
                 location,
             )?)?;
@@ -339,62 +338,80 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
     Ok(converted)
 }
 
-/// Lowers one nested control flow branch program into a fresh region with a single block.
-///
-/// `entry_effect_tokens` are the active tokens of each effect class in the enclosing scope, which the region references
-/// through StableHLO's implicit region capture. This is the same mechanism that feeds `input_values` into
-/// `stablehlo.if` branches. Ordinary results are converted to `output_types` before the region returns one trailing
-/// token for each class in `threaded_effects`, in canonical effect order. A branch that is pure for one of those
-/// classes returns that class's incoming token unchanged. `threaded_effects` must cover every ordered class whose token
-/// the lowering of `program` advances, as [`lowered_effect_classes`] computes them. The region cannot return the token
-/// of any other class, so an advanced token of such a class is reported as a [`ProgramError::MalformedProgram`] instead
-/// of being dropped, which would leave later effects of that class unordered with respect to the effects of the region.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    program: &FlatProgram<EagerContext<Constant, O>>,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    output_types: &[Type],
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-    captured_values: &[ValueRef<'b, 'c, 't>],
-    nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-    collective_state: &CollectiveLoweringState,
-    entry_effect_tokens: EffectTokens<'b, 'c, 't>,
-    threaded_effects: EffectClasses,
-) -> Result<DetachedRegion<'c, 't>, Error> {
-    let mut region = context.region();
-    let block = context.block_with_no_arguments();
-    {
-        let mut block_ref = block.as_ref();
-        let mut region_effect_tokens = entry_effect_tokens;
-        let mut outputs = lower_nested_program_inline(
-            program,
-            input_values,
-            &mut block_ref,
-            context,
-            location,
-            captured_values,
-            &RematerializationOptimizationBarrier::None,
-            nested_functions,
-            collective_state,
-            &mut region_effect_tokens,
-        )?;
-        validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, threaded_effects)?;
-        // Normalize ordinary results before appending tokens so both conditional branches return the instruction's
-        // common refined shapes even when their declared dynamic and static result types differ.
-        outputs = lower_refined_region_outputs(
-            outputs,
-            &program.output_types(),
-            output_types,
-            &mut block_ref,
-            context,
-            location,
-        )?;
-        outputs.extend(threaded_effect_token_values(region_effect_tokens, threaded_effects));
-        block_ref.append_operation(stable_hlo::r#return(outputs.as_slice(), location)?)?;
+/// Lowering of a nested program to the region of a StableHLO control flow operation.
+pub(crate) trait ControlFlowRegionLoweringExtension<O: LowerableOperationFamily> {
+    /// Lowers one nested control flow branch program into a fresh region with a single block.
+    ///
+    /// `entry_effect_tokens` are the active tokens of each effect class in the enclosing scope, which the region
+    /// references through StableHLO's implicit region capture. This is the same mechanism that feeds `input_values`
+    /// into `stablehlo.if` branches. Ordinary results are converted to `output_types` before the region returns one
+    /// trailing token for each class in `threaded_effects`, in canonical effect order. A branch that is pure for one of
+    /// those classes returns that class's incoming token unchanged. `threaded_effects` must cover every ordered class
+    /// whose token the lowering of this program advances, as [`lowered_effect_classes`] computes them. The region
+    /// cannot return the token of any other class, so an advanced token of such a class is reported as a
+    /// [`ProgramError::MalformedProgram`] instead of being dropped, which would leave later effects of that class
+    /// unordered with respect to the effects of the region.
+    fn lower_control_flow_region<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[Type],
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+        captured_values: &[ValueRef<'b, 'c, 't>],
+        nested_functions: Option<&Rc<CallFunctionMap<O>>>,
+        collective_state: &CollectiveLoweringState,
+        entry_effect_tokens: EffectTokens<'b, 'c, 't>,
+        threaded_effects: EffectClasses,
+    ) -> Result<DetachedRegion<'c, 't>, Error>;
+}
+
+impl<O: LowerableOperationFamily> ControlFlowRegionLoweringExtension<O> for FlatProgram<EagerContext<Constant, O>> {
+    #[allow(clippy::too_many_arguments)]
+    fn lower_control_flow_region<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[Type],
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+        captured_values: &[ValueRef<'b, 'c, 't>],
+        nested_functions: Option<&Rc<CallFunctionMap<O>>>,
+        collective_state: &CollectiveLoweringState,
+        entry_effect_tokens: EffectTokens<'b, 'c, 't>,
+        threaded_effects: EffectClasses,
+    ) -> Result<DetachedRegion<'c, 't>, Error> {
+        let mut region = context.region();
+        let block = context.block_with_no_arguments();
+        {
+            let mut block_ref = block.as_ref();
+            let mut region_effect_tokens = entry_effect_tokens;
+            let mut outputs = self.lower_inline(
+                input_values,
+                &mut block_ref,
+                context,
+                location,
+                captured_values,
+                &RematerializationOptimizationBarrier::None,
+                nested_functions,
+                collective_state,
+                &mut region_effect_tokens,
+            )?;
+            validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, threaded_effects)?;
+            // Normalize ordinary results before appending tokens so both conditional branches return the instruction's
+            // common refined shapes even when their declared dynamic and static result types differ.
+            outputs = lower_refined_region_outputs(
+                outputs,
+                &self.output_types(),
+                output_types,
+                &mut block_ref,
+                context,
+                location,
+            )?;
+            outputs.extend(threaded_effect_token_values(region_effect_tokens, threaded_effects));
+            block_ref.append_operation(stable_hlo::r#return(outputs.as_slice(), location)?)?;
+        }
+        region.append_block(block)?;
+        Ok(region)
     }
-    region.append_block(block)?;
-    Ok(region)
 }
 
 /// Validates that lowering a control flow region whose tokens were `entry_effect_tokens` when it started and are
@@ -474,12 +491,13 @@ pub(crate) fn threaded_effect_token_values<'b, 'c: 'b, 't: 'c>(
 
 /// Constrains each of the lowered `outputs` of a control flow operation whose array type in `output_types` carries a
 /// sharding over a mesh with at least one `Explicit` axis to that sharding with `sdy.sharding_constraint`, and returns
-/// the constrained values. This includes results that such a sharding replicates or shards only over the `Auto` axes
-/// of that mesh. Nothing inside a region needs to pin the placement of a result over a mesh with explicit axes (e.g., a
+/// the constrained values. This includes results that such a sharding replicates or shards only over the `Auto` axes of
+/// that mesh. Nothing inside a region needs to pin the placement of a result over a mesh with explicit axes (e.g., a
 /// region may return a replicated constant), so propagation could otherwise assign the result a placement other than
 /// the one that its type states. Results without a sharding, results whose mesh has no explicit axis (e.g., only `Auto`
 /// or `Manual` axes), references, and first-class dimensions remain unconstrained. Mesh axes in `bound_manual_axes`,
-/// which enclosing manual regions bind, are excluded from the constraints that [`lower_sharding_constraint`] emits.
+/// which enclosing manual regions bind, are excluded from the constraints that [`ShardingExtension::lower_sharding_constraint`]
+/// emits.
 pub(crate) fn lower_explicit_sharding_constraints<'b, 'c: 'b, 't: 'c>(
     outputs: Vec<ValueRef<'b, 'c, 't>>,
     output_types: &[Type],
@@ -497,7 +515,7 @@ pub(crate) fn lower_explicit_sharding_constraints<'b, 'c: 'b, 't: 'c>(
         };
         constrained.push(match explicit_sharding {
             Some(sharding) => {
-                lower_sharding_constraint(output, sharding, OpenDimensions::All, bound_manual_axes, block, location)?
+                sharding.lower_sharding_constraint(output, OpenDimensions::All, bound_manual_axes, block, location)?
             }
             None => output,
         });
@@ -519,7 +537,7 @@ mod tests {
     use ryft_pjrt::{Client, Program as PjrtProgram};
 
     use crate::lowering::tests::{dynamic_dimension, test_vector_type};
-    use crate::lowering::types::lower_array_ir_type;
+    use crate::lowering::types::{TypeLoweringExtension, lower_f64_constant_splat};
     use crate::operations::Operation;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
@@ -769,7 +787,7 @@ mod tests {
         let input_type: Type = ArrayType::new_static(DataType::F64, [3]).into();
         let region_input_type: Type =
             ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))])).into();
-        let block = context.block(&[(lower_array_ir_type(&input_type, &context, location).unwrap(), location)]);
+        let block = context.block(&[(input_type.lower(&context, location).unwrap(), location)]);
         let input = block.as_ref().argument(0).unwrap().as_ref();
         let unchanged =
             lower_refined_region_input(input, &input_type, &input_type, &mut block.as_ref(), &context, location);
@@ -799,7 +817,7 @@ mod tests {
         let region_output_type: Type =
             ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))])).into();
         let output_type: Type = ArrayType::new_static(DataType::F64, [3]).into();
-        let lowered_type = lower_array_ir_type(&region_output_type, &context, location).unwrap();
+        let lowered_type = region_output_type.lower(&context, location).unwrap();
         let block = context.block(&[(lowered_type, location), (lowered_type, location)]);
         let refined = block.as_ref().argument(0).unwrap().as_ref();
         let unchanged = block.as_ref().argument(1).unwrap().as_ref();
@@ -861,7 +879,64 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_control_flow_region_rejects_unthreaded_token_advances() {
+    fn test_flat_program_lower_control_flow_region() {
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(scalar_type.clone().into());
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let module = context.module(location).unwrap();
+        let mut block = module.body().unwrap();
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let predicate_tensor_type = predicate_type.lower(&context, location).unwrap();
+        let predicate =
+            lower_f64_constant_splat(1.0, &predicate_type, predicate_tensor_type, &mut block, &context, location)
+                .unwrap();
+        let input_tensor_type = scalar_type.lower(&context, location).unwrap();
+        let input =
+            lower_f64_constant_splat(2.0, &scalar_type, input_tensor_type, &mut block, &context, location).unwrap();
+
+        // The regions are rendered inside a conditional, because the program reads its input from the enclosing scope.
+        let lower = || {
+            program
+                .lower_control_flow_region(
+                    &[input],
+                    &[scalar_type.clone().into()],
+                    &context,
+                    location,
+                    &[],
+                    None,
+                    &CollectiveLoweringState::new(),
+                    EffectTokens::default(),
+                    EffectClasses::NONE,
+                )
+                .unwrap()
+        };
+        block.append_operation(stable_hlo::r#if(predicate, lower(), lower(), location).unwrap()).unwrap();
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  %c = stablehlo.constant dense<true> : tensor<i1>
+                  %cst = stablehlo.constant dense<2.000000e+00> : tensor<f32>
+                  %0 = "stablehlo.if"(%c) ({
+                    %1 = stablehlo.add %cst, %cst : tensor<f32>
+                    stablehlo.return %1 : tensor<f32>
+                  }, {
+                    %1 = stablehlo.add %cst, %cst : tensor<f32>
+                    stablehlo.return %1 : tensor<f32>
+                  }) : (tensor<i1>) -> tensor<f32>
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_flat_program_lower_control_flow_region_rejects_unthreaded_token_advances() {
         // A print advances the ordered I/O token. A region whose threaded classes include ordered I/O returns the
         // advanced token, whereas a region that threads no class could not return it, so lowering it would leave later
         // I/O unordered with respect to the print.
@@ -876,11 +951,10 @@ mod tests {
             .unwrap();
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
-        let block = context.block(&[(lower_tensor_type(&scalar_type, &context, location).unwrap(), location)]);
+        let block = context.block(&[(scalar_type.lower(&context, location).unwrap(), location)]);
         let input = block.as_ref().argument(0).unwrap().as_ref();
         let lower = |threaded_effects| {
-            lower_control_flow_region(
-                &program,
+            program.lower_control_flow_region(
                 &[input],
                 &[scalar_type.clone().into()],
                 &context,

@@ -9,12 +9,12 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    lower_explicit_shape, lower_f64_constant_splat, lower_runtime_dimension_size_i64, lower_static_index_constants,
-    lower_tensor_type, lower_unplaced_constant_output,
+    ArrayTypeLoweringExtension, lower_explicit_shape, lower_f64_constant_splat, lower_runtime_dimension_size_i64,
+    lower_static_index_constants, lower_unplaced_constant_output,
 };
 use crate::operations::complex::lower_select_principal_phase_to_mlir;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
-use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};
+use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_operands};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ExpOperation<ArrayType> {
@@ -28,7 +28,7 @@ impl LowerableOperation for ExpOperation<ArrayType> {
         let _ = (input_types, output_types);
         let result = lowerer.block().append_operation(stable_hlo::exponential(
             input_values[0],
-            lower_accuracy(self.accuracy()),
+            self.accuracy().lower(),
             lowerer.location(),
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])
@@ -48,7 +48,7 @@ impl LowerableOperation for ExpM1Operation<ArrayType> {
             return Ok(vec![lower_complex_exp_m1_to_mlir(
                 input_values[0],
                 &output_types[0],
-                lower_accuracy(self.accuracy()),
+                self.accuracy().lower(),
                 &mut lowerer.block(),
                 lowerer.context(),
                 lowerer.location(),
@@ -56,7 +56,7 @@ impl LowerableOperation for ExpM1Operation<ArrayType> {
         }
         let result = lowerer.block().append_operation(stable_hlo::exponential_minus_one(
             input_values[0],
-            lower_accuracy(self.accuracy()),
+            self.accuracy().lower(),
             lowerer.location(),
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])
@@ -74,7 +74,7 @@ impl LowerableOperation for LogOperation<ArrayType> {
         let _ = (input_types, output_types);
         let result = lowerer.block().append_operation(stable_hlo::log(
             input_values[0],
-            lower_accuracy(self.accuracy()),
+            self.accuracy().lower(),
             lowerer.location(),
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])
@@ -101,7 +101,7 @@ impl LowerableOperation for Ln1pOperation<ArrayType> {
         }
         let result = lowerer.block().append_operation(stable_hlo::log_plus_one(
             input_values[0],
-            lower_accuracy(self.accuracy()),
+            self.accuracy().lower(),
             lowerer.location(),
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])
@@ -155,7 +155,7 @@ impl LowerableOperation for LogisticOperation<ArrayType> {
         let complex = output_type.data_type().is_complex();
         let narrow = !complex && !matches!(output_type.data_type(), DataType::F32 | DataType::F64);
         let working_type = if narrow { output_type.clone().with_data_type(DataType::F32) } else { output_type.clone() };
-        let working_tensor_type = lower_tensor_type(&working_type, lowerer.context(), lowerer.location())?;
+        let working_tensor_type = working_type.lower(lowerer.context(), lowerer.location())?;
         let input = if narrow {
             lowerer
                 .block()
@@ -233,11 +233,7 @@ impl LowerableOperation for LogisticOperation<ArrayType> {
             .as_ref();
         let exponential = lowerer
             .block()
-            .append_operation(stable_hlo::exponential(
-                exponential_input,
-                lower_accuracy(self.accuracy()),
-                lowerer.location(),
-            )?)?
+            .append_operation(stable_hlo::exponential(exponential_input, self.accuracy().lower(), lowerer.location())?)?
             .result(0)
             .unwrap()
             .as_ref();
@@ -270,7 +266,7 @@ impl LowerableOperation for LogisticOperation<ArrayType> {
                 .block()
                 .append_operation(stable_hlo::convert(
                     output,
-                    lower_tensor_type(output_type, lowerer.context(), lowerer.location())?,
+                    output_type.lower(lowerer.context(), lowerer.location())?,
                     lowerer.location(),
                 )?)?
                 .result(0)
@@ -307,12 +303,12 @@ pub(crate) fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+    let output_tensor_type = output_type.lower(context, location)?;
     let data_type = output_type.data_type();
     let narrow = !data_type.is_complex() && !matches!(data_type, DataType::F32 | DataType::F64);
     let (left, right) = if narrow {
         // Evaluate the entire composition in one working type, then round only its final output.
-        let working_type = lower_tensor_type(&output_type.clone().with_data_type(DataType::F32), context, location)?;
+        let working_type = output_type.clone().with_data_type(DataType::F32).lower(context, location)?;
         let left = block
             .append_operation(stable_hlo::convert(left, working_type, location)?)?
             .result(0)
@@ -337,7 +333,7 @@ pub(crate) fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
             output_type
                 .clone()
                 .with_data_type(if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 });
-        let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+        let part_tensor_type = part_type.lower(context, location)?;
         let zero = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
         let larger_real = block.append_operation(stable_hlo::real(larger, location)?)?.result(0).unwrap().as_ref();
         let larger_imaginary = block.append_operation(stable_hlo::imag(larger, location)?)?.result(0).unwrap().as_ref();
@@ -468,7 +464,7 @@ fn lower_exponential_constant_like<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+    let output_tensor_type = output_type.lower(context, location)?;
     if output_type.static_shape().is_some() {
         return lower_f64_constant_splat(factor, output_type, output_tensor_type, block, context, location);
     }
@@ -476,7 +472,7 @@ fn lower_exponential_constant_like<'b, 'c: 'b, 't: 'c>(
     let scalar = lower_f64_constant_splat(
         factor,
         &scalar_type,
-        lower_tensor_type(&scalar_type, context, location)?,
+        scalar_type.lower(context, location)?,
         block,
         context,
         location,
@@ -598,7 +594,7 @@ fn lower_complex_ln_1p_to_mlir<'b, 'c: 'b, 't: 'c>(
     } else {
         DataType::F64
     });
-    let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+    let part_tensor_type = part_type.lower(context, location)?;
     let one = lower_f64_constant_splat(1.0, &part_type, part_tensor_type, block, context, location)?;
     let two = lower_f64_constant_splat(2.0, &part_type, part_tensor_type, block, context, location)?;
     let half = lower_f64_constant_splat(0.5, &part_type, part_tensor_type, block, context, location)?;

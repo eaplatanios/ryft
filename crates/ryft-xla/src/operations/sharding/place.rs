@@ -6,9 +6,10 @@ use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
 use crate::arrays::placement::place_operation_bindings;
-use crate::lowering::types::lower_transfer_to_memory;
-use crate::operations::manipulation::conversions::lower_layout_conversion;
-use crate::{Array, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, ToMlir};
+use crate::lowering::types::MemoryLoweringExtension;
+use crate::operations::manipulation::conversions::ArrayTypeLayoutConversionLoweringExtension;
+use crate::sharding::{OpenDimensions, ShardingExtension};
+use crate::{Array, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 impl PlaceDispatch<ArrayType, Array> for ValueDomainDispatch {
     fn place_operation(input: &Array, operation: PlaceOperation) -> Result<Array, ProgramError> {
@@ -99,7 +100,7 @@ impl LowerableOperation for PlaceOperation {
         };
         if let Some(sharding) = sharding {
             let location = lowerer.location();
-            let sharding = sharding.to_mlir(location)?;
+            let sharding = sharding.lower(OpenDimensions::None, location)?;
             value = lowerer
                 .block()
                 .append_operation(shardy::sharding_constraint(value, sharding, location)?)?
@@ -108,11 +109,10 @@ impl LowerableOperation for PlaceOperation {
                 .as_ref();
         }
         if output_type.layout().is_some() && output_type.layout() != input_type.layout() {
-            value = lower_layout_conversion(value, output_type, lowerer)?;
+            value = output_type.lower_layout_conversion(value, lowerer)?;
         }
         if output_type.memory() != input_type.memory() {
-            value = lower_transfer_to_memory(
-                output_type.memory(),
+            value = output_type.memory().lower_transfer(
                 &[value],
                 &mut lowerer.block(),
                 lowerer.context(),
@@ -1963,10 +1963,8 @@ mod tests {
                         pullback.apply_materialized(lift(seed.clone())).map(into_array).map(observe_placement);
                     assert_eq!(gradient, Ok((vec![source], vec![5., 6., 7., 8.], true)));
                 }
-                let gradient = pullback
-                    .apply_materialized(lift(mismatched_seed.clone()))
-                    .map(into_array)
-                    .map(observe_placement);
+                let gradient =
+                    pullback.apply_materialized(lift(mismatched_seed.clone())).map(into_array).map(observe_placement);
                 assert_eq!(
                     gradient,
                     Err(ProgramError::MalformedProgram(format!(

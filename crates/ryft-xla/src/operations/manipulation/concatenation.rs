@@ -10,8 +10,8 @@ use ryft_mlir::{
 
 use crate::lowering::EffectTokens;
 use crate::lowering::types::{
-    dimension_extent_i32, dimension_extent_i64, lower_constant_output, lower_physical_bound_value,
-    lower_restore_dynamic_dimensions, lower_static_index_constants, lower_tensor_type, physical_bound_type,
+    ArrayTypeLoweringExtension, dimension_extent_i32, dimension_extent_i64, lower_constant_output,
+    lower_static_index_constants, physical_bound_type,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_CONCATENATE_KIND, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE,
@@ -59,7 +59,7 @@ impl LowerableOperation for ConcatenateOperation<Type> {
             // The callback receives every concrete logical input extent and computes their checked sum on the
             // host. This avoids both overflow in a speculative StableHLO sum and false rejection from conservative
             // declared maxima. A type-derived proof omits this entire assertion path for static signatures.
-            let i64_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
+            let i64_type = ArrayType::scalar(DataType::I64).lower(context, location)?;
             let mut input_extents = Vec::with_capacity(array_inputs.len());
             for (input, r#type) in array_inputs.iter().zip(array_input_types) {
                 let r#type = <&ArrayType>::try_from(r#type)?;
@@ -93,7 +93,7 @@ impl LowerableOperation for ConcatenateOperation<Type> {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
         let output_type = <&ArrayType>::try_from(output_type)?;
-        let expected_type = lower_tensor_type(output_type, context, location)?;
+        let expected_type = output_type.lower(context, location)?;
         if result.r#type()? != expected_type.as_ref() {
             let inputs = array_input_types.iter().map(<&ArrayType>::try_from).collect::<Result<Vec<_>, _>>()?;
             let mut inferred_extent = DimensionSizeOperation::new(inputs[0], self.axis())
@@ -119,7 +119,7 @@ impl LowerableOperation for ConcatenateOperation<Type> {
             // allocation bound in XLA, even when its runtime element count stays unchanged.
             let padding_value = i64::from(output_type.data_type() == DataType::F8E8M0FNU);
             result =
-                lower_physical_bound_value(result, &inferred_type, padding_value as f64, block, context, location)?;
+                inferred_type.lower_physical_bound_value(result, padding_value as f64, block, context, location)?;
             let mut high_padding = vec![0; output_type.rank()];
             high_padding[self.axis()] =
                 dimension_extent_i64(physical_output_type.dimension(self.axis()).value().unwrap())?
@@ -144,9 +144,8 @@ impl LowerableOperation for ConcatenateOperation<Type> {
                 )?)?;
                 result = resized.result(0).unwrap().as_ref();
             }
-            result = lower_restore_dynamic_dimensions(
+            result = output_type.lower_restore_dynamic_dimensions(
                 result,
-                output_type,
                 &(0..output_type.rank()).map(|axis| (logical_result, axis)).collect::<Vec<_>>(),
                 block,
                 context,
@@ -671,7 +670,7 @@ mod tests {
     fn test_lower_concatenate_tree() {
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let input_type = lower_tensor_type(&test_vector_type(1), &context, location).unwrap();
+        let input_type = test_vector_type(1).lower(&context, location).unwrap();
         let block = context.block(&[(input_type, location)]);
         assert!(matches!(
             lower_concatenate_tree(&[], 0, &mut block.as_ref(), location.as_ref()),

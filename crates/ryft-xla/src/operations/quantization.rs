@@ -12,10 +12,8 @@ use ryft_mlir::{
     Type as MlirType, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{
-    lower_element_type, lower_f64_constant_splat, lower_physical_bound_value, lower_restore_dynamic_dimensions,
-    lower_tensor_type, physical_bound_type,
+    ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_f64_constant_splat, physical_bound_type,
 };
 use crate::operations::call::lower_shared_function_call;
 use crate::operations::composites::{NamedCompositionKey, named_composition_input_types};
@@ -92,6 +90,13 @@ pub(crate) fn scaled_dot_composition_key(
 }
 
 impl LowerableOperation for ScaledDotOperation {
+    /// Lowers one scaled dot. On CUDA, calls whose formats cuDNN accepts, as
+    /// [`block_scaled_dot_custom_call_permutations`] decides, lower to the `__op$block_scaled_dot` custom call, which
+    /// XLA hands to cuDNN's block-scaled matrix product on capable devices. Every other call lowers to the exact
+    /// four-operand `stablehlo.composite "xla.scaled_dot"` boundary consumed by XLA's block-scaling replacement pass.
+    /// Either scale omitted by the public Ryft call is represented by the same JAX-compatible identity scale used by
+    /// the pinned composite contract. The typed decomposition remains the portable fallback when XLA does not replace
+    /// the composite.
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
@@ -99,162 +104,210 @@ impl LowerableOperation for ScaledDotOperation {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let collective_state = lowerer.collective_state().clone();
-        lower_scaled_dot_to_mlir(
-            self,
-            &collective_state,
-            input_values,
-            input_types,
-            output_types,
-            &mut lowerer.block(),
-            lowerer.context(),
-            lowerer.location(),
-        )
-    }
-}
-
-/// Lowers one scaled dot. On CUDA, calls whose formats cuDNN accepts, as
-/// [`block_scaled_dot_custom_call_permutations`] decides, lower to the `__op$block_scaled_dot` custom call, which XLA
-/// hands to cuDNN's block-scaled matrix product on capable devices. Every other call lowers to the exact four-operand
-/// `stablehlo.composite "xla.scaled_dot"` boundary consumed by XLA's block-scaling replacement pass. Either scale
-/// omitted by the public Ryft call is represented by the same JAX-compatible identity scale used by the pinned
-/// composite contract. The typed decomposition remains the portable fallback when XLA does not replace the composite.
-fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &ScaledDotOperation,
-    collective_state: &CollectiveLoweringState,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let expected_input_count = 2 + usize::from(operation.has_lhs_scale()) + usize::from(operation.has_rhs_scale());
-    check_count!("input", input_values, expected_input_count, ProgramError);
-    check_count!("input", input_types, input_values.len(), ProgramError);
-    check_count!("output", output_types, 1, ProgramError);
-    let input_values = &lower_scaled_dot_input_barrier(input_values, input_types, block, location)?;
-    if let Some(permutations) =
-        block_scaled_dot_custom_call_permutations(operation, input_types, collective_state.target_platform())?
-    {
-        return lower_block_scaled_dot_custom_call(
-            operation,
-            &permutations,
-            input_values,
-            input_types,
-            output_types,
-            block,
-            context,
-            location,
-        );
-    }
-    let uses_physical_boundary =
-        scaled_dot_uses_cuda_physical_boundary(operation, input_types, collective_state.target_platform())?;
-    // The composition types are present because the call does not lower to the custom call.
-    let (composition_input_types, composition_output_types) =
-        scaled_dot_composition_types(operation, input_types, output_types, collective_state.target_platform())?
-            .unwrap();
-    let decomposition = match collective_state.named_compositions() {
-        Some(functions) => functions.get(operation, &composition_input_types, &composition_output_types)?,
-        None => None,
-    };
-    if let Some(function) = decomposition {
-        if collective_state.target_platform() == Some("cuda") && !uses_physical_boundary {
-            let output_types = output_types.iter().cloned().map(Type::from).collect::<Vec<_>>();
-            return lower_shared_function_call(
-                function.symbol(),
-                &output_types,
+        let collective_state = lowerer.collective_state();
+        let block = &mut lowerer.block();
+        let (context, location) = (lowerer.context(), lowerer.location());
+        let expected_input_count = 2 + usize::from(self.has_lhs_scale()) + usize::from(self.has_rhs_scale());
+        check_count!("input", input_values, expected_input_count, ProgramError);
+        check_count!("input", input_types, input_values.len(), ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        let input_values = &lower_scaled_dot_input_barrier(input_values, input_types, block, location)?;
+        if let Some(permutations) =
+            block_scaled_dot_custom_call_permutations(self, input_types, collective_state.target_platform())?
+        {
+            return self.lower_block_custom_call(
+                &permutations,
                 input_values,
+                input_types,
+                output_types,
                 block,
                 context,
                 location,
             );
         }
-        let composition_input_values = if uses_physical_boundary {
-            input_values
-                .iter()
-                .zip(input_types)
-                .map(|(value, r#type)| lower_physical_bound_value(*value, r#type, 0.0, block, context, location))
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            input_values.to_vec()
+        let uses_physical_boundary =
+            scaled_dot_uses_cuda_physical_boundary(self, input_types, collective_state.target_platform())?;
+        // The composition types are present because the call does not lower to the custom call.
+        let (composition_input_types, composition_output_types) =
+            scaled_dot_composition_types(self, input_types, output_types, collective_state.target_platform())?.unwrap();
+        let decomposition = match collective_state.named_compositions() {
+            Some(functions) => functions.get(self, &composition_input_types, &composition_output_types)?,
+            None => None,
         };
-        let mut composite_values = vec![composition_input_values[0], composition_input_values[1]];
-        let mut scale_index = 2;
-        for (present, element_index, contracting_dimensions) in [
-            (operation.has_lhs_scale(), 0, operation.dimensions().lhs_contracting_dimensions()),
-            (operation.has_rhs_scale(), 1, operation.dimensions().rhs_contracting_dimensions()),
-        ] {
-            if present {
-                composite_values.push(composition_input_values[scale_index]);
-                scale_index += 1;
-                continue;
-            }
-            let dummy_type =
-                scaled_dot_dummy_scale_type(&composition_input_types[element_index], contracting_dimensions);
-            let physical_type = physical_bound_type(&dummy_type)?;
-            let physical_tensor_type = lower_tensor_type(&physical_type, context, location)?;
-            let dummy = lower_f64_constant_splat(1.0, &physical_type, physical_tensor_type, block, context, location)?;
-            if uses_physical_boundary {
-                composite_values.push(dummy);
-            } else {
-                let sources =
-                    (0..dummy_type.rank()).map(|axis| (input_values[element_index], axis)).collect::<Vec<_>>();
-                composite_values.push(lower_restore_dynamic_dimensions(
-                    dummy,
-                    &dummy_type,
-                    sources.as_slice(),
+        if let Some(function) = decomposition {
+            if collective_state.target_platform() == Some("cuda") && !uses_physical_boundary {
+                let output_types = output_types.iter().cloned().map(Type::from).collect::<Vec<_>>();
+                return lower_shared_function_call(
+                    function.symbol(),
+                    &output_types,
+                    input_values,
                     block,
                     context,
                     location,
-                )?);
+                );
             }
+            let composition_input_values = if uses_physical_boundary {
+                input_values
+                    .iter()
+                    .zip(input_types)
+                    .map(|(value, r#type)| r#type.lower_physical_bound_value(*value, 0.0, block, context, location))
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                input_values.to_vec()
+            };
+            let mut composite_values = vec![composition_input_values[0], composition_input_values[1]];
+            let mut scale_index = 2;
+            for (present, element_index, contracting_dimensions) in [
+                (self.has_lhs_scale(), 0, self.dimensions().lhs_contracting_dimensions()),
+                (self.has_rhs_scale(), 1, self.dimensions().rhs_contracting_dimensions()),
+            ] {
+                if present {
+                    composite_values.push(composition_input_values[scale_index]);
+                    scale_index += 1;
+                    continue;
+                }
+                let dummy_type =
+                    scaled_dot_dummy_scale_type(&composition_input_types[element_index], contracting_dimensions);
+                let physical_type = physical_bound_type(&dummy_type)?;
+                let physical_tensor_type = physical_type.lower(context, location)?;
+                let dummy =
+                    lower_f64_constant_splat(1.0, &physical_type, physical_tensor_type, block, context, location)?;
+                if uses_physical_boundary {
+                    composite_values.push(dummy);
+                } else {
+                    let sources =
+                        (0..dummy_type.rank()).map(|axis| (input_values[element_index], axis)).collect::<Vec<_>>();
+                    composite_values.push(dummy_type.lower_restore_dynamic_dimensions(
+                        dummy,
+                        sources.as_slice(),
+                        block,
+                        context,
+                        location,
+                    )?);
+                }
+            }
+            let render_axes = |axes: &[usize]| axes.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+            let dimensions = format!(
+                "[[[{}], [{}]], [[{}], [{}]]]",
+                render_axes(self.dimensions().lhs_contracting_dimensions()),
+                render_axes(self.dimensions().rhs_contracting_dimensions()),
+                render_axes(self.dimensions().lhs_batching_dimensions()),
+                render_axes(self.dimensions().rhs_batching_dimensions()),
+            );
+            let attributes = HashMap::from([
+                (StringRef::from("dimension_numbers"), context.parse_attribute(dimensions.as_str())?),
+                (
+                    StringRef::from("preferred_element_type"),
+                    context.type_attribute(self.accumulation_type().lower(context)?).as_ref(),
+                ),
+            ]);
+            let result_types = composition_output_types
+                .iter()
+                .map(|r#type| r#type.lower(context, location).map(|r#type| r#type.as_ref()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let composite = block.append_operation(stable_hlo::composite(
+                "xla.scaled_dot",
+                0,
+                Some(&attributes),
+                composite_values.as_slice(),
+                function.symbol(),
+                Vec::new(),
+                result_types.as_slice(),
+                location,
+            )?)?;
+            let results =
+                (0..output_types.len()).map(|index| composite.result(index).unwrap().as_ref()).collect::<Vec<_>>();
+            if !uses_physical_boundary {
+                return Ok(results);
+            }
+            return Ok(vec![output_types[0].lower_restore_dynamic_dimensions(
+                results[0],
+                scaled_dot_output_sources(self, input_values, input_types).as_slice(),
+                block,
+                context,
+                location,
+            )?]);
         }
-        let render_axes = |axes: &[usize]| axes.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
-        let dimensions = format!(
-            "[[[{}], [{}]], [[{}], [{}]]]",
-            render_axes(operation.dimensions().lhs_contracting_dimensions()),
-            render_axes(operation.dimensions().rhs_contracting_dimensions()),
-            render_axes(operation.dimensions().lhs_batching_dimensions()),
-            render_axes(operation.dimensions().rhs_batching_dimensions()),
-        );
-        let attributes = HashMap::from([
-            (StringRef::from("dimension_numbers"), context.parse_attribute(dimensions.as_str())?),
-            (
-                StringRef::from("preferred_element_type"),
-                context.type_attribute(lower_element_type(operation.accumulation_type(), context)?).as_ref(),
-            ),
-        ]);
-        let result_types = composition_output_types
-            .iter()
-            .map(|r#type| lower_tensor_type(r#type, context, location).map(|r#type| r#type.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let composite = block.append_operation(stable_hlo::composite(
-            "xla.scaled_dot",
-            0,
-            Some(&attributes),
-            composite_values.as_slice(),
-            function.symbol(),
-            Vec::new(),
-            result_types.as_slice(),
+
+        Err(ProgramError::MalformedProgram(format!("missing typed decomposition for `{}`", self.name())).into())
+    }
+}
+
+/// Lowering of a [`ScaledDotOperation`] for its values.
+trait ScaledDotOperationLoweringExtension {
+    /// Lowers one scaled dot that qualifies according to [`block_scaled_dot_custom_call_permutations`] to
+    /// `stablehlo.custom_call @__op$block_scaled_dot(lhs, rhs, lhs_scale, rhs_scale)`. The inputs are first exposed as
+    /// their bounded physical carriers, because XLA's block-scaling expansion cannot propagate dynamic dimension
+    /// annotations. Elements are padded with zeros, so padded elements contribute nothing to the result, and scales are
+    /// padded with ones, which every scale type represents, whereas `f8e8m0fnu` cannot represent zero. Each element
+    /// array and its scale array are then transposed by `permutations` to the `[batch, free, contracting]` layout that
+    /// the custom call requires. XLA gives a transpose the permuted memory layout of its input, which makes it a
+    /// bitcast, but `BlockScalingRewriter` hands only inputs with the default major-to-minor layout to cuDNN. The
+    /// custom call therefore declares default input and result layouts, which makes XLA materialize every transposed
+    /// input. The custom call returns its result in the `[batch, lhs free, rhs free]` order of `dot_general`, so only
+    /// its logical dynamic extents need restoring.
+    fn lower_block_custom_call<'b, 'c: 'b, 't: 'c>(
+        &self,
+        permutations: &[Vec<usize>; 2],
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl ScaledDotOperationLoweringExtension for ScaledDotOperation {
+    fn lower_block_custom_call<'b, 'c: 'b, 't: 'c>(
+        &self,
+        permutations: &[Vec<usize>; 2],
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let mut operands = Vec::with_capacity(input_values.len());
+        for (index, (value, r#type)) in input_values.iter().zip(input_types).enumerate() {
+            let padding_value = if index < 2 { 0.0 } else { 1.0 };
+            let value = r#type.lower_physical_bound_value(*value, padding_value, block, context, location)?;
+            let permutation = &permutations[index % 2];
+            if permutation.iter().enumerate().all(|(axis, source)| axis == *source) {
+                operands.push(value);
+                continue;
+            }
+            let transposed = block.append_operation(stable_hlo::transpose(value, permutation, location)?)?;
+            operands.push(transposed.result(0).unwrap().as_ref());
+        }
+        let output_type = physical_bound_type(&output_types[0])?.lower(context, location)?;
+        let default_layout = |rank: usize| (0..rank).rev().collect::<Vec<_>>();
+        let custom_call = block.append_operation(stable_hlo::custom_call(
+            operands.as_slice(),
+            "__op$block_scaled_dot",
+            false,
+            None,
+            CustomCallApiVersion::Original,
+            &[],
+            Some(CustomCallMemoryLayouts {
+                operands: input_types.iter().map(|r#type| default_layout(r#type.rank())).collect(),
+                results: vec![default_layout(output_types[0].rank())],
+            }),
+            &[],
+            None,
+            &[output_type],
             location,
         )?)?;
-        let results =
-            (0..output_types.len()).map(|index| composite.result(index).unwrap().as_ref()).collect::<Vec<_>>();
-        if !uses_physical_boundary {
-            return Ok(results);
-        }
-        return Ok(vec![lower_restore_dynamic_dimensions(
-            results[0],
-            &output_types[0],
-            scaled_dot_output_sources(operation, input_values, input_types).as_slice(),
+        let result = custom_call.result(0).unwrap().as_ref();
+        Ok(vec![output_types[0].lower_restore_dynamic_dimensions(
+            result,
+            scaled_dot_output_sources(self, input_values, input_types).as_slice(),
             block,
             context,
             location,
-        )?]);
+        )?])
     }
-
-    Err(ProgramError::MalformedProgram(format!("missing typed decomposition for `{}`", operation.name())).into())
 }
 
 /// Places an optimization barrier on the scaled dot inputs whose element types are narrow floating-point types. The
@@ -295,68 +348,6 @@ fn lower_scaled_dot_input_barrier<'b, 'c: 'b, 't: 'c>(
             barrier.result(barrier_index - 1).unwrap().as_ref()
         })
         .collect())
-}
-
-/// Lowers one scaled dot that qualifies according to [`block_scaled_dot_custom_call_permutations`] to
-/// `stablehlo.custom_call @__op$block_scaled_dot(lhs, rhs, lhs_scale, rhs_scale)`. The inputs are first exposed as
-/// their bounded physical carriers, because XLA's block-scaling expansion cannot propagate dynamic dimension
-/// annotations. Elements are padded with zeros, so padded elements contribute nothing to the result, and scales are
-/// padded with ones, which every scale type represents, whereas `f8e8m0fnu` cannot represent zero. Each element array
-/// and its scale array are then transposed by `permutations` to the `[batch, free, contracting]` layout that the
-/// custom call requires. XLA gives a transpose the permuted memory layout of its input, which makes it a bitcast, but
-/// `BlockScalingRewriter` hands only inputs with the default major-to-minor layout to cuDNN. The custom call therefore
-/// declares default input and result layouts, which makes XLA materialize every transposed input. The custom call
-/// returns its result in the `[batch, lhs free, rhs free]` order of `dot_general`, so only its logical dynamic extents
-/// need restoring.
-fn lower_block_scaled_dot_custom_call<'b, 'c: 'b, 't: 'c>(
-    operation: &ScaledDotOperation,
-    permutations: &[Vec<usize>; 2],
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let mut operands = Vec::with_capacity(input_values.len());
-    for (index, (value, r#type)) in input_values.iter().zip(input_types).enumerate() {
-        let padding_value = if index < 2 { 0.0 } else { 1.0 };
-        let value = lower_physical_bound_value(*value, r#type, padding_value, block, context, location)?;
-        let permutation = &permutations[index % 2];
-        if permutation.iter().enumerate().all(|(axis, source)| axis == *source) {
-            operands.push(value);
-            continue;
-        }
-        let transposed = block.append_operation(stable_hlo::transpose(value, permutation, location)?)?;
-        operands.push(transposed.result(0).unwrap().as_ref());
-    }
-    let output_type = lower_tensor_type(&physical_bound_type(&output_types[0])?, context, location)?;
-    let default_layout = |rank: usize| (0..rank).rev().collect::<Vec<_>>();
-    let custom_call = block.append_operation(stable_hlo::custom_call(
-        operands.as_slice(),
-        "__op$block_scaled_dot",
-        false,
-        None,
-        CustomCallApiVersion::Original,
-        &[],
-        Some(CustomCallMemoryLayouts {
-            operands: input_types.iter().map(|r#type| default_layout(r#type.rank())).collect(),
-            results: vec![default_layout(output_types[0].rank())],
-        }),
-        &[],
-        None,
-        &[output_type],
-        location,
-    )?)?;
-    let result = custom_call.result(0).unwrap().as_ref();
-    Ok(vec![lower_restore_dynamic_dimensions(
-        result,
-        &output_types[0],
-        scaled_dot_output_sources(operation, input_values, input_types).as_slice(),
-        block,
-        context,
-        location,
-    )?])
 }
 
 /// Returns the input value and axis that carry the runtime extent of each scaled dot output dimension, in the

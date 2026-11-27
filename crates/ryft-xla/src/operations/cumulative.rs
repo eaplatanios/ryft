@@ -8,7 +8,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type, lower_unplaced_constant_output};
+use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat, lower_unplaced_constant_output};
 use crate::operations::complex::lower_principal_phase_to_mlir;
 use crate::operations::exponential::lower_log_add_exp_to_mlir;
 use crate::operations::extrema::FloatExtremumForm;
@@ -27,8 +27,7 @@ impl LowerableOperation for CumulativeOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = input_types;
         check_count!("output", output_types, 1, ProgramError);
-        let value = lower_cumulative_to_mlir(
-            self.kind(),
+        let value = self.kind().lower(
             self.axis(),
             self.reverse(),
             input_values[0],
@@ -42,167 +41,189 @@ impl LowerableOperation for CumulativeOperation {
     }
 }
 
-/// Lowers one prefix scan dispatch to a `stablehlo.reduce_window` whose window spans the whole scanned axis.
-///
-/// The window has extent `n` along the scanned axis and extent one everywhere else, and the scan direction is
-/// expressed purely through the padding of that axis. A forward scan pads `(n - 1, 0)` so that output position `i`
-/// covers input positions `0..=i`, and a reverse scan pads `(0, n - 1)` so that it covers `i..n`. The reducer body
-/// and the initial value come from the scan's [`CumulativeKind`], whose identity is what makes the padded positions
-/// inert.
-///
-/// The window form looks quadratic, but it is the same emission JAX's `cumred_reduce_window_impl` produces, and XLA's
-/// `TryOptimizeAssociativeScan` rewriter recognizes the shape of a window over the full prefix and rewrites it into a
-/// tree of strided `reduce-window`s with logarithmic depth. On the pinned XLA version, the rewriter matches both the
-/// forward and the reverse padding, as observed in the optimized HLO of a CUDA compilation.
-///
-/// On GPU targets (i.e., when `target_platform` is `"cuda"` or `"rocm"`), a forward [`CumulativeKind::Sum`] over a
-/// statically shaped real numeric operand lowers to a
-/// [`chlo.scan`](https://openxla.org/stablehlo/generated/chlo#chloscan_chloscanop) instead, which is what JAX's
-/// `_cumred_gpu_lowering` emits. The scan carries one running sum per row of the unscanned axes, seeded with the sum
-/// identity, and its body adds each slice to that carry. Reverse, Boolean, and complex sums keep the window form, as
-/// they do in JAX. XLA imports the scan as an associative HLO `scan`, which leaves the choice of a scan implementation
-/// to the GPU backend. The pinned XLA version has no dedicated prefix sum kernel (e.g., one backed by CUB) and expands
-/// it into the same `reduce-window` tree with logarithmic depth as the window form.
-#[allow(clippy::too_many_arguments)]
-fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
-    kind: CumulativeKind,
-    axis: usize,
-    reverse: bool,
-    input_value: ValueRef<'b, 'c, 't>,
-    output_array_type: &ArrayType,
-    target_platform: Option<&str>,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    // The scanned extent is static by construction, because `ryft-core` type inference rejects a dynamic scanned axis,
-    // so a dynamic extent here means the staged program bypassed that rule.
-    let extent = match output_array_type.shape().dimensions().get(axis) {
-        Some(Dimension::Static(extent)) => *extent,
-        _ => {
+/// Lowering of cumulative operations of a [`CumulativeKind`] to StableHLO.
+trait CumulativeKindLoweringExtension {
+    /// Lowers one prefix scan dispatch to a `stablehlo.reduce_window` whose window spans the whole scanned axis.
+    ///
+    /// The window has extent `n` along the scanned axis and extent one everywhere else, and the scan direction is
+    /// expressed purely through the padding of that axis. A forward scan pads `(n - 1, 0)` so that output position `i`
+    /// covers input positions `0..=i`, and a reverse scan pads `(0, n - 1)` so that it covers `i..n`. The reducer body
+    /// and the initial value come from the scan's [`CumulativeKind`], whose identity is what makes the padded positions
+    /// inert.
+    ///
+    /// The window form looks quadratic, but it is the same emission JAX's `cumred_reduce_window_impl` produces, and
+    /// XLA's `TryOptimizeAssociativeScan` rewriter recognizes the shape of a window over the full prefix and rewrites
+    /// it into a tree of strided `reduce-window`s with logarithmic depth. On the pinned XLA version, the rewriter
+    /// matches both the forward and the reverse padding, as observed in the optimized HLO of a CUDA compilation.
+    ///
+    /// On GPU targets (i.e., when `target_platform` is `"cuda"` or `"rocm"`), a forward [`CumulativeKind::Sum`] over a
+    /// statically shaped real numeric operand lowers to a
+    /// [`chlo.scan`](https://openxla.org/stablehlo/generated/chlo#chloscan_chloscanop) instead, which is what JAX's
+    /// `_cumred_gpu_lowering` emits. The scan carries one running sum per row of the unscanned axes, seeded with the
+    /// sum identity, and its body adds each slice to that carry. Reverse, Boolean, and complex sums keep the window
+    /// form, as they do in JAX. XLA imports the scan as an associative HLO `scan`, which leaves the choice of a scan
+    /// implementation to the GPU backend. The pinned XLA version has no dedicated prefix sum kernel (e.g., one backed
+    /// by CUB) and expands it into the same `reduce-window` tree with logarithmic depth as the window form.
+    fn lower<'b, 'c: 'b, 't: 'c>(
+        self,
+        axis: usize,
+        reverse: bool,
+        input_value: ValueRef<'b, 'c, 't>,
+        output_array_type: &ArrayType,
+        target_platform: Option<&str>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+}
+
+impl CumulativeKindLoweringExtension for CumulativeKind {
+    #[allow(clippy::too_many_arguments)]
+    fn lower<'b, 'c: 'b, 't: 'c>(
+        self,
+        axis: usize,
+        reverse: bool,
+        input_value: ValueRef<'b, 'c, 't>,
+        output_array_type: &ArrayType,
+        target_platform: Option<&str>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        // The scanned extent is static by construction, because `ryft-core` type inference rejects a dynamic scanned
+        // axis, so a dynamic extent here means the staged program bypassed that rule.
+        let extent = match output_array_type.shape().dimensions().get(axis) {
+            Some(Dimension::Static(extent)) => *extent,
+            _ => {
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: CUMULATIVE_OPERATION_NAME.to_string(),
+                    reason: format!(
+                        "`{CUMULATIVE_OPERATION_NAME}` with kind `{self}` over dynamically sized axis {axis}"
+                    ),
+                }));
+            }
+        };
+        // An empty scanned axis accumulates nothing, and a window with zero extent is not a valid `reduce_window`.
+        if extent == 0 {
+            return Ok(input_value);
+        }
+        let element_type = output_array_type.data_type();
+        // A structural zero has no payload and both its prefix sums and products stay zero. In particular, its
+        // product must not construct a multiplicative identity, which this element type cannot represent.
+        if element_type == DataType::Zero {
+            return Ok(input_value);
+        }
+        if self == CumulativeKind::Sum
+            && !reverse
+            && matches!(target_platform, Some("cuda" | "rocm"))
+            && element_type.is_real()
+            && let Some(shape) = output_array_type.static_shape()
+        {
+            let mut carry_dimensions = shape.dimensions().to_vec();
+            carry_dimensions.remove(axis);
+            let carry_tensor_type =
+                (ArrayType::new_static(element_type, carry_dimensions.clone())).lower(context, location)?;
+            let identity =
+                build_reduction_identity_constant(ReductionKind::Sum, element_type, block, context, location)?;
+            let initial_value = match carry_dimensions.is_empty() {
+                true => identity,
+                false => block
+                    .append_operation(stable_hlo::broadcast(identity, carry_tensor_type, &[], location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref(),
+            };
+
+            // The body receives one slice of the operand and the carry, and returns their sum both as the output slice
+            // and as the next carry.
+            let mut body_region = context.region();
+            let mut body_block = body_region
+                .append_block(context.block(&[(carry_tensor_type, location), (carry_tensor_type, location)]))?;
+            let slice = body_block.argument(0)?.as_ref();
+            let carry = body_block.argument(1)?.as_ref();
+            let sum = if matches!(element_type, DataType::I1 | DataType::U1) {
+                // Boolean addition on the predicate carrier is OR, while one-bit integer addition wraps modulo two.
+                body_block.append_operation(stable_hlo::xor(slice, carry, location)?)?
+            } else {
+                body_block.append_operation(stable_hlo::add(slice, carry, location)?)?
+            };
+            let sum = sum.result(0).unwrap().as_ref();
+            body_block.append_operation(stable_hlo::r#return(&[sum, sum], location)?)?;
+            let scan = block.append_operation(chlo::scan(
+                &[input_value],
+                &[initial_value],
+                axis,
+                None,
+                false,
+                Some(true),
+                body_region,
+                location,
+            )?)?;
+            return Ok(scan.result(0).unwrap().as_ref());
+        }
+        // Rounded pairwise identities stay neutral in any binary tree, independent of the window extent.
+        if matches!(self, CumulativeKind::LogSumExp) && matches!(element_type, DataType::F8E8M0FNU | DataType::F6E2M3FN)
+        {
             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                 operation: CUMULATIVE_OPERATION_NAME.to_string(),
-                reason: format!("`{CUMULATIVE_OPERATION_NAME}` with kind `{kind}` over dynamically sized axis {axis}"),
+                reason: format!(
+                    "`{CUMULATIVE_OPERATION_NAME}` with kind `{self}` over `{element_type}`, whose lowest value is not a \
+                     `log_add_exp` identity",
+                ),
             }));
         }
-    };
-    // An empty scanned axis accumulates nothing, and a window with zero extent is not a valid `reduce_window`.
-    if extent == 0 {
-        return Ok(input_value);
-    }
-    let element_type = output_array_type.data_type();
-    // A structural zero has no payload and both its prefix sums and products stay zero. In particular, its
-    // product must not construct a multiplicative identity, which this element type cannot represent.
-    if element_type == DataType::Zero {
-        return Ok(input_value);
-    }
-    if kind == CumulativeKind::Sum
-        && !reverse
-        && matches!(target_platform, Some("cuda" | "rocm"))
-        && element_type.is_real()
-        && let Some(shape) = output_array_type.static_shape()
-    {
-        let mut carry_dimensions = shape.dimensions().to_vec();
-        carry_dimensions.remove(axis);
-        let carry_tensor_type =
-            lower_tensor_type(&ArrayType::new_static(element_type, carry_dimensions.clone()), context, location)?;
-        let identity = build_reduction_identity_constant(ReductionKind::Sum, element_type, block, context, location)?;
-        let initial_value = match carry_dimensions.is_empty() {
-            true => identity,
-            false => block
-                .append_operation(stable_hlo::broadcast(identity, carry_tensor_type, &[], location)?)?
-                .result(0)
-                .unwrap()
-                .as_ref(),
+        // A finite log-sum-exp identity is neutral only after rounding each pair. GPU float normalization can widen
+        // the reducer and remove those conversions, so carry the narrow encodings as integers through the window.
+        let carrier_type = match (self, target_platform, element_type) {
+            (CumulativeKind::LogSumExp, Some("cuda" | "rocm"), DataType::F4E2M1FN) => Some(DataType::U4),
+            (
+                CumulativeKind::LogSumExp,
+                Some("cuda" | "rocm"),
+                DataType::F8E4M3FN | DataType::F8E4M3FNUZ | DataType::F8E4M3B11FNUZ | DataType::F8E5M2FNUZ,
+            ) => Some(DataType::U8),
+            _ => None,
         };
-
-        // The body receives one slice of the operand and the carry, and returns their sum both as the output slice and
-        // as the next carry.
-        let mut body_region = context.region();
-        let mut body_block =
-            body_region.append_block(context.block(&[(carry_tensor_type, location), (carry_tensor_type, location)]))?;
-        let slice = body_block.argument(0)?.as_ref();
-        let carry = body_block.argument(1)?.as_ref();
-        let sum = if matches!(element_type, DataType::I1 | DataType::U1) {
-            // Boolean addition on the predicate carrier is OR, while one-bit integer addition wraps modulo two.
-            body_block.append_operation(stable_hlo::xor(slice, carry, location)?)?
+        let initial_value = build_cumulative_initial_value(self, element_type, block, context, location)?;
+        let (input_value, initial_value) = if let Some(carrier_type) = carrier_type {
+            let input_type = output_array_type.clone().with_data_type(carrier_type).lower(context, location)?;
+            let initial_type = ArrayType::scalar(carrier_type).lower(context, location)?;
+            let input = block.append_operation(stable_hlo::bitcast_convert(input_value, input_type, location)?)?;
+            let initial =
+                block.append_operation(stable_hlo::bitcast_convert(initial_value, initial_type, location)?)?;
+            (input.result(0).unwrap().as_ref(), initial.result(0).unwrap().as_ref())
         } else {
-            body_block.append_operation(stable_hlo::add(slice, carry, location)?)?
+            (input_value, initial_value)
         };
-        let sum = sum.result(0).unwrap().as_ref();
-        body_block.append_operation(stable_hlo::r#return(&[sum, sum], location)?)?;
-        let scan = block.append_operation(chlo::scan(
+        let body_region = build_cumulative_body_region(self, element_type, carrier_type, context, location)?;
+        let rank = output_array_type.rank();
+        let mut window_dimensions = vec![1; rank];
+        window_dimensions[axis] = extent;
+        let mut padding = vec![(0, 0); rank];
+        padding[axis] = match reverse {
+            true => (0, extent - 1),
+            false => (extent - 1, 0),
+        };
+        let result = block.append_operation(stable_hlo::reduce_window(
             &[input_value],
             &[initial_value],
-            axis,
+            &window_dimensions,
             None,
-            false,
-            Some(true),
+            None,
+            None,
+            Some(&padding),
             body_region,
             location,
         )?)?;
-        return Ok(scan.result(0).unwrap().as_ref());
-    }
-    // Rounded pairwise identities stay neutral in any binary tree, independent of the window extent.
-    if matches!(kind, CumulativeKind::LogSumExp) && matches!(element_type, DataType::F8E8M0FNU | DataType::F6E2M3FN) {
-        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: CUMULATIVE_OPERATION_NAME.to_string(),
-            reason: format!(
-                "`{CUMULATIVE_OPERATION_NAME}` with kind `{kind}` over `{element_type}`, whose lowest value is not a \
-                 `log_add_exp` identity",
-            ),
-        }));
-    }
-    // A finite log-sum-exp identity is neutral only after rounding each pair. GPU float normalization can widen
-    // the reducer and remove those conversions, so carry the narrow encodings as integers through the window.
-    let carrier_type = match (kind, target_platform, element_type) {
-        (CumulativeKind::LogSumExp, Some("cuda" | "rocm"), DataType::F4E2M1FN) => Some(DataType::U4),
-        (
-            CumulativeKind::LogSumExp,
-            Some("cuda" | "rocm"),
-            DataType::F8E4M3FN | DataType::F8E4M3FNUZ | DataType::F8E4M3B11FNUZ | DataType::F8E5M2FNUZ,
-        ) => Some(DataType::U8),
-        _ => None,
-    };
-    let initial_value = build_cumulative_initial_value(kind, element_type, block, context, location)?;
-    let (input_value, initial_value) = if let Some(carrier_type) = carrier_type {
-        let input_type = lower_tensor_type(&output_array_type.clone().with_data_type(carrier_type), context, location)?;
-        let initial_type = lower_tensor_type(&ArrayType::scalar(carrier_type), context, location)?;
-        let input = block.append_operation(stable_hlo::bitcast_convert(input_value, input_type, location)?)?;
-        let initial = block.append_operation(stable_hlo::bitcast_convert(initial_value, initial_type, location)?)?;
-        (input.result(0).unwrap().as_ref(), initial.result(0).unwrap().as_ref())
-    } else {
-        (input_value, initial_value)
-    };
-    let body_region = build_cumulative_body_region(kind, element_type, carrier_type, context, location)?;
-    let rank = output_array_type.rank();
-    let mut window_dimensions = vec![1; rank];
-    window_dimensions[axis] = extent;
-    let mut padding = vec![(0, 0); rank];
-    padding[axis] = match reverse {
-        true => (0, extent - 1),
-        false => (extent - 1, 0),
-    };
-    let result = block.append_operation(stable_hlo::reduce_window(
-        &[input_value],
-        &[initial_value],
-        &window_dimensions,
-        None,
-        None,
-        None,
-        Some(&padding),
-        body_region,
-        location,
-    )?)?;
-    let result = result.result(0).unwrap().as_ref();
-    if carrier_type.is_some() {
-        let output_type = lower_tensor_type(output_array_type, context, location)?;
-        let result = block.append_operation(stable_hlo::bitcast_convert(result, output_type, location)?)?;
-        return Ok(result.result(0).unwrap().as_ref());
-    }
-    match kind == CumulativeKind::LogSumExp && element_type.is_complex() {
-        true => lower_principal_phase_to_mlir(result, output_array_type, block, context, location),
-        false => Ok(result),
+        let result = result.result(0).unwrap().as_ref();
+        if carrier_type.is_some() {
+            let output_type = output_array_type.lower(context, location)?;
+            let result = block.append_operation(stable_hlo::bitcast_convert(result, output_type, location)?)?;
+            return Ok(result.result(0).unwrap().as_ref());
+        }
+        match self == CumulativeKind::LogSumExp && element_type.is_complex() {
+            true => lower_principal_phase_to_mlir(result, output_array_type, block, context, location),
+            false => Ok(result),
+        }
     }
 }
 
@@ -236,7 +257,7 @@ fn build_cumulative_initial_value<'b, 'c: 'b, 't: 'c>(
         CumulativeKind::LogSumExp if element_type.is_complex() => {
             let part_type =
                 ArrayType::scalar(if element_type == DataType::C64 { DataType::F32 } else { DataType::F64 });
-            let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+            let part_tensor_type = part_type.lower(context, location)?;
             let real =
                 lower_f64_constant_splat(f64::NEG_INFINITY, &part_type, part_tensor_type, block, context, location)?;
             let imaginary = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
@@ -281,9 +302,9 @@ fn build_cumulative_body_region<'c, 't>(
     }
 
     // Product, log-sum-exp, and one-bit integer combiners build their body over a pair of scalar block arguments.
-    let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(element_type), context, location)?;
+    let scalar_tensor_type = ArrayType::scalar(element_type).lower(context, location)?;
     let argument_type = if let Some(carrier_type) = carrier_type {
-        lower_tensor_type(&ArrayType::scalar(carrier_type), context, location)?
+        ArrayType::scalar(carrier_type).lower(context, location)?
     } else {
         scalar_tensor_type
     };
@@ -331,7 +352,7 @@ fn build_cumulative_body_region<'c, 't>(
             )?;
             let part_type =
                 ArrayType::scalar(if element_type == DataType::C64 { DataType::F32 } else { DataType::F64 });
-            let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+            let part_tensor_type = part_type.lower(context, location)?;
             let negative_infinity = lower_f64_constant_splat(
                 f64::NEG_INFINITY,
                 &part_type,
@@ -850,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cumulative_executes() {
+    fn test_cumulative_operation_lower_executes() {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
@@ -898,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cumulative_sum_matches_sequential_scan() {
+    fn test_cumulative_operation_lower_sum_matches_sequential_scan() {
         // Forward real sums lower to `chlo.scan` on GPU targets and to a `reduce_window` over the full prefix
         // elsewhere, while reverse sums keep the `reduce_window` form everywhere. Small integral values keep every
         // `f32` prefix sum exact, so every form must agree with a sequential scan bit for bit, including along a
@@ -939,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cumulative_one_bit_sum_on_gpu() {
+    fn test_cumulative_operation_lower_one_bit_sum_on_gpu() {
         for data_type in [DataType::I1, DataType::U1] {
             let input_type = ArrayType::new_static(data_type, [2, 4]);
             let mut builder = ProgramBuilder::new();
@@ -977,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cumulative_one_bit_integers_matches_reference_backend() {
+    fn test_cumulative_operation_lower_one_bit_integers_matches_reference_backend() {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);
@@ -1002,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cumulative_structural_zero() {
+    fn test_cumulative_operation_lower_structural_zero() {
         for kind in [CumulativeKind::Sum, CumulativeKind::Product] {
             for reverse in [false, true] {
                 assert_eq!(
@@ -1026,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cumulative_log_sum_exp_identities() {
+    fn test_cumulative_operation_lower_log_sum_exp_identities() {
         // Invalid unchecked programs still cannot seed a fold with a value that is not an identity.
         for element_type in [DataType::F8E8M0FNU, DataType::F6E2M3FN] {
             let array_type = ArrayType::new(element_type, Shape::new(vec![Dimension::Static(4)]));
@@ -1107,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cumulative_log_sum_exp_complex() {
+    fn test_cumulative_operation_lower_log_sum_exp_complex() {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);

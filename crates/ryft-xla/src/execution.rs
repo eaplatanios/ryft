@@ -2173,13 +2173,14 @@ mod tests {
         boolean_vector, domain_mesh, f32_scalar, f32_vector, program_array, read_first_shard, read_sharded_f32_array,
         replicated_scalar_type, replicated_vector_type, two_device_mesh,
     };
+    use crate::sharding::{LogicalMeshExtension, OpenDimensions, ShardingExtension};
     use crate::tests::{
         cpu_client, execution_client, other_cpu_client, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
         Array, CompileTracer, Constant, Error, ExecutionError, Operation, Options, PRINT_CUSTOM_CALL_TARGET, Platform,
-        Reference, RetainedArray, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider, Session, ToMlir,
-        Type, Value, compile_statefully, compile_statefully_with_captures, compile_with_captures, with_captured_prints,
+        Reference, RetainedArray, RuntimeError, RuntimeExtension, RuntimeExtensions, RuntimeProvider, Session, Type,
+        Value, compile_statefully, compile_statefully_with_captures, compile_with_captures, with_captured_prints,
     };
 
     use super::*;
@@ -2651,11 +2652,12 @@ mod tests {
         let mesh_operation = mesh_module
             .body()
             .unwrap()
-            .append_operation(left_array.sharding().mesh().to_mlir(location).unwrap())
+            .append_operation(left_array.sharding().mesh().lower(location).unwrap())
             .unwrap()
             .to_string();
-        let left_sharding_attribute = left_array.sharding().to_mlir(location).unwrap().to_string();
-        let right_sharding_attribute = right_array.sharding().to_mlir(location).unwrap().to_string();
+        let left_sharding_attribute = left_array.sharding().lower(OpenDimensions::None, location).unwrap().to_string();
+        let right_sharding_attribute =
+            right_array.sharding().lower(OpenDimensions::None, location).unwrap().to_string();
 
         assert_eq!(mesh_operation, "sdy.mesh @mesh = <[\"x\"=8]>");
         assert_eq!(left_sharding_attribute, "#sdy.sharding<@mesh, [{\"x\"}, {}]>");
@@ -2750,15 +2752,21 @@ mod tests {
         );
 
         let context = MlirContext::new();
-        let input_sharding = boundary.input_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
-        let output_sharding = boundary.output_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
+        let input_sharding = boundary.input_shardings()[0]
+            .lower(OpenDimensions::None, context.unknown_location())
+            .unwrap()
+            .to_string();
+        let output_sharding = boundary.output_shardings()[0]
+            .lower(OpenDimensions::None, context.unknown_location())
+            .unwrap()
+            .to_string();
         let manual_computation_attributes =
             r#"in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"}"#;
         let mesh_module = context.module(context.unknown_location()).unwrap();
         let mesh_operation = mesh_module
             .body()
             .unwrap()
-            .append_operation(boundary.mesh().to_mlir(context.unknown_location()).unwrap())
+            .append_operation(boundary.mesh().lower(context.unknown_location()).unwrap())
             .unwrap()
             .to_string();
 

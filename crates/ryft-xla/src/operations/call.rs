@@ -48,11 +48,11 @@ use crate::lowering::EffectTokens;
 use crate::lowering::emissions::{omits_regions, partition_session_constants, unread_call_captures};
 use crate::lowering::extensions::{RegionPlacementRequestsExtension, ShardingLoweringExtension};
 use crate::lowering::reductions::validate_declared_pending_reduction;
-use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::lowering::states::CollectiveLoweringState;
-use crate::lowering::types::{lower_array_ir_type, lower_unplaced_constant_output};
+use crate::lowering::types::{TypeLoweringExtension, lower_unplaced_constant_output};
 use crate::operations::control_flow::lowered_effect_classes;
-use crate::operations::manipulation::conversions::lower_cast_shape;
+use crate::operations::manipulation::conversions::TypeCastLoweringExtension;
 use crate::operations::{Operation, unread_lifted_captures};
 use crate::{
     Array, Constant, Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
@@ -306,12 +306,12 @@ pub(crate) fn emit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily
     let argument_tensor_types = function
         .input_types
         .iter()
-        .map(|r#type| lower_array_ir_type(r#type, context, location))
+        .map(|r#type| r#type.lower(context, location))
         .collect::<Result<Vec<_>, _>>()?;
     let result_tensor_types = function
         .output_types
         .iter()
-        .map(|r#type| lower_array_ir_type(r#type, context, location))
+        .map(|r#type| r#type.lower(context, location))
         .collect::<Result<Vec<_>, _>>()?;
 
     let function_block = context.block(
@@ -329,8 +329,7 @@ pub(crate) fn emit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily
         // Deduplicated callees are pure by construction (`collect_call_functions` skips programs whose lowering
         // has effects, including synthesized entry guards), so the shared function body never creates an effect token.
         let mut effect_tokens = EffectTokens::default();
-        let outputs = lower_nested_program_inline(
-            &function.program,
+        let outputs = function.program.lower_inline(
             input_values.as_slice(),
             &mut function_block_ref,
             context,
@@ -375,10 +374,8 @@ pub(crate) fn lower_shared_function_call<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let result_tensor_types = output_types
-        .iter()
-        .map(|r#type| lower_array_ir_type(r#type, context, location))
-        .collect::<Result<Vec<_>, _>>()?;
+    let result_tensor_types =
+        output_types.iter().map(|r#type| r#type.lower(context, location)).collect::<Result<Vec<_>, _>>()?;
     let operation = block.append_operation(func::call(
         symbol,
         func::CallProperties {
@@ -964,11 +961,10 @@ impl LowerableOperation for CallOperation<Type> {
                 .zip(input_types.iter().zip(callee_input_types.iter()))
                 .map(|(&value, (r#type, declared))| match r#type == declared {
                     true => Ok(value),
-                    false => lower_cast_shape(value, r#type, declared, &mut block, context, location),
+                    false => r#type.lower_cast_shape(value, declared, &mut block, context, location),
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
-            let output_values = lower_call(
-                callee,
+            let output_values = callee.lower_call(
                 self.capture_count(),
                 &input_values,
                 captured_values,
@@ -984,7 +980,7 @@ impl LowerableOperation for CallOperation<Type> {
                 .zip(callee.output_types().iter().zip(output_types))
                 .map(|(value, (declared, r#type))| match declared == r#type {
                     true => Ok(value),
-                    false => lower_cast_shape(value, declared, r#type, &mut block, context, location),
+                    false => declared.lower_cast_shape(value, r#type, &mut block, context, location),
                 })
                 .collect::<Result<Vec<_>, Error>>()?
         };
@@ -1304,65 +1300,82 @@ where
     Ok(())
 }
 
-/// Lowers one `call` to either a `func.call` of a shared private function (when its callee was deduplicated) or
-/// an inlined copy of the callee body (otherwise).
-///
-/// `input_values` are the lowered call operands in callee-input order. `capture_count` is the operation payload's
-/// exact leading lifted-capture prefix length. Deriving it from capture-constant indices instead would conflate the
-/// independent capture namespaces of nested calls inside the callee arena. `caller_captured_values` are the captured
-/// values of the calling scope, whose session-constant suffix the inlined callee inherits (refer to
-/// [`CollectiveLoweringState::session_values`]).
-#[allow(clippy::too_many_arguments)]
-fn lower_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    program: &FlatProgram<EagerContext<Constant, O>>,
-    capture_count: usize,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    caller_captured_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-    nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-    collective_state: &CollectiveLoweringState,
-    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    // Only pure callees are ever deduplicated (`collect_call_functions` skips effectful programs), so the shared
-    // function path below never interacts with the caller's effect tokens. Effectful callees always take the inline
-    // path, which threads the caller's per-class tokens through the callee body in program order.
-    if let Some(map) = nested_functions
-        && let Some(function) = map.get(program)
-    {
-        // The `call` operation's type inference already pins its operands to the callee input types, so a
-        // matching arity is the only guard needed before emitting the symbol call. Anything else inlines.
-        if input_values.len() == function.input_types.len() {
-            return lower_shared_function_call(
-                &function.symbol,
-                &function.output_types,
-                input_values,
-                block,
-                context,
-                location,
-            );
+/// Lowering of the callee program of a `call`.
+trait CallProgramLoweringExtension<O: LowerableOperationFamily> {
+    /// Lowers one `call` to either a `func.call` of a shared private function (when its callee was deduplicated) or
+    /// an inlined copy of the callee body (otherwise).
+    ///
+    /// `input_values` are the lowered call operands in callee-input order. `capture_count` is the operation payload's
+    /// exact leading lifted-capture prefix length. Deriving it from capture-constant indices instead would conflate the
+    /// independent capture namespaces of nested calls inside the callee arena. `caller_captured_values` are the
+    /// captured values of the calling scope, whose session-constant suffix the inlined callee inherits (refer to
+    /// [`CollectiveLoweringState::session_values`]).
+    fn lower_call<'b, 'c: 'b, 't: 'c>(
+        &self,
+        capture_count: usize,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        caller_captured_values: &[ValueRef<'b, 'c, 't>],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+        nested_functions: Option<&Rc<CallFunctionMap<O>>>,
+        collective_state: &CollectiveLoweringState,
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl<O: LowerableOperationFamily> CallProgramLoweringExtension<O> for FlatProgram<EagerContext<Constant, O>> {
+    #[allow(clippy::too_many_arguments)]
+    fn lower_call<'b, 'c: 'b, 't: 'c>(
+        &self,
+        capture_count: usize,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        caller_captured_values: &[ValueRef<'b, 'c, 't>],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+        nested_functions: Option<&Rc<CallFunctionMap<O>>>,
+        collective_state: &CollectiveLoweringState,
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        // Only pure callees are ever deduplicated (`collect_call_functions` skips effectful programs), so the shared
+        // function path below never interacts with the caller's effect tokens. Effectful callees always take the inline
+        // path, which threads the caller's per-class tokens through the callee body in program order.
+        if let Some(map) = nested_functions
+            && let Some(function) = map.get(self)
+        {
+            // The `call` operation's type inference already pins its operands to the callee input types, so a
+            // matching arity is the only guard needed before emitting the symbol call. Anything else inlines.
+            if input_values.len() == function.input_types.len() {
+                return lower_shared_function_call(
+                    &function.symbol,
+                    &function.output_types,
+                    input_values,
+                    block,
+                    context,
+                    location,
+                );
+            }
         }
+        if input_values.len() < capture_count {
+            // The provided inputs cover the leading captures, so the first capture without a value is the next one.
+            return Err(Error::Lowering(LoweringError::MissingCapturedConstant { index: input_values.len() }));
+        }
+        // The callee's capture references name its own leading inputs, while session constants remain module-scoped.
+        let mut captured_values = input_values[..capture_count].to_vec();
+        captured_values.extend_from_slice(collective_state.session_values(caller_captured_values));
+        self.lower_inline(
+            input_values,
+            block,
+            context,
+            location,
+            captured_values.as_slice(),
+            &RematerializationOptimizationBarrier::None,
+            nested_functions,
+            collective_state,
+            effect_tokens,
+        )
     }
-    if input_values.len() < capture_count {
-        // The provided inputs cover the leading captures, so the first capture without a value is the next one.
-        return Err(Error::Lowering(LoweringError::MissingCapturedConstant { index: input_values.len() }));
-    }
-    // The callee's capture references name its own leading inputs, while session constants remain module-scoped.
-    let mut captured_values = input_values[..capture_count].to_vec();
-    captured_values.extend_from_slice(collective_state.session_values(caller_captured_values));
-    lower_nested_program_inline(
-        program,
-        input_values,
-        block,
-        context,
-        location,
-        captured_values.as_slice(),
-        &RematerializationOptimizationBarrier::None,
-        nested_functions,
-        collective_state,
-        effect_tokens,
-    )
 }
 
 /// Constrains `value`, an operand or a result of type `r#type` of a `call`, to `sharding`, the effective boundary

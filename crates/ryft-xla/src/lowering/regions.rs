@@ -11,7 +11,6 @@ use ryft_mlir::{
 
 use crate::lowering::emissions::lowers_without_regions;
 use crate::lowering::states::CollectiveLoweringState;
-use crate::lowering::types::lower_constant;
 use crate::lowering::{
     EffectTokens, LowerableOperationFamily, Lowerer, lower_instruction, lower_instruction_operation,
 };
@@ -20,47 +19,65 @@ use crate::{Constant, Error};
 
 // TODO(eaplatanios): Review this module.
 
-/// Inlines a nested program into the given block by mapping the provided input MLIR values to the input atoms of its
-/// body, lowering constants and instructions in topological order, and returning the lowered values that correspond
-/// to the output atoms of the program.
-///
-/// `effect_tokens` are the per-class tokens of the lowering scope the program inlines into. They flow into the lowerer
-/// of each instruction and the updated tokens are read back out after the instruction lowers, so effects of the same
-/// class chain in program order and the caller observes the final tokens of the program.
-///
-/// When `optimization_barrier` selects any input, one
-/// [`stablehlo.optimization_barrier`](https://openxla.org/stablehlo/spec#optimization_barrier) wraps the selected
-/// input values together with the present effect tokens before the body is replayed, and the body consumes the
-/// barrier's results. XLA cannot look through the barrier, so it can neither schedule the body before the selected
-/// inputs are produced nor deduplicate it against an identical computation on the same inputs elsewhere (e.g., a
-/// rematerialized recomputation of a primal computation). Because the tokens go through the same barrier and the
-/// enclosing scope continues from the barrier's token results, the body's ordered effects are also sequenced after the
-/// barrier. Unselected inputs and captured constants, which are not inputs of the body, do not go through the barrier.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    program: &FlatProgram<EagerContext<Constant, O>>,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-    captured_values: &[ValueRef<'b, 'c, 't>],
-    optimization_barrier: &RematerializationOptimizationBarrier,
-    nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-    collective_state: &CollectiveLoweringState,
-    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    lower_nested_region_inline(
-        program.entry_region_ref(),
-        input_values,
-        block,
-        context,
-        location,
-        captured_values,
-        optimization_barrier,
-        nested_functions,
-        collective_state,
-        effect_tokens,
-    )
+/// Lowering of a nested program into the block of its enclosing function.
+pub(crate) trait NestedProgramLoweringExtension<O: LowerableOperationFamily> {
+    /// Inlines a nested program into the given block by mapping the provided input MLIR values to the input atoms of
+    /// its body, lowering constants and instructions in topological order, and returning the lowered values that
+    /// correspond to the output atoms of the program.
+    ///
+    /// `effect_tokens` are the per-class tokens of the lowering scope the program inlines into. They flow into the
+    /// lowerer of each instruction and the updated tokens are read back out after the instruction lowers, so effects of
+    /// the same class chain in program order and the caller observes the final tokens of the program.
+    ///
+    /// When `optimization_barrier` selects any input, one
+    /// [`stablehlo.optimization_barrier`](https://openxla.org/stablehlo/spec#optimization_barrier) wraps the selected
+    /// input values together with the present effect tokens before the body is replayed, and the body consumes the
+    /// barrier's results. XLA cannot look through the barrier, so it can neither schedule the body before the selected
+    /// inputs are produced nor deduplicate it against an identical computation on the same inputs elsewhere (e.g., a
+    /// rematerialized recomputation of a primal computation). Because the tokens go through the same barrier and the
+    /// enclosing scope continues from the barrier's token results, the body's ordered effects are also sequenced after
+    /// the barrier. Unselected inputs and captured constants, which are not inputs of the body, do not go through the
+    /// barrier.
+    fn lower_inline<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+        captured_values: &[ValueRef<'b, 'c, 't>],
+        optimization_barrier: &RematerializationOptimizationBarrier,
+        nested_functions: Option<&Rc<CallFunctionMap<O>>>,
+        collective_state: &CollectiveLoweringState,
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl<O: LowerableOperationFamily> NestedProgramLoweringExtension<O> for FlatProgram<EagerContext<Constant, O>> {
+    #[allow(clippy::too_many_arguments)]
+    fn lower_inline<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+        captured_values: &[ValueRef<'b, 'c, 't>],
+        optimization_barrier: &RematerializationOptimizationBarrier,
+        nested_functions: Option<&Rc<CallFunctionMap<O>>>,
+        collective_state: &CollectiveLoweringState,
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        self.entry_region_ref().lower_inline(
+            input_values,
+            block,
+            context,
+            location,
+            captured_values,
+            optimization_barrier,
+            nested_functions,
+            collective_state,
+            effect_tokens,
+        )
+    }
 }
 
 /// Lowers one traced program with explicit array inputs and the enclosing effect chains, and returns its lowered
@@ -106,9 +123,7 @@ where
         block,
         context,
         location,
-        |_, value, block, context, location| {
-            lower_constant(value, captured_values, collective_state, block, context, location)
-        },
+        |_, value, block, context, location| value.lower(captured_values, collective_state, block, context, location),
         |instruction, inputs, block, context, location| {
             lower_instruction(
                 program,
@@ -126,103 +141,123 @@ where
     )
 }
 
-/// Inlines a borrowed nested region into the given block without materializing the region itself. Refer to the
-/// documentation of [`lower_nested_program_inline`] for the effect token and optimization barrier contracts.
-#[allow(clippy::too_many_arguments)]
-fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    region: RegionRef<'_, Constant, O>,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-    captured_values: &[ValueRef<'b, 'c, 't>],
-    optimization_barrier: &RematerializationOptimizationBarrier,
-    nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-    collective_state: &CollectiveLoweringState,
-    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let mut input_values = input_values.to_vec();
-    let selected_input_indices =
-        (0..input_values.len()).filter(|index| optimization_barrier.selects(*index)).collect::<Vec<_>>();
-    if !selected_input_indices.is_empty() {
-        // The barrier results mirror its inputs, with the selected input values first, followed by the present tokens
-        // in the order in which they were appended.
-        let barrier_inputs = selected_input_indices
-            .iter()
-            .map(|index| input_values[*index])
-            .chain(effect_tokens.ordered_assertion)
-            .chain(effect_tokens.ordered_io)
-            .collect::<Vec<_>>();
-        let barrier = block.append_operation(stable_hlo::optimization_barrier(barrier_inputs.as_slice(), location)?)?;
-        let mut results = (0..barrier_inputs.len()).map(|index| barrier.result(index).unwrap().as_ref());
-        for index in selected_input_indices {
-            input_values[index] = results.next().unwrap();
-        }
-        if effect_tokens.ordered_assertion.is_some() {
-            effect_tokens.ordered_assertion = results.next();
-        }
-        if effect_tokens.ordered_io.is_some() {
-            effect_tokens.ordered_io = results.next();
-        }
-    }
-    replay_region_ref_into_block(
-        region,
-        input_values,
-        block,
-        context,
-        location,
-        |_, value, block, context, location| {
-            lower_constant(value, captured_values, collective_state, block, context, location)
-        },
-        |instruction, inputs, block, context, location| {
-            let input_types = instruction
-                .inputs()
+/// Lowering of a borrowed nested region into the block of its enclosing function.
+trait NestedRegionLoweringExtension<O: LowerableOperationFamily> {
+    /// Inlines a borrowed nested region into the given block without materializing the region itself. Refer to the
+    /// documentation of [`NestedProgramLoweringExtension::lower_inline`] for the effect token and optimization barrier
+    /// contracts.
+    fn lower_inline<'b, 'c: 'b, 't: 'c>(
+        self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+        captured_values: &[ValueRef<'b, 'c, 't>],
+        optimization_barrier: &RematerializationOptimizationBarrier,
+        nested_functions: Option<&Rc<CallFunctionMap<O>>>,
+        collective_state: &CollectiveLoweringState,
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl<O: LowerableOperationFamily> NestedRegionLoweringExtension<O> for RegionRef<'_, Constant, O> {
+    #[allow(clippy::too_many_arguments)]
+    fn lower_inline<'b, 'c: 'b, 't: 'c>(
+        self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+        captured_values: &[ValueRef<'b, 'c, 't>],
+        optimization_barrier: &RematerializationOptimizationBarrier,
+        nested_functions: Option<&Rc<CallFunctionMap<O>>>,
+        collective_state: &CollectiveLoweringState,
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let mut input_values = input_values.to_vec();
+        let selected_input_indices =
+            (0..input_values.len()).filter(|index| optimization_barrier.selects(*index)).collect::<Vec<_>>();
+        if !selected_input_indices.is_empty() {
+            // The barrier results mirror its inputs, with the selected input values first, followed by the present
+            // tokens in the order in which they were appended.
+            let barrier_inputs = selected_input_indices
                 .iter()
-                .map(|input| region.atoms()[input.index()].r#type().into_owned())
+                .map(|index| input_values[*index])
+                .chain(effect_tokens.ordered_assertion)
+                .chain(effect_tokens.ordered_io)
                 .collect::<Vec<_>>();
-            let output_types = instruction
-                .outputs()
-                .iter()
-                .map(|output| region.atoms()[output.index()].r#type().into_owned())
-                .collect::<Vec<_>>();
-            let regions = if lowers_without_regions(
-                instruction.operation(),
-                &input_types,
-                &output_types,
-                nested_functions,
-                collective_state.target_platform(),
-            ) {
-                Vec::new()
-            } else {
-                instruction
-                    .regions()
-                    .iter()
-                    .map(|attached| RegionRef::new(region.arena(), *attached).map(RegionRef::to_program))
-                    .collect::<Result<Vec<_>, ProgramError>>()?
-            };
-            // Every StableHLO operation generated from this one Ryft instruction inherits the instruction's
-            // provenance through the lowerer's shared location, with the ambient location as its base.
-            let location = collective_state.instruction_location(context, instruction.provenance(), location);
-            let mut lowerer = Lowerer::new(*block, context, location)
-                .with_regions(regions)
-                .with_nested_functions(nested_functions.cloned())
-                .with_captured_values(captured_values)
-                .with_effect_tokens(*effect_tokens)
-                .with_collective_state(collective_state.clone());
-            let outputs = lower_instruction_operation(
-                instruction.operation(),
-                &mut lowerer,
-                inputs,
-                input_types.as_slice(),
-                output_types.as_slice(),
-            )?;
-            if lowerer.effect_tokens.ordered_assertion.is_some() {
-                collective_state.record_assertion();
+            let barrier =
+                block.append_operation(stable_hlo::optimization_barrier(barrier_inputs.as_slice(), location)?)?;
+            let mut results = (0..barrier_inputs.len()).map(|index| barrier.result(index).unwrap().as_ref());
+            for index in selected_input_indices {
+                input_values[index] = results.next().unwrap();
             }
-            *effect_tokens = lowerer.effect_tokens;
-            Ok(outputs)
-        },
-    )
+            if effect_tokens.ordered_assertion.is_some() {
+                effect_tokens.ordered_assertion = results.next();
+            }
+            if effect_tokens.ordered_io.is_some() {
+                effect_tokens.ordered_io = results.next();
+            }
+        }
+        replay_region_ref_into_block(
+            self,
+            input_values,
+            block,
+            context,
+            location,
+            |_, value, block, context, location| {
+                value.lower(captured_values, collective_state, block, context, location)
+            },
+            |instruction, inputs, block, context, location| {
+                let input_types = instruction
+                    .inputs()
+                    .iter()
+                    .map(|input| self.atoms()[input.index()].r#type().into_owned())
+                    .collect::<Vec<_>>();
+                let output_types = instruction
+                    .outputs()
+                    .iter()
+                    .map(|output| self.atoms()[output.index()].r#type().into_owned())
+                    .collect::<Vec<_>>();
+                let regions = if lowers_without_regions(
+                    instruction.operation(),
+                    &input_types,
+                    &output_types,
+                    nested_functions,
+                    collective_state.target_platform(),
+                ) {
+                    Vec::new()
+                } else {
+                    instruction
+                        .regions()
+                        .iter()
+                        .map(|attached| RegionRef::new(self.arena(), *attached).map(RegionRef::to_program))
+                        .collect::<Result<Vec<_>, ProgramError>>()?
+                };
+                // Every StableHLO operation generated from this one Ryft instruction inherits the instruction's
+                // provenance through the lowerer's shared location, with the ambient location as its base.
+                let location = collective_state.instruction_location(context, instruction.provenance(), location);
+                let mut lowerer = Lowerer::new(*block, context, location)
+                    .with_regions(regions)
+                    .with_nested_functions(nested_functions.cloned())
+                    .with_captured_values(captured_values)
+                    .with_effect_tokens(*effect_tokens)
+                    .with_collective_state(collective_state.clone());
+                let outputs = lower_instruction_operation(
+                    instruction.operation(),
+                    &mut lowerer,
+                    inputs,
+                    input_types.as_slice(),
+                    output_types.as_slice(),
+                )?;
+                if lowerer.effect_tokens.ordered_assertion.is_some() {
+                    collective_state.record_assertion();
+                }
+                *effect_tokens = lowerer.effect_tokens;
+                Ok(outputs)
+            },
+        )
+    }
 }
 
 /// Drives [`Program::interpret_with`](ryft_core::Program::interpret_with) to lower a staged program into MLIR
@@ -331,7 +366,7 @@ pub(in crate::lowering) mod tests {
     };
 
     use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
-    use crate::lowering::types::{lower_literal_value, lower_tensor_type};
+    use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::lowering::{LowerableOperation, LoweringError, MlirLowerableValue};
     use crate::{ArrayConstant, Operation, Session};
 
@@ -363,7 +398,7 @@ pub(in crate::lowering) mod tests {
             block,
             context,
             location,
-            |_, value, block, context, location| lower_literal_value(value, block, context, location),
+            |_, value, block, context, location| value.lower_literal(block, context, location),
             |instruction, inputs, block, context, location| {
                 let input_types = instruction
                     .inputs()
@@ -404,23 +439,22 @@ pub(in crate::lowering) mod tests {
         )
     }
 
-    /// Inlines `program` into the body of a `main` function behind an optimization barrier on all of its inputs,
-    /// returns the inlined outputs from that function, and renders the verified module. When `ordered_io` is set, the
-    /// enclosing scope already holds an ordered I/O token when the program is inlined, so the barrier must thread it.
-    fn lower_nested_program_inline_behind_input_barrier(
+    /// Inlines `program` into the body of a `main` function behind an optimization barrier on the inputs that
+    /// `optimization_barrier` selects, returns the inlined outputs from that function, and renders the verified
+    /// module. When `ordered_io` is set, the enclosing scope already holds an ordered I/O token when the program is
+    /// inlined, so any barrier must thread it.
+    fn lower_flat_program_inline(
         program: &FlatProgram<Session>,
         input_types: &[ArrayType],
         output_types: &[ArrayType],
+        optimization_barrier: &RematerializationOptimizationBarrier,
         ordered_io: bool,
     ) -> String {
         let context = MlirContext::new();
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
         let tensor_types = |types: &[ArrayType]| {
-            types
-                .iter()
-                .map(|r#type| lower_tensor_type(r#type, &context, location).unwrap())
-                .collect::<Vec<_>>()
+            types.iter().map(|r#type| r#type.lower(&context, location).unwrap()).collect::<Vec<_>>()
         };
         let input_tensor_types = tensor_types(input_types);
         let output_tensor_types = tensor_types(output_types);
@@ -437,19 +471,19 @@ pub(in crate::lowering) mod tests {
                     block.append_operation(stable_hlo::after_all::<ValueRef, _>(&[], location).unwrap()).unwrap();
                 effect_tokens.ordered_io = Some(token.result(0).unwrap().as_ref());
             }
-            let outputs = lower_nested_program_inline(
-                program,
-                inputs.as_slice(),
-                &mut block,
-                &context,
-                location.as_ref(),
-                &[],
-                &RematerializationOptimizationBarrier::All,
-                None,
-                &CollectiveLoweringState::new(),
-                &mut effect_tokens,
-            )
-            .unwrap();
+            let outputs = program
+                .lower_inline(
+                    inputs.as_slice(),
+                    &mut block,
+                    &context,
+                    location.as_ref(),
+                    &[],
+                    optimization_barrier,
+                    None,
+                    &CollectiveLoweringState::new(),
+                    &mut effect_tokens,
+                )
+                .unwrap();
             block.append_operation(func::r#return(outputs.as_slice(), location).unwrap()).unwrap();
         }
         let mut function_region = context.region();
@@ -477,7 +511,37 @@ pub(in crate::lowering) mod tests {
     }
 
     #[test]
-    fn test_lower_nested_program_inline_input_optimization_barrier() {
+    fn test_flat_program_lower_inline() {
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = ProgramBuilder::new();
+        let left = builder.add_input(array_type.clone());
+        let right = builder.add_input(array_type.clone());
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let program = unproject_plain_program(program);
+        assert_eq!(
+            lower_flat_program_inline(
+                &program,
+                &[array_type.clone(), array_type.clone()],
+                &[array_type],
+                &RematerializationOptimizationBarrier::None,
+                false,
+            ),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf32>, %arg1: tensor<2xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.multiply %arg0, %arg1 : tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_flat_program_lower_inline_input_optimization_barrier() {
         // A pure body consumes the barrier's results instead of the enclosing scope's values.
         let array_type = ArrayType::new_static(DataType::F32, [2]);
         let mut builder = ProgramBuilder::new();
@@ -489,10 +553,11 @@ pub(in crate::lowering) mod tests {
             .unwrap();
         let program = unproject_plain_program(program);
         assert_eq!(
-            lower_nested_program_inline_behind_input_barrier(
+            lower_flat_program_inline(
                 &program,
                 &[array_type.clone(), array_type.clone()],
                 &[array_type],
+                &RematerializationOptimizationBarrier::All,
                 false,
             ),
             indoc! {r#"
@@ -508,7 +573,7 @@ pub(in crate::lowering) mod tests {
     }
 
     #[test]
-    fn test_lower_nested_program_inline_input_optimization_barrier_orders_effects() {
+    fn test_flat_program_lower_inline_input_optimization_barrier_orders_effects() {
         // The enclosing ordered I/O token goes through the same barrier as the inputs, so the print of the body
         // consumes the token result of the barrier and is sequenced after the barrier.
         let array_type = ArrayType::new_static(DataType::F32, [2]);
@@ -523,11 +588,12 @@ pub(in crate::lowering) mod tests {
             .unwrap();
         let program = unproject_plain_program(program);
         assert_eq!(
-            lower_nested_program_inline_behind_input_barrier(
+            lower_flat_program_inline(
                 &program,
                 std::slice::from_ref(&array_type),
                 std::slice::from_ref(&array_type),
-                true
+                &RematerializationOptimizationBarrier::All,
+                true,
             ),
             indoc! {"
                 module {
@@ -560,7 +626,7 @@ pub(in crate::lowering) mod tests {
         let program = unproject_plain_program(program);
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let tensor_type = lower_tensor_type(&array_type, &context, location).unwrap();
+        let tensor_type = array_type.lower(&context, location).unwrap();
         let block = context.block(&[(tensor_type, location)]);
         let mut block = block.as_ref();
         let input = block.argument(0).unwrap().as_ref();

@@ -8,7 +8,7 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::types::{annotate_output_memory, lower_f64_constant_splat, lower_tensor_type};
+use crate::lowering::types::{ArrayTypeLoweringExtension, annotate_output_memory, lower_f64_constant_splat};
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
@@ -21,8 +21,7 @@ impl LowerableOperation for RngBitGeneratorOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (input_types, output_types);
-        lower_rng_bit_generator_to_mlir(
-            self.algorithm(),
+        self.algorithm().lower_bit_generator(
             self.output_type(),
             input_values,
             &mut lowerer.block(),
@@ -80,7 +79,7 @@ impl LowerableOperation for RngBitGeneratorOperation<Type> {
             context,
             location,
         )?;
-        lower_rng_bit_generator_to_mlir(self.algorithm(), bits_type, &input_values[..1], block, context, location)
+        self.algorithm().lower_bit_generator(bits_type, &input_values[..1], block, context, location)
     }
 }
 
@@ -120,15 +119,14 @@ impl LowerableOperation for DropoutOperation {
             Some(state) => (RandomAlgorithm::from_state_type(&input_types[1])?, *state),
             None => {
                 let state_type = RandomAlgorithm::ThreeFry.state_type();
-                let state_tensor_type = lower_tensor_type(&state_type, context, location)?;
+                let state_tensor_type = state_type.lower(context, location)?;
                 let state = lower_f64_constant_splat(0.0, &state_type, state_tensor_type, block, context, location)?;
                 (RandomAlgorithm::ThreeFry, state)
             }
         };
         let mask_type = self.mask_type(input_type)?;
-        let generated =
-            lower_unplaced_rng_bit_generator_to_mlir(algorithm, &mask_type, &[state], block, context, location)?;
-        let mask_tensor_type = lower_tensor_type(&mask_type, context, location)?;
+        let generated = algorithm.lower_unplaced_bit_generator(&mask_type, &[state], block, context, location)?;
+        let mask_tensor_type = mask_type.lower(context, location)?;
         let threshold = lower_f64_constant_splat(
             f64::from(self.drop_threshold()),
             &mask_type,
@@ -148,12 +146,12 @@ impl LowerableOperation for DropoutOperation {
             .result(0)
             .unwrap()
             .as_ref();
-        let input_tensor_type = lower_tensor_type(input_type, context, location)?;
+        let input_tensor_type = input_type.lower(context, location)?;
         let keep = if mask_type.shape() == input_type.shape() {
             keep
         } else {
             let keep_type = input_type.clone().with_data_type(DataType::Boolean).with_layout(None);
-            let keep_tensor_type = lower_tensor_type(&keep_type, context, location)?;
+            let keep_tensor_type = keep_type.lower(context, location)?;
             let dimensions = (0..input_type.rank()).collect::<Vec<_>>();
             block
                 .append_operation(stable_hlo::broadcast(keep, keep_tensor_type, &dimensions, location)?)?
@@ -175,7 +173,7 @@ impl LowerableOperation for DropoutOperation {
             ),
             Some(part_data_type) => {
                 let part_type = input_type.clone().with_data_type(part_data_type).with_layout(None);
-                let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+                let part_tensor_type = part_type.lower(context, location)?;
                 let part_zero = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
                 let part_scale =
                     lower_f64_constant_splat(self.scale(), &part_type, part_tensor_type, block, context, location)?;
@@ -203,45 +201,72 @@ impl LowerableOperation for DropoutOperation {
     }
 }
 
-/// Lowers one random bit generation like [`lower_unplaced_rng_bit_generator_to_mlir`] and applies the declared memory
-/// placement of `bits_type` to the generated bits when that placement is not the device memory. The advanced state
-/// keeps the placement of the input state.
-fn lower_rng_bit_generator_to_mlir<'b, 'c: 'b, 't: 'c>(
-    algorithm: RandomAlgorithm,
-    bits_type: &ArrayType,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let mut generated =
-        lower_unplaced_rng_bit_generator_to_mlir(algorithm, bits_type, input_values, block, context, location)?;
-    generated[1] = annotate_output_memory(generated[1], bits_type, block, context, location)?;
-    Ok(generated)
+/// Lowering of the bit generators of a [`RandomAlgorithm`] to StableHLO.
+trait RandomAlgorithmLoweringExtension {
+    /// Lowers one random bit generation like [`RandomAlgorithmLoweringExtension::lower_unplaced_bit_generator`] and
+    /// applies the declared memory placement of `bits_type` to the generated bits when that placement is not the device
+    /// memory. The advanced state keeps the placement of the input state.
+    fn lower_bit_generator<'b, 'c: 'b, 't: 'c>(
+        self,
+        bits_type: &ArrayType,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+
+    /// Lowers one random bit generation with this algorithm to a `stablehlo.rng_bit_generator` that produces bits of
+    /// type `bits_type`, mapping the algorithm to the corresponding StableHLO algorithm attribute. The two results are
+    /// the advanced generator state and the bits. The bits type is the instruction's output type, which may be refined,
+    /// rather than the operation's declared one, whose dynamic axes exact extent operands may have refined to static
+    /// axes. The bits stay in the memory where they are generated, which suits callers that consume them inside their
+    /// own lowering.
+    fn lower_unplaced_bit_generator<'b, 'c: 'b, 't: 'c>(
+        self,
+        bits_type: &ArrayType,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
 
-/// Lowers one random bit generation with `algorithm` to a `stablehlo.rng_bit_generator` that produces bits of type
-/// `bits_type`, mapping the algorithm to the corresponding StableHLO algorithm attribute. The two results are the
-/// advanced generator state and the bits. The bits type is the instruction's output type, which may be refined, rather
-/// than the operation's declared one, whose dynamic axes exact extent operands may have refined to static axes. The
-/// bits stay in the memory where they are generated, which suits callers that consume them inside their own lowering.
-fn lower_unplaced_rng_bit_generator_to_mlir<'b, 'c: 'b, 't: 'c>(
-    algorithm: RandomAlgorithm,
-    bits_type: &ArrayType,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    check_count!("input", input_values, 1, ProgramError);
-    let algorithm = match algorithm {
-        RandomAlgorithm::ThreeFry => stable_hlo::RngAlgorithm::ThreeFry,
-        RandomAlgorithm::Philox => stable_hlo::RngAlgorithm::Philox,
-    };
-    let output_type = lower_tensor_type(bits_type, context, location)?;
-    let generated =
-        block.append_operation(stable_hlo::rng_bit_generator(input_values[0], algorithm, output_type, location)?)?;
-    Ok(vec![generated.result(0).unwrap().as_ref(), generated.result(1).unwrap().as_ref()])
+impl RandomAlgorithmLoweringExtension for RandomAlgorithm {
+    fn lower_bit_generator<'b, 'c: 'b, 't: 'c>(
+        self,
+        bits_type: &ArrayType,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let mut generated = self.lower_unplaced_bit_generator(bits_type, input_values, block, context, location)?;
+        generated[1] = annotate_output_memory(generated[1], bits_type, block, context, location)?;
+        Ok(generated)
+    }
+
+    fn lower_unplaced_bit_generator<'b, 'c: 'b, 't: 'c>(
+        self,
+        bits_type: &ArrayType,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        check_count!("input", input_values, 1, ProgramError);
+        let algorithm = match self {
+            RandomAlgorithm::ThreeFry => stable_hlo::RngAlgorithm::ThreeFry,
+            RandomAlgorithm::Philox => stable_hlo::RngAlgorithm::Philox,
+        };
+        let output_type = bits_type.lower(context, location)?;
+        let generated = block.append_operation(stable_hlo::rng_bit_generator(
+            input_values[0],
+            algorithm,
+            output_type,
+            location,
+        )?)?;
+        Ok(vec![generated.result(0).unwrap().as_ref(), generated.result(1).unwrap().as_ref()])
+    }
 }
 
 #[cfg(test)]
@@ -258,7 +283,7 @@ mod tests {
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
     use crate::lowering::tests::{MixedValue, ProgramBuilder, execute_mixed_program, unproject_plain_program};
-    use crate::lowering::types::lower_tensor_type;
+    use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::operations::Operation;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::sessions::tests::domain_mesh;
@@ -495,8 +520,8 @@ mod tests {
         let context = MlirContext::new();
         let location = context.unknown_location();
         let block = context.block(&[
-            (lower_tensor_type(&state_type, &context, location).unwrap(), location),
-            (lower_tensor_type(&ArrayType::scalar(DataType::I64), &context, location).unwrap(), location),
+            (state_type.lower(&context, location).unwrap(), location),
+            (ArrayType::scalar(DataType::I64).lower(&context, location).unwrap(), location),
         ]);
         let inputs = vec![block.argument(0).unwrap().as_ref(), block.argument(1).unwrap().as_ref()];
         let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
@@ -521,8 +546,8 @@ mod tests {
         let context = MlirContext::new();
         let location = context.unknown_location();
         let block = context.block(&[
-            (lower_tensor_type(&state_type, &context, location).unwrap(), location),
-            (lower_tensor_type(&ArrayType::scalar(DataType::I64), &context, location).unwrap(), location),
+            (state_type.lower(&context, location).unwrap(), location),
+            (ArrayType::scalar(DataType::I64).lower(&context, location).unwrap(), location),
         ]);
         let inputs = vec![block.argument(0).unwrap().as_ref(), block.argument(1).unwrap().as_ref()];
         let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());

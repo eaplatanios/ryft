@@ -10,15 +10,15 @@ use ryft_mlir::{
 
 use crate::lowering::EffectTokens;
 use crate::lowering::types::{
-    dimension_extent_i32, dimension_extent_i64, lower_explicit_reshape_shape, lower_runtime_dimension_size_i64,
-    lower_static_index_constants, lower_tensor_type, physical_bound_type, stable_hlo_dynamic_dimension_bound,
-    static_dimensions,
+    ArrayTypeLoweringExtension, dimension_extent_i32, dimension_extent_i64, lower_explicit_reshape_shape,
+    lower_runtime_dimension_size_i64, lower_static_index_constants, physical_bound_type,
+    stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE, ASSERT_RESHAPE_KIND,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::sharding::{OpenDimensions, lower_sharding_constraint};
+use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for ReshapeOperation {
@@ -30,8 +30,7 @@ impl LowerableOperation for ReshapeOperation {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_types, 1, ProgramError);
-        lower_reshape_to_mlir(
-            self,
+        self.lower_to_mlir(
             &input_types[0],
             input_values,
             output_types,
@@ -145,7 +144,7 @@ impl LowerableOperation for DynamicReshapeOperation {
             let reshape =
                 block.append_operation(stable_hlo::dynamic_reshape(input, shape, &output_bounds, location)?)?;
             let result = reshape.result(0).unwrap().as_ref();
-            let expected_type = lower_tensor_type(output_type, context, location)?;
+            let expected_type = output_type.lower(context, location)?;
             if result.r#type()? == expected_type.as_ref() {
                 result
             } else {
@@ -156,7 +155,13 @@ impl LowerableOperation for DynamicReshapeOperation {
         let result = if self.output_sharding().is_some() {
             let output_sharding = output_type.sharding().unwrap();
             let bound_manual_axes = collective_state.bound_manual_axes();
-            lower_sharding_constraint(result, output_sharding, OpenDimensions::All, bound_manual_axes, block, location)?
+            output_sharding.lower_sharding_constraint(
+                result,
+                OpenDimensions::All,
+                bound_manual_axes,
+                block,
+                location,
+            )?
         } else {
             result
         };
@@ -164,98 +169,122 @@ impl LowerableOperation for DynamicReshapeOperation {
     }
 }
 
-/// Lowers a [`ReshapeOperation`] after validating its unary input and single output contract. A static output lowers
-/// to `stablehlo.reshape`. A dynamic output is either the input's own shape, which needs no operation, or a shape that
-/// keeps the input's dynamic dimensions in order and regroups the static dimensions between them, which lowers to
-/// `stablehlo.dynamic_reshape` with a runtime shape that reads each dynamic extent back from the input.
-#[allow(clippy::too_many_arguments)]
-fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &ReshapeOperation,
-    input_type: &ArrayType,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    output_types: &[ArrayType],
-    bound_manual_axes: &[String],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    check_count!("input", input_values, 1, ProgramError);
-    check_count!("output", output_types, 1, ProgramError);
-    let input = input_values[0];
-    let result = if output_types[0].static_shape().is_none() {
-        if input_type.shape() == output_types[0].shape() {
-            // The dynamic target is exactly the input shape, so the input already has the required result type.
-            input
-        } else {
-            // Core type inference admits a dynamic target only when it keeps the dynamic dimensions of the input in
-            // order and regroups the static dimensions between them, so every dynamic output axis corresponds in
-            // order to a dynamic input axis whose runtime size is read back, and every static output axis is a
-            // constant. The physical capacities agree as well, because the static groups keep their element counts.
-            let mut input_axes = input_type
-                .shape()
-                .dimensions()
-                .iter()
-                .enumerate()
-                .filter(|(_, dimension)| matches!(dimension, Dimension::Dynamic(_)))
-                .map(|(axis, _)| axis);
-            let mut extents = Vec::with_capacity(output_types[0].rank());
-            for dimension in output_types[0].shape().dimensions() {
-                extents.push(match dimension {
-                    Dimension::Static(extent) => lower_static_index_constants(&[*extent], block, context, location)?[0],
-                    Dimension::Dynamic(_) => {
-                        let axis = input_axes.next().ok_or_else(|| {
-                            Error::Lowering(LoweringError::UnsupportedOperation {
-                                operation: operation.name().to_string(),
-                                reason: format!(
-                                    "`reshape` from `{}` to `{}` does not preserve the dynamic dimensions in order",
-                                    input_type.shape(),
-                                    output_types[0].shape(),
-                                ),
-                            })
-                        })?;
-                        lower_runtime_dimension_size_i64(input, axis, block, context, location)?
-                    }
-                });
-            }
-            let shape = lower_explicit_reshape_shape(&extents, block, context, location)?;
-            let output_bounds = output_types[0]
-                .shape()
-                .dimensions()
-                .iter()
-                .map(|dimension| match dimension {
-                    Dimension::Static(extent) => Some(*extent),
-                    Dimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(dimension),
-                })
-                .collect::<Vec<_>>();
-            for bound in output_bounds.iter().flatten() {
-                dimension_extent_i32(*bound)?;
-            }
-            let reshape =
-                block.append_operation(stable_hlo::dynamic_reshape(input, shape, &output_bounds, location)?)?;
-            let result = reshape.result(0).unwrap().as_ref();
-            let expected_type = lower_tensor_type(&output_types[0], context, location)?;
-            if result.r#type()? == expected_type.as_ref() {
-                result
+/// Lowering of a [`ReshapeOperation`] for its values.
+trait ReshapeOperationLoweringExtension {
+    /// Lowers a [`ReshapeOperation`] after validating its unary input and single output contract. A static output
+    /// lowers to `stablehlo.reshape`. A dynamic output is either the input's own shape, which needs no operation, or a
+    /// shape that keeps the input's dynamic dimensions in order and regroups the static dimensions between them, which
+    /// lowers to `stablehlo.dynamic_reshape` with a runtime shape that reads each dynamic extent back from the input.
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_type: &ArrayType,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        bound_manual_axes: &[String],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl ReshapeOperationLoweringExtension for ReshapeOperation {
+    #[allow(clippy::too_many_arguments)]
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_type: &ArrayType,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        bound_manual_axes: &[String],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        check_count!("input", input_values, 1, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        let input = input_values[0];
+        let result = if output_types[0].static_shape().is_none() {
+            if input_type.shape() == output_types[0].shape() {
+                // The dynamic target is exactly the input shape, so the input already has the required result type.
+                input
             } else {
-                let cast = block.append_operation(tensor::cast(result, expected_type, location)?)?;
-                cast.result(0).unwrap().as_ref()
+                // Core type inference admits a dynamic target only when it keeps the dynamic dimensions of the input in
+                // order and regroups the static dimensions between them, so every dynamic output axis corresponds in
+                // order to a dynamic input axis whose runtime size is read back, and every static output axis is a
+                // constant. The physical capacities agree as well, because the static groups keep their element counts.
+                let mut input_axes = input_type
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, dimension)| matches!(dimension, Dimension::Dynamic(_)))
+                    .map(|(axis, _)| axis);
+                let mut extents = Vec::with_capacity(output_types[0].rank());
+                for dimension in output_types[0].shape().dimensions() {
+                    extents.push(match dimension {
+                        Dimension::Static(extent) => {
+                            lower_static_index_constants(&[*extent], block, context, location)?[0]
+                        }
+                        Dimension::Dynamic(_) => {
+                            let axis = input_axes.next().ok_or_else(|| {
+                                Error::Lowering(LoweringError::UnsupportedOperation {
+                                    operation: self.name().to_string(),
+                                    reason: format!(
+                                        "`reshape` from `{}` to `{}` does not preserve the dynamic dimensions in order",
+                                        input_type.shape(),
+                                        output_types[0].shape(),
+                                    ),
+                                })
+                            })?;
+                            lower_runtime_dimension_size_i64(input, axis, block, context, location)?
+                        }
+                    });
+                }
+                let shape = lower_explicit_reshape_shape(&extents, block, context, location)?;
+                let output_bounds = output_types[0]
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .map(|dimension| match dimension {
+                        Dimension::Static(extent) => Some(*extent),
+                        Dimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(dimension),
+                    })
+                    .collect::<Vec<_>>();
+                for bound in output_bounds.iter().flatten() {
+                    dimension_extent_i32(*bound)?;
+                }
+                let reshape =
+                    block.append_operation(stable_hlo::dynamic_reshape(input, shape, &output_bounds, location)?)?;
+                let result = reshape.result(0).unwrap().as_ref();
+                let expected_type = output_types[0].lower(context, location)?;
+                if result.r#type()? == expected_type.as_ref() {
+                    result
+                } else {
+                    let cast = block.append_operation(tensor::cast(result, expected_type, location)?)?;
+                    cast.result(0).unwrap().as_ref()
+                }
             }
-        }
-    } else {
-        let output_shape = static_dimensions(&output_types[0])?;
-        for dimension in &output_shape {
-            dimension_extent_i64(*dimension)?;
-        }
-        let reshape = block.append_operation(stable_hlo::reshape(input, output_shape.as_slice(), location)?)?;
-        reshape.result(0).unwrap().as_ref()
-    };
-    let result = if operation.output_sharding().is_some() {
-        let output_sharding = output_types[0].sharding().unwrap();
-        lower_sharding_constraint(result, output_sharding, OpenDimensions::All, bound_manual_axes, block, location)?
-    } else {
-        result
-    };
-    Ok(vec![result])
+        } else {
+            let output_shape = static_dimensions(&output_types[0])?;
+            for dimension in &output_shape {
+                dimension_extent_i64(*dimension)?;
+            }
+            let reshape = block.append_operation(stable_hlo::reshape(input, output_shape.as_slice(), location)?)?;
+            reshape.result(0).unwrap().as_ref()
+        };
+        let result = if self.output_sharding().is_some() {
+            let output_sharding = output_types[0].sharding().unwrap();
+            output_sharding.lower_sharding_constraint(
+                result,
+                OpenDimensions::All,
+                bound_manual_axes,
+                block,
+                location,
+            )?
+        } else {
+            result
+        };
+        Ok(vec![result])
+    }
 }
 
 /// Checks equality of the input and output logical element counts without overflowing device-side arithmetic.
@@ -1401,22 +1430,22 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_reshape_to_mlir_input_arity() {
+    fn test_reshape_operation_lower_to_mlir_input_arity() {
         let context = MlirContext::new();
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
         let mut block = module.body().unwrap();
-        let error = lower_reshape_to_mlir(
-            &ReshapeOperation::new(vec![4], vec![4]),
-            &test_vector_type(4),
-            &[],
-            &[test_vector_type(4)],
-            &[],
-            &mut block,
-            &context,
-            location.as_ref(),
-        )
-        .unwrap_err();
+        let error = ReshapeOperation::new(vec![4], vec![4])
+            .lower_to_mlir(
+                &test_vector_type(4),
+                &[],
+                &[test_vector_type(4)],
+                &[],
+                &mut block,
+                &context,
+                location.as_ref(),
+            )
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -1428,17 +1457,17 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_reshape_to_mlir_dynamic_dimension_order() {
+    fn test_reshape_operation_lower_to_mlir_dynamic_dimension_order() {
         // Core type inference never pairs a static input with a dynamic target, so this lowers that pair directly.
         let input_type = test_vector_type(4);
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let block = context.block(&[(lower_tensor_type(&input_type, &context, location).unwrap(), location)]);
+        let block = context.block(&[(input_type.lower(&context, location).unwrap(), location)]);
         let input = block.argument(0).unwrap().as_ref();
+        let operation = ReshapeOperation::new(input_type.shape().clone(), output_type.shape().clone());
         assert!(matches!(
-            lower_reshape_to_mlir(
-                &ReshapeOperation::new(input_type.shape().clone(), output_type.shape().clone()),
+            operation.lower_to_mlir(
                 &input_type,
                 &[input],
                 &[output_type],
@@ -1568,7 +1597,7 @@ mod tests {
                 if input_size != output_size {
                     assert_eq!(
                         execution.err().unwrap().to_string(),
-                        format!("`reshape` changes the number of elements from {input_size} to {output_size}")
+                        format!("`reshape` changes the number of elements from {input_size} to {output_size}"),
                     );
                 } else {
                     let outputs = execution.unwrap().remove(0).outputs;

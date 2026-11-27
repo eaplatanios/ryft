@@ -12,13 +12,12 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    lower_compare_to_mlir, lower_constant_elements_attribute, lower_element_type, lower_f64_constant_splat,
-    lower_f64_scalar_elements_attribute, lower_restore_dynamic_dimensions, lower_signed_one_bit_to_mlir,
-    lower_tensor_type, lower_unplaced_constant_output, physical_bound_type, signed_integer_width,
-    unsigned_integer_width,
+    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, DataTypeLoweringExtension,
+    lower_f64_constant_splat, lower_signed_one_bit_to_mlir, lower_unplaced_constant_output, physical_bound_type,
+    signed_integer_width, unsigned_integer_width,
 };
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
-use crate::sharding::lower_replication_constraint;
+use crate::sharding::ShardingExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// Lowers the scalar product combiner of a `reduce` or `cumulative` body over `element_type`. Complex operands return
@@ -75,7 +74,7 @@ pub(crate) fn build_reduce_body_region<'c, 't>(
     location: LocationRef<'c, 't>,
 ) -> Result<DetachedRegion<'c, 't>, Error> {
     let scalar_array_type = ArrayType::scalar(element_type);
-    let scalar_tensor_type = lower_tensor_type(&scalar_array_type, context, location)?;
+    let scalar_tensor_type = scalar_array_type.lower(context, location)?;
     let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
     let mut region = context.region();
     let mut block_ref = region.append_block(block)?;
@@ -118,132 +117,150 @@ pub(crate) fn build_reduce_body_region<'c, 't>(
     Ok(region)
 }
 
-/// Lowers an [`ArrayOperation::Reduce`](ryft_core::ArrayOperation::Reduce) dispatch using the reduction kind's scalar
-/// combiner and identity. [`ReductionKind::Mean`] divides a sum by the reduced element count, while
-/// [`ReductionKind::LogSumExp`] uses the guarded expansion shifted by the maximum in [`lower_log_sum_exp_to_mlir`].
-/// Floating-point extrema, including the maximum of that expansion, use the provided [`FloatExtremumForm`]. Callers
-/// that lower for a target obtain it from [`FloatExtremumForm::for_combiner`], and it has no effect on the other kinds.
-/// The [`FloatExtremumForm::TotalOrder`] extrema of the floating-point types that have [`TotalOrderKeys`] reduce those
-/// keys instead of comparing in the combiner, as [`lower_total_order_extremum_reduce_to_mlir`] describes.
-pub(crate) fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
-    kind: ReductionKind,
-    axes: &[usize],
-    input_value: ValueRef<'b, 'c, 't>,
-    output_array_type: &ArrayType,
-    form: FloatExtremumForm,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let element_type = output_array_type.data_type();
-    if matches!(kind, ReductionKind::Sum | ReductionKind::Product | ReductionKind::Mean | ReductionKind::LogSumExp)
-        && element_type.is_floating_point()
-        && !matches!(element_type, DataType::F32 | DataType::F64)
-        && (element_type != DataType::F8E8M0FNU || kind == ReductionKind::Product)
-        && (kind != ReductionKind::LogSumExp
-            || matches!(
-                element_type,
-                DataType::BF16 | DataType::F16 | DataType::F8E3M4 | DataType::F8E4M3 | DataType::F8E5M2,
-            ))
-    {
-        // Keep both accumulation and mean normalization in `f32`, because rounding the sum or count first can overflow.
-        let input_type = input_value.r#type()?.cast::<TensorTypeRef>().unwrap();
-        let working_input_type = context.tensor_type(
-            context.float32_type(),
-            &input_type.dimensions().collect::<Vec<_>>(),
-            None,
-            location,
-        )?;
-        let input = block
-            .append_operation(stable_hlo::convert(input_value, working_input_type, location)?)?
-            .result(0)
-            .unwrap()
-            .as_ref();
-        let output = lower_reduce_to_mlir(
-            kind,
-            axes,
-            input,
-            &output_array_type.clone().with_data_type(DataType::F32),
-            form,
-            block,
-            context,
-            location,
-        )?;
-        return Ok(block
-            .append_operation(stable_hlo::convert(
-                output,
-                lower_tensor_type(output_array_type, context, location)?,
+/// Lowering of reductions of a [`ReductionKind`] to StableHLO.
+pub(crate) trait ReductionKindLoweringExtension {
+    /// Lowers an [`ArrayOperation::Reduce`](ryft_core::ArrayOperation::Reduce) dispatch using the reduction kind's
+    /// scalar combiner and identity. [`ReductionKind::Mean`] divides a sum by the reduced element count, while
+    /// [`ReductionKind::LogSumExp`] uses the guarded expansion shifted by the maximum in [`lower_log_sum_exp_to_mlir`].
+    /// Floating-point extrema, including the maximum of that expansion, use the provided [`FloatExtremumForm`]. Callers
+    /// that lower for a target obtain it from [`FloatExtremumForm::for_combiner`], and it has no effect on the other
+    /// kinds. The [`FloatExtremumForm::TotalOrder`] extrema of the floating-point types that have [`TotalOrderKeys`]
+    /// reduce those keys instead of comparing in the combiner, as [`lower_total_order_extremum_reduce_to_mlir`]
+    /// describes.
+    fn lower<'b, 'c: 'b, 't: 'c>(
+        self,
+        axes: &[usize],
+        input_value: ValueRef<'b, 'c, 't>,
+        output_array_type: &ArrayType,
+        form: FloatExtremumForm,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+}
+
+impl ReductionKindLoweringExtension for ReductionKind {
+    fn lower<'b, 'c: 'b, 't: 'c>(
+        self,
+        axes: &[usize],
+        input_value: ValueRef<'b, 'c, 't>,
+        output_array_type: &ArrayType,
+        form: FloatExtremumForm,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        let element_type = output_array_type.data_type();
+        if matches!(self, ReductionKind::Sum | ReductionKind::Product | ReductionKind::Mean | ReductionKind::LogSumExp)
+            && element_type.is_floating_point()
+            && !matches!(element_type, DataType::F32 | DataType::F64)
+            && (element_type != DataType::F8E8M0FNU || self == ReductionKind::Product)
+            && (self != ReductionKind::LogSumExp
+                || matches!(
+                    element_type,
+                    DataType::BF16 | DataType::F16 | DataType::F8E3M4 | DataType::F8E4M3 | DataType::F8E5M2,
+                ))
+        {
+            // Keep both accumulation and mean normalization in `f32`, because rounding the sum or count first can
+            // overflow.
+            let input_type = input_value.r#type()?.cast::<TensorTypeRef>().unwrap();
+            let working_input_type = context.tensor_type(
+                context.float32_type(),
+                &input_type.dimensions().collect::<Vec<_>>(),
+                None,
                 location,
-            )?)?
-            .result(0)
-            .unwrap()
-            .as_ref());
-    }
-    if kind == ReductionKind::LogSumExp {
-        return lower_log_sum_exp_to_mlir(axes, input_value, output_array_type, form, block, context, location);
-    }
-    if matches!(kind, ReductionKind::Max | ReductionKind::Min)
-        && form == FloatExtremumForm::TotalOrder
-        && let Some(keys) = TotalOrderKeys::of(element_type)
-    {
-        return lower_total_order_extremum_reduce_to_mlir(
-            kind == ReductionKind::Max,
+            )?;
+            let input = block
+                .append_operation(stable_hlo::convert(input_value, working_input_type, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
+            let output = self.lower(
+                axes,
+                input,
+                &output_array_type.clone().with_data_type(DataType::F32),
+                form,
+                block,
+                context,
+                location,
+            )?;
+            return Ok(block
+                .append_operation(stable_hlo::convert(output, output_array_type.lower(context, location)?, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref());
+        }
+        if self == ReductionKind::LogSumExp {
+            return lower_log_sum_exp_to_mlir(axes, input_value, output_array_type, form, block, context, location);
+        }
+        if matches!(self, ReductionKind::Max | ReductionKind::Min)
+            && form == FloatExtremumForm::TotalOrder
+            && let Some(keys) = TotalOrderKeys::of(element_type)
+        {
+            return lower_total_order_extremum_reduce_to_mlir(
+                self == ReductionKind::Max,
+                axes,
+                input_value,
+                output_array_type,
+                keys,
+                block,
+                context,
+                location,
+            );
+        }
+        let initial_value = build_reduction_identity_constant(self, element_type, block, context, location)?;
+        let body_region = build_reduce_body_region(self, element_type, form, context, location)?;
+        let reduced = block.append_operation(stable_hlo::reduce(
+            &[input_value],
+            &[initial_value],
             axes,
-            input_value,
-            output_array_type,
-            keys,
-            block,
-            context,
+            body_region,
             location,
-        );
-    }
-    let initial_value = build_reduction_identity_constant(kind, element_type, block, context, location)?;
-    let body_region = build_reduce_body_region(kind, element_type, form, context, location)?;
-    let reduced =
-        block.append_operation(stable_hlo::reduce(&[input_value], &[initial_value], axes, body_region, location)?)?;
-    let reduced = reduced.result(0).unwrap().as_ref();
-    if !matches!(kind, ReductionKind::Mean) {
-        return Ok(reduced);
-    }
-    // Floating-point empty means use `0 / 0`, producing NaN. Integer means retain the zero identity by clamping
-    // the count, since integer division has no NaN representation.
-    let input_type = input_value.r#type()?;
-    let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| {
-        Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: REDUCE_OPERATION_NAME.to_string(),
-            reason: format!("`reduce` operand has non-tensor MLIR type `{input_type}`"),
-        })
-    })?;
-    let dimensions = input_tensor_type.dimensions().collect::<Vec<_>>();
-    let mut count = 1usize;
-    for axis in axes {
-        match dimensions.get(*axis) {
-            Some(MlirSize::Static(size)) => count *= size,
-            _ => {
-                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                    operation: REDUCE_OPERATION_NAME.to_string(),
-                    reason: format!("`reduce` mean over dynamically sized axis {axis}"),
-                }));
+        )?)?;
+        let reduced = reduced.result(0).unwrap().as_ref();
+        if !matches!(self, ReductionKind::Mean) {
+            return Ok(reduced);
+        }
+        // Floating-point empty means use `0 / 0`, producing NaN. Integer means retain the zero identity by clamping
+        // the count, since integer division has no NaN representation.
+        let input_type = input_value.r#type()?;
+        let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| {
+            Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: REDUCE_OPERATION_NAME.to_string(),
+                reason: format!("`reduce` operand has non-tensor MLIR type `{input_type}`"),
+            })
+        })?;
+        let dimensions = input_tensor_type.dimensions().collect::<Vec<_>>();
+        let mut count = 1usize;
+        for axis in axes {
+            match dimensions.get(*axis) {
+                Some(MlirSize::Static(size)) => count *= size,
+                _ => {
+                    return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                        operation: REDUCE_OPERATION_NAME.to_string(),
+                        reason: format!("`reduce` mean over dynamically sized axis {axis}"),
+                    }));
+                }
             }
         }
-    }
-    let output_tensor_type = lower_tensor_type(output_array_type, context, location)?;
-    let count = if element_type.is_integer() { count.max(1) } else { count };
-    let divisor = if element_type.is_complex() {
-        let part_type = output_array_type.clone().with_data_type(if element_type == DataType::C64 {
-            DataType::F32
+        let output_tensor_type = output_array_type.lower(context, location)?;
+        let count = if element_type.is_integer() { count.max(1) } else { count };
+        let divisor = if element_type.is_complex() {
+            let part_type = output_array_type.clone().with_data_type(if element_type == DataType::C64 {
+                DataType::F32
+            } else {
+                DataType::F64
+            });
+            let part_tensor_type = part_type.lower(context, location)?;
+            let real = lower_f64_constant_splat(count as f64, &part_type, part_tensor_type, block, context, location)?;
+            let imaginary = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
+            block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0).unwrap().as_ref()
         } else {
-            DataType::F64
-        });
-        let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
-        let real = lower_f64_constant_splat(count as f64, &part_type, part_tensor_type, block, context, location)?;
-        let imaginary = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
-        block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0).unwrap().as_ref()
-    } else {
-        lower_f64_constant_splat(count as f64, output_array_type, output_tensor_type, block, context, location)?
-    };
-    let mean = block.append_operation(stable_hlo::divide(reduced, divisor, location)?)?;
-    Ok(mean.result(0).unwrap().as_ref())
+            lower_f64_constant_splat(count as f64, output_array_type, output_tensor_type, block, context, location)?
+        };
+        let mean = block.append_operation(stable_hlo::divide(reduced, divisor, location)?)?;
+        Ok(mean.result(0).unwrap().as_ref())
+    }
 }
 
 /// Builds a scalar constant equal to the identity element for the given reduction kind, returned as an MLIR
@@ -256,7 +273,7 @@ pub(crate) fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let scalar_array_type = ArrayType::scalar(element_type);
-    let scalar_tensor_type = lower_tensor_type(&scalar_array_type, context, location)?;
+    let scalar_tensor_type = scalar_array_type.lower(context, location)?;
     if element_type.is_complex() {
         let real = match kind {
             ReductionKind::Sum | ReductionKind::Mean => 0.0,
@@ -272,7 +289,7 @@ pub(crate) fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
         };
         let part_data_type = if element_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
         let part_type = ArrayType::scalar(part_data_type);
-        let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+        let part_tensor_type = part_type.lower(context, location)?;
         let real_value = lower_f64_constant_splat(real, &part_type, part_tensor_type, block, context, location)?;
         // Products use `1 + 0i`, while lexicographic extrema need both components at the same bound.
         let imaginary_value = if kind == ReductionKind::Product {
@@ -327,17 +344,15 @@ impl LowerableOperation for ReduceOperation {
         if let Some(sharding) = shardable_sharding
             && !has_distributable_combiner(self.kind(), element_type, form)
         {
-            input_value = lower_replication_constraint(
+            input_value = sharding.lower_replication_constraint(
                 input_value,
-                sharding,
                 self.axes(),
                 lowerer.collective_state().bound_manual_axes(),
                 &mut lowerer.block(),
                 lowerer.location(),
             )?;
         }
-        let value = lower_reduce_to_mlir(
-            self.kind(),
+        let value = self.kind().lower(
             self.axes(),
             input_value,
             &output_types[0],
@@ -498,11 +513,10 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
         _ => (element_type, input_value),
     };
     let shift_type = output_array_type.clone().with_data_type(shift_element_type);
-    let maximum =
-        lower_reduce_to_mlir(ReductionKind::Max, axes, maximum_input, &shift_type, form, block, context, location)?;
+    let maximum = ReductionKind::Max.lower(axes, maximum_input, &shift_type, form, block, context, location)?;
     let finite = block.append_operation(stable_hlo::is_finite(maximum, location)?)?;
     let finite = finite.result(0).unwrap().as_ref();
-    let shift_tensor_type = lower_tensor_type(&shift_type, context, location)?;
+    let shift_tensor_type = shift_type.lower(context, location)?;
     let zero = lower_f64_constant_splat(0.0, &shift_type, shift_tensor_type, block, context, location)?;
     let shift = block.append_operation(stable_hlo::select(finite, maximum, zero, location)?)?;
     let shift = shift.result(0).unwrap().as_ref();
@@ -545,12 +559,12 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
 /// result = bitcast(total_order_keys(reduce(keys)))    // with the key of the identity as the initial value
 /// ```
 ///
-/// The result is the one of a reduction that compares in the total order and propagates NaNs in its combiner (i.e.,
-/// the [`FloatExtremumForm::TotalOrder`] form of [`lower_extremum_to_mlir`]), but that combiner is not one that XLA
-/// can distribute. XLA partitions a reduction over a sharded dimension into a reduction of every shard that is
-/// followed by an all-reduce with the same combiner, and its backends implement all-reduce only for the combiners that
-/// consist of one operation that they recognize, as
-/// [`lower_collective_to_all_reduce`](crate::operations::collectives::parallel_reduce::lower_collective_to_all_reduce)
+/// The result is the one of a reduction that compares in the total order and propagates NaNs in its combiner (i.e., the
+/// [`FloatExtremumForm::TotalOrder`] form of [`lower_extremum_to_mlir`]), but that combiner is not one that XLA can
+/// distribute. XLA partitions a reduction over a sharded dimension into a reduction of every shard that is followed by
+/// an all-reduce with the same combiner, and its backends implement all-reduce only for the combiners that consist of
+/// one operation that they recognize, as
+/// [`lower_to_all_reduce`](crate::operations::collectives::parallel_reduce::ParallelReduceOperationLoweringExtension::lower_to_all_reduce)
 /// describes. The comparisons move out of the combiner because the keys are computed once for every element, which
 /// costs what the expansion of the total order comparison inside of the combiner costs.
 ///
@@ -579,8 +593,8 @@ fn lower_total_order_extremum_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-        let scalar_type = lower_tensor_type(&ArrayType::scalar(keys.data_type), context, location)?;
-        let elements = lower_constant_elements_attribute(keys.data_type, scalar_type, value, context)?;
+        let scalar_type = ArrayType::scalar(keys.data_type).lower(context, location)?;
+        let elements = keys.data_type.lower_constant_elements_attribute(scalar_type, value, context)?;
         let scalar = block.append_operation(stable_hlo::constant(elements, location)?)?;
         let scalar = scalar.result(0).unwrap().as_ref();
         let splat = block.append_operation(stable_hlo::clamp(scalar, like, scalar, location)?)?;
@@ -619,7 +633,7 @@ fn lower_total_order_extremum_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
         })
     })?;
     let input_keys_type = context.tensor_type(
-        lower_element_type(keys.data_type, context)?,
+        keys.data_type.lower(context)?,
         &input_tensor_type.dimensions().collect::<Vec<_>>(),
         input_tensor_type.encoding()?,
         location,
@@ -645,8 +659,8 @@ fn lower_total_order_extremum_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
     let input_keys = input_keys.result(0).unwrap().as_ref();
 
     let kind = if maximum { ReductionKind::Max } else { ReductionKind::Min };
-    let scalar_keys_type = lower_tensor_type(&ArrayType::scalar(keys.data_type), context, location)?;
-    let identity = lower_constant_elements_attribute(keys.data_type, scalar_keys_type, identity_key, context)?;
+    let scalar_keys_type = ArrayType::scalar(keys.data_type).lower(context, location)?;
+    let identity = keys.data_type.lower_constant_elements_attribute(scalar_keys_type, identity_key, context)?;
     let identity = block.append_operation(stable_hlo::constant(identity, location)?)?;
     let identity = identity.result(0).unwrap().as_ref();
     let body_region = build_reduce_body_region(kind, keys.data_type, FloatExtremumForm::TotalOrder, context, location)?;
@@ -655,7 +669,7 @@ fn lower_total_order_extremum_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
     let reduced = reduced.result(0).unwrap().as_ref();
 
     let bits = convert(reduced, keys, block, context, location)?;
-    let output_tensor_type = lower_tensor_type(output_array_type, context, location)?;
+    let output_tensor_type = output_array_type.lower(context, location)?;
     let result = block.append_operation(stable_hlo::bitcast_convert(bits, output_tensor_type, location)?)?;
     let result = result.result(0).unwrap().as_ref();
     if maximum {
@@ -705,7 +719,7 @@ fn build_reduction_identity_attribute<'c, 't>(
                 }));
             }
         };
-        return lower_f64_scalar_elements_attribute(element_type, tensor_type, identity, context);
+        return element_type.lower_f64_scalar_elements_attribute(tensor_type, identity, context);
     }
     if let Some((minimum, maximum)) = integer_reduction_identity_bounds(element_type) {
         let identity = match kind {
@@ -720,7 +734,7 @@ fn build_reduction_identity_attribute<'c, 't>(
                 }));
             }
         };
-        return lower_constant_elements_attribute(element_type, tensor_type, identity, context);
+        return element_type.lower_constant_elements_attribute(tensor_type, identity, context);
     }
     match (kind, element_type) {
         (ReductionKind::Any | ReductionKind::Max, DataType::Boolean) => Ok(context
@@ -763,9 +777,10 @@ fn float_reduction_identity_bounds(data_type: DataType) -> Option<(f64, f64)> {
 }
 
 /// Returns the `(minimum, maximum)` values representable by the given integer data type, used as the `Max` and `Min`
-/// reduction identities. The values are raw `i64` payloads for [`lower_constant_elements_attribute`], which encodes
-/// them at the type's width and signedness. [`DataType::U64`]'s maximum therefore wraps to `-1`, whose two's
-/// complement bits are exactly `u64::MAX`. Returns `None` for non-integer data types.
+/// reduction identities. The values are raw `i64` payloads for
+/// [`DataTypeLoweringExtension::lower_constant_elements_attribute`], which encodes them at the type's width and
+/// signedness. [`DataType::U64`]'s maximum therefore wraps to `-1`, whose two's complement bits are exactly `u64::MAX`.
+/// Returns `None` for non-integer data types.
 fn integer_reduction_identity_bounds(data_type: DataType) -> Option<(i64, i64)> {
     if data_type.is_signed() {
         let width = signed_integer_width(data_type).unwrap();
@@ -778,13 +793,13 @@ fn integer_reduction_identity_bounds(data_type: DataType) -> Option<(i64, i64)> 
     }
 }
 
-/// Returns whether XLA can distribute the `stablehlo.reduce` operations that [`lower_reduce_to_mlir`] emits for a
-/// reduction of the provided kind over `element_type` in the provided [`FloatExtremumForm`]. XLA partitions a
-/// reduction over a sharded dimension into a reduction of every shard that is followed by an all-reduce with the same
+/// Returns whether XLA can distribute the `stablehlo.reduce` operations that [`ReductionKindLoweringExtension::lower`]
+/// emits for a reduction of the provided kind over `element_type` in the provided [`FloatExtremumForm`]. XLA partitions
+/// a reduction over a sharded dimension into a reduction of every shard that is followed by an all-reduce with the same
 /// combiner, and its backends implement all-reduce only for the combiners that consist of one operation that they
 /// recognize. The combiners that do not are the lexicographic comparison of complex extrema, the complex product of
-/// [`lower_product_combiner_to_mlir`], and the comparisons and NaN selections of floating-point extrema
-/// that do not reduce [`TotalOrderKeys`], which are also the extrema inside of a [`ReductionKind::LogSumExp`].
+/// [`lower_product_combiner_to_mlir`], and the comparisons and NaN selections of floating-point extrema that do not
+/// reduce [`TotalOrderKeys`], which are also the extrema inside of a [`ReductionKind::LogSumExp`].
 fn has_distributable_combiner(kind: ReductionKind, element_type: DataType, form: FloatExtremumForm) -> bool {
     match kind {
         ReductionKind::Sum | ReductionKind::Mean | ReductionKind::Any | ReductionKind::All => true,
@@ -826,8 +841,7 @@ fn lower_index_reduction_to_mlir<'b, 'c: 'b, 't: 'c>(
     let (value, value_data_type) = match input_type.data_type() {
         DataType::I1 => (lower_signed_one_bit_to_mlir(input_value, block, context, location)?, DataType::I8),
         data_type if data_type.is_floating_point() && !matches!(data_type, DataType::F32 | DataType::F64) => {
-            let working_type =
-                lower_tensor_type(&ArrayType::new(DataType::F32, input_type.shape().clone()), context, location)?;
+            let working_type = (ArrayType::new(DataType::F32, input_type.shape().clone())).lower(context, location)?;
             let converted = block.append_operation(stable_hlo::convert(input_value, working_type, location)?)?;
             (converted.result(0).unwrap().as_ref(), DataType::F32)
         }
@@ -842,15 +856,15 @@ fn lower_index_reduction_to_mlir<'b, 'c: 'b, 't: 'c>(
     // the input. It is built at the physical bound of every dynamic axis and then receives the runtime extents of the
     // input. Statically shaped inputs need no refinement.
     let index_type = ArrayType::new(index_data_type, input_type.shape().clone());
-    let physical_index_tensor_type = lower_tensor_type(&physical_bound_type(&index_type)?, context, location)?;
+    let physical_index_tensor_type = physical_bound_type(&index_type)?.lower(context, location)?;
     let indices = block.append_operation(stable_hlo::iota(physical_index_tensor_type, axis, location)?)?;
     let indices = indices.result(0).unwrap().as_ref();
     let extent_sources = (0..index_type.rank()).map(|axis| (input_value, axis)).collect::<Vec<_>>();
-    let indices = lower_restore_dynamic_dimensions(indices, &index_type, &extent_sources, block, context, location)?;
+    let indices = index_type.lower_restore_dynamic_dimensions(indices, &extent_sources, block, context, location)?;
     let identity_kind = if maximize { ReductionKind::Max } else { ReductionKind::Min };
     let value_identity = build_reduction_identity_constant(identity_kind, value_data_type, block, context, location)?;
     let scalar_index_type = ArrayType::scalar(index_data_type);
-    let scalar_index_tensor_type = lower_tensor_type(&scalar_index_type, context, location)?;
+    let scalar_index_tensor_type = scalar_index_type.lower(context, location)?;
     let index_identity =
         lower_f64_constant_splat(0.0, &scalar_index_type, scalar_index_tensor_type, block, context, location)?;
     let body = build_index_reduction_body_region(maximize, value_data_type, index_data_type, context, location)?;
@@ -865,7 +879,7 @@ fn lower_index_reduction_to_mlir<'b, 'c: 'b, 't: 'c>(
     if index_data_type == output_type.data_type() {
         return Ok(reduced_indices);
     }
-    let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+    let output_tensor_type = output_type.lower(context, location)?;
     let converted = block.append_operation(stable_hlo::convert(reduced_indices, output_tensor_type, location)?)?;
     Ok(converted.result(0).unwrap().as_ref())
 }
@@ -884,8 +898,8 @@ fn build_index_reduction_body_region<'c, 't>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<DetachedRegion<'c, 't>, Error> {
-    let value_tensor_type = lower_tensor_type(&ArrayType::scalar(value_data_type), context, location)?;
-    let index_tensor_type = lower_tensor_type(&ArrayType::scalar(index_data_type), context, location)?;
+    let value_tensor_type = ArrayType::scalar(value_data_type).lower(context, location)?;
+    let index_tensor_type = ArrayType::scalar(index_data_type).lower(context, location)?;
     let block = context.block(&[
         (value_tensor_type, location),
         (index_tensor_type, location),
@@ -899,16 +913,16 @@ fn build_index_reduction_body_region<'c, 't>(
     let right_value = block_ref.argument(2)?.as_ref();
     let right_index = block_ref.argument(3)?.as_ref();
     let direction = if maximize { ComparisonDirection::GreaterThan } else { ComparisonDirection::LessThan };
-    let mut better = lower_compare_to_mlir(direction, left_value, right_value, &mut block_ref, location)?;
+    let mut better = direction.lower_comparison(left_value, right_value, &mut block_ref, location)?;
     let mut equivalent =
-        lower_compare_to_mlir(ComparisonDirection::Equal, left_value, right_value, &mut block_ref, location)?;
+        ComparisonDirection::Equal.lower_comparison(left_value, right_value, &mut block_ref, location)?;
     if value_data_type.is_floating_point() {
         let left_is_nan =
-            lower_compare_to_mlir(ComparisonDirection::NotEqual, left_value, left_value, &mut block_ref, location)?;
+            ComparisonDirection::NotEqual.lower_comparison(left_value, left_value, &mut block_ref, location)?;
         let right_is_nan =
-            lower_compare_to_mlir(ComparisonDirection::NotEqual, right_value, right_value, &mut block_ref, location)?;
+            ComparisonDirection::NotEqual.lower_comparison(right_value, right_value, &mut block_ref, location)?;
         let right_is_ordered =
-            lower_compare_to_mlir(ComparisonDirection::Equal, right_value, right_value, &mut block_ref, location)?;
+            ComparisonDirection::Equal.lower_comparison(right_value, right_value, &mut block_ref, location)?;
         let nan_beats_ordered =
             block_ref.append_operation(stable_hlo::and(left_is_nan, right_is_ordered, location)?)?;
         let nan_beats_ordered = nan_beats_ordered.result(0).unwrap().as_ref();
@@ -926,7 +940,7 @@ fn build_index_reduction_body_region<'c, 't>(
             .as_ref();
     }
     let lower_index =
-        lower_compare_to_mlir(ComparisonDirection::LessThan, left_index, right_index, &mut block_ref, location)?;
+        ComparisonDirection::LessThan.lower_comparison(left_index, right_index, &mut block_ref, location)?;
     let tie = block_ref.append_operation(stable_hlo::and(equivalent, lower_index, location)?)?;
     let tie = tie.result(0).unwrap().as_ref();
     let pick_left = block_ref.append_operation(stable_hlo::or(better, tie, location)?)?;
@@ -956,7 +970,8 @@ mod tests {
 
     use crate::lowering::tests::{
         ProgramBuilder, UnreducedApplication, UnreducedInput, lower_unreduced_application, lowered_reduce_module,
-        lowered_unary_module, to_mlir_module_for_plain_program, unproject_plain_program,
+        lowered_unary_module, test_matrix_type, test_vector_type, to_mlir_module_for_plain_program,
+        unproject_plain_program,
     };
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type, two_device_mesh};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
@@ -1028,6 +1043,38 @@ mod tests {
                     && reason == "`reduce` with kind `log_sum_exp` requires a maximum-shifted expansion instead of a \
                                   scalar combiner",
         ));
+    }
+
+    #[test]
+    fn test_reduction_kind_lower() {
+        // `Mean` divides the sum by the static count of the reduced elements. The operations are rendered outside any
+        // function, so their detached inputs print as unknown SSA values.
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let input_type = test_matrix_type(2, 3).lower(&context, location).unwrap();
+        let block = context.block(&[(input_type, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let output_type = test_vector_type(3);
+        let form = FloatExtremumForm::TotalOrder;
+        let mut block_ref = block.as_ref();
+        let location = location.as_ref();
+        let sum = ReductionKind::Sum.lower(&[0], input, &output_type, form, &mut block_ref, &context, location);
+        let mean = ReductionKind::Mean.lower(&[0], input, &output_type, form, &mut block_ref, &context, location);
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(sum.unwrap(), operations[1].result(0).unwrap().as_ref());
+        assert_eq!(mean.unwrap(), operations[6].result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "%cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>",
+                "%0 = stablehlo.reduce(<<UNKNOWN SSA VALUE>> init: <<UNKNOWN SSA VALUE>>) applies stablehlo.add across dimensions = [0] : (tensor<2x3xf32>, tensor<f32>) -> tensor<3xf32>",
+                "%cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>",
+                "%0 = stablehlo.reduce(<<UNKNOWN SSA VALUE>> init: <<UNKNOWN SSA VALUE>>) applies stablehlo.add across dimensions = [0] : (tensor<2x3xf32>, tensor<f32>) -> tensor<3xf32>",
+                "%cst = stablehlo.constant dense<2.000000e+00> : tensor<f32>",
+                "%0 = stablehlo.broadcast_in_dim <<UNKNOWN SSA VALUE>>, dims = [] : (tensor<f32>) -> tensor<3xf32>",
+                "%0 = stablehlo.divide <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>> : tensor<3xf32>",
+            ],
+        );
     }
 
     #[test]

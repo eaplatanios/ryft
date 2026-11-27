@@ -8,7 +8,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::states::CollectiveLoweringState;
-use crate::lowering::types::lower_tensor_type;
+use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::operations::collectives::refine_collective_result_dimensions;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation, Type};
 
@@ -37,8 +37,7 @@ impl LowerableOperation for ParallelAllGatherOperation {
                 operation.infer_output_types(input_types, &[])
             },
         )?;
-        lower_parallel_all_gather_to_mlir(
-            self,
+        self.lower_to_mlir(
             &collective_state,
             input_values[0],
             &output_types[0],
@@ -82,44 +81,54 @@ impl MemberLowerableOperation<Type> for ParallelAllGatherOperation {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
         let output_type = <&ArrayType>::try_from(output_type)?;
-        let result =
-            lower_parallel_all_gather_to_mlir(self, collective_state, *input, output_type, block, context, location)?
-                .remove(0);
+        let result = self.lower_to_mlir(collective_state, *input, output_type, block, context, location)?.remove(0);
         refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
     }
 }
 
-/// Lowers one traced `parallel_all_gather` to a channeled `stablehlo.all_gather` over the named mesh axis's replica
-/// groups.
-fn lower_parallel_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &ParallelAllGatherOperation,
-    collective_state: &CollectiveLoweringState,
-    input_value: ValueRef<'b, 'c, 't>,
-    output_array_type: &ArrayType,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let (replica_groups, _) = collective_state.replica_groups(
-        operation.axes(),
-        operation.axis_size(),
-        operation.options().axis_index_groups(),
-    )?;
-    let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
-    let input_value =
-        insert_untiled_all_gather_axis(operation, input_value, output_array_type, block, context, location)?;
-    let output_type = lower_tensor_type(output_array_type, context, location)?;
-    let result = block.append_operation(stable_hlo::all_gather(
-        &[input_value],
-        operation.concatenation_axis(),
-        stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-        Some(collective_state.next_channel_id()),
-        Some(stable_hlo::ChannelHandleType::DeviceToDevice),
-        true,
-        &[output_type],
-        location,
-    )?)?;
-    Ok(vec![result.result(0).unwrap().as_ref()])
+/// Lowering of a [`ParallelAllGatherOperation`] for one value.
+trait ParallelAllGatherOperationLoweringExtension {
+    /// Lowers one traced `parallel_all_gather` to a channeled `stablehlo.all_gather` over the named mesh axis's replica
+    /// groups.
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_value: ValueRef<'b, 'c, 't>,
+        output_array_type: &ArrayType,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl ParallelAllGatherOperationLoweringExtension for ParallelAllGatherOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_value: ValueRef<'b, 'c, 't>,
+        output_array_type: &ArrayType,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let (replica_groups, _) =
+            collective_state.replica_groups(self.axes(), self.axis_size(), self.options().axis_index_groups())?;
+        let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
+        let input_value =
+            insert_untiled_all_gather_axis(self, input_value, output_array_type, block, context, location)?;
+        let output_type = output_array_type.lower(context, location)?;
+        let result = block.append_operation(stable_hlo::all_gather(
+            &[input_value],
+            self.concatenation_axis(),
+            stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
+            Some(collective_state.next_channel_id()),
+            Some(stable_hlo::ChannelHandleType::DeviceToDevice),
+            true,
+            &[output_type],
+            location,
+        )?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
+    }
 }
 
 /// Returns `input_value` with the unit participant axis that an untiled all-gather inserts at its concatenation axis,
@@ -137,8 +146,7 @@ fn insert_untiled_all_gather_axis<'b, 'c: 'b, 't: 'c>(
     }
     let mut dimensions = output_array_type.shape().dimensions().to_vec();
     dimensions[operation.concatenation_axis()] = Dimension::Static(1);
-    let input_type =
-        lower_tensor_type(&output_array_type.clone().with_shape(Shape::new(dimensions)), context, location)?;
+    let input_type = (output_array_type.clone().with_shape(Shape::new(dimensions))).lower(context, location)?;
     let broadcast_dimensions = (0..output_array_type.rank())
         .filter(|&axis| axis != operation.concatenation_axis())
         .collect::<Vec<_>>();

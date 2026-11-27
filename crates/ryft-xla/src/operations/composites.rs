@@ -18,12 +18,10 @@ use ryft_mlir::{
 
 use crate::lowering::EffectTokens;
 use crate::lowering::emissions::omits_regions;
-use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::lowering::states::CollectiveLoweringState;
-use crate::lowering::types::lower_array_ir_type;
-use crate::operations::attention::{
-    lower_fused_attention, lower_fused_attention_backward, select_attention_implementation,
-};
+use crate::lowering::types::TypeLoweringExtension;
+use crate::operations::attention::{AttentionConfigurationLoweringExtension, select_attention_implementation};
 use crate::operations::call::lower_shared_function_call;
 use crate::operations::quantization::{
     scaled_dot_composition_key, scaled_dot_composition_types, trace_scaled_dot_composition,
@@ -137,8 +135,7 @@ impl NamedCompositeImplementation {
                 .map_err(ProgramError::from)
         };
         match self {
-            Self::Attention { configuration, input_structure, return_residual } => lower_fused_attention(
-                *configuration,
+            Self::Attention { configuration, input_structure, return_residual } => (*configuration).lower_fused(
                 *input_structure,
                 *return_residual,
                 input_values,
@@ -148,8 +145,7 @@ impl NamedCompositeImplementation {
                 lowerer.context(),
                 lowerer.location(),
             ),
-            Self::AttentionBackward { configuration, input_structure } => lower_fused_attention_backward(
-                *configuration,
+            Self::AttentionBackward { configuration, input_structure } => (*configuration).lower_fused_backward(
                 *input_structure,
                 input_values,
                 array_types(input_types)?.as_slice(),
@@ -264,8 +260,7 @@ where
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
         let (effect_tokens, regions, captured_values, nested_functions, collective_state) =
             lowerer.split_effect_tokens();
-        lower_nested_program_inline(
-            &regions[0],
+        regions[0].lower_inline(
             input_values,
             &mut block,
             context,
@@ -505,14 +500,10 @@ pub(crate) fn emit_named_composition_function<'b, 'c: 'b, 't: 'c>(
 ) -> Result<(), Error> {
     let input_types = function.program.input_types();
     let output_types = function.program.output_types();
-    let argument_tensor_types = input_types
-        .iter()
-        .map(|r#type| lower_array_ir_type(r#type, context, location))
-        .collect::<Result<Vec<_>, _>>()?;
-    let result_tensor_types = output_types
-        .iter()
-        .map(|r#type| lower_array_ir_type(r#type, context, location))
-        .collect::<Result<Vec<_>, _>>()?;
+    let argument_tensor_types =
+        input_types.iter().map(|r#type| r#type.lower(context, location)).collect::<Result<Vec<_>, _>>()?;
+    let result_tensor_types =
+        output_types.iter().map(|r#type| r#type.lower(context, location)).collect::<Result<Vec<_>, _>>()?;
     let function_block = context.block(
         argument_tensor_types
             .iter()
@@ -526,15 +517,13 @@ pub(crate) fn emit_named_composition_function<'b, 'c: 'b, 't: 'c>(
             .map(|index| function_block.argument(index).unwrap().as_ref())
             .collect::<Vec<_>>();
         let mut effect_tokens = EffectTokens::default();
-        let outputs = lower_nested_program_inline(
-            &function.program,
+        let outputs = function.program.lower_inline(
             input_values.as_slice(),
             &mut function_block_ref,
             context,
             location,
             &[],
-            &RematerializationOptimizationBarrier::None,
-            // Decompositions are traced independently of the lowered program and contain no `call` sharing.
+            &RematerializationOptimizationBarrier::None, // Decompositions are traced independently of the lowered program and contain no `call` sharing.
             None,
             collective_state,
             &mut effect_tokens,

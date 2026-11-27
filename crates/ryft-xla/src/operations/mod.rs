@@ -52,10 +52,10 @@ use ryft_mlir::{
 
 use crate::lowering::DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked, XlaZeroPadded};
 use crate::lowering::emissions::{emitted_capture_reads, omits_regions};
-use crate::lowering::types::{lower_restore_dynamic_dimensions, lower_tensor_type, physical_bound_type};
+use crate::lowering::types::{ArrayTypeLoweringExtension, physical_bound_type};
 use crate::lowering::{DataDependentPaddingDiscipline, MlirLowerableValue, validate_local_output_placement};
 use crate::operations::composites::NamedCompositeImplementation;
-use crate::operations::constants::lower_layout_constraint;
+use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::{
     Constant, Error, KernelOperation, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type,
     lower_operation_variants,
@@ -1219,7 +1219,7 @@ where
             reason: format!("elementwise operand has non-tensor MLIR type `{input_type}`"),
         })
     })?;
-    let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+    let output_tensor_type = output_type.lower(context, location)?;
     let output_element_type = output_tensor_type.element_type()?;
     let mut input = input;
     if input_tensor_type.element_type()? != output_element_type {
@@ -1249,16 +1249,23 @@ where
     Ok(input)
 }
 
-/// Returns the StableHLO result accuracy that requests the provided [`CoreAccuracy`] from the backend.
-pub(crate) fn lower_accuracy(accuracy: CoreAccuracy) -> Accuracy {
-    match accuracy {
-        CoreAccuracy::Default => Accuracy::Default,
-        CoreAccuracy::Highest => Accuracy::Highest,
-        CoreAccuracy::Tolerance(tolerance) => Accuracy::Tolerance {
-            absolute_tolerance: tolerance.absolute(),
-            relative_tolerance: tolerance.relative(),
-            units_of_least_precision: tolerance.units_of_least_precision(),
-        },
+/// Lowering of a [`CoreAccuracy`] to StableHLO.
+pub(crate) trait AccuracyLoweringExtension {
+    /// Returns the StableHLO result accuracy that requests the provided [`CoreAccuracy`] from the backend.
+    fn lower(self) -> Accuracy;
+}
+
+impl AccuracyLoweringExtension for CoreAccuracy {
+    fn lower(self) -> Accuracy {
+        match self {
+            CoreAccuracy::Default => Accuracy::Default,
+            CoreAccuracy::Highest => Accuracy::Highest,
+            CoreAccuracy::Tolerance(tolerance) => Accuracy::Tolerance {
+                absolute_tolerance: tolerance.absolute(),
+                relative_tolerance: tolerance.relative(),
+                units_of_least_precision: tolerance.units_of_least_precision(),
+            },
+        }
     }
 }
 
@@ -1277,7 +1284,7 @@ where
     check_count!("input", input_values, 2, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
     let output_type = &output_types[0];
-    let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+    let output_tensor_type = output_type.lower(context, location)?;
     let multiple_dynamic_axes = output_type
         .shape()
         .dimensions()
@@ -1308,20 +1315,18 @@ where
             let physical_type = physical_bound_type(output_type)?;
             let broadcast = block.append_operation(stable_hlo::broadcast(
                 scalar,
-                lower_tensor_type(&physical_type, context, location)?,
+                physical_type.lower(context, location)?,
                 &[],
                 location,
             )?)?;
-            let result = lower_layout_constraint(
+            let result = physical_type.lower_layout_constraint(
                 broadcast.result(0).unwrap().as_ref(),
-                &physical_type,
                 &mut block.as_ref(),
                 location.as_ref(),
             )?;
             let sources = (0..output_type.rank()).map(|axis| (input_values[1 - index], axis)).collect::<Vec<_>>();
-            inputs[index] = lower_restore_dynamic_dimensions(
+            inputs[index] = output_type.lower_restore_dynamic_dimensions(
                 result,
-                output_type,
                 &sources,
                 &mut block.as_ref(),
                 context,
@@ -2277,7 +2282,7 @@ mod tests {
         let vector_type = ArrayType::new_static(DataType::F32, [3]);
         let block = context.block(&[
             (token_type.as_ref(), location),
-            (lower_tensor_type(&matrix_type, &context, location).unwrap().as_ref(), location),
+            (matrix_type.lower(&context, location).unwrap().as_ref(), location),
         ]);
         let token = block.as_ref().argument(0).unwrap().as_ref();
         let matrix = block.as_ref().argument(1).unwrap().as_ref();
@@ -2338,7 +2343,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_accuracy() {
+    fn test_accuracy_lower() {
         // The default accuracy keeps the default StableHLO result accuracy, while other accuracies request theirs.
         assert_eq!(
             lowered_unary_module(ArrayOperation::Sin(SinOperation::new()), DataType::F32, vec![2]).unwrap(),
@@ -2370,7 +2375,7 @@ mod tests {
         let tolerance = Tolerance::new(1e-6, 0.0, 2).unwrap();
         assert_eq!(
             lowered_unary_module(
-                ArrayOperation::Exp(ExpOperation::new().with_accuracy(Accuracy::Tolerance(tolerance)),),
+                ArrayOperation::Exp(ExpOperation::new().with_accuracy(Accuracy::Tolerance(tolerance))),
                 DataType::F32,
                 vec![2],
             )
@@ -2387,7 +2392,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_accuracy_matches_reference_backend() {
+    fn test_accuracy_lower_matches_reference_backend() {
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
         let mesh = domain_mesh(client, "x", 1);

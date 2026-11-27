@@ -2,7 +2,7 @@ use ryft_core::{ArrayType, DataType, ErfOperation};
 use ryft_mlir::dialects::{chlo, stable_hlo};
 use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::lowering::types::lower_tensor_type;
+use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 // [`ErfOperation`] lowers to `chlo.erf`, which the XLA compiler legalizes to a rational polynomial approximation
@@ -29,21 +29,15 @@ impl LowerableOperation for ErfOperation<ArrayType> {
         // rounds to 0x00. XLA's CPU FloatNormalization pass widens a direct F8E8M0FNU select to f32 and converts
         // its result back to F8E8M0FNU. Selecting the integer encodings keeps the correction independent of f32
         // subnormal handling.
-        let byte_type = lower_tensor_type(
-            &output_type.clone().with_data_type(DataType::U8),
-            lowerer.context(),
-            lowerer.location(),
-        )?;
+        let byte_type =
+            output_type.clone().with_data_type(DataType::U8).lower(lowerer.context(), lowerer.location())?;
         let input_bits =
             lowerer
                 .block()
                 .append_operation(stable_hlo::bitcast_convert(input, byte_type, lowerer.location())?)?;
         let input_bits = input_bits.result(0).unwrap().as_ref();
-        let predicate_type = lower_tensor_type(
-            &output_type.clone().with_data_type(DataType::Boolean),
-            lowerer.context(),
-            lowerer.location(),
-        )?;
+        let predicate_type =
+            output_type.clone().with_data_type(DataType::Boolean).lower(lowerer.context(), lowerer.location())?;
         let is_nonzero_encoding =
             lowerer
                 .block()
@@ -60,7 +54,7 @@ impl LowerableOperation for ErfOperation<ArrayType> {
         )?)?;
         let result = lowerer.block().append_operation(stable_hlo::bitcast_convert(
             selected_bits.result(0).unwrap().as_ref(),
-            lower_tensor_type(output_type, lowerer.context(), lowerer.location())?,
+            output_type.lower(lowerer.context(), lowerer.location())?,
             lowerer.location(),
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])

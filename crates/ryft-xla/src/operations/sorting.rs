@@ -5,7 +5,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
+use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for SortOperation {
@@ -17,150 +17,157 @@ impl LowerableOperation for SortOperation {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = input_types;
-        lower_sort_to_mlir(
-            self,
-            input_values,
-            output_types,
-            &mut lowerer.block(),
-            lowerer.context(),
-            lowerer.location(),
-        )
+        self.lower_to_mlir(input_values, output_types, &mut lowerer.block(), lowerer.context(), lowerer.location())
     }
 }
 
-/// Lowers one sort instruction to a `stablehlo.sort` with a synthesized comparator region. The region takes two scalar
-/// block arguments per operand and compares the first `key_count` operand pairs lexicographically with the sort's
-/// direction (i.e., `LT` for ascending and `GT` for descending), so that the operands that are not keys ride along as
-/// passengers. Each key contributes one comparison component, except for complex keys, which contribute their real
-/// part followed by their imaginary part. For components `0..N`, the synthesized result is
-/// `cmp_0 OR (eq_0 AND (cmp_1 OR (eq_1 AND … cmp_{N-1})))`, built right to left, where `cmp_i` is the direction
-/// comparison of component pair `i` and `eq_i` its equality comparison. Each component derives its own comparison type
-/// from its data type. Floating-point components compare with `TOTALORDER` semantics for both the direction and the
-/// equality comparison, so that NaN ties fall through deterministically. Boolean and unsigned integer components
-/// compare `UNSIGNED`, and signed integer components compare `SIGNED`. Under [`SortOrdering::Canonical`], every
-/// floating-point component is first canonicalized exactly like JAX's `lax.sort` comparator does it (i.e.,
-/// `select(x == 0, 0, x)` followed by `select(x != x, NaN, ·)`), so that signed zeros and all NaNs compare equal. Each
-/// step is omitted for data types that cannot need it, which are those that have no negative zero or a single NaN
-/// encoding. The emitted sort is always stable, which is what routes ranking ties to the lowest index.
-fn lower_sort_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &SortOperation,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    output_types: &[ArrayType],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    if output_types.is_empty() {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!("`{SORT_OPERATION_NAME}` needs at least one input"),
-        }
-        .into());
-    }
-    let mut comparator_arguments = Vec::with_capacity(2 * output_types.len());
-    for output_type in output_types {
-        let scalar_type = lower_tensor_type(&ArrayType::scalar(output_type.data_type()), context, location)?;
-        comparator_arguments.push((scalar_type, location));
-        comparator_arguments.push((scalar_type, location));
-    }
-    let comparator_block = context.block(comparator_arguments.as_slice());
-    let mut comparator = context.region();
-    let mut comparator_block = comparator.append_block(comparator_block)?;
-    let comparison_direction = match operation.direction() {
-        SortDirection::Ascending => stable_hlo::ComparisonDirection::LessThan,
-        SortDirection::Descending => stable_hlo::ComparisonDirection::GreaterThan,
-    };
+/// Lowering of a [`SortOperation`] for its values.
+trait SortOperationLoweringExtension {
+    /// Lowers one sort instruction to a `stablehlo.sort` with a synthesized comparator region. The region takes two
+    /// scalar block arguments per operand and compares the first `key_count` operand pairs lexicographically with the
+    /// sort's direction (i.e., `LT` for ascending and `GT` for descending), so that the operands that are not keys ride
+    /// along as passengers. Each key contributes one comparison component, except for complex keys, which contribute
+    /// their real part followed by their imaginary part. For components `0..N`, the synthesized result is `cmp_0 OR
+    /// (eq_0 AND (cmp_1 OR (eq_1 AND … cmp_{N-1})))`, built right to left, where `cmp_i` is the direction comparison of
+    /// component pair `i` and `eq_i` its equality comparison. Each component derives its own comparison type from its
+    /// data type. Floating-point components compare with `TOTALORDER` semantics for both the direction and the equality
+    /// comparison, so that NaN ties fall through deterministically. Boolean and unsigned integer components compare
+    /// `UNSIGNED`, and signed integer components compare `SIGNED`. Under [`SortOrdering::Canonical`], every
+    /// floating-point component is first canonicalized exactly like JAX's `lax.sort` comparator does it (i.e.,
+    /// `select(x == 0, 0, x)` followed by `select(x != x, NaN, ·)`), so that signed zeros and all NaNs compare equal.
+    /// Each step is omitted for data types that cannot need it, which are those that have no negative zero or a single
+    /// NaN encoding. The emitted sort is always stable, which is what routes ranking ties to the lowest index.
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
 
-    // Each key contributes its comparison components in lexicographic order as left and right scalar values together
-    // with their comparison type.
-    let mut components = Vec::with_capacity(operation.key_count().get());
-    for (key_index, key_type) in output_types.iter().enumerate().take(operation.key_count().get()) {
-        let left_key = comparator_block.argument(2 * key_index)?.as_ref();
-        let right_key = comparator_block.argument(2 * key_index + 1)?.as_ref();
-        let data_type = key_type.data_type();
-        let comparison_type = match data_type {
-            DataType::Boolean
-            | DataType::U1
-            | DataType::U2
-            | DataType::U4
-            | DataType::U8
-            | DataType::U16
-            | DataType::U32
-            | DataType::U64 => stable_hlo::ComparisonType::Unsigned,
-            DataType::I1
-            | DataType::I2
-            | DataType::I4
-            | DataType::I8
-            | DataType::I16
-            | DataType::I32
-            | DataType::I64 => stable_hlo::ComparisonType::Signed,
-            _ => stable_hlo::ComparisonType::TotalOrder,
+impl SortOperationLoweringExtension for SortOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        if output_types.is_empty() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("`{SORT_OPERATION_NAME}` needs at least one input"),
+            }
+            .into());
+        }
+        let mut comparator_arguments = Vec::with_capacity(2 * output_types.len());
+        for output_type in output_types {
+            let scalar_type = (ArrayType::scalar(output_type.data_type())).lower(context, location)?;
+            comparator_arguments.push((scalar_type, location));
+            comparator_arguments.push((scalar_type, location));
+        }
+        let comparator_block = context.block(comparator_arguments.as_slice());
+        let mut comparator = context.region();
+        let mut comparator_block = comparator.append_block(comparator_block)?;
+        let comparison_direction = match self.direction() {
+            SortDirection::Ascending => stable_hlo::ComparisonDirection::LessThan,
+            SortDirection::Descending => stable_hlo::ComparisonDirection::GreaterThan,
         };
-        if !data_type.is_complex() {
-            if data_type.is_floating_point() && operation.ordering() == SortOrdering::Canonical {
+
+        // Each key contributes its comparison components in lexicographic order as left and right scalar values
+        // together with their comparison type.
+        let mut components = Vec::with_capacity(self.key_count().get());
+        for (key_index, key_type) in output_types.iter().enumerate().take(self.key_count().get()) {
+            let left_key = comparator_block.argument(2 * key_index)?.as_ref();
+            let right_key = comparator_block.argument(2 * key_index + 1)?.as_ref();
+            let data_type = key_type.data_type();
+            let comparison_type = match data_type {
+                DataType::Boolean
+                | DataType::U1
+                | DataType::U2
+                | DataType::U4
+                | DataType::U8
+                | DataType::U16
+                | DataType::U32
+                | DataType::U64 => stable_hlo::ComparisonType::Unsigned,
+                DataType::I1
+                | DataType::I2
+                | DataType::I4
+                | DataType::I8
+                | DataType::I16
+                | DataType::I32
+                | DataType::I64 => stable_hlo::ComparisonType::Signed,
+                _ => stable_hlo::ComparisonType::TotalOrder,
+            };
+            if !data_type.is_complex() {
+                if data_type.is_floating_point() && self.ordering() == SortOrdering::Canonical {
+                    components.push((
+                        lower_canonical_sort_key(left_key, data_type, &mut comparator_block, context, location)?,
+                        lower_canonical_sort_key(right_key, data_type, &mut comparator_block, context, location)?,
+                        comparison_type,
+                    ));
+                } else {
+                    components.push((left_key, right_key, comparison_type));
+                }
+                continue;
+            }
+            // Type inference rejects complex keys under the total ordering, so complex keys are canonical here.
+            let part_data_type = if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
+            let left_real = comparator_block.append_operation(stable_hlo::real(left_key, location)?)?;
+            let right_real = comparator_block.append_operation(stable_hlo::real(right_key, location)?)?;
+            let left_imaginary = comparator_block.append_operation(stable_hlo::imag(left_key, location)?)?;
+            let right_imaginary = comparator_block.append_operation(stable_hlo::imag(right_key, location)?)?;
+            for (left_part, right_part) in [
+                (left_real.result(0).unwrap().as_ref(), right_real.result(0).unwrap().as_ref()),
+                (left_imaginary.result(0).unwrap().as_ref(), right_imaginary.result(0).unwrap().as_ref()),
+            ] {
                 components.push((
-                    lower_canonical_sort_key(left_key, data_type, &mut comparator_block, context, location)?,
-                    lower_canonical_sort_key(right_key, data_type, &mut comparator_block, context, location)?,
+                    lower_canonical_sort_key(left_part, part_data_type, &mut comparator_block, context, location)?,
+                    lower_canonical_sort_key(right_part, part_data_type, &mut comparator_block, context, location)?,
                     comparison_type,
                 ));
-            } else {
-                components.push((left_key, right_key, comparison_type));
             }
-            continue;
         }
-        // Type inference rejects complex keys under the total ordering, so complex keys are canonical here.
-        let part_data_type = if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
-        let left_real = comparator_block.append_operation(stable_hlo::real(left_key, location)?)?;
-        let right_real = comparator_block.append_operation(stable_hlo::real(right_key, location)?)?;
-        let left_imaginary = comparator_block.append_operation(stable_hlo::imag(left_key, location)?)?;
-        let right_imaginary = comparator_block.append_operation(stable_hlo::imag(right_key, location)?)?;
-        for (left_part, right_part) in [
-            (left_real.result(0).unwrap().as_ref(), right_real.result(0).unwrap().as_ref()),
-            (left_imaginary.result(0).unwrap().as_ref(), right_imaginary.result(0).unwrap().as_ref()),
-        ] {
-            components.push((
-                lower_canonical_sort_key(left_part, part_data_type, &mut comparator_block, context, location)?,
-                lower_canonical_sort_key(right_part, part_data_type, &mut comparator_block, context, location)?,
-                comparison_type,
-            ));
-        }
-    }
 
-    // The lexicographic chain builds right to left. The innermost term is the last component's direction comparison,
-    // and every earlier component wraps the accumulated tail as `cmp_i OR (eq_i AND tail)`.
-    let mut compared = None;
-    for (left, right, comparison_type) in components.into_iter().rev() {
-        let directed = comparator_block.append_operation(stable_hlo::compare(
-            left,
-            right,
-            comparison_direction,
-            comparison_type,
-            location,
-        )?)?;
-        let directed = directed.result(0).unwrap().as_ref();
-        compared = Some(match compared {
-            None => directed,
-            Some(tail) => {
-                let equal = comparator_block.append_operation(stable_hlo::compare(
-                    left,
-                    right,
-                    stable_hlo::ComparisonDirection::Equal,
-                    comparison_type,
-                    location,
-                )?)?;
-                let equal = equal.result(0).unwrap().as_ref();
-                let tied = comparator_block.append_operation(stable_hlo::and(equal, tail, location)?)?;
-                let tied = tied.result(0).unwrap().as_ref();
-                let chained = comparator_block.append_operation(stable_hlo::or(directed, tied, location)?)?;
-                chained.result(0).unwrap().as_ref()
-            }
-        });
+        // The lexicographic chain builds right to left. The innermost term is the last component's direction
+        // comparison, and every earlier component wraps the accumulated tail as `cmp_i OR (eq_i AND tail)`.
+        let mut compared = None;
+        for (left, right, comparison_type) in components.into_iter().rev() {
+            let directed = comparator_block.append_operation(stable_hlo::compare(
+                left,
+                right,
+                comparison_direction,
+                comparison_type,
+                location,
+            )?)?;
+            let directed = directed.result(0).unwrap().as_ref();
+            compared = Some(match compared {
+                None => directed,
+                Some(tail) => {
+                    let equal = comparator_block.append_operation(stable_hlo::compare(
+                        left,
+                        right,
+                        stable_hlo::ComparisonDirection::Equal,
+                        comparison_type,
+                        location,
+                    )?)?;
+                    let equal = equal.result(0).unwrap().as_ref();
+                    let tied = comparator_block.append_operation(stable_hlo::and(equal, tail, location)?)?;
+                    let tied = tied.result(0).unwrap().as_ref();
+                    let chained = comparator_block.append_operation(stable_hlo::or(directed, tied, location)?)?;
+                    chained.result(0).unwrap().as_ref()
+                }
+            });
+        }
+        // A `SortOperation` always carries at least one key, so the chain is never empty.
+        let compared = compared.unwrap();
+        comparator_block.append_operation(stable_hlo::r#return(&[compared], location)?)?;
+        let sorted =
+            block.append_operation(stable_hlo::sort(input_values, self.axis(), true, comparator, location)?)?;
+        Ok((0..output_types.len()).map(|index| sorted.result(index).unwrap().as_ref()).collect())
     }
-    // A `SortOperation` always carries at least one key, so the chain is never empty.
-    let compared = compared.unwrap();
-    comparator_block.append_operation(stable_hlo::r#return(&[compared], location)?)?;
-    let sorted =
-        block.append_operation(stable_hlo::sort(input_values, operation.axis(), true, comparator, location)?)?;
-    Ok((0..output_types.len()).map(|index| sorted.result(index).unwrap().as_ref()).collect())
 }
 
 /// Canonicalizes one scalar floating-point sort key `value` of `data_type` inside a sort comparator for
@@ -181,7 +188,7 @@ fn lower_canonical_sort_key<'b, 'c: 'b, 't: 'c>(
         _ => (true, true),
     };
     let scalar_type = ArrayType::scalar(data_type);
-    let scalar_tensor_type = lower_tensor_type(&scalar_type, context, location)?;
+    let scalar_tensor_type = scalar_type.lower(context, location)?;
     let mut canonical = value;
     if has_negative_zero {
         let zero = lower_f64_constant_splat(0.0, &scalar_type, scalar_tensor_type, block, context, location)?;
@@ -405,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_sort_to_mlir_matches_reference_backend() {
+    fn test_sort_operation_lower_matches_reference_backend() {
         // The canonical ordering ties signed zeros and all NaNs, while the total ordering separates them, so both the
         // sorted keys (compared bit for bit) and the payloads expose any disagreement in tie handling.
         let client = execution_client();
@@ -439,30 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_sort_to_mlir_without_inputs() {
-        let context = MlirContext::new();
-        let location = context.unknown_location().as_ref();
-        let mut region = context.region();
-        let mut block = region.append_block(context.block_with_no_arguments()).unwrap();
-        assert!(matches!(
-            lower_sort_to_mlir(
-                &SortOperation::new(0, SortDirection::Ascending),
-                &[],
-                &[],
-                &mut block,
-                &context,
-                location,
-            ),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                CoreError::Program(ProgramError::UnsupportedOperation { message })
-                    if message == "`sort` needs at least one input",
-            ),
-        ));
-    }
-
-    #[test]
-    fn test_lower_sort_to_mlir_top_k() {
+    fn test_sort_operation_lower_top_k() {
         // Ties select the lowest index, so both threes appear before the two and index 0 precedes index 2.
         let client = execution_client();
         let session = Session::builder().client(client).build().unwrap();
@@ -475,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_sort_to_mlir_multiple_keys() {
+    fn test_sort_operation_lower_multiple_keys_execution() {
         // Duplicates in the `i32` primary key fall through to the `f32` secondary key, full ties keep their original
         // order because the sort is stable, and the passenger co-permutes.
         let client = execution_client();
@@ -525,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_sort_to_mlir_complex_keys() {
+    fn test_sort_operation_lower_complex_keys_execution() {
         // Canonical complex keys order lexicographically by their canonicalized real and imaginary parts, so that
         // real parts that are signed zeros tie and NaN parts order last, as in JAX's `lax.sort`.
         let client = execution_client();
@@ -550,5 +534,21 @@ mod tests {
         let sorted = Sort::sort(&[keys, positions], 0, SortDirection::Ascending).unwrap();
         assert_eq!(sorted.len(), 2);
         assert_eq!(sorted[1].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![4.0, 5.0, 3.0, 2.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_sort_operation_lower_to_mlir_without_inputs() {
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let mut region = context.region();
+        let mut block = region.append_block(context.block_with_no_arguments()).unwrap();
+        assert!(matches!(
+            SortOperation::new(0, SortDirection::Ascending).lower_to_mlir(&[], &[], &mut block, &context, location),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
+                    if message == "`sort` needs at least one input",
+            ),
+        ));
     }
 }

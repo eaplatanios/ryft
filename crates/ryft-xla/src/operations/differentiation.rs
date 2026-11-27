@@ -4,7 +4,7 @@ use ryft_core::{
 };
 use ryft_mlir::ValueRef;
 
-use crate::lowering::regions::lower_nested_program_inline;
+use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for StopGradientOperation<ArrayType> {
@@ -87,8 +87,7 @@ impl LowerableOperation for RematerializeOperation<Type> {
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
         let (effect_tokens, regions, captured_values, nested_functions, collective_state) =
             lowerer.split_effect_tokens();
-        lower_nested_program_inline(
-            &regions[0],
+        regions[0].lower_inline(
             input_values,
             &mut block,
             context,
@@ -140,7 +139,7 @@ mod tests {
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
     use crate::lowering::tests::test_vector_type;
-    use crate::lowering::types::lower_tensor_type;
+    use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type};
     use crate::tests::{execution_client, values_to_bytes};
@@ -156,7 +155,7 @@ mod tests {
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let tensor_type = lower_tensor_type(&scalar_type, &context, location).unwrap();
+        let tensor_type = scalar_type.lower(&context, location).unwrap();
         let block = context.block(&[(tensor_type, location), (tensor_type, location)]);
         let inputs = [0, 1].map(|index| block.as_ref().argument(index).unwrap().as_ref());
         let mut lowerer =

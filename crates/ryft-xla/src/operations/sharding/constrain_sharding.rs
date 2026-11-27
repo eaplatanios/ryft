@@ -2,7 +2,7 @@ use ryft_core::macros::check_count;
 use ryft_core::{ArrayType, ConstrainShardingOperation, ProgramError};
 use ryft_mlir::ValueRef;
 
-use crate::sharding::{OpenDimensions, lower_sharding_constraint};
+use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ConstrainShardingOperation {
@@ -20,9 +20,8 @@ impl LowerableOperation for ConstrainShardingOperation {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let sharding = self.lowered_sharding(&output_types[0]).map_err(ProgramError::from)?;
-        let value = lower_sharding_constraint(
+        let value = sharding.lower_sharding_constraint(
             input_values[0],
-            &sharding,
             OpenDimensions::None,
             lowerer.collective_state().bound_manual_axes(),
             &mut lowerer.block(),
@@ -42,7 +41,7 @@ mod tests {
     use ryft_mlir::{Block, Context as MlirContext, Location, Operation as MlirOperation, Value as MlirValue};
 
     use crate::lowering::states::CollectiveLoweringState;
-    use crate::lowering::types::lower_tensor_type;
+    use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::operations::Operation;
     use crate::sessions::tests::two_device_mesh;
     use crate::sharding::tests::{test_input_type, test_mesh};
@@ -61,7 +60,7 @@ mod tests {
         let output_types = operation.infer_output_types(std::slice::from_ref(&input_type), &[]).unwrap();
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
+        let tensor_type = input_type.lower(&context, location).unwrap();
         let block = context.block(&[(tensor_type, location)]);
         let input = block.argument(0).unwrap().as_ref();
         let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
@@ -98,7 +97,7 @@ mod tests {
         let output_types = operation.infer_output_types(std::slice::from_ref(&input_type), &[]).unwrap();
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
+        let tensor_type = input_type.lower(&context, location).unwrap();
         let block = context.block(&[(tensor_type, location)]);
         let input = block.argument(0).unwrap().as_ref();
         let state = CollectiveLoweringState::new()

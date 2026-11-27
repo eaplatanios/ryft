@@ -15,8 +15,8 @@ use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef}
 
 use crate::lowering::{current_or_new_token, token_threaded_effects};
 use crate::operations::control_flow::{
-    lower_control_flow_region, lower_explicit_sharding_constraints, lower_refined_region_input, lower_region_guard,
-    lowered_effect_classes, set_threaded_effect_tokens,
+    ControlFlowRegionLoweringExtension, lower_explicit_sharding_constraints, lower_refined_region_input,
+    lower_region_guard, lowered_effect_classes, set_threaded_effect_tokens,
 };
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
 
@@ -109,8 +109,7 @@ impl LowerableOperation for ConditionOperation<Type> {
         // The declared branch outputs may differ (e.g., `f64[extent]` and `f64[3]`) while agreeing after input
         // refinement, so each branch normalizes its results to the condition's output types.
         let [true_branch_region, false_branch_region] = [true_branch, false_branch].map(|branch| {
-            lower_control_flow_region(
-                branch,
+            branch.lower_control_flow_region(
                 &branch_inputs,
                 output_types,
                 context,

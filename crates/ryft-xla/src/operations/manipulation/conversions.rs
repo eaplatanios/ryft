@@ -10,16 +10,15 @@ use ryft_mlir::{
 
 use crate::lowering::modules::cast_changes_explicit_placement;
 use crate::lowering::types::{
-    lower_f64_constant_splat, lower_physical_bound_value, lower_physical_storage, lower_restore_dynamic_dimensions,
-    lower_signed_one_bit_to_mlir, lower_tensor_type, lower_unplaced_constant_output, physical_bound_type,
-    static_dimensions,
+    ArrayTypeLoweringExtension, lower_f64_constant_splat, lower_signed_one_bit_to_mlir, lower_unplaced_constant_output,
+    physical_bound_type, static_dimensions,
 };
 use crate::operations::assertions::{lower_dependency_barrier, lower_type_relationship_checks};
-use crate::operations::constants::lower_layout_constraint;
+use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::operations::control_flow::{lower_refined_region_input, lower_refined_region_outputs};
 use crate::operations::extrema::FloatExtremumForm;
-use crate::operations::reductions::lower_reduce_to_mlir;
-use crate::sharding::{OpenDimensions, lower_sharding_constraint};
+use crate::operations::reductions::ReductionKindLoweringExtension;
+use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
@@ -36,7 +35,7 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
         let input_type = &input_types[0];
         let mut input_data_type = input_type.data_type();
         let output_data_type = output_types[0].data_type();
-        let output_type = lower_tensor_type(&output_types[0], lowerer.context(), lowerer.location())?;
+        let output_type = output_types[0].lower(lowerer.context(), lowerer.location())?;
         let mut input = input_values[0];
         if self.bitcast() {
             return Ok(vec![lower_bitcast_to_mlir(
@@ -102,7 +101,7 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
                 DataType::U8
             };
             let carrier_type = ArrayType::new(carrier_data_type, input_type.shape().clone());
-            let carrier_tensor_type = lower_tensor_type(&carrier_type, lowerer.context(), lowerer.location())?;
+            let carrier_tensor_type = carrier_type.lower(lowerer.context(), lowerer.location())?;
             let converted = lowerer.block().append_operation(stable_hlo::convert(
                 input,
                 carrier_tensor_type,
@@ -172,7 +171,7 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
             // These formats have no NaN or infinity encodings. Normalize exceptional values and clamp finite
             // overflow before native conversion, whose handling otherwise differs across CPU and GPU backends.
             let float_type = input_type.clone().with_data_type(DataType::F32);
-            let float_tensor_type = lower_tensor_type(&float_type, lowerer.context(), lowerer.location())?;
+            let float_tensor_type = float_type.lower(lowerer.context(), lowerer.location())?;
             let converted =
                 lowerer
                     .block()
@@ -249,7 +248,7 @@ impl LowerableOperation for CastOperation<ArrayType> {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        lower_cast_operation(self, lowerer, input_values, input_types, output_types)
+        self.lower_operation(lowerer, input_values, input_types, output_types)
     }
 }
 
@@ -261,188 +260,235 @@ impl LowerableOperation for CastOperation<Type> {
         input_types: &[Type],
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        lower_cast_operation(self, lowerer, input_values, input_types, output_types)
+        self.lower_operation(lowerer, input_values, input_types, output_types)
     }
 }
 
-/// Converts the shape of the lowered `value` of type `input_type` to that of the compatible `output_type`, following
-/// the compatibility rules of [`CastOperation`] and [`GuardOperation`](ryft_core::GuardOperation). First-class
-/// dimensions lower to `i64` scalars whatever their type. The value is converted through the type whose axes are static
-/// wherever either type is static. Narrowing a bounded dynamic axis to a static extent slices the physical buffer via
-/// [`lower_refined_region_outputs`]. Then, widening a static axis to a bounded dynamic one, or moving a dynamic axis to
-/// another identity with another physical bound, pads or slices it and restores its runtime size via
-/// [`lower_refined_region_input`]. Neither conversion checks runtime extents. Checked casts and guards validate the
-/// relationship first, and unchecked casts from transforms carry a proof of the relationship and dependencies on the
-/// values that justify it. Both conversions operate on the static physical buffer of the whole value, so a conversion
-/// of any axis is rejected when either type has an unbounded dynamic axis, whereas a value whose tensor type does not
-/// change is returned unchanged even when it has unbounded axes.
-pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
-    value: ValueRef<'b, 'c, 't>,
-    input_type: &Type,
-    output_type: &Type,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    // Converting any axis materializes the static physical buffer of the whole value, which needs a finite physical
-    // bound for every dynamic axis of both types, including axes that this conversion leaves unchanged.
-    if let (Type::Array(input), Type::Array(output)) = (input_type, output_type) {
-        let dimension_pairs = input.shape().dimensions().iter().zip(output.shape().dimensions()).collect::<Vec<_>>();
-        let changed_axis = dimension_pairs.iter().position(|pair| match pair {
-            (Dimension::Static(_), Dimension::Static(_)) => false,
-            (Dimension::Dynamic(input), Dimension::Dynamic(output)) => {
-                input.bounds().upper() != output.bounds().upper()
+/// Lowering of casts between array IR [`Type`]s to StableHLO.
+pub(crate) trait TypeCastLoweringExtension {
+    /// Converts the shape of the lowered `value` of this type to that of the compatible `output_type`, following the
+    /// compatibility rules of [`CastOperation`] and [`GuardOperation`](ryft_core::GuardOperation). First-class
+    /// dimensions lower to `i64` scalars whatever their type. The value is converted through the type whose axes are
+    /// static wherever either type is static. Narrowing a bounded dynamic axis to a static extent slices the physical
+    /// buffer via [`lower_refined_region_outputs`]. Then, widening a static axis to a bounded dynamic one, or moving a
+    /// dynamic axis to another identity with another physical bound, pads or slices it and restores its runtime size
+    /// via [`lower_refined_region_input`]. Neither conversion checks runtime extents. Checked casts and guards validate
+    /// the relationship first, and unchecked casts from transforms carry a proof of the relationship and dependencies
+    /// on the values that justify it. Both conversions operate on the static physical buffer of the whole value, so a
+    /// conversion of any axis is rejected when either type has an unbounded dynamic axis, whereas a value whose tensor
+    /// type does not change is returned unchanged even when it has unbounded axes.
+    fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
+        &self,
+        value: ValueRef<'b, 'c, 't>,
+        output_type: &Type,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+}
+
+impl TypeCastLoweringExtension for Type {
+    fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
+        &self,
+        value: ValueRef<'b, 'c, 't>,
+        output_type: &Type,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        // Converting any axis materializes the static physical buffer of the whole value, which needs a finite physical
+        // bound for every dynamic axis of both types, including axes that this conversion leaves unchanged.
+        if let (Type::Array(input), Type::Array(output)) = (self, output_type) {
+            let dimension_pairs =
+                input.shape().dimensions().iter().zip(output.shape().dimensions()).collect::<Vec<_>>();
+            let changed_axis = dimension_pairs.iter().position(|pair| match pair {
+                (Dimension::Static(_), Dimension::Static(_)) => false,
+                (Dimension::Dynamic(input), Dimension::Dynamic(output)) => {
+                    input.bounds().upper() != output.bounds().upper()
+                }
+                _ => true,
+            });
+            let unbounded_dimension = |axis: usize| {
+                let (input, output) = dimension_pairs[axis];
+                [input, output].into_iter().find(|dimension| dimension.bounds().upper().is_none())
+            };
+            if let Some(changed_axis) = changed_axis {
+                if let Some(dimension) = unbounded_dimension(changed_axis) {
+                    return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                        operation: CAST_OPERATION_NAME.to_string(),
+                        reason: format!(
+                            "shape conversion along axis {changed_axis} requires a finite physical bound, but that axis \
+                             has unbounded dimension `{dimension}`",
+                        ),
+                    }));
+                }
+                if let Some((axis, dimension)) = (0..dimension_pairs.len())
+                    .find_map(|axis| unbounded_dimension(axis).map(|dimension| (axis, dimension)))
+                {
+                    return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                        operation: CAST_OPERATION_NAME.to_string(),
+                        reason: format!(
+                            "shape conversion along axis {changed_axis} requires finite physical bounds for every axis, \
+                             but axis {axis} has unbounded dimension `{dimension}`",
+                        ),
+                    }));
+                }
             }
-            _ => true,
-        });
-        let unbounded_dimension = |axis: usize| {
-            let (input, output) = dimension_pairs[axis];
-            [input, output].into_iter().find(|dimension| dimension.bounds().upper().is_none())
+        }
+        let intermediate_type = match (self, output_type) {
+            (Type::Array(input), Type::Array(output)) if input.rank() == output.rank() => {
+                let dimensions = input
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .zip(output.shape().dimensions())
+                    .map(|(input, output)| match (input, output) {
+                        (Dimension::Dynamic(_), Dimension::Static(_)) => output.clone(),
+                        _ => input.clone(),
+                    })
+                    .collect();
+                Type::Array(input.clone().with_shape(Shape::new(dimensions)))
+            }
+            _ => self.clone(),
         };
-        if let Some(changed_axis) = changed_axis {
-            if let Some(dimension) = unbounded_dimension(changed_axis) {
-                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                    operation: CAST_OPERATION_NAME.to_string(),
-                    reason: format!(
-                        "shape conversion along axis {changed_axis} requires a finite physical bound, but that axis \
-                         has unbounded dimension `{dimension}`",
-                    ),
-                }));
+        let value = lower_refined_region_outputs(
+            vec![value],
+            std::slice::from_ref(self),
+            std::slice::from_ref(&intermediate_type),
+            block,
+            context,
+            location,
+        )?
+        .remove(0);
+        lower_refined_region_input(value, &intermediate_type, output_type, block, context, location)
+    }
+}
+
+/// Lowering of conversions to the layout of an [`ArrayType`].
+pub(crate) trait ArrayTypeLayoutConversionLoweringExtension {
+    /// Converts the lowered `value`, whose type has the shape of this type but another layout, to the physical layout
+    /// of this type, which must name one. The `LayoutConstraint` custom call that enforces the layout takes a static
+    /// physical buffer, so the logical sizes of any bounded dynamic axes are kept on the converted value while that
+    /// buffer is exposed and are restored after its allocation is constrained. No padding becomes logical data.
+    fn lower_layout_conversion<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        value: ValueRef<'b, 'c, 't>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+}
+
+impl ArrayTypeLayoutConversionLoweringExtension for ArrayType {
+    fn lower_layout_conversion<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        value: ValueRef<'b, 'c, 't>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        let physical_type = physical_bound_type(self)?;
+        let physical =
+            self.lower_physical_storage(value, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+        let result = physical_type.lower_layout_constraint(physical, &mut lowerer.block(), lowerer.location())?;
+        let sources = (0..self.rank()).map(|axis| (value, axis)).collect::<Vec<_>>();
+        self.lower_restore_dynamic_dimensions(
+            result,
+            &sources,
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
+        )
+    }
+}
+
+/// Lowering of a [`CastOperation`] in any of its type universes.
+trait CastOperationLoweringExtension<T> {
+    /// Lowers the same complete [`CastOperation`] contract for native and array IR type families. Witness producers are
+    /// explicit dependencies even for unchecked casts. A [checked](CastOperation::is_checked) cast is also ordered
+    /// after preceding assertions, because its dependency barrier consumes the current assertion token, without
+    /// advancing it, whether or not the cast emits a check of its own. A checked cast emits no check when the actual
+    /// input types prove its relationship. An unchecked cast never consumes the assertion token.
+    fn lower_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[T],
+        output_types: &[T],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+
+    /// Lowers the runtime check of a [checked](CastOperation::is_checked) cast whose inputs are `input_values` of the
+    /// `input_types` (i.e., the value followed by the witnesses). The check requires that the value at the cast's
+    /// output type and the witnesses at their declared types satisfy their shared identity relationships. The source
+    /// and output declarations observe the same first input, preserving its original nominal bindings. Unchecked casts
+    /// emit nothing.
+    fn lower_check<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[T],
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+    ) -> Result<(), Error>;
+}
+
+impl<T: CastType + Into<Type>> CastOperationLoweringExtension<T> for CastOperation<T> {
+    fn lower_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[T],
+        output_types: &[T],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        check_count!("output", output_types, 1, ProgramError);
+        if input_values.is_empty() || input_types.is_empty() {
+            return Err(ProgramError::InvalidInputCount {
+                expected: 1,
+                actual: input_values.len().min(input_types.len()),
             }
-            if let Some((axis, dimension)) =
-                (0..dimension_pairs.len()).find_map(|axis| unbounded_dimension(axis).map(|dimension| (axis, dimension)))
-            {
-                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                    operation: CAST_OPERATION_NAME.to_string(),
-                    reason: format!(
-                        "shape conversion along axis {changed_axis} requires finite physical bounds for every axis, \
-                         but axis {axis} has unbounded dimension `{dimension}`",
-                    ),
-                }));
-            }
+            .into());
         }
+        // A checked cast is ordered after preceding assertions even when the actual types prove its relationship and no
+        // check is emitted, so the dependency barrier follows the mode rather than the emitted check. Binding
+        // normalizes proven casts to unchecked ones, so this only affects casts staged directly through a program
+        // builder.
+        self.lower_check(input_values, input_types, lowerer)?;
+        let values = lower_dependency_barrier(
+            input_values,
+            if self.is_checked() { lowerer.effect_tokens().ordered_assertion() } else { None },
+            &mut lowerer.block(),
+            lowerer.location(),
+        )?;
+        Ok(vec![lower_cast(values[0], &input_types[0].clone().into(), &output_types[0].clone().into(), lowerer)?])
     }
-    let intermediate_type = match (input_type, output_type) {
-        (Type::Array(input), Type::Array(output)) if input.rank() == output.rank() => {
-            let dimensions = input
-                .shape()
-                .dimensions()
-                .iter()
-                .zip(output.shape().dimensions())
-                .map(|(input, output)| match (input, output) {
-                    (Dimension::Dynamic(_), Dimension::Static(_)) => output.clone(),
-                    _ => input.clone(),
-                })
-                .collect();
-            Type::Array(input.clone().with_shape(Shape::new(dimensions)))
+
+    fn lower_check<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[T],
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+    ) -> Result<(), Error> {
+        if !self.is_checked() || T::infer_cast_output_type(self, input_types).map_err(ProgramError::from)?.1.is_some() {
+            return Ok(());
         }
-        _ => input_type.clone(),
-    };
-    let value = lower_refined_region_outputs(
-        vec![value],
-        std::slice::from_ref(input_type),
-        std::slice::from_ref(&intermediate_type),
-        block,
-        context,
-        location,
-    )?
-    .remove(0);
-    lower_refined_region_input(value, &intermediate_type, output_type, block, context, location)
-}
-
-/// Converts the lowered `value`, whose type has the shape of `output_type` but another layout, to the physical layout
-/// of `output_type`, which must name one. The `LayoutConstraint` custom call that enforces the layout takes a static
-/// physical buffer, so the logical sizes of any bounded dynamic axes are kept on the converted value while that buffer
-/// is exposed and are restored after its allocation is constrained. No padding becomes logical data.
-pub(crate) fn lower_layout_conversion<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    value: ValueRef<'b, 'c, 't>,
-    output_type: &ArrayType,
-    lowerer: &mut Lowerer<'b, 'c, 't, O>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let physical_type = physical_bound_type(output_type)?;
-    let physical =
-        lower_physical_storage(value, output_type, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
-    let result = lower_layout_constraint(physical, &physical_type, &mut lowerer.block(), lowerer.location())?;
-    let sources = (0..output_type.rank()).map(|axis| (value, axis)).collect::<Vec<_>>();
-    lower_restore_dynamic_dimensions(
-        result,
-        output_type,
-        &sources,
-        &mut lowerer.block(),
-        lowerer.context(),
-        lowerer.location(),
-    )
-}
-
-/// Lowers the same complete [`CastOperation`] contract for native and array IR type families. Witness producers are
-/// explicit dependencies even for unchecked casts. A [checked](CastOperation::is_checked) cast is also ordered after
-/// preceding assertions, because its dependency barrier consumes the current assertion token, without advancing it,
-/// whether or not the cast emits a check of its own. A checked cast emits no check when the actual input types prove
-/// its relationship. An unchecked cast never consumes the assertion token.
-fn lower_cast_operation<'b, 'c: 'b, 't: 'c, T: CastType + Into<Type>, O: LowerableOperationFamily>(
-    operation: &CastOperation<T>,
-    lowerer: &mut Lowerer<'b, 'c, 't, O>,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[T],
-    output_types: &[T],
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    check_count!("output", output_types, 1, ProgramError);
-    if input_values.is_empty() || input_types.is_empty() {
-        return Err(
-            ProgramError::InvalidInputCount { expected: 1, actual: input_values.len().min(input_types.len()) }.into()
-        );
+        let declared_types = std::iter::once(self.output_type())
+            .chain(self.input_types())
+            .cloned()
+            .map(Into::into)
+            .collect::<Vec<_>>();
+        let values = std::iter::once(input_values[0]).chain(input_values.iter().copied()).collect::<Vec<_>>();
+        let actual_types = std::iter::once(input_types[0].clone())
+            .chain(input_types.iter().cloned())
+            .map(Into::into)
+            .collect::<Vec<_>>();
+        let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+        lower_type_relationship_checks(
+            CAST_OPERATION_NAME,
+            &format!("in `{CAST_OPERATION_NAME}`"),
+            &declared_types,
+            &values,
+            &actual_types,
+            lowerer.effect_tokens_mut(),
+            &mut block,
+            context,
+            location,
+        )
+        .map(|_| ())
     }
-    // A checked cast is ordered after preceding assertions even when the actual types prove its relationship and no
-    // check is emitted, so the dependency barrier follows the mode rather than the emitted check. Binding normalizes
-    // proven casts to unchecked ones, so this only affects casts staged directly through a program builder.
-    lower_cast_check(operation, input_values, input_types, lowerer)?;
-    let values = lower_dependency_barrier(
-        input_values,
-        if operation.is_checked() { lowerer.effect_tokens().ordered_assertion() } else { None },
-        &mut lowerer.block(),
-        lowerer.location(),
-    )?;
-    Ok(vec![lower_cast(values[0], &input_types[0].clone().into(), &output_types[0].clone().into(), lowerer)?])
-}
-
-/// Lowers the runtime check of a [checked](CastOperation::is_checked) cast whose inputs are `input_values` of the
-/// `input_types` (i.e., the value followed by the witnesses). The check requires that the value at the cast's output
-/// type and the witnesses at their declared types satisfy their shared identity relationships. The source and output
-/// declarations observe the same first input, preserving its original nominal bindings. Unchecked casts emit nothing.
-fn lower_cast_check<'b, 'c: 'b, 't: 'c, T: CastType + Into<Type>, O: LowerableOperationFamily>(
-    operation: &CastOperation<T>,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[T],
-    lowerer: &mut Lowerer<'b, 'c, 't, O>,
-) -> Result<(), Error> {
-    if !operation.is_checked()
-        || T::infer_cast_output_type(operation, input_types).map_err(ProgramError::from)?.1.is_some()
-    {
-        return Ok(());
-    }
-    let declared_types = std::iter::once(operation.output_type())
-        .chain(operation.input_types())
-        .cloned()
-        .map(Into::into)
-        .collect::<Vec<_>>();
-    let values = std::iter::once(input_values[0]).chain(input_values.iter().copied()).collect::<Vec<_>>();
-    let actual_types = std::iter::once(input_types[0].clone())
-        .chain(input_types.iter().cloned())
-        .map(Into::into)
-        .collect::<Vec<_>>();
-    let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-    lower_type_relationship_checks(
-        CAST_OPERATION_NAME,
-        &format!("in `{CAST_OPERATION_NAME}`"),
-        &declared_types,
-        &values,
-        &actual_types,
-        lowerer.effect_tokens_mut(),
-        &mut block,
-        context,
-        location,
-    )
-    .map(|_| ())
 }
 
 /// Converts a cast's shape and enforces its requested physical layout and explicit sharding.
@@ -453,21 +499,20 @@ fn lower_cast<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let value =
-        lower_cast_shape(value, input_type, output_type, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+        input_type.lower_cast_shape(value, output_type, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
     let (Type::Array(input_type), Type::Array(output_type)) = (input_type, output_type) else {
         return Ok(value);
     };
     let mut result = value;
     if output_type.layout().is_some() && output_type.layout() != input_type.layout() {
         // An input that already declares the requested layout was constrained by its producer.
-        result = lower_layout_conversion(value, output_type, lowerer)?;
+        result = output_type.lower_layout_conversion(value, lowerer)?;
     }
     if let Some(sharding) = output_type.sharding()
         && cast_changes_explicit_placement(input_type, output_type)
     {
-        result = lower_sharding_constraint(
+        result = sharding.lower_sharding_constraint(
             result,
-            sharding,
             OpenDimensions::All,
             lowerer.collective_state().bound_manual_axes(),
             &mut lowerer.block(),
@@ -487,18 +532,15 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let float_type = lower_tensor_type(&input_type.clone().with_data_type(DataType::F32), context, location)?;
+    let float_type = input_type.clone().with_data_type(DataType::F32).lower(context, location)?;
     let float = block.append_operation(stable_hlo::convert(input, float_type, location)?)?;
     let float = float.result(0).unwrap().as_ref();
     // The intermediate rounding is observable here. Prevent excess precision optimizations from cancelling
     // the narrowing and widening pair and incorrectly proving that the original conversion was exact.
     let float = block.append_operation(stable_hlo::optimization_barrier(&[float], location)?)?;
     let float = float.result(0).unwrap().as_ref();
-    let recovered = block.append_operation(stable_hlo::convert(
-        float,
-        lower_tensor_type(input_type, context, location)?,
-        location,
-    )?)?;
+    let recovered =
+        block.append_operation(stable_hlo::convert(float, input_type.lower(context, location)?, location)?)?;
     let recovered = recovered.result(0).unwrap().as_ref();
     let comparison_type = if input_type.data_type().is_floating_point() {
         stable_hlo::ComparisonType::Float
@@ -548,11 +590,8 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
         increased = direction.result(0).unwrap().as_ref();
     }
     let bits_type = input_type.clone().with_data_type(DataType::U32);
-    let bits = block.append_operation(stable_hlo::bitcast_convert(
-        float,
-        lower_tensor_type(&bits_type, context, location)?,
-        location,
-    )?)?;
+    let bits =
+        block.append_operation(stable_hlo::bitcast_convert(float, bits_type.lower(context, location)?, location)?)?;
     let bits = bits.result(0).unwrap().as_ref();
     let one = lower_unplaced_constant_output(&[bits_type], 1, block, context, location)?[0];
     let previous = block.append_operation(stable_hlo::subtract(bits, one, location)?)?;
@@ -567,7 +606,7 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
         // encodings directly from f64 bits instead. Shift the exact significand to f32 subnormal precision and
         // jam every discarded nonzero bit into its low bit, without any floating-point arithmetic.
         let wide_type = input_type.clone().with_data_type(DataType::U64);
-        let wide_tensor_type = lower_tensor_type(&wide_type, context, location)?;
+        let wide_tensor_type = wide_type.lower(context, location)?;
         let source_bits = block.append_operation(stable_hlo::bitcast_convert(input, wide_tensor_type, location)?)?;
         let source_bits = source_bits.result(0).unwrap().as_ref();
         let magnitude_mask =
@@ -647,7 +686,7 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
         let subnormal = subnormal.result(0).unwrap().as_ref();
         let subnormal = block.append_operation(stable_hlo::convert(
             subnormal,
-            lower_tensor_type(&input_type.clone().with_data_type(DataType::U32), context, location)?,
+            input_type.clone().with_data_type(DataType::U32).lower(context, location)?,
             location,
         )?)?;
         let subnormal = subnormal.result(0).unwrap().as_ref();
@@ -690,7 +729,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     if input_type.rank() == output_type.rank() {
         let result = block.append_operation(stable_hlo::bitcast_convert(
             input,
-            lower_tensor_type(output_type, context, location)?,
+            output_type.lower(context, location)?,
             location,
         )?)?;
         return Ok(result.result(0).unwrap().as_ref());
@@ -708,16 +747,16 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     let padding = if input_type.data_type() == DataType::F8E8M0FNU { 1.0 } else { 0.0 };
     let carrier_input_type =
         if input_one_bit { input_type.clone().with_data_type(DataType::Boolean) } else { input_type.clone() };
-    let physical_input = lower_physical_bound_value(input, &carrier_input_type, padding, block, context, location)?;
+    let physical_input = carrier_input_type.lower_physical_bound_value(input, padding, block, context, location)?;
     let physical_output_type = physical_bound_type(output_type)?;
-    let output_tensor_type = lower_tensor_type(&physical_output_type, context, location)?;
+    let output_tensor_type = physical_output_type.lower(context, location)?;
     let result = if matches!(input_type.data_type(), DataType::F6E2M3FN | DataType::F6E3M2FN) {
         // XLA stores FP6 in a byte and native rank-changing bitcasts expose eight bits. Recover the six logical
         // encoding bits explicitly before splitting them into one- or two-bit groups.
         let bits = lower_fp6_to_bits(physical_input, &physical_input_type, block, context, location)?;
         let group_width = if output_one_bit { 1 } else { 2 };
         let expanded_type = physical_output_type.clone().with_data_type(DataType::U8);
-        let expanded_tensor_type = lower_tensor_type(&expanded_type, context, location)?;
+        let expanded_tensor_type = expanded_type.lower(context, location)?;
         let expanded = block.append_operation(stable_hlo::broadcast(
             bits,
             expanded_tensor_type,
@@ -752,7 +791,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     } else if matches!(output_type.data_type(), DataType::F6E2M3FN | DataType::F6E3M2FN) {
         let group_width = if input_one_bit { 1 } else { 2 };
         let groups_type = physical_input_type.clone().with_data_type(DataType::U8);
-        let groups_tensor_type = lower_tensor_type(&groups_type, context, location)?;
+        let groups_tensor_type = groups_type.lower(context, location)?;
         let groups = block.append_operation(stable_hlo::convert(physical_input, groups_tensor_type, location)?)?;
         let mask = lower_unplaced_constant_output(
             std::slice::from_ref(&groups_type),
@@ -771,8 +810,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             offsets.result(0).unwrap().as_ref(),
             location,
         )?)?;
-        let bits = lower_reduce_to_mlir(
-            ReductionKind::Sum,
+        let bits = ReductionKind::Sum.lower(
             &[input_type.rank() - 1],
             shifted.result(0).unwrap().as_ref(),
             &physical_output_type.clone().with_data_type(DataType::U8),
@@ -795,19 +833,19 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             ArrayType::new(DataType::U2, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
         let groups = block.append_operation(stable_hlo::bitcast_convert(
             physical_input,
-            lower_tensor_type(&groups_type, context, location)?,
+            groups_type.lower(context, location)?,
             location,
         )?)?;
         let groups = block.append_operation(stable_hlo::convert(
             groups.result(0).unwrap().as_ref(),
-            lower_tensor_type(&groups_type.clone().with_data_type(DataType::U8), context, location)?,
+            groups_type.clone().with_data_type(DataType::U8).lower(context, location)?,
             location,
         )?)?;
         let group_rank = shape.len();
         shape.push(2);
         let expanded_type =
             ArrayType::new(DataType::U8, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
-        let expanded_tensor_type = lower_tensor_type(&expanded_type, context, location)?;
+        let expanded_tensor_type = expanded_type.lower(context, location)?;
         let expanded = block.append_operation(stable_hlo::broadcast(
             groups.result(0).unwrap().as_ref(),
             expanded_tensor_type,
@@ -824,7 +862,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         let bits = block.append_operation(stable_hlo::and(shifted.result(0).unwrap().as_ref(), one, location)?)?;
         let bits = block.append_operation(stable_hlo::convert(
             bits.result(0).unwrap().as_ref(),
-            lower_tensor_type(&expanded_type.with_data_type(DataType::Boolean), context, location)?,
+            expanded_type.with_data_type(DataType::Boolean).lower(context, location)?,
             location,
         )?)?;
         let result = block.append_operation(stable_hlo::reshape(
@@ -844,7 +882,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         let reshaped = block.append_operation(stable_hlo::reshape(physical_input, &shape, location)?)?;
         let expanded_type =
             ArrayType::new(DataType::U8, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
-        let expanded_tensor_type = lower_tensor_type(&expanded_type, context, location)?;
+        let expanded_tensor_type = expanded_type.lower(context, location)?;
         let expanded = block.append_operation(stable_hlo::convert(
             reshaped.result(0).unwrap().as_ref(),
             expanded_tensor_type,
@@ -859,8 +897,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         )?)?;
         shape.pop();
         let groups_type = ArrayType::new(DataType::U8, Shape::new(shape.into_iter().map(Dimension::Static).collect()));
-        let groups = lower_reduce_to_mlir(
-            ReductionKind::Sum,
+        let groups = ReductionKind::Sum.lower(
             &[bit_axis],
             shifted.result(0).unwrap().as_ref(),
             &groups_type,
@@ -871,7 +908,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         )?;
         let groups = block.append_operation(stable_hlo::convert(
             groups,
-            lower_tensor_type(&groups_type.with_data_type(DataType::U2), context, location)?,
+            groups_type.with_data_type(DataType::U2).lower(context, location)?,
             location,
         )?)?;
         let result = block.append_operation(stable_hlo::bitcast_convert(
@@ -886,7 +923,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         result.result(0).unwrap().as_ref()
     };
     let sources = (0..output_type.rank()).map(|axis| (input, axis)).collect::<Vec<_>>();
-    lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)
+    output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)
 }
 
 /// Extracts a finite FP6 encoding through its exact `f32` representation, preserving the sign of zero.
@@ -899,9 +936,9 @@ fn lower_fp6_to_bits<'b, 'c: 'b, 't: 'c>(
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let (mantissa_bits, bias) = if r#type.data_type() == DataType::F6E2M3FN { (3, 1) } else { (2, 3) };
     let integer_type = r#type.clone().with_data_type(DataType::U32);
-    let integer_tensor_type = lower_tensor_type(&integer_type, context, location)?;
+    let integer_tensor_type = integer_type.lower(context, location)?;
     let float_type = r#type.clone().with_data_type(DataType::F32);
-    let float_tensor_type = lower_tensor_type(&float_type, context, location)?;
+    let float_tensor_type = float_type.lower(context, location)?;
     // The native dependency patches the finite-only FP6 NaN predicate, making this exact widening conversion valid.
     let float = block.append_operation(stable_hlo::convert(input, float_tensor_type, location)?)?;
     let float = float.result(0).unwrap().as_ref();
@@ -982,7 +1019,7 @@ fn lower_fp6_to_bits<'b, 'c: 'b, 't: 'c>(
     let encoding = encoding.result(0).unwrap().as_ref();
     let result = block.append_operation(stable_hlo::convert(
         encoding,
-        lower_tensor_type(&r#type.clone().with_data_type(DataType::U8), context, location)?,
+        r#type.clone().with_data_type(DataType::U8).lower(context, location)?,
         location,
     )?)?;
     let result = result.result(0).unwrap().as_ref();
@@ -999,9 +1036,9 @@ fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let (mantissa_bits, bias) = if r#type.data_type() == DataType::F6E2M3FN { (3, 1) } else { (2, 3) };
     let integer_type = r#type.clone().with_data_type(DataType::U32);
-    let integer_tensor_type = lower_tensor_type(&integer_type, context, location)?;
+    let integer_tensor_type = integer_type.lower(context, location)?;
     let float_type = r#type.clone().with_data_type(DataType::F32);
-    let float_tensor_type = lower_tensor_type(&float_type, context, location)?;
+    let float_tensor_type = float_type.lower(context, location)?;
     let bits = block.append_operation(stable_hlo::convert(input, integer_tensor_type, location)?)?;
     let bits = bits.result(0).unwrap().as_ref();
     let sign_mask =
@@ -1083,8 +1120,7 @@ fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
     let encoding = encoding.result(0).unwrap().as_ref();
     let float = block.append_operation(stable_hlo::bitcast_convert(encoding, float_tensor_type, location)?)?;
     let float = float.result(0).unwrap().as_ref();
-    let result =
-        block.append_operation(stable_hlo::convert(float, lower_tensor_type(r#type, context, location)?, location)?)?;
+    let result = block.append_operation(stable_hlo::convert(float, r#type.lower(context, location)?, location)?)?;
     let result = result.result(0).unwrap().as_ref();
     Ok(result)
 }
@@ -1759,8 +1795,8 @@ mod tests {
         let context = MlirContext::new();
         let location = context.unknown_location();
         let block = context.block(&[
-            (lower_tensor_type(&symbolic, &context, location).unwrap(), location),
-            (lower_tensor_type(&exact, &context, location).unwrap(), location),
+            (symbolic.lower(&context, location).unwrap(), location),
+            (exact.lower(&context, location).unwrap(), location),
         ]);
         let source = block.argument(0).unwrap().as_ref();
         let unrelated = block.argument(1).unwrap().as_ref();
@@ -4388,7 +4424,7 @@ mod tests {
         for (input_type, output_type, expected) in cases {
             let context = MlirContext::new();
             let location = context.unknown_location();
-            let block = context.block(&[(lower_tensor_type(&input_type, &context, location).unwrap(), location)]);
+            let block = context.block(&[(input_type.lower(&context, location).unwrap(), location)]);
             let source = block.argument(0).unwrap().as_ref();
             let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
             let result = CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]).unwrap().lower(
@@ -4406,24 +4442,75 @@ mod tests {
             }
         }
     }
+
     #[test]
-    fn test_lower_cast_shape() {
+    fn test_type_lower_cast_shape() {
         // Widening a static axis to a bounded dynamic one pads the physical buffer to the bound and restores the
-        // runtime extent, whereas narrowing that axis back slices the physical buffer to the static extent.
+        // runtime extent, whereas narrowing that axis back slices the physical buffer to the static extent. The
+        // operations are rendered outside any function, so their detached inputs print as unknown SSA values.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let exact = ArrayType::new_static(DataType::F32, [2]);
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let block = context.block(&[(lower_tensor_type(&exact, &context, location).unwrap(), location)]);
+        let block = context.block(&[(exact.lower(&context, location).unwrap(), location)]);
         let input = block.argument(0).unwrap().as_ref();
         let (exact, symbolic) = (Type::from(exact), Type::from(symbolic));
         let widened =
-            lower_cast_shape(input, &exact, &symbolic, &mut block.as_ref(), &context, location.as_ref()).unwrap();
-        let narrowed =
-            lower_cast_shape(widened, &symbolic, &exact, &mut block.as_ref(), &context, location.as_ref()).unwrap();
-        assert_eq!(widened.r#type().unwrap().to_string(), "tensor<?xf32, #stablehlo.bounds<4>>");
-        assert_eq!(narrowed.r#type().unwrap().to_string(), "tensor<2xf32>");
+            exact.lower_cast_shape(input, &symbolic, &mut block.as_ref(), &context, location.as_ref()).unwrap();
+        let narrowed = symbolic
+            .lower_cast_shape(widened, &exact, &mut block.as_ref(), &context, location.as_ref())
+            .unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(widened, operations[3].result(0).unwrap().as_ref());
+        assert_eq!(narrowed, operations[6].result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "%c = stablehlo.constant dense<2> : tensor<i32>",
+                "%cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>",
+                "%0 = stablehlo.pad <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>>, low = [0], high = [2], \
+                 interior = [0] : (tensor<2xf32>, tensor<f32>) -> tensor<4xf32>",
+                "%0 = stablehlo.set_dimension_size <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>>, dim = 0 : \
+                 (tensor<4xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<4>>",
+                "%c = stablehlo.constant dense<4> : tensor<i32>",
+                "%0 = stablehlo.set_dimension_size <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>>, dim = 0 : \
+                 (tensor<?xf32, #stablehlo.bounds<4>>, tensor<i32>) -> tensor<4xf32>",
+                "%0 = stablehlo.slice <<UNKNOWN SSA VALUE>> [0:2] : (tensor<4xf32>) -> tensor<2xf32>",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_array_type_lower_layout_conversion() {
+        // The layout constraint takes the static physical buffer, so the runtime extent of the bounded dynamic axis is
+        // read from the input and restored on the constrained buffer. The operations are rendered outside any
+        // function, so their detached inputs print as unknown SSA values.
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("n", Some(5)), 3.into()]));
+        let output_type = input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let block = context.block(&[(input_type.lower(&context, location).unwrap(), location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
+        let output = output_type.lower_layout_conversion(input, &mut lowerer).unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output, operations.last().unwrap().result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "%c = stablehlo.constant dense<4> : tensor<i32>",
+                "%0 = stablehlo.set_dimension_size <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>>, dim = 0 : \
+                 (tensor<?x3xf64, #stablehlo.bounds<4, ?>>, tensor<i32>) -> tensor<4x3xf64>",
+                "%0 = stablehlo.custom_call @LayoutConstraint(<<UNKNOWN SSA VALUE>>) {operand_layouts = \
+                 [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : \
+                 (tensor<4x3xf64>) -> tensor<4x3xf64>",
+                "%0 = stablehlo.get_dimension_size <<UNKNOWN SSA VALUE>>, dim = 0 : \
+                 (tensor<?x3xf64, #stablehlo.bounds<4, ?>>) -> tensor<i32>",
+                "%0 = stablehlo.set_dimension_size <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>>, dim = 0 : \
+                 (tensor<4x3xf64>, tensor<i32>) -> tensor<?x3xf64, #stablehlo.bounds<4, ?>>",
+            ],
+        );
     }
 
     #[test]

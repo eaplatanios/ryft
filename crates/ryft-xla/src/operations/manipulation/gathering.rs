@@ -7,13 +7,13 @@ use ryft_mlir::{
 
 use crate::lowering::MlirLowerableValue;
 use crate::lowering::types::{
-    lower_compare_to_mlir, lower_explicit_shape, lower_physical_bound_value, lower_restore_dynamic_dimensions,
-    lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type, lower_unplaced_constant_output,
+    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, lower_explicit_shape,
+    lower_runtime_dimension_size_i64, lower_static_index_constants, lower_unplaced_constant_output,
     physical_bound_type,
 };
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::build_reduce_body_region;
-use crate::sharding::{OpenDimensions, lower_sharding_constraint};
+use crate::sharding::{OpenDimensions, ShardingExtension};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for GatherOperation {
@@ -24,8 +24,7 @@ impl LowerableOperation for GatherOperation {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let values = lower_gather_to_mlir(
-            self,
+        let values = self.lower_to_mlir(
             input_values,
             input_types,
             output_types,
@@ -37,9 +36,8 @@ impl LowerableOperation for GatherOperation {
             return Ok(values);
         }
         check_count!("input", values, 1, ProgramError);
-        let value = lower_sharding_constraint(
+        let value = output_types[0].sharding().unwrap().lower_sharding_constraint(
             values[0],
-            output_types[0].sharding().unwrap(),
             OpenDimensions::All,
             lowerer.collective_state().bound_manual_axes(),
             &mut lowerer.block(),
@@ -49,210 +47,222 @@ impl LowerableOperation for GatherOperation {
     }
 }
 
-/// Lowers a [`GatherOperation`] with its explicit index vector axis. [`GatherMode::Fill`] masks whole out-of-bounds
-/// windows, and [`GatherMode::Clip`] clamps against logical input sizes even when the allocation is larger. Comparisons
-/// preserve index signedness.
-fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &GatherOperation,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    check_count!("input", input_values, 2, ProgramError);
-    check_count!("input", input_types, 2, ProgramError);
-    check_count!("output", output_types, 1, ProgramError);
-    // Native gather expects integer indices, whereas the one-bit MLIR carrier denotes a predicate. Widen every index
-    // family without changing its signedness and explicitly recover the numeric value of I1 (i.e., -1 or 0).
-    let index_data_type = if input_types[1].data_type().is_unsigned() { DataType::U64 } else { DataType::I64 };
-    let indices_type = input_types[1].clone().with_data_type(index_data_type);
-    let mut indices = block
-        .append_operation(stable_hlo::convert(
-            input_values[1],
-            lower_tensor_type(&indices_type, context, location)?,
-            location,
-        )?)?
-        .result(0)
-        .unwrap()
-        .as_ref();
-    if input_types[1].data_type() == DataType::I1 {
-        indices = block.append_operation(stable_hlo::negate(indices, location)?)?.result(0).unwrap().as_ref();
-    }
-    let dimensions = operation.dimensions();
-    let (input_batching, indices_batching): (Vec<_>, Vec<_>) = dimensions.batching_dimensions().iter().copied().unzip();
-    let index_vector_dimension = input_types[1].rank() - 1;
-    let attribute = context.stable_hlo_gather_dimensions(
-        dimensions.offset_dimensions(),
-        dimensions.collapsed_slice_dimensions(),
-        &input_batching,
-        &indices_batching,
-        dimensions.start_index_map(),
-        index_vector_dimension,
-    )?;
-    // Paired axes select matching batch coordinates and do not contribute window coordinates. Use the
-    // canonical window entry when the extent proves which form is valid, which is zero for an empty axis and one for a
-    // nonempty axis. A retained symbolic batch may have used zero to admit an empty extent, and leaving that entry
-    // zero after specialization to a nonempty batch can make XLA replace the entire gather with zeros. If the extent
-    // can still be zero or positive, retain the original entry, because changing it to one would violate the gather
-    // window bound on an input that is empty at runtime. This does not add support for unspecialized batching over
-    // extents that are zero at runtime.
-    let mut slice_sizes = operation.slice_sizes().to_vec();
-    for &(axis, _) in dimensions.batching_dimensions() {
-        let bounds = input_types[0].dimension(axis).bounds();
-        if bounds.upper() == Some(1) {
-            slice_sizes[axis] = 0;
-        } else if bounds.lower() > 0 {
-            slice_sizes[axis] = 1;
+/// Lowering of a [`GatherOperation`] for its values.
+trait GatherOperationLoweringExtension {
+    /// Lowers a [`GatherOperation`] with its explicit index vector axis. [`GatherMode::Fill`] masks whole out-of-bounds
+    /// windows, and [`GatherMode::Clip`] clamps against logical input sizes even when the allocation is larger.
+    /// Comparisons preserve index signedness.
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl GatherOperationLoweringExtension for GatherOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        check_count!("input", input_values, 2, ProgramError);
+        check_count!("input", input_types, 2, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        // Native gather expects integer indices, whereas the one-bit MLIR carrier denotes a predicate. Widen every
+        // index family without changing its signedness and explicitly recover the numeric value of I1 (i.e., -1 or 0).
+        let index_data_type = if input_types[1].data_type().is_unsigned() { DataType::U64 } else { DataType::I64 };
+        let indices_type = input_types[1].clone().with_data_type(index_data_type);
+        let mut indices = block
+            .append_operation(stable_hlo::convert(input_values[1], indices_type.lower(context, location)?, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        if input_types[1].data_type() == DataType::I1 {
+            indices = block.append_operation(stable_hlo::negate(indices, location)?)?.result(0).unwrap().as_ref();
         }
-    }
-    let result = block.append_operation(stable_hlo::gather(
-        input_values[0],
-        indices,
-        attribute,
-        &slice_sizes,
-        operation.indices_are_sorted(),
-        location,
-    )?)?;
-    let result = result.result(0).unwrap().as_ref();
-    if operation.mode() == &GatherMode::PromiseInBounds
-        || (operation.mode() == &GatherMode::Clip && input_types[0].static_shape().is_some())
-    {
-        return Ok(vec![result]);
-    }
-
-    // Compute predicates on bounded storage and restore query extents afterwards. This avoids broadcasting scalar
-    // constants to dynamic tensor types without supplying their runtime sizes.
-    let comparison_type = physical_bound_type(&indices_type)?;
-    let physical_output_type = physical_bound_type(&output_types[0])?;
-    let indices = lower_physical_bound_value(indices, &indices_type, 0.0, block, context, location)?;
-
-    // Widen before comparing, because a legal input extent can exceed the range of an i8 or u8 index. In particular,
-    // converting u64 indices to i64 would incorrectly turn its largest values into negative indices or wrap a clipping
-    // operation. The bounds themselves are never negative, because type inference requires every slice size to fit the
-    // input extent, or the guaranteed minimum extent of a dynamic input axis.
-    let mut upper_bounds = Vec::with_capacity(dimensions.start_index_map().len());
-    for &axis in dimensions.start_index_map() {
-        let extent = match input_types[0].shape().dimensions()[axis] {
-            Dimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
-            Dimension::Dynamic(_) => lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?,
-        };
-        let window = lower_static_index_constants(&[operation.slice_sizes()[axis]], block, context, location)?[0];
-        upper_bounds
-            .push(block.append_operation(stable_hlo::subtract(extent, window, location)?)?.result(0).unwrap().as_ref());
-    }
-    let upper_bounds = lower_explicit_shape(&upper_bounds, block, context, location)?;
-    let upper_bounds_type = ArrayType::new_static(index_data_type, [dimensions.start_index_map().len()]);
-    let upper_bounds = block
-        .append_operation(stable_hlo::convert(
-            upper_bounds,
-            lower_tensor_type(&upper_bounds_type, context, location)?,
+        let dimensions = self.dimensions();
+        let (input_batching, indices_batching): (Vec<_>, Vec<_>) =
+            dimensions.batching_dimensions().iter().copied().unzip();
+        let index_vector_dimension = input_types[1].rank() - 1;
+        let attribute = context.stable_hlo_gather_dimensions(
+            dimensions.offset_dimensions(),
+            dimensions.collapsed_slice_dimensions(),
+            &input_batching,
+            &indices_batching,
+            dimensions.start_index_map(),
+            index_vector_dimension,
+        )?;
+        // Paired axes select matching batch coordinates and do not contribute window coordinates. Use the canonical
+        // window entry when the extent proves which form is valid, which is zero for an empty axis and one for a
+        // nonempty axis. A retained symbolic batch may have used zero to admit an empty extent, and leaving that entry
+        // zero after specialization to a nonempty batch can make XLA replace the entire gather with zeros. If the
+        // extent can still be zero or positive, retain the original entry, because changing it to one would violate the
+        // gather window bound on an input that is empty at runtime. This does not add support for unspecialized
+        // batching over extents that are zero at runtime.
+        let mut slice_sizes = self.slice_sizes().to_vec();
+        for &(axis, _) in dimensions.batching_dimensions() {
+            let bounds = input_types[0].dimension(axis).bounds();
+            if bounds.upper() == Some(1) {
+                slice_sizes[axis] = 0;
+            } else if bounds.lower() > 0 {
+                slice_sizes[axis] = 1;
+            }
+        }
+        let result = block.append_operation(stable_hlo::gather(
+            input_values[0],
+            indices,
+            attribute,
+            &slice_sizes,
+            self.indices_are_sorted(),
             location,
-        )?)?
-        .result(0)
-        .unwrap()
-        .as_ref();
-    let upper_bounds = block
-        .append_operation(stable_hlo::broadcast(
-            upper_bounds,
-            lower_tensor_type(&comparison_type, context, location)?,
-            &[index_vector_dimension],
-            location,
-        )?)?
-        .result(0)
-        .unwrap()
-        .as_ref();
-    let zero = lower_unplaced_constant_output(&[comparison_type], 0, block, context, location)?[0];
-    if operation.mode() == &GatherMode::Clip {
-        // Native gather clamps against allocation capacities, which can exceed a dynamic input's logical size.
-        // Clamp explicitly before gathering, then carry query sizes from the original gather's shape computation.
-        let clipped =
-            block.append_operation(stable_hlo::maximum(indices, zero, location)?)?.result(0).unwrap().as_ref();
-        let clipped = block
-            .append_operation(stable_hlo::minimum(clipped, upper_bounds, location)?)?
+        )?)?;
+        let result = result.result(0).unwrap().as_ref();
+        if self.mode() == &GatherMode::PromiseInBounds
+            || (self.mode() == &GatherMode::Clip && input_types[0].static_shape().is_some())
+        {
+            return Ok(vec![result]);
+        }
+
+        // Compute predicates on bounded storage and restore query extents afterwards. This avoids broadcasting scalar
+        // constants to dynamic tensor types without supplying their runtime sizes.
+        let comparison_type = physical_bound_type(&indices_type)?;
+        let physical_output_type = physical_bound_type(&output_types[0])?;
+        let indices = indices_type.lower_physical_bound_value(indices, 0.0, block, context, location)?;
+
+        // Widen before comparing, because a legal input extent can exceed the range of an i8 or u8 index. In
+        // particular, converting u64 indices to i64 would incorrectly turn its largest values into negative indices or
+        // wrap a clipping operation. The bounds themselves are never negative, because type inference requires every
+        // slice size to fit the input extent, or the guaranteed minimum extent of a dynamic input axis.
+        let mut upper_bounds = Vec::with_capacity(dimensions.start_index_map().len());
+        for &axis in dimensions.start_index_map() {
+            let extent = match input_types[0].shape().dimensions()[axis] {
+                Dimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
+                Dimension::Dynamic(_) => {
+                    lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?
+                }
+            };
+            let window = lower_static_index_constants(&[self.slice_sizes()[axis]], block, context, location)?[0];
+            upper_bounds.push(
+                block.append_operation(stable_hlo::subtract(extent, window, location)?)?.result(0).unwrap().as_ref(),
+            );
+        }
+        let upper_bounds = lower_explicit_shape(&upper_bounds, block, context, location)?;
+        let upper_bounds_type = ArrayType::new_static(index_data_type, [dimensions.start_index_map().len()]);
+        let upper_bounds = block
+            .append_operation(stable_hlo::convert(
+                upper_bounds,
+                upper_bounds_type.lower(context, location)?,
+                location,
+            )?)?
             .result(0)
             .unwrap()
             .as_ref();
-        // Componentwise clamping can reorder lexicographically sorted index vectors, so discard the sorting hint.
-        let clipped = block
-            .append_operation(stable_hlo::gather(input_values[0], clipped, attribute, &slice_sizes, false, location)?)?
+        let upper_bounds = block
+            .append_operation(stable_hlo::broadcast(
+                upper_bounds,
+                comparison_type.lower(context, location)?,
+                &[index_vector_dimension],
+                location,
+            )?)?
             .result(0)
             .unwrap()
             .as_ref();
-        let clipped = lower_physical_bound_value(clipped, &output_types[0], 0.0, block, context, location)?;
-        let sources = (0..output_types[0].rank()).map(|axis| (result, axis)).collect::<Vec<_>>();
-        return Ok(vec![lower_restore_dynamic_dimensions(
-            clipped,
-            &output_types[0],
-            &sources,
-            block,
+        let zero = lower_unplaced_constant_output(&[comparison_type], 0, block, context, location)?[0];
+        if self.mode() == &GatherMode::Clip {
+            // Native gather clamps against allocation capacities, which can exceed a dynamic input's logical size.
+            // Clamp explicitly before gathering, then carry query sizes from the original gather's shape computation.
+            let clipped =
+                block.append_operation(stable_hlo::maximum(indices, zero, location)?)?.result(0).unwrap().as_ref();
+            let clipped = block
+                .append_operation(stable_hlo::minimum(clipped, upper_bounds, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
+            // Componentwise clamping can reorder lexicographically sorted index vectors, so discard the sorting hint.
+            let clipped = block
+                .append_operation(stable_hlo::gather(
+                    input_values[0],
+                    clipped,
+                    attribute,
+                    &slice_sizes,
+                    false,
+                    location,
+                )?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
+            let clipped = output_types[0].lower_physical_bound_value(clipped, 0.0, block, context, location)?;
+            let sources = (0..output_types[0].rank()).map(|axis| (result, axis)).collect::<Vec<_>>();
+            return Ok(vec![
+                output_types[0].lower_restore_dynamic_dimensions(clipped, &sources, block, context, location)?,
+            ]);
+        }
+        let upper_mask =
+            ComparisonDirection::LessThanOrEqual.lower_comparison(indices, upper_bounds, block, location)?;
+        let lower_mask = ComparisonDirection::GreaterThanOrEqual.lower_comparison(indices, zero, block, location)?;
+        let mask = block
+            .append_operation(stable_hlo::and(lower_mask, upper_mask, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let initial =
+            lower_unplaced_constant_output(&[ArrayType::scalar(DataType::Boolean)], 1, block, context, location)?[0];
+        let reduction = build_reduce_body_region(
+            ReductionKind::All,
+            DataType::Boolean,
+            FloatExtremumForm::TotalOrder,
             context,
             location,
-        )?]);
-    }
-    let upper_mask =
-        lower_compare_to_mlir(ComparisonDirection::LessThanOrEqual, indices, upper_bounds, block, location)?;
-    let lower_mask = lower_compare_to_mlir(ComparisonDirection::GreaterThanOrEqual, indices, zero, block, location)?;
-    let mask = block
-        .append_operation(stable_hlo::and(lower_mask, upper_mask, location)?)?
-        .result(0)
-        .unwrap()
-        .as_ref();
-    let initial =
-        lower_unplaced_constant_output(&[ArrayType::scalar(DataType::Boolean)], 1, block, context, location)?[0];
-    let reduction = build_reduce_body_region(
-        ReductionKind::All,
-        DataType::Boolean,
-        FloatExtremumForm::TotalOrder,
-        context,
-        location,
-    )?;
-    let mask = block
-        .append_operation(stable_hlo::reduce(&[mask], &[initial], &[index_vector_dimension], reduction, location)?)?
-        .result(0)
-        .unwrap()
-        .as_ref();
-    let batch_axes = (0..output_types[0].rank())
-        .filter(|axis| !dimensions.offset_dimensions().contains(axis))
-        .collect::<Vec<_>>();
-    let mask_type = physical_output_type.clone().with_data_type(DataType::Boolean);
-    let mask = block
-        .append_operation(stable_hlo::broadcast(
-            mask,
-            lower_tensor_type(&mask_type, context, location)?,
-            &batch_axes,
-            location,
-        )?)?
-        .result(0)
-        .unwrap()
-        .as_ref();
+        )?;
+        let mask = block
+            .append_operation(stable_hlo::reduce(&[mask], &[initial], &[index_vector_dimension], reduction, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let batch_axes = (0..output_types[0].rank())
+            .filter(|axis| !dimensions.offset_dimensions().contains(axis))
+            .collect::<Vec<_>>();
+        let mask_type = physical_output_type.clone().with_data_type(DataType::Boolean);
+        let mask = block
+            .append_operation(stable_hlo::broadcast(mask, mask_type.lower(context, location)?, &batch_axes, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
 
-    let fill = operation.options().resolved_fill_value(output_types[0].data_type())?;
-    let scalar_type = lower_tensor_type(&ArrayType::scalar(output_types[0].data_type()), context, location)?;
-    let fill = block
-        .append_operation(stable_hlo::constant(fill.to_dense_elements_attribute(scalar_type, context)?, location)?)?
-        .result(0)
-        .unwrap()
-        .as_ref();
-    let fill = block
-        .append_operation(stable_hlo::broadcast(
-            fill,
-            lower_tensor_type(&physical_output_type, context, location)?,
-            &[],
-            location,
-        )?)?
-        .result(0)
-        .unwrap()
-        .as_ref();
-    let physical_result = lower_physical_bound_value(result, &output_types[0], 0.0, block, context, location)?;
-    let filled = block
-        .append_operation(stable_hlo::select(mask, physical_result, fill, location)?)?
-        .result(0)
-        .unwrap()
-        .as_ref();
-    let sources = (0..output_types[0].rank()).map(|axis| (result, axis)).collect::<Vec<_>>();
-    Ok(vec![lower_restore_dynamic_dimensions(filled, &output_types[0], &sources, block, context, location)?])
+        let fill = self.options().resolved_fill_value(output_types[0].data_type())?;
+        let scalar_type = (ArrayType::scalar(output_types[0].data_type())).lower(context, location)?;
+        let fill = block
+            .append_operation(stable_hlo::constant(fill.to_dense_elements_attribute(scalar_type, context)?, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let fill = block
+            .append_operation(stable_hlo::broadcast(
+                fill,
+                physical_output_type.lower(context, location)?,
+                &[],
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let physical_result = output_types[0].lower_physical_bound_value(result, 0.0, block, context, location)?;
+        let filled = block
+            .append_operation(stable_hlo::select(mask, physical_result, fill, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let sources = (0..output_types[0].rank()).map(|axis| (result, axis)).collect::<Vec<_>>();
+        Ok(vec![output_types[0].lower_restore_dynamic_dimensions(filled, &sources, block, context, location)?])
+    }
 }
 
 #[cfg(test)]
@@ -700,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_gather_to_mlir_diagonal_matches_reference_backend() {
+    fn test_gather_operation_lower_diagonal_matches_reference_backend() {
         // A diagonal is a slice of its two axes followed by one gather over iota indices, which lowers and executes
         // like the reference backend, including for offsets, axes with different extents, and empty diagonals.
         let client = execution_client();

@@ -28,7 +28,7 @@ mod tests {
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
     use crate::Session;
-    use crate::lowering::types::lower_tensor_type;
+    use crate::lowering::types::ArrayTypeLoweringExtension;
 
     use super::*;
 
@@ -39,7 +39,7 @@ mod tests {
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
         let scalar_type = ArrayType::scalar(DataType::F32);
-        let block = context.block(&[(lower_tensor_type(&scalar_type, &context, location).unwrap(), location)]);
+        let block = context.block(&[(scalar_type.lower(&context, location).unwrap(), location)]);
         let input = block.as_ref().argument(0).unwrap().as_ref();
         let mut lowerer =
             Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());

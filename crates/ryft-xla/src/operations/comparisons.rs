@@ -2,7 +2,7 @@ use ryft_core::macros::check_count;
 use ryft_core::{ArrayType, CompareOperation, DataType, ProgramError};
 use ryft_mlir::ValueRef;
 
-use crate::lowering::types::{lower_compare_to_mlir, lower_signed_one_bit_to_mlir};
+use crate::lowering::types::{ComparisonDirectionLoweringExtension, lower_signed_one_bit_to_mlir};
 use crate::operations::normalize_binary_elementwise_operands;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
 
@@ -34,7 +34,7 @@ impl LowerableOperation for CompareOperation<ArrayType> {
             lowerer.context(),
             lowerer.location(),
         )?;
-        let value = lower_compare_to_mlir(self.direction(), left, right, &mut lowerer.block(), lowerer.location())?;
+        let value = self.direction().lower_comparison(left, right, &mut lowerer.block(), lowerer.location())?;
         Ok(vec![value])
     }
 }
@@ -55,7 +55,7 @@ impl LowerableOperation for CompareOperation<Type> {
         };
         // Dimension atoms already lower to scalar `i64` SSA values, so the ordinary comparison lowering can
         // consume them directly without a data gateway or host-side shape reconstruction.
-        Ok(vec![lower_compare_to_mlir(self.direction(), *left, *right, block, location)?])
+        Ok(vec![self.direction().lower_comparison(*left, *right, block, location)?])
     }
 }
 

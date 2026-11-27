@@ -13,9 +13,7 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::types::{
-    annotate_output_memory, lower_physical_storage, lower_tensor_type, lower_unplaced_constant_output,
-};
+use crate::lowering::types::{ArrayTypeLoweringExtension, annotate_output_memory, lower_unplaced_constant_output};
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{
@@ -35,8 +33,7 @@ impl LowerableOperation for CustomCallOperation {
             lowerer.require_runtime(requirement)?;
         }
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-        let results = lower_custom_call_to_mlir(
-            self,
+        let results = self.lower_to_mlir(
             input_values,
             input_types,
             output_types,
@@ -131,7 +128,7 @@ impl MemberLowerableOperation<Type> for CustomCallOperation {
         let physical_inputs = array_inputs
             .iter()
             .zip(&array_input_types)
-            .map(|(input, input_type)| lower_physical_storage(*input, input_type, block, context, location))
+            .map(|(input, input_type)| input_type.lower_physical_storage(*input, block, context, location))
             .collect::<Result<Vec<_>, _>>()?;
         let results = if let Some(predicate) = validation {
             // A separate assertion token cannot gate a pure or nullary foreign ABI. The conditional keeps every
@@ -145,8 +142,7 @@ impl MemberLowerableOperation<Type> for CustomCallOperation {
             {
                 let mut true_block = true_block.as_ref();
                 let mut true_tokens = *effect_tokens;
-                let mut outputs = lower_custom_call_to_mlir(
-                    self,
+                let mut outputs = self.lower_to_mlir(
                     &physical_inputs,
                     &physical_input_types,
                     &physical_output_types,
@@ -197,8 +193,7 @@ impl MemberLowerableOperation<Type> for CustomCallOperation {
             }
             (0..physical_output_types.len()).map(|index| guarded.result(index).unwrap().as_ref()).collect()
         } else {
-            lower_custom_call_to_mlir(
-                self,
+            self.lower_to_mlir(
                 &physical_inputs,
                 &physical_input_types,
                 &physical_output_types,
@@ -228,7 +223,7 @@ impl MemberLowerableOperation<Type> for CustomCallOperation {
                 let mut dimensions = refined_type.shape().dimensions().to_vec();
                 dimensions[axis] = dimension;
                 refined_type = refined_type.with_shape(Shape::new(dimensions));
-                let refined_tensor_type = lower_tensor_type(&refined_type, context, location)?;
+                let refined_tensor_type = refined_type.lower(context, location)?;
                 let result = block.append_operation(stable_hlo::set_dimension_size(
                     results[output_index],
                     extent,
@@ -260,111 +255,126 @@ fn lower_custom_call_output_memories<'b, 'c: 'b, 't: 'c>(
         .collect()
 }
 
-/// Lowers one custom call to a `stablehlo.custom_call` using the typed FFI calling convention (i.e.,
-/// `api_version = 4`). Typed attributes become the `backend_config` dictionary. Array layouts, which are the declared
-/// input layouts or else the input and output types' own layouts, become complete StableHLO operand and result layout
-/// lists, and flat input and output aliases become StableHLO output operand aliases. A call with an ordered effect
-/// class additionally consumes and produces the current token of its ordering domain, which is the ordered assertion
-/// chain or the ordered I/O chain for both [`EffectClass::OrderedIo`] and [`EffectClass::DeviceOrderedIo`]. Calls in
-/// that class therefore remain ordered even when their array results do not carry a data dependency, and their
-/// handlers receive a trailing token argument and result. An [`EffectClass::UnorderedIo`] call is only marked
-/// `has_side_effect = true`, which keeps it alive without ordering it and gives its handler the same ABI without
-/// tokens as a pure call, matching JAX's `has_side_effect=True`. The XLA runtime resolves handlers through the target
-/// name at execution time (e.g., handlers registered with
-/// [`Client::register_ffi_handler`](ryft_pjrt::Client::register_ffi_handler)).
-fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &CustomCallOperation,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let token_class = custom_call_token_class(operation)?;
-    let has_token = token_class.is_some();
-    check_count!("input", input_types, input_values.len(), ProgramError);
-    // Input type layouts describe the incoming values. The kernel receives the call's declared layouts instead,
-    // with omitted declarations and `None` entries requesting dense row-major storage.
-    let input_types = input_types
-        .iter()
-        .enumerate()
-        .map(|(index, input_type)| {
-            input_type.clone().with_layout(operation.input_layouts().get(index).cloned().flatten())
-        })
-        .collect::<Vec<_>>();
-    let input_types = input_types.as_slice();
-    let attributes = lower_custom_call_attributes(
-        operation.attributes().iter().filter(|(name, _)| name != RUNTIME_REQUIREMENTS_ATTRIBUTE),
-        context,
-        location,
-    )?;
-    let backend_config = context.dictionary_attribute(&attributes);
-    let memory_layouts = Some(lower_custom_call_memory_layouts(input_types, output_types, has_token)?);
-    #[cfg(feature = "mosaic-gpu")]
-    let memory_layouts = if operation.target_name() == ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_FFI_TARGET
-    {
-        let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "mosaic GPU")?;
-        if has_token {
-            layouts.operands.push(Vec::new());
-            layouts.results.push(Vec::new());
+/// Lowering of a [`CustomCallOperation`] for its values.
+trait CustomCallOperationLoweringExtension {
+    /// Lowers one custom call to a `stablehlo.custom_call` using the typed FFI calling convention (i.e., `api_version =
+    /// 4`). Typed attributes become the `backend_config` dictionary. Array layouts, which are the declared input
+    /// layouts or else the input and output types' own layouts, become complete StableHLO operand and result layout
+    /// lists, and flat input and output aliases become StableHLO output operand aliases. A call with an ordered effect
+    /// class additionally consumes and produces the current token of its ordering domain, which is the ordered
+    /// assertion chain or the ordered I/O chain for both [`EffectClass::OrderedIo`] and
+    /// [`EffectClass::DeviceOrderedIo`]. Calls in that class therefore remain ordered even when their array results do
+    /// not carry a data dependency, and their handlers receive a trailing token argument and result. An
+    /// [`EffectClass::UnorderedIo`] call is only marked `has_side_effect = true`, which keeps it alive without ordering
+    /// it and gives its handler the same ABI without tokens as a pure call, matching JAX's `has_side_effect=True`. The
+    /// XLA runtime resolves handlers through the target name at execution time (e.g., handlers registered with
+    /// [`Client::register_ffi_handler`](ryft_pjrt::Client::register_ffi_handler)).
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl CustomCallOperationLoweringExtension for CustomCallOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let token_class = custom_call_token_class(self)?;
+        let has_token = token_class.is_some();
+        check_count!("input", input_types, input_values.len(), ProgramError);
+        // Input type layouts describe the incoming values. The kernel receives the call's declared layouts instead,
+        // with omitted declarations and `None` entries requesting dense row-major storage.
+        let input_types = input_types
+            .iter()
+            .enumerate()
+            .map(|(index, input_type)| {
+                input_type.clone().with_layout(self.input_layouts().get(index).cloned().flatten())
+            })
+            .collect::<Vec<_>>();
+        let input_types = input_types.as_slice();
+        let attributes = lower_custom_call_attributes(
+            self.attributes().iter().filter(|(name, _)| name != RUNTIME_REQUIREMENTS_ATTRIBUTE),
+            context,
+            location,
+        )?;
+        let backend_config = context.dictionary_attribute(&attributes);
+        let memory_layouts = Some(lower_custom_call_memory_layouts(input_types, output_types, has_token)?);
+        #[cfg(feature = "mosaic-gpu")]
+        let memory_layouts = if self.target_name() == ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_FFI_TARGET {
+            let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "mosaic GPU")?;
+            if has_token {
+                layouts.operands.push(Vec::new());
+                layouts.results.push(Vec::new());
+            }
+            Some(layouts)
+        } else {
+            memory_layouts
+        };
+        // Compiler-provided static strides require fixed layouts even when the logical array type leaves them implicit.
+        let memory_layouts = if self.attributes().iter().any(|(name, value)| {
+            matches!(name.as_str(), "ryft.cuda.row_major" | "ryft.rocm.row_major")
+                && *value == CustomCallAttribute::Boolean(true)
+        }) {
+            let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "kernel")?;
+            if has_token {
+                layouts.operands.push(Vec::new());
+                layouts.results.push(Vec::new());
+            }
+            Some(layouts)
+        } else {
+            memory_layouts
+        };
+        let mut lowered_inputs = input_values.to_vec();
+        if let Some(token_class) = token_class {
+            lowered_inputs.push(current_or_new_token(token_class, effect_tokens, block, location)?);
         }
-        Some(layouts)
-    } else {
-        memory_layouts
-    };
-    // Compiler-provided static strides require fixed layouts even when the logical array type leaves them implicit.
-    let memory_layouts = if operation.attributes().iter().any(|(name, value)| {
-        matches!(name.as_str(), "ryft.cuda.row_major" | "ryft.rocm.row_major")
-            && *value == CustomCallAttribute::Boolean(true)
-    }) {
-        let mut layouts = crate::kernels::dense_memory_layouts(input_types, output_types, "kernel")?;
+        let mut lowered_output_types = output_types
+            .iter()
+            .map(|output_type| output_type.lower(context, location).map(|r#type| r#type.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
         if has_token {
-            layouts.operands.push(Vec::new());
-            layouts.results.push(Vec::new());
+            lowered_output_types.push(context.stable_hlo_token_type()?.as_ref());
         }
-        Some(layouts)
-    } else {
-        memory_layouts
-    };
-    let mut lowered_inputs = input_values.to_vec();
-    if let Some(token_class) = token_class {
-        lowered_inputs.push(current_or_new_token(token_class, effect_tokens, block, location)?);
+        let output_operand_aliases = self
+            .input_output_aliases()
+            .iter()
+            .map(|alias| {
+                let output_tuple_indices =
+                    if lowered_output_types.len() == 1 { Vec::new() } else { vec![alias.output_index()] };
+                context.stable_hlo_output_operand_alias(output_tuple_indices.as_slice(), alias.input_index(), &[])
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let lowered = block.append_operation(stable_hlo::custom_call(
+            lowered_inputs.as_slice(),
+            self.target_name(),
+            self.has_side_effect(),
+            Some(backend_config.as_ref()),
+            CustomCallApiVersion::TypedFfi,
+            &[],
+            memory_layouts,
+            output_operand_aliases.as_slice(),
+            None,
+            &lowered_output_types,
+            location,
+        )?)?;
+        if let Some(token_class) = token_class {
+            effect_tokens.set(token_class, lowered.result(output_types.len()).unwrap().as_ref());
+        }
+        Ok((0..output_types.len()).map(|index| lowered.result(index).unwrap().as_ref()).collect())
     }
-    let mut lowered_output_types = output_types
-        .iter()
-        .map(|output_type| lower_tensor_type(output_type, context, location).map(|r#type| r#type.as_ref()))
-        .collect::<Result<Vec<_>, _>>()?;
-    if has_token {
-        lowered_output_types.push(context.stable_hlo_token_type()?.as_ref());
-    }
-    let output_operand_aliases = operation
-        .input_output_aliases()
-        .iter()
-        .map(|alias| {
-            let output_tuple_indices =
-                if lowered_output_types.len() == 1 { Vec::new() } else { vec![alias.output_index()] };
-            context.stable_hlo_output_operand_alias(output_tuple_indices.as_slice(), alias.input_index(), &[])
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let lowered = block.append_operation(stable_hlo::custom_call(
-        lowered_inputs.as_slice(),
-        operation.target_name(),
-        operation.has_side_effect(),
-        Some(backend_config.as_ref()),
-        CustomCallApiVersion::TypedFfi,
-        &[],
-        memory_layouts,
-        output_operand_aliases.as_slice(),
-        None,
-        &lowered_output_types,
-        location,
-    )?)?;
-    if let Some(token_class) = token_class {
-        effect_tokens.set(token_class, lowered.result(output_types.len()).unwrap().as_ref());
-    }
-    Ok((0..output_types.len()).map(|index| lowered.result(index).unwrap().as_ref()).collect())
 }
 
 /// Returns the class of the effect token that a custom call threads for its effect class. That is the ordered
@@ -425,8 +435,8 @@ fn lower_custom_call_memory_layouts(
     output_types: &[ArrayType],
     has_effect_token: bool,
 ) -> Result<CustomCallMemoryLayouts, Error> {
-    let mut operands = input_types.iter().map(lower_custom_call_layout).collect::<Result<Vec<_>, _>>()?;
-    let mut results = output_types.iter().map(lower_custom_call_layout).collect::<Result<Vec<_>, _>>()?;
+    let mut operands = input_types.iter().map(ArrayType::lower_custom_call_layout).collect::<Result<Vec<_>, _>>()?;
+    let mut results = output_types.iter().map(ArrayType::lower_custom_call_layout).collect::<Result<Vec<_>, _>>()?;
     if has_effect_token {
         operands.push(Vec::new());
         results.push(Vec::new());
@@ -434,40 +444,47 @@ fn lower_custom_call_memory_layouts(
     Ok(CustomCallMemoryLayouts { operands, results })
 }
 
-/// Returns the minor-to-major layout required by one custom call array type.
-fn lower_custom_call_layout(r#type: &ArrayType) -> Result<Vec<usize>, Error> {
-    let Some(layout) = r#type.layout() else {
-        return Ok((0..r#type.rank()).rev().collect());
-    };
-    let Layout::Tiled(layout) = layout else {
-        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: CUSTOM_CALL_OPERATION_NAME.to_string(),
-            reason: format!("`{CUSTOM_CALL_OPERATION_NAME}` with strided array layout `{layout}`"),
-        }));
-    };
-    if !layout.tiles().is_empty() {
-        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: CUSTOM_CALL_OPERATION_NAME.to_string(),
-            reason: format!("`{CUSTOM_CALL_OPERATION_NAME}` with tiled array layout `{layout}`"),
-        }));
+/// Lowering of an [`ArrayType`] at the boundary of a custom call.
+trait ArrayTypeCustomCallLoweringExtension {
+    /// Returns the minor-to-major layout required by one custom call array type.
+    fn lower_custom_call_layout(&self) -> Result<Vec<usize>, Error>;
+}
+
+impl ArrayTypeCustomCallLoweringExtension for ArrayType {
+    fn lower_custom_call_layout(&self) -> Result<Vec<usize>, Error> {
+        let Some(layout) = self.layout() else {
+            return Ok((0..self.rank()).rev().collect());
+        };
+        let Layout::Tiled(layout) = layout else {
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: CUSTOM_CALL_OPERATION_NAME.to_string(),
+                reason: format!("`{CUSTOM_CALL_OPERATION_NAME}` with strided array layout `{layout}`"),
+            }));
+        };
+        if !layout.tiles().is_empty() {
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: CUSTOM_CALL_OPERATION_NAME.to_string(),
+                reason: format!("`{CUSTOM_CALL_OPERATION_NAME}` with tiled array layout `{layout}`"),
+            }));
+        }
+        if layout.rank() != self.rank()
+            || layout.minor_to_major().iter().any(|axis| *axis >= self.rank())
+            || layout.minor_to_major().iter().collect::<HashSet<_>>().len() != self.rank()
+        {
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: CUSTOM_CALL_OPERATION_NAME.to_string(),
+                reason: format!(
+                    "`{CUSTOM_CALL_OPERATION_NAME}` with invalid array layout `{layout}` for rank-{} type `{self}`",
+                    self.rank(),
+                ),
+            }));
+        }
+        Ok(layout.minor_to_major().to_vec())
     }
-    if layout.rank() != r#type.rank()
-        || layout.minor_to_major().iter().any(|axis| *axis >= r#type.rank())
-        || layout.minor_to_major().iter().collect::<HashSet<_>>().len() != r#type.rank()
-    {
-        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: CUSTOM_CALL_OPERATION_NAME.to_string(),
-            reason: format!(
-                "`{CUSTOM_CALL_OPERATION_NAME}` with invalid array layout `{layout}` for rank-{} type `{type}`",
-                r#type.rank(),
-            ),
-        }));
-    }
-    Ok(layout.minor_to_major().to_vec())
 }
 
 /// Lowers named custom call attributes to MLIR named attributes, in declaration order. Refer to
-/// [`lower_custom_call_attribute`] for the encoding of each attribute kind.
+/// [`CustomCallAttributeLoweringExtension::lower`] for the encoding of each attribute kind.
 fn lower_custom_call_attributes<'o, 'c, 't: 'c>(
     attributes: impl IntoIterator<Item = &'o (String, CustomCallAttribute)>,
     context: &'c MlirContext<'t>,
@@ -476,84 +493,96 @@ fn lower_custom_call_attributes<'o, 'c, 't: 'c>(
     attributes
         .into_iter()
         .map(|(name, value)| {
-            let value = lower_custom_call_attribute(value, context, location)?;
+            let value = value.lower(context, location)?;
             Ok(context.named_attribute(context.identifier(name.as_str()), value))
         })
         .collect()
 }
 
-/// Lowers one typed custom call attribute to the MLIR attribute that XLA's typed FFI decodes into the matching handler
-/// attribute type, as implemented in XLA's
-/// [`xla/ffi/attribute_map.cc`](https://github.com/openxla/xla/blob/main/xla/ffi/attribute_map.cc). Signed integers
-/// become signless integer attributes and unsigned integers become unsigned integer attributes of the same width,
-/// because the FFI decodes integer signedness from the attribute type. Signed integer and floating-point arrays become
-/// dense array attributes, while
-/// unsigned arrays become dense elements attributes of a rank-1 unsigned tensor type, which is the only unsigned
-/// array encoding that the FFI decodes. Binary data becomes a string attribute holding the exact bytes, and
-/// dictionaries recurse.
-fn lower_custom_call_attribute<'c, 't: 'c>(
-    value: &CustomCallAttribute,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<AttributeRef<'c, 't>, Error> {
-    let unsigned_tensor_type = |bit_width: usize, length: usize| {
-        context.tensor_type(context.unsigned_integer_type(bit_width), &[MlirSize::Static(length)], None, location)
-    };
-    Ok(match value {
-        CustomCallAttribute::String(string) => context.string_attribute(string.as_str()).as_ref(),
-        CustomCallAttribute::Bytes(bytes) => context.string_attribute(StringRef::from(bytes.as_slice())).as_ref(),
-        CustomCallAttribute::Boolean(boolean) => context.boolean_attribute(*boolean).as_ref(),
-        CustomCallAttribute::I8(integer) => {
-            context.integer_attribute(context.signless_integer_type(8), i64::from(*integer)).as_ref()
-        }
-        CustomCallAttribute::I16(integer) => {
-            context.integer_attribute(context.signless_integer_type(16), i64::from(*integer)).as_ref()
-        }
-        CustomCallAttribute::I32(integer) => {
-            context.integer_attribute(context.signless_integer_type(32), i64::from(*integer)).as_ref()
-        }
-        CustomCallAttribute::I64(integer) => {
-            context.integer_attribute(context.signless_integer_type(64), *integer).as_ref()
-        }
-        CustomCallAttribute::U8(integer) => {
-            context.integer_attribute(context.unsigned_integer_type(8), i64::from(*integer)).as_ref()
-        }
-        CustomCallAttribute::U16(integer) => {
-            context.integer_attribute(context.unsigned_integer_type(16), i64::from(*integer)).as_ref()
-        }
-        CustomCallAttribute::U32(integer) => {
-            context.integer_attribute(context.unsigned_integer_type(32), i64::from(*integer)).as_ref()
-        }
-        // MLIR stores integer attributes as 64-bit words and the unsigned type reinterprets their bits.
-        CustomCallAttribute::U64(integer) => {
-            context.integer_attribute(context.unsigned_integer_type(64), integer.cast_signed()).as_ref()
-        }
-        CustomCallAttribute::F32(float) => context.float_attribute(context.float32_type(), f64::from(*float)).as_ref(),
-        CustomCallAttribute::F64(float) => context.float_attribute(context.float64_type(), *float).as_ref(),
-        CustomCallAttribute::Array(array) => match array {
-            CustomCallArrayAttribute::I8(values) => context.dense_i8_array_attribute(values)?.as_ref(),
-            CustomCallArrayAttribute::I16(values) => context.dense_i16_array_attribute(values)?.as_ref(),
-            CustomCallArrayAttribute::I32(values) => context.dense_i32_array_attribute(values)?.as_ref(),
-            CustomCallArrayAttribute::I64(values) => context.dense_i64_array_attribute(values)?.as_ref(),
-            CustomCallArrayAttribute::U8(values) => {
-                context.dense_u8_elements_attribute(unsigned_tensor_type(8, values.len())?, values)?.as_ref()
+/// Lowering of a [`CustomCallAttribute`] to an MLIR attribute.
+trait CustomCallAttributeLoweringExtension {
+    /// Lowers one typed custom call attribute to the MLIR attribute that XLA's typed FFI decodes into the matching
+    /// handler attribute type, as implemented in XLA's
+    /// [`xla/ffi/attribute_map.cc`](https://github.com/openxla/xla/blob/main/xla/ffi/attribute_map.cc). Signed integers
+    /// become signless integer attributes and unsigned integers become unsigned integer attributes of the same width,
+    /// because the FFI decodes integer signedness from the attribute type. Signed integer and floating-point arrays
+    /// become dense array attributes, while unsigned arrays become dense elements attributes of a rank-1 unsigned
+    /// tensor type, which is the only unsigned array encoding that the FFI decodes. Binary data becomes a string
+    /// attribute holding the exact bytes, and dictionaries recurse.
+    fn lower<'c, 't: 'c>(
+        &self,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<AttributeRef<'c, 't>, Error>;
+}
+
+impl CustomCallAttributeLoweringExtension for CustomCallAttribute {
+    fn lower<'c, 't: 'c>(
+        &self,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<AttributeRef<'c, 't>, Error> {
+        let unsigned_tensor_type = |bit_width: usize, length: usize| {
+            context.tensor_type(context.unsigned_integer_type(bit_width), &[MlirSize::Static(length)], None, location)
+        };
+        Ok(match self {
+            CustomCallAttribute::String(string) => context.string_attribute(string.as_str()).as_ref(),
+            CustomCallAttribute::Bytes(bytes) => context.string_attribute(StringRef::from(bytes.as_slice())).as_ref(),
+            CustomCallAttribute::Boolean(boolean) => context.boolean_attribute(*boolean).as_ref(),
+            CustomCallAttribute::I8(integer) => {
+                context.integer_attribute(context.signless_integer_type(8), i64::from(*integer)).as_ref()
             }
-            CustomCallArrayAttribute::U16(values) => {
-                context.dense_u16_elements_attribute(unsigned_tensor_type(16, values.len())?, values)?.as_ref()
+            CustomCallAttribute::I16(integer) => {
+                context.integer_attribute(context.signless_integer_type(16), i64::from(*integer)).as_ref()
             }
-            CustomCallArrayAttribute::U32(values) => {
-                context.dense_u32_elements_attribute(unsigned_tensor_type(32, values.len())?, values)?.as_ref()
+            CustomCallAttribute::I32(integer) => {
+                context.integer_attribute(context.signless_integer_type(32), i64::from(*integer)).as_ref()
             }
-            CustomCallArrayAttribute::U64(values) => {
-                context.dense_u64_elements_attribute(unsigned_tensor_type(64, values.len())?, values)?.as_ref()
+            CustomCallAttribute::I64(integer) => {
+                context.integer_attribute(context.signless_integer_type(64), *integer).as_ref()
             }
-            CustomCallArrayAttribute::F32(values) => context.dense_f32_array_attribute(values)?.as_ref(),
-            CustomCallArrayAttribute::F64(values) => context.dense_f64_array_attribute(values)?.as_ref(),
-        },
-        CustomCallAttribute::Dictionary(attributes) => {
-            context.dictionary_attribute(&lower_custom_call_attributes(attributes, context, location)?).as_ref()
-        }
-    })
+            CustomCallAttribute::U8(integer) => {
+                context.integer_attribute(context.unsigned_integer_type(8), i64::from(*integer)).as_ref()
+            }
+            CustomCallAttribute::U16(integer) => {
+                context.integer_attribute(context.unsigned_integer_type(16), i64::from(*integer)).as_ref()
+            }
+            CustomCallAttribute::U32(integer) => {
+                context.integer_attribute(context.unsigned_integer_type(32), i64::from(*integer)).as_ref()
+            }
+            // MLIR stores integer attributes as 64-bit words and the unsigned type reinterprets their bits.
+            CustomCallAttribute::U64(integer) => {
+                context.integer_attribute(context.unsigned_integer_type(64), integer.cast_signed()).as_ref()
+            }
+            CustomCallAttribute::F32(float) => {
+                context.float_attribute(context.float32_type(), f64::from(*float)).as_ref()
+            }
+            CustomCallAttribute::F64(float) => context.float_attribute(context.float64_type(), *float).as_ref(),
+            CustomCallAttribute::Array(array) => match array {
+                CustomCallArrayAttribute::I8(values) => context.dense_i8_array_attribute(values)?.as_ref(),
+                CustomCallArrayAttribute::I16(values) => context.dense_i16_array_attribute(values)?.as_ref(),
+                CustomCallArrayAttribute::I32(values) => context.dense_i32_array_attribute(values)?.as_ref(),
+                CustomCallArrayAttribute::I64(values) => context.dense_i64_array_attribute(values)?.as_ref(),
+                CustomCallArrayAttribute::U8(values) => {
+                    context.dense_u8_elements_attribute(unsigned_tensor_type(8, values.len())?, values)?.as_ref()
+                }
+                CustomCallArrayAttribute::U16(values) => {
+                    context.dense_u16_elements_attribute(unsigned_tensor_type(16, values.len())?, values)?.as_ref()
+                }
+                CustomCallArrayAttribute::U32(values) => {
+                    context.dense_u32_elements_attribute(unsigned_tensor_type(32, values.len())?, values)?.as_ref()
+                }
+                CustomCallArrayAttribute::U64(values) => {
+                    context.dense_u64_elements_attribute(unsigned_tensor_type(64, values.len())?, values)?.as_ref()
+                }
+                CustomCallArrayAttribute::F32(values) => context.dense_f32_array_attribute(values)?.as_ref(),
+                CustomCallArrayAttribute::F64(values) => context.dense_f64_array_attribute(values)?.as_ref(),
+            },
+            CustomCallAttribute::Dictionary(attributes) => {
+                context.dictionary_attribute(&lower_custom_call_attributes(attributes, context, location)?).as_ref()
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -700,21 +729,6 @@ mod tests {
             program.to_mlir_module("main"),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "strided input layout `strided{12,4}`",
-        ));
-        let invalid_permutation_type =
-            test_matrix_type(2, 3).with_layout(Some(TiledLayout::new(vec![0, 0], Vec::new()).into()));
-        assert!(matches!(
-            lower_custom_call_layout(&invalid_permutation_type),
-            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
-                if reason == "`custom_call` with invalid array layout `tiled{0,0}` for rank-2 type \
-                   `f32[2, 3][layout=tiled{0,0}]`",
-        ));
-        let tiled_type = test_matrix_type(2, 3)
-            .with_layout(Some(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(2)])]).into()));
-        assert!(matches!(
-            lower_custom_call_layout(&tiled_type),
-            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
-                if reason == "`custom_call` with tiled array layout `tiled{1,0:T(2)}`",
         ));
     }
 
@@ -2054,6 +2068,32 @@ mod tests {
                     && reason
                         == "`custom_call` output dimension `size` needs a finite upper bound for physical buffer \
                             allocation",
+        ));
+    }
+
+    #[test]
+    fn test_array_type_lower_custom_call_layout() {
+        // A type without a layout takes the default row-major layout, and a dense tiled layout keeps its own order.
+        assert_eq!(test_matrix_type(2, 3).lower_custom_call_layout().unwrap(), vec![1, 0]);
+        let column_major_type =
+            test_matrix_type(2, 3).with_layout(Some(TiledLayout::new(vec![0, 1], Vec::new()).into()));
+        assert_eq!(column_major_type.lower_custom_call_layout().unwrap(), vec![0, 1]);
+
+        // StableHLO's custom call layouts are permutations, so they cannot repeat an axis or describe tiles.
+        let invalid_permutation_type =
+            test_matrix_type(2, 3).with_layout(Some(TiledLayout::new(vec![0, 0], Vec::new()).into()));
+        assert!(matches!(
+            invalid_permutation_type.lower_custom_call_layout(),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason == "`custom_call` with invalid array layout `tiled{0,0}` for rank-2 type \
+                   `f32[2, 3][layout=tiled{0,0}]`",
+        ));
+        let tiled_type = test_matrix_type(2, 3)
+            .with_layout(Some(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(2)])]).into()));
+        assert!(matches!(
+            tiled_type.lower_custom_call_layout(),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason == "`custom_call` with tiled array layout `tiled{1,0:T(2)}`",
         ));
     }
 }

@@ -8,174 +8,189 @@ use ryft_mlir::{
 
 use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
 use crate::lowering::states::CollectiveLoweringState;
-use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
+use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
-/// Lowers one [`ParallelReduceOperation`] inside a `sdy.manual_computation` region to a `stablehlo.all_reduce` over
-/// the device mesh axis the collective names.
-///
-/// The replica groups are the dense global device-id groups that
-/// [`CollectiveLoweringState::mesh_axis_replica_groups`] derives from the mesh's row-major device linearization, or,
-/// when the collective records explicit logical participant groups, those groups expanded inside every fixed
-/// coordinate of the mesh's other axes without reordering either the groups or their members. The emitted operation
-/// carries a module-unique channel id with a device-to-device channel type and `use_global_device_ids`, the standard
-/// SPMD emission for cross-partition collectives.
-///
-/// Each kind combines with the single StableHLO operation of its reduction (i.e., `add` for `Sum` and `Mean`,
-/// `multiply` for `Product`, `maximum` and `minimum` for `Max` and `Min`, and `or` and `and` for `Any` and `All`), and
-/// a `Mean` then divides the all-reduced sum by the effective group size. Unlike the `stablehlo.reduce` lowering, the
-/// combiner never needs a guard for an identity element because an all-reduce combines only its participants' values,
-/// and it must stay a single operation because XLA backends implement all-reduce only for the combiners that they
-/// recognize. Floating-point extrema therefore follow the backend's native `maximum` and `minimum`, as
-/// `jax.lax.pmax` and `jax.lax.pmin` do, so their NaN and signed-zero behavior is backend-defined. The combiner also
-/// takes the input element type, without the conversion to `f32` that [`ReductionKind::Sum`] documents for narrower
-/// floating-point `reduce` inputs, so that, e.g., `bf16` gradient all-reduces keep their communication volume. How
-/// precisely the backend then accumulates is its own choice: the CPU plugin accumulates `bf16` sums in `f32` and the
-/// sums of the narrower formats in `f16`, in ascending order of the participants (refer to the section on pending
-/// reductions of [`crate::arrays::host`]), so a sum of `f16` and narrower values can differ from a `reduce` of the
-/// same values. A `LogSumExp` has no single combiner and is rejected, because the
-/// [`ParallelReduce`](ryft_core::ParallelReduce) capability composes it from a mesh maximum and a mesh sum instead. A
-/// sum, mean, maximum, or minimum of a data type for which the all-reduce of XLA does not compute what the data type
-/// means (e.g., one-bit integers, which XLA adds as predicates) is rejected as well, by the rule that every collective
-/// that reduces shares (refer to [`compiled_reduction_rejection`]), because the result would be another number or the
-/// compilation would fail or abort the process. A collective lowered outside any manual region, or naming an axis the
-/// innermost region does not bind as a manual mesh axis, is an error. A recorded mesh must have the topology of the
-/// binding region's mesh and make the same axes manual (i.e., satisfy
-/// [`LogicalMesh::has_same_manual_axes`](ryft_core::LogicalMesh::has_same_manual_axes)), so that `auto_axes` and
-/// `explicit_axes` may retype the region's free axes, and the replica groups come from the region's mesh.
-pub(crate) fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
-    operation: &ParallelReduceOperation,
-    collective_state: &CollectiveLoweringState,
-    input_value: ValueRef<'b, 'c, 't>,
-    output_array_type: &ArrayType,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    if let Some(mesh) = operation.mesh()
-        && collective_state
-            .manual_axis_region(operation.axis_name())
-            .is_some_and(|region| !mesh.has_same_manual_axes(region.mesh()))
-    {
-        return Err(ProgramError::MalformedProgram(format!(
-            "`{}` mesh does not match its active manual binding",
-            operation.name(),
-        ))
-        .into());
-    }
-    let (replica_groups, effective_axis_size) = match operation.axis_index_groups() {
-        Some(axis_index_groups) => collective_state.replica_groups(
-            operation.axis_name(),
-            operation.axis_size().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "grouped `{}` over axis `{}` does not record the full axis size",
-                    operation.name(),
-                    operation.axis_name(),
-                ))
-            })?,
-            Some(axis_index_groups),
-        )?,
-        None => collective_state.mesh_axis_replica_groups(operation.axis_name())?,
-    };
-    let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
+/// Lowering of a [`ParallelReduceOperation`] for one value.
+pub(crate) trait ParallelReduceOperationLoweringExtension {
+    /// Lowers one [`ParallelReduceOperation`] inside a `sdy.manual_computation` region to a `stablehlo.all_reduce` over
+    /// the device mesh axis the collective names.
+    ///
+    /// The replica groups are the dense global device-id groups that
+    /// [`CollectiveLoweringState::mesh_axis_replica_groups`] derives from the mesh's row-major device linearization,
+    /// or, when the collective records explicit logical participant groups, those groups expanded inside every fixed
+    /// coordinate of the mesh's other axes without reordering either the groups or their members. The emitted operation
+    /// carries a module-unique channel id with a device-to-device channel type and `use_global_device_ids`, the
+    /// standard SPMD emission for cross-partition collectives.
+    ///
+    /// Each kind combines with the single StableHLO operation of its reduction (i.e., `add` for `Sum` and `Mean`,
+    /// `multiply` for `Product`, `maximum` and `minimum` for `Max` and `Min`, and `or` and `and` for `Any` and `All`),
+    /// and a `Mean` then divides the all-reduced sum by the effective group size. Unlike the `stablehlo.reduce`
+    /// lowering, the combiner never needs a guard for an identity element because an all-reduce combines only its
+    /// participants' values, and it must stay a single operation because XLA backends implement all-reduce only for the
+    /// combiners that they recognize. Floating-point extrema therefore follow the backend's native `maximum` and
+    /// `minimum`, as `jax.lax.pmax` and `jax.lax.pmin` do, so their NaN and signed-zero behavior is backend-defined.
+    /// The combiner also takes the input element type, without the conversion to `f32` that [`ReductionKind::Sum`]
+    /// documents for narrower floating-point `reduce` inputs, so that, e.g., `bf16` gradient all-reduces keep their
+    /// communication volume. How precisely the backend then accumulates is its own choice: the CPU plugin accumulates
+    /// `bf16` sums in `f32` and the sums of the narrower formats in `f16`, in ascending order of the participants
+    /// (refer to the section on pending reductions of [`crate::arrays::host`]), so a sum of `f16` and narrower values
+    /// can differ from a `reduce` of the same values. A `LogSumExp` has no single combiner and is rejected, because the
+    /// [`ParallelReduce`](ryft_core::ParallelReduce) capability composes it from a mesh maximum and a mesh sum instead.
+    /// A sum, mean, maximum, or minimum of a data type for which the all-reduce of XLA does not compute what the data
+    /// type means (e.g., one-bit integers, which XLA adds as predicates) is rejected as well, by the rule that every
+    /// collective that reduces shares (refer to [`compiled_reduction_rejection`]), because the result would be another
+    /// number or the compilation would fail or abort the process. A collective lowered outside any manual region, or
+    /// naming an axis the innermost region does not bind as a manual mesh axis, is an error. A recorded mesh must have
+    /// the topology of the binding region's mesh and make the same axes manual (i.e., satisfy
+    /// [`LogicalMesh::has_same_manual_axes`](ryft_core::LogicalMesh::has_same_manual_axes)), so that `auto_axes` and
+    /// `explicit_axes` may retype the region's free axes, and the replica groups come from the region's mesh.
+    fn lower_to_all_reduce<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_value: ValueRef<'b, 'c, 't>,
+        output_array_type: &ArrayType,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+}
 
-    // The all-reduce is the collective that completes a pending reduction of the same kind, so it is exact for the same
-    // data types (a mean divides a sum afterwards). The other kinds combine with operations that XLA computes as the
-    // data type means them.
-    let completed = match operation.kind() {
-        ReductionKind::Sum | ReductionKind::Mean => Some(UnreducedKind::Sum),
-        ReductionKind::Max => Some(UnreducedKind::Max),
-        ReductionKind::Min => Some(UnreducedKind::Min),
-        _ => None,
-    };
-    let data_type = output_array_type.data_type();
-    if let Some(reason) =
-        completed.and_then(|completed| compiled_reduction_rejection(data_type, ReductionChange::Complete(completed)))
-    {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{}` with kind `{}` cannot reduce `{data_type}` values over mesh axis `{}`, because {reason}",
-                operation.name(),
-                operation.kind(),
-                operation.axis_name(),
-            ),
+impl ParallelReduceOperationLoweringExtension for ParallelReduceOperation {
+    fn lower_to_all_reduce<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_value: ValueRef<'b, 'c, 't>,
+        output_array_type: &ArrayType,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        if let Some(mesh) = self.mesh()
+            && collective_state
+                .manual_axis_region(self.axis_name())
+                .is_some_and(|region| !mesh.has_same_manual_axes(region.mesh()))
+        {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{}` mesh does not match its active manual binding",
+                self.name(),
+            ))
+            .into());
         }
-        .into());
-    }
+        let (replica_groups, effective_axis_size) = match self.axis_index_groups() {
+            Some(axis_index_groups) => collective_state.replica_groups(
+                self.axis_name(),
+                self.axis_size().ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!(
+                        "grouped `{}` over axis `{}` does not record the full axis size",
+                        self.name(),
+                        self.axis_name(),
+                    ))
+                })?,
+                Some(axis_index_groups),
+            )?,
+            None => collective_state.mesh_axis_replica_groups(self.axis_name())?,
+        };
+        let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
 
-    let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(output_array_type.data_type()), context, location)?;
-    let mut computation = context.region();
-    let mut combiner_block =
-        computation.append_block(context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]))?;
-    let left = combiner_block.argument(0)?.as_ref();
-    let right = combiner_block.argument(1)?.as_ref();
-    let combined = match operation.kind() {
-        ReductionKind::Sum | ReductionKind::Mean => combiner_block
-            .append_operation(stable_hlo::add(left, right, location)?)?
-            .result(0)
-            .unwrap()
-            .as_ref(),
-        ReductionKind::Product => combiner_block
-            .append_operation(stable_hlo::multiply(left, right, location)?)?
-            .result(0)
-            .unwrap()
-            .as_ref(),
-        ReductionKind::Max => combiner_block
-            .append_operation(stable_hlo::maximum(left, right, location)?)?
-            .result(0)
-            .unwrap()
-            .as_ref(),
-        ReductionKind::Min => combiner_block
-            .append_operation(stable_hlo::minimum(left, right, location)?)?
-            .result(0)
-            .unwrap()
-            .as_ref(),
-        ReductionKind::Any => {
-            combiner_block.append_operation(stable_hlo::or(left, right, location)?)?.result(0).unwrap().as_ref()
-        }
-        ReductionKind::All => combiner_block
-            .append_operation(stable_hlo::and(left, right, location)?)?
-            .result(0)
-            .unwrap()
-            .as_ref(),
-        ReductionKind::LogSumExp => {
+        // The all-reduce is the collective that completes a pending reduction of the same kind, so it is exact for the
+        // same data types (a mean divides a sum afterwards). The other kinds combine with operations that XLA computes
+        // as the data type means them.
+        let completed = match self.kind() {
+            ReductionKind::Sum | ReductionKind::Mean => Some(UnreducedKind::Sum),
+            ReductionKind::Max => Some(UnreducedKind::Max),
+            ReductionKind::Min => Some(UnreducedKind::Min),
+            _ => None,
+        };
+        let data_type = output_array_type.data_type();
+        if let Some(reason) = completed
+            .and_then(|completed| compiled_reduction_rejection(data_type, ReductionChange::Complete(completed)))
+        {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "`{}` with kind `{}` has no all-reduce combiner; stage it through the `ParallelReduce` \
-                     capability, which composes it from primitive mesh reductions",
-                    operation.name(),
-                    operation.kind(),
+                    "`{}` with kind `{}` cannot reduce `{data_type}` values over mesh axis `{}`, because {reason}",
+                    self.name(),
+                    self.kind(),
+                    self.axis_name(),
                 ),
             }
             .into());
         }
-    };
-    combiner_block.append_operation(stable_hlo::r#return(&[combined], location)?)?;
-    let result = block.append_operation(stable_hlo::all_reduce(
-        &[input_value],
-        stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-        Some(collective_state.next_channel_id()),
-        Some(stable_hlo::ChannelHandleType::DeviceToDevice),
-        true,
-        computation,
-        location,
-    )?)?;
-    let reduced = result.result(0).unwrap().as_ref();
-    if operation.kind() != ReductionKind::Mean {
-        return Ok(reduced);
+
+        let scalar_tensor_type = (ArrayType::scalar(output_array_type.data_type())).lower(context, location)?;
+        let mut computation = context.region();
+        let mut combiner_block = computation
+            .append_block(context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]))?;
+        let left = combiner_block.argument(0)?.as_ref();
+        let right = combiner_block.argument(1)?.as_ref();
+        let combined = match self.kind() {
+            ReductionKind::Sum | ReductionKind::Mean => combiner_block
+                .append_operation(stable_hlo::add(left, right, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref(),
+            ReductionKind::Product => combiner_block
+                .append_operation(stable_hlo::multiply(left, right, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref(),
+            ReductionKind::Max => combiner_block
+                .append_operation(stable_hlo::maximum(left, right, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref(),
+            ReductionKind::Min => combiner_block
+                .append_operation(stable_hlo::minimum(left, right, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref(),
+            ReductionKind::Any => {
+                combiner_block.append_operation(stable_hlo::or(left, right, location)?)?.result(0).unwrap().as_ref()
+            }
+            ReductionKind::All => combiner_block
+                .append_operation(stable_hlo::and(left, right, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref(),
+            ReductionKind::LogSumExp => {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "`{}` with kind `{}` has no all-reduce combiner; stage it through the `ParallelReduce` \
+                         capability, which composes it from primitive mesh reductions",
+                        self.name(),
+                        self.kind(),
+                    ),
+                }
+                .into());
+            }
+        };
+        combiner_block.append_operation(stable_hlo::r#return(&[combined], location)?)?;
+        let result = block.append_operation(stable_hlo::all_reduce(
+            &[input_value],
+            stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
+            Some(collective_state.next_channel_id()),
+            Some(stable_hlo::ChannelHandleType::DeviceToDevice),
+            true,
+            computation,
+            location,
+        )?)?;
+        let reduced = result.result(0).unwrap().as_ref();
+        if self.kind() != ReductionKind::Mean {
+            return Ok(reduced);
+        }
+        // `Mean` is the mean over the effective participant group, so divide the all-reduced sum by the group size.
+        let output_tensor_type = output_array_type.lower(context, location)?;
+        let divisor = lower_f64_constant_splat(
+            effective_axis_size as f64,
+            output_array_type,
+            output_tensor_type,
+            block,
+            context,
+            location,
+        )?;
+        let mean = block.append_operation(stable_hlo::divide(reduced, divisor, location)?)?;
+        Ok(mean.result(0).unwrap().as_ref())
     }
-    // `Mean` is the mean over the effective participant group, so divide the all-reduced sum by the group size.
-    let output_tensor_type = lower_tensor_type(output_array_type, context, location)?;
-    let divisor = lower_f64_constant_splat(
-        effective_axis_size as f64,
-        output_array_type,
-        output_tensor_type,
-        block,
-        context,
-        location,
-    )?;
-    let mean = block.append_operation(stable_hlo::divide(reduced, divisor, location)?)?;
-    Ok(mean.result(0).unwrap().as_ref())
 }
 
 impl LowerableOperation for ParallelReduceOperation {
@@ -222,8 +237,7 @@ impl LowerableOperation for ParallelReduceOperation {
             }
         }
 
-        let result = lower_collective_to_all_reduce(
-            self,
+        let result = self.lower_to_all_reduce(
             &collective_state,
             input_values[0],
             &output_types[0],
@@ -328,6 +342,37 @@ pub(crate) mod tests {
             .into_iter()
             .map(|output| output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap())
             .collect()
+    }
+
+    #[test]
+    fn test_parallel_reduce_operation_lower_to_all_reduce() {
+        let mesh = test_manual_mesh("x", 2);
+        let boundary = ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let state = CollectiveLoweringState::new().enter_manual_region(boundary);
+        let array_type = test_vector_type(2);
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let mut block = module.body().unwrap();
+        let tensor_type = array_type.lower(&context, location).unwrap();
+        let input = lower_f64_constant_splat(1.0, &array_type, tensor_type, &mut block, &context, location).unwrap();
+        ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string())
+            .lower_to_all_reduce(&state, input, &array_type, &mut block, &context, location.as_ref())
+            .unwrap();
+        assert_eq!(
+            module.to_string(),
+            indoc! {r#"
+                module {
+                  %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                  %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<2xf32>
+                  %1 = "stablehlo.all_reduce"(%0) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> ({
+                  ^bb0(%arg0: tensor<f32>, %arg1: tensor<f32>):
+                    %2 = stablehlo.add %arg0, %arg1 : tensor<f32>
+                    stablehlo.return %2 : tensor<f32>
+                  }) : (tensor<2xf32>) -> tensor<2xf32>
+                }
+            "#},
+        );
     }
 
     #[test]
@@ -989,7 +1034,7 @@ pub(crate) mod tests {
             let state = CollectiveLoweringState::new().enter_manual_region(boundary.clone());
             let context = MlirContext::new();
             let location = context.unknown_location();
-            let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
+            let tensor_type = input_type.lower(&context, location).unwrap();
             let block = context.block(&[(tensor_type, location)]);
             let input = block.argument(0).unwrap().as_ref();
             let mut lowerer: Lowerer<'_, '_, '_, Operation> =

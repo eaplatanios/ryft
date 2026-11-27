@@ -6,8 +6,8 @@ use ryft_core::{
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, TensorTypeRef, Type as MlirType, Value as MlirValue, ValueRef};
 
-use crate::lowering::types::{lower_constant_elements_attribute, lower_signed_one_bit_to_mlir, lower_tensor_type};
-use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};
+use crate::lowering::types::{ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_signed_one_bit_to_mlir};
+use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_operands};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 impl LowerableOperation for AddOperation<ArrayType> {
@@ -74,13 +74,12 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
         let width = data_type.bit_width();
         let minimum = i64::MIN >> (64 - width);
         let maximum = i64::MAX >> (64 - width);
-        let scalar_type =
-            lower_tensor_type(&ArrayType::scalar(carrier_data_type), lowerer.context(), lowerer.location())?;
+        let scalar_type = ArrayType::scalar(carrier_data_type).lower(lowerer.context(), lowerer.location())?;
         let constants = [minimum, maximum, 0]
             .into_iter()
             .map(|value| {
                 let elements =
-                    lower_constant_elements_attribute(carrier_data_type, scalar_type, value, lowerer.context())?;
+                    carrier_data_type.lower_constant_elements_attribute(scalar_type, value, lowerer.context())?;
                 let constant = lowerer.block().append_operation(stable_hlo::constant(elements, lowerer.location())?)?;
                 // Broadcasting against a normalized input retains its runtime extents for bounded dynamic arrays.
                 Ok(normalize_binary_elementwise_operands(
@@ -180,7 +179,7 @@ impl LowerableOperation for SqrtOperation<ArrayType> {
         let _ = (input_types, output_types);
         let result = lowerer.block().append_operation(stable_hlo::sqrt(
             input_values[0],
-            lower_accuracy(self.accuracy()),
+            self.accuracy().lower(),
             lowerer.location(),
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])
@@ -198,7 +197,7 @@ impl LowerableOperation for RsqrtOperation<ArrayType> {
         let _ = (input_types, output_types);
         let result = lowerer.block().append_operation(stable_hlo::rsqrt(
             input_values[0],
-            lower_accuracy(self.accuracy()),
+            self.accuracy().lower(),
             lowerer.location(),
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])
@@ -314,7 +313,7 @@ fn lower_arithmetic_output<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     let tensor_type = output.r#type()?.cast::<TensorTypeRef>().unwrap();
     let scalar_type = lowerer.context().tensor_type(tensor_type.element_type()?, &[], None, lowerer.location())?;
     let data_type = if output_type.data_type() == DataType::I1 { DataType::I8 } else { DataType::U8 };
-    let one = lower_constant_elements_attribute(data_type, scalar_type, 1, lowerer.context())?;
+    let one = data_type.lower_constant_elements_attribute(scalar_type, 1, lowerer.context())?;
     let one = lowerer.block().append_operation(stable_hlo::constant(one, lowerer.location())?)?;
     let one = normalize_binary_elementwise_operands(
         &[one.result(0).unwrap().as_ref(), output],
@@ -326,7 +325,7 @@ fn lower_arithmetic_output<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     let masked = lowerer.block().append_operation(stable_hlo::and(output, one, lowerer.location())?)?;
     let narrowed = lowerer.block().append_operation(stable_hlo::convert(
         masked.result(0).unwrap().as_ref(),
-        lower_tensor_type(output_type, lowerer.context(), lowerer.location())?,
+        output_type.lower(lowerer.context(), lowerer.location())?,
         lowerer.location(),
     )?)?;
     Ok(narrowed.result(0).unwrap().as_ref())

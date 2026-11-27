@@ -10,9 +10,8 @@ use ryft_mlir::{
 
 use crate::lowering::EffectTokens;
 use crate::lowering::types::{
-    dimension_extent_i32, lower_constant_output, lower_physical_bound_value, lower_restore_dynamic_dimensions,
-    lower_runtime_dimension_size_i64, lower_static_index_constants, lower_tensor_type, lower_unplaced_constant_output,
-    physical_bound_type, static_dimensions,
+    ArrayTypeLoweringExtension, dimension_extent_i32, lower_constant_output, lower_runtime_dimension_size_i64,
+    lower_static_index_constants, lower_unplaced_constant_output, physical_bound_type, static_dimensions,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_KIND_ATTRIBUTE,
@@ -53,7 +52,7 @@ impl LowerableOperation for SliceOperation {
 
         let input_type = &input_types[0];
         let physical_type = physical_bound_type(input_type)?;
-        let size_type = lower_tensor_type(&ArrayType::scalar(DataType::I32), context, location)?;
+        let size_type = ArrayType::scalar(DataType::I32).lower(context, location)?;
         let mut physical = input_values[0];
         let mut physical_dimensions = input_type.shape().dimensions().to_vec();
         for (axis, dimension) in physical_type.shape().dimensions().iter().enumerate() {
@@ -69,7 +68,7 @@ impl LowerableOperation for SliceOperation {
                 .append_operation(stable_hlo::set_dimension_size(
                     physical,
                     size,
-                    lower_tensor_type(&physical_type, context, location)?,
+                    physical_type.lower(context, location)?,
                     axis,
                     location,
                 )?)?
@@ -92,7 +91,7 @@ impl LowerableOperation for SliceOperation {
         )?)?;
         let result = result.result(0).unwrap().as_ref();
         let sources = (0..input_type.rank()).map(|axis| (input_values[0], axis)).collect::<Vec<_>>();
-        Ok(vec![lower_restore_dynamic_dimensions(result, &output_types[0], &sources, block, context, location)?])
+        Ok(vec![output_types[0].lower_restore_dynamic_dimensions(result, &sources, block, context, location)?])
     }
 }
 
@@ -319,7 +318,7 @@ impl LowerableOperation for DynamicSliceOperation<Type> {
         // Only the requested logical size is exposed, so padded values never become observable elements.
         let padding_value = if input_type.data_type() == DataType::F8E8M0FNU { 1 } else { 0 };
         let physical_input =
-            lower_physical_bound_value(*input, input_type, padding_value as f64, block, context, location)?;
+            input_type.lower_physical_bound_value(*input, padding_value as f64, block, context, location)?;
         let padding = lower_constant_output(
             &[ArrayType::scalar(input_type.data_type())],
             padding_value,
@@ -368,7 +367,7 @@ impl LowerableOperation for DynamicSliceOperation<Type> {
             let mut dimensions = refined_type.shape().dimensions().to_vec();
             dimensions[axis] = dimension;
             refined_type = refined_type.with_shape(Shape::new(dimensions));
-            let refined_tensor_type = lower_tensor_type(&refined_type, context, location)?;
+            let refined_tensor_type = refined_type.lower(context, location)?;
             let refined = block.append_operation(stable_hlo::set_dimension_size(
                 result,
                 size,
@@ -528,7 +527,7 @@ fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
             })
             .collect();
     }
-    let signed_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
+    let signed_type = ArrayType::scalar(DataType::I64).lower(context, location)?;
     starts
         .iter()
         .zip(start_types)
@@ -537,7 +536,7 @@ fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
         .map(|(axis, ((start, start_type), size))| {
             let data_type = if start_type.data_type().is_unsigned() { DataType::U64 } else { DataType::I64 };
             let scalar_type = ArrayType::scalar(data_type);
-            let tensor_type = lower_tensor_type(&scalar_type, context, location)?;
+            let tensor_type = scalar_type.lower(context, location)?;
             let mut start = block
                 .append_operation(stable_hlo::convert(*start, tensor_type, location)?)?
                 .result(0)
@@ -649,7 +648,7 @@ fn lower_array_start<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let signed_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
+    let signed_type = ArrayType::scalar(DataType::I64).lower(context, location)?;
     if !start_type.data_type().is_unsigned() {
         let start = block
             .append_operation(stable_hlo::convert(start, signed_type, location)?)?
@@ -662,7 +661,7 @@ fn lower_array_start<'b, 'c: 'b, 't: 'c>(
         return Ok(start);
     }
     let unsigned_scalar_type = ArrayType::scalar(DataType::U64);
-    let unsigned_type = lower_tensor_type(&unsigned_scalar_type, context, location)?;
+    let unsigned_type = unsigned_scalar_type.lower(context, location)?;
     let start = block
         .append_operation(stable_hlo::convert(start, unsigned_type, location)?)?
         .result(0)
@@ -996,7 +995,7 @@ mod tests {
         );
 
         // The dynamic slice pullback scatters the cotangent at the captured index factors, which materialize as
-        // integer constants through `lower_literal_value`.
+        // integer constants through `MlirLowerableValue::lower_literal`.
         let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
             .vjp(
                 |x, ()| {
@@ -1958,9 +1957,9 @@ mod tests {
     fn test_dynamic_slice_operation_lower_input_type_count() {
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let index_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), &context, location).unwrap();
+        let index_type = ArrayType::scalar(DataType::I64).lower(&context, location).unwrap();
         let block = context.block(&[
-            (lower_tensor_type(&ArrayType::new_static(DataType::I64, [4]), &context, location).unwrap(), location),
+            (ArrayType::new_static(DataType::I64, [4]).lower(&context, location).unwrap(), location),
             (index_type, location),
             (index_type, location),
         ]);

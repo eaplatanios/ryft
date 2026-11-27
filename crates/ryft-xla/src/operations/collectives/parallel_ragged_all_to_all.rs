@@ -12,12 +12,12 @@ use ryft_mlir::{
 
 use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{
-    lower_constant_elements_attribute, lower_constant_output, lower_restore_dynamic_dimensions, lower_tensor_type,
-    lower_u64_scalar_constant, physical_bound_type,
+    ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_constant_output, lower_u64_scalar_constant,
+    physical_bound_type,
 };
-use crate::operations::collectives::axis_index::lower_axis_index_to_coordinate;
+use crate::operations::collectives::axis_index::AxisIndexOperationLoweringExtension;
 use crate::operations::extrema::FloatExtremumForm;
-use crate::operations::reductions::lower_reduce_to_mlir;
+use crate::operations::reductions::ReductionKindLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation, Type};
 
 impl LowerableOperation for ParallelRaggedAllToAllOperation {
@@ -44,8 +44,7 @@ impl LowerableOperation for ParallelRaggedAllToAllOperation {
                 operation.infer_output_types(input_types, &[])
             },
         )?;
-        lower_parallel_ragged_all_to_all_to_mlir(
-            self,
+        self.lower_to_mlir(
             &collective_state,
             input_values,
             input_types,
@@ -96,15 +95,7 @@ impl MemberLowerableOperation<Type> for ParallelRaggedAllToAllOperation {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
         <&ArrayType>::try_from(output_type)?;
-        lower_parallel_ragged_all_to_all_to_mlir(
-            self,
-            collective_state,
-            input_values,
-            array_input_types.as_slice(),
-            block,
-            context,
-            location,
-        )
+        self.lower_to_mlir(collective_state, input_values, array_input_types.as_slice(), block, context, location)
     }
 }
 
@@ -185,378 +176,398 @@ fn validate_parallel_ragged_all_to_all_target(collective_state: &CollectiveLower
     Ok(())
 }
 
-/// Lowers one named-axis ragged exchange to XLA's typed-FFI `ragged_all_to_all` custom call.
-///
-/// The public overwrite operation maps directly to one call. The transpose-only additive form rebases every transfer
-/// into a private slot of an expanded output, then reduces the slots and adds the supplied output seed. The custom
-/// call therefore still writes disjoint regions while duplicate sends accumulate in the reduction. The native call has
-/// no batch dimensions, so the batch items of an operation with
-/// [`batch_dimension_count`](ParallelRaggedAllToAllOperation::batch_dimension_count) are first flattened into one
-/// exchange (refer to [`lower_batched_parallel_ragged_all_to_all`] for more information).
-fn lower_parallel_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &ParallelRaggedAllToAllOperation,
-    collective_state: &CollectiveLoweringState,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    if operation.is_physical() {
-        return Err(ProgramError::MalformedProgram(
-            "`parallel_ragged_all_to_all` lowering does not support the batching-internal physical operand \
-             representation"
-                .to_string(),
-        )
-        .into());
+/// Lowering of a [`ParallelRaggedAllToAllOperation`] for its values.
+trait ParallelRaggedAllToAllOperationLoweringExtension {
+    /// Lowers one named-axis ragged exchange to XLA's typed-FFI `ragged_all_to_all` custom call.
+    ///
+    /// The public overwrite operation maps directly to one call. The transpose-only additive form rebases every
+    /// transfer into a private slot of an expanded output, then reduces the slots and adds the supplied output seed.
+    /// The custom call therefore still writes disjoint regions while duplicate sends accumulate in the reduction. The
+    /// native call has no batch dimensions, so the batch items of an operation with
+    /// [`batch_dimension_count`](ParallelRaggedAllToAllOperation::batch_dimension_count) are first flattened into one
+    /// exchange (refer to [`ParallelRaggedAllToAllOperationLoweringExtension::lower_batched`] for more information).
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+
+    /// Lowers an exchange with batch dimensions as one exchange over all of its batch items.
+    ///
+    /// With `B` batch items, `N` `operand` rows, `M` `output` rows, and `K` metadata entries per item, the data inputs
+    /// are reshaped to `B·N` and `B·M` rows, and the offsets of item `b` are rebased by `b·N` and `b·M` rows. The `(B,
+    /// K)` metadata are transposed to `(K, B)` before they are flattened, so that the entries that one participant
+    /// sends to or receives from another stay contiguous, and the flattened `output` is finally reshaped back into its
+    /// batch items. This matches how JAX batches `ragged_all_to_all`. The rebased metadata are `u64`, so that they
+    /// cannot overflow a narrower metadata type, and the flattening requires static shapes.
+    fn lower_batched<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+
+    /// Lowers an exchange without batch dimensions, ignoring the
+    /// [`batch_dimension_count`](ParallelRaggedAllToAllOperation::batch_dimension_count) of this operation.
+    fn lower_unbatched<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAllOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        if self.is_physical() {
+            return Err(ProgramError::MalformedProgram(
+                "`parallel_ragged_all_to_all` lowering does not support the batching-internal physical operand \
+                 representation"
+                    .to_string(),
+            )
+            .into());
+        }
+        validate_parallel_ragged_all_to_all_target(collective_state)?;
+        check_count!("input", input_values, 6, ProgramError);
+        check_count!("input", input_types, 6, ProgramError);
+        if self.batch_dimension_count() > 0 {
+            return self.lower_batched(collective_state, input_values, input_types, block, context, location);
+        }
+        self.lower_unbatched(collective_state, input_values, input_types, block, context, location)
     }
-    validate_parallel_ragged_all_to_all_target(collective_state)?;
-    check_count!("input", input_values, 6, ProgramError);
-    check_count!("input", input_types, 6, ProgramError);
-    if operation.batch_dimension_count() > 0 {
-        return lower_batched_parallel_ragged_all_to_all(
-            operation,
+
+    fn lower_batched<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let batch_dimension_count = self.batch_dimension_count();
+        let shapes = input_types
+            .iter()
+            .enumerate()
+            .map(|(index, r#type)| {
+                r#type.static_shape().ok_or_else(|| ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "`parallel_ragged_all_to_all` lowering of batch dimensions requires static input shapes but input \
+                         {index} has type `{type}`",
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let overflow = || ProgramError::UnsupportedOperation {
+            message: "`parallel_ragged_all_to_all` lowering of batch dimensions overflowed its flattened extents"
+                .to_string(),
+        };
+        let item_count = shapes[0].dimensions()[..batch_dimension_count]
+            .iter()
+            .try_fold(1usize, |count, &extent| count.checked_mul(extent))
+            .ok_or_else(overflow)?;
+        if item_count == 0 {
+            return Ok(vec![input_values[1]]);
+        }
+
+        let reshape = |value: ValueRef<'b, 'c, 't>,
+                       r#type: &ArrayType,
+                       block: &mut BlockRef<'b, 'c, 't>|
+         -> Result<ValueRef<'b, 'c, 't>, Error> {
+            let tensor_type = r#type.lower(context, location)?;
+            let reshaped =
+                block.append_operation(stable_hlo::reshape_with_output_type(value, tensor_type, location)?)?;
+            Ok(reshaped.result(0).unwrap().as_ref())
+        };
+
+        // Each data input becomes `(B·R, A, ...)` for `R` rows per item.
+        let mut flat_types = Vec::with_capacity(6);
+        let mut flat_values = Vec::with_capacity(6);
+        let mut row_extents = [0; 2];
+        for index in 0..2 {
+            let dimensions = shapes[index].dimensions();
+            row_extents[index] = dimensions[batch_dimension_count];
+            let flat_extent = item_count.checked_mul(row_extents[index]).ok_or_else(overflow)?;
+            let flat_type = input_types[index].clone().with_shape(Shape::new(
+                std::iter::once(flat_extent)
+                    .chain(dimensions[batch_dimension_count + 1..].iter().copied())
+                    .map(Dimension::Static)
+                    .collect(),
+            ));
+            flat_values.push(reshape(input_values[index], &flat_type, block)?);
+            flat_types.push(flat_type);
+        }
+
+        // Each metadata input becomes `(K·B)` with entry `k·B + b` holding entry `k` of item `b`.
+        let metadata_length = shapes[2].dimensions()[batch_dimension_count];
+        let flat_metadata_length = item_count.checked_mul(metadata_length).ok_or_else(overflow)?;
+        let item_metadata_type = ArrayType::new_static(DataType::U64, [item_count, metadata_length]);
+        let item_metadata_tensor_type = item_metadata_type.lower(context, location)?;
+        let flat_metadata_type = ArrayType::new_static(DataType::U64, [flat_metadata_length]);
+        for index in 2..6 {
+            let mut value = input_values[index];
+            if batch_dimension_count != 1 {
+                let item_type = input_types[index]
+                    .clone()
+                    .with_shape(Shape::new(vec![Dimension::Static(item_count), Dimension::Static(metadata_length)]));
+                value = reshape(value, &item_type, block)?;
+            }
+            if input_types[index].data_type() != DataType::U64 {
+                let converted =
+                    block.append_operation(stable_hlo::convert(value, item_metadata_tensor_type, location)?)?;
+                value = converted.result(0).unwrap().as_ref();
+            }
+            let row_extent = match index {
+                2 => Some(row_extents[0]),
+                4 => Some(row_extents[1]),
+                _ => None,
+            };
+            if let Some(row_extent) = row_extent {
+                let row_extent = u64::try_from(row_extent).map_err(|_| overflow())?;
+                let items = block.append_operation(stable_hlo::iota(item_metadata_tensor_type, 0, location)?)?;
+                let items = items.result(0).unwrap().as_ref();
+                let row_extent = lower_u64_scalar_constant(row_extent, block, context, location)?;
+                let row_extent = block.append_operation(stable_hlo::broadcast(
+                    row_extent,
+                    item_metadata_tensor_type,
+                    &[],
+                    location,
+                )?)?;
+                let row_extent = row_extent.result(0).unwrap().as_ref();
+                let bases = block.append_operation(stable_hlo::multiply(items, row_extent, location)?)?;
+                let bases = bases.result(0).unwrap().as_ref();
+                let rebased = block.append_operation(stable_hlo::add(value, bases, location)?)?;
+                value = rebased.result(0).unwrap().as_ref();
+            }
+            let transposed = block.append_operation(stable_hlo::transpose(value, &[1, 0], location)?)?;
+            let transposed = transposed.result(0).unwrap().as_ref();
+            flat_values.push(reshape(transposed, &flat_metadata_type, block)?);
+            flat_types.push(flat_metadata_type.clone());
+        }
+
+        let mut outputs = self.lower_unbatched(
             collective_state,
-            input_values,
-            input_types,
+            flat_values.as_slice(),
+            flat_types.as_slice(),
             block,
             context,
             location,
-        );
-    }
-    lower_unbatched_parallel_ragged_all_to_all(
-        operation,
-        collective_state,
-        input_values,
-        input_types,
-        block,
-        context,
-        location,
-    )
-}
-
-/// Lowers an exchange with batch dimensions as one exchange over all of its batch items.
-///
-/// With `B` batch items, `N` `operand` rows, `M` `output` rows, and `K` metadata entries per item, the data inputs are
-/// reshaped to `B·N` and `B·M` rows, and the offsets of item `b` are rebased by `b·N` and `b·M` rows. The `(B, K)`
-/// metadata are transposed to `(K, B)` before they are flattened, so that the entries that one participant sends to or
-/// receives from another stay contiguous, and the flattened `output` is finally reshaped back into its batch items.
-/// This matches how JAX batches `ragged_all_to_all`. The rebased metadata are `u64`, so that they cannot overflow
-/// a narrower metadata type, and the flattening requires static shapes.
-fn lower_batched_parallel_ragged_all_to_all<'b, 'c: 'b, 't: 'c>(
-    operation: &ParallelRaggedAllToAllOperation,
-    collective_state: &CollectiveLoweringState,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let batch_dimension_count = operation.batch_dimension_count();
-    let shapes = input_types
-        .iter()
-        .enumerate()
-        .map(|(index, r#type)| {
-            r#type.static_shape().ok_or_else(|| ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`parallel_ragged_all_to_all` lowering of batch dimensions requires static input shapes but input \
-                     {index} has type `{type}`",
-                ),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let overflow = || ProgramError::UnsupportedOperation {
-        message: "`parallel_ragged_all_to_all` lowering of batch dimensions overflowed its flattened extents"
-            .to_string(),
-    };
-    let item_count = shapes[0].dimensions()[..batch_dimension_count]
-        .iter()
-        .try_fold(1usize, |count, &extent| count.checked_mul(extent))
-        .ok_or_else(overflow)?;
-    if item_count == 0 {
-        return Ok(vec![input_values[1]]);
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(vec![reshape(outputs.remove(0), &input_types[1], block)?])
     }
 
-    let reshape = |value: ValueRef<'b, 'c, 't>,
-                   r#type: &ArrayType,
-                   block: &mut BlockRef<'b, 'c, 't>|
-     -> Result<ValueRef<'b, 'c, 't>, Error> {
-        let tensor_type = lower_tensor_type(r#type, context, location)?;
-        let reshaped = block.append_operation(stable_hlo::reshape_with_output_type(value, tensor_type, location)?)?;
-        Ok(reshaped.result(0).unwrap().as_ref())
-    };
-
-    // Each data input becomes `(B·R, A, ...)` for `R` rows per item.
-    let mut flat_types = Vec::with_capacity(6);
-    let mut flat_values = Vec::with_capacity(6);
-    let mut row_extents = [0; 2];
-    for index in 0..2 {
-        let dimensions = shapes[index].dimensions();
-        row_extents[index] = dimensions[batch_dimension_count];
-        let flat_extent = item_count.checked_mul(row_extents[index]).ok_or_else(overflow)?;
-        let flat_type = input_types[index].clone().with_shape(Shape::new(
-            std::iter::once(flat_extent)
-                .chain(dimensions[batch_dimension_count + 1..].iter().copied())
-                .map(Dimension::Static)
-                .collect(),
-        ));
-        flat_values.push(reshape(input_values[index], &flat_type, block)?);
-        flat_types.push(flat_type);
-    }
-
-    // Each metadata input becomes `(K·B)` with entry `k·B + b` holding entry `k` of item `b`.
-    let metadata_length = shapes[2].dimensions()[batch_dimension_count];
-    let flat_metadata_length = item_count.checked_mul(metadata_length).ok_or_else(overflow)?;
-    let item_metadata_type = ArrayType::new_static(DataType::U64, [item_count, metadata_length]);
-    let item_metadata_tensor_type = lower_tensor_type(&item_metadata_type, context, location)?;
-    let flat_metadata_type = ArrayType::new_static(DataType::U64, [flat_metadata_length]);
-    for index in 2..6 {
-        let mut value = input_values[index];
-        if batch_dimension_count != 1 {
-            let item_type = input_types[index]
-                .clone()
-                .with_shape(Shape::new(vec![Dimension::Static(item_count), Dimension::Static(metadata_length)]));
-            value = reshape(value, &item_type, block)?;
+    fn lower_unbatched<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let (replica_groups, effective_axis_size) =
+            collective_state.replica_groups(self.axis_name(), self.axis_size(), self.axis_index_groups())?;
+        if !self.accumulates_updates() {
+            return Ok(vec![emit_parallel_ragged_all_to_all_custom_call(
+                collective_state,
+                replica_groups.as_slice(),
+                input_values,
+                block,
+                context,
+                location,
+            )?]);
         }
-        if input_types[index].data_type() != DataType::U64 {
-            let converted = block.append_operation(stable_hlo::convert(value, item_metadata_tensor_type, location)?)?;
-            value = converted.result(0).unwrap().as_ref();
+
+        let metadata_length = input_types[2].shape().dimensions()[0].value().ok_or_else(|| {
+            ProgramError::MalformedProgram(
+                "`parallel_ragged_all_to_all` additive lowering requires a static metadata length".to_string(),
+            )
+        })?;
+        if metadata_length % effective_axis_size != 0 {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`parallel_ragged_all_to_all` metadata length {metadata_length} is not divisible by group size \
+                 {effective_axis_size}",
+            ))
+            .into());
         }
-        let row_extent = match index {
-            2 => Some(row_extents[0]),
-            4 => Some(row_extents[1]),
-            _ => None,
+        let transfers_per_participant = metadata_length / effective_axis_size;
+        let output_extent = input_types[1].shape().dimensions()[0].value().ok_or_else(|| {
+            ProgramError::MalformedProgram(
+                "`parallel_ragged_all_to_all` additive lowering requires a static output leading dimension".to_string(),
+            )
+        })?;
+        let expanded_extent = metadata_length.checked_mul(output_extent).ok_or_else(|| {
+            ProgramError::MalformedProgram(
+                "`parallel_ragged_all_to_all` additive lowering overflowed its expanded output extent".to_string(),
+            )
+        })?;
+        let mut expanded_dimensions = input_types[1].shape().dimensions().to_vec();
+        expanded_dimensions[0] = Dimension::Static(expanded_extent);
+        let expanded_output_type = input_types[1].clone().with_shape(Shape::new(expanded_dimensions));
+        let expanded_output = if expanded_output_type.static_shape().is_some() {
+            lower_constant_output(std::slice::from_ref(&expanded_output_type), 0, block, context, location)?.remove(0)
+        } else {
+            let physical_type = physical_bound_type(&expanded_output_type)?;
+            let zero =
+                lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
+            let dimension_sources =
+                (0..expanded_output_type.rank()).map(|axis| (input_values[1], axis)).collect::<Vec<_>>();
+            expanded_output_type.lower_restore_dynamic_dimensions(
+                zero,
+                dimension_sources.as_slice(),
+                block,
+                context,
+                location,
+            )?
         };
-        if let Some(row_extent) = row_extent {
-            let row_extent = u64::try_from(row_extent).map_err(|_| overflow())?;
-            let items = block.append_operation(stable_hlo::iota(item_metadata_tensor_type, 0, location)?)?;
-            let items = items.result(0).unwrap().as_ref();
-            let row_extent = lower_u64_scalar_constant(row_extent, block, context, location)?;
-            let row_extent =
-                block.append_operation(stable_hlo::broadcast(row_extent, item_metadata_tensor_type, &[], location)?)?;
-            let row_extent = row_extent.result(0).unwrap().as_ref();
-            let bases = block.append_operation(stable_hlo::multiply(items, row_extent, location)?)?;
-            let bases = bases.result(0).unwrap().as_ref();
-            let rebased = block.append_operation(stable_hlo::add(value, bases, location)?)?;
-            value = rebased.result(0).unwrap().as_ref();
-        }
-        let transposed = block.append_operation(stable_hlo::transpose(value, &[1, 0], location)?)?;
-        let transposed = transposed.result(0).unwrap().as_ref();
-        flat_values.push(reshape(transposed, &flat_metadata_type, block)?);
-        flat_types.push(flat_metadata_type.clone());
-    }
 
-    let mut outputs = lower_unbatched_parallel_ragged_all_to_all(
-        operation,
-        collective_state,
-        flat_values.as_slice(),
-        flat_types.as_slice(),
-        block,
-        context,
-        location,
-    )?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(vec![reshape(outputs.remove(0), &input_types[1], block)?])
-}
-
-/// Lowers an exchange without batch dimensions, ignoring the
-/// [`batch_dimension_count`](ParallelRaggedAllToAllOperation::batch_dimension_count) of `operation`.
-fn lower_unbatched_parallel_ragged_all_to_all<'b, 'c: 'b, 't: 'c>(
-    operation: &ParallelRaggedAllToAllOperation,
-    collective_state: &CollectiveLoweringState,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let (replica_groups, effective_axis_size) =
-        collective_state.replica_groups(operation.axis_name(), operation.axis_size(), operation.axis_index_groups())?;
-    if !operation.accumulates_updates() {
-        return Ok(vec![emit_parallel_ragged_all_to_all_custom_call(
+        let metadata_type = input_types[2].clone().with_data_type(DataType::U64);
+        let metadata_tensor_type = metadata_type.lower(context, location)?;
+        let metadata = input_values[2..]
+            .iter()
+            .zip(&input_types[2..])
+            .map(|(&value, r#type)| {
+                if r#type.data_type() == DataType::U64 {
+                    return Ok(value);
+                }
+                let converted = block.append_operation(stable_hlo::convert(value, metadata_tensor_type, location)?)?;
+                Ok(converted.result(0).unwrap().as_ref())
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let metadata_indices = block.append_operation(stable_hlo::iota(metadata_tensor_type, 0, location)?)?;
+        let metadata_indices = metadata_indices.result(0).unwrap().as_ref();
+        let transfers_per_participant_value = lower_u64_scalar_constant(
+            u64::try_from(transfers_per_participant).map_err(|_| {
+                ProgramError::MalformedProgram(
+                    "`parallel_ragged_all_to_all` transfers per participant cannot be represented as `u64`".to_string(),
+                )
+            })?,
+            block,
+            context,
+            location,
+        )?;
+        let transfer_count = block.append_operation(stable_hlo::broadcast(
+            transfers_per_participant_value,
+            metadata_tensor_type,
+            &[],
+            location,
+        )?)?;
+        let transfer_count = transfer_count.result(0).unwrap().as_ref();
+        let transfer_slots =
+            block.append_operation(stable_hlo::remainder(metadata_indices, transfer_count, location)?)?;
+        let transfer_slots = transfer_slots.result(0).unwrap().as_ref();
+        let source_axis_index = (AxisIndexOperation::new(self.axis_name().to_string())).lower_to_coordinate(
+            collective_state,
+            block,
+            context,
+            location,
+        )?;
+        let source_group_position = if let Some(groups) = self.axis_index_groups() {
+            let mut positions = vec![0i64; self.axis_size()];
+            for group in groups {
+                for (position, &axis_index) in group.iter().enumerate() {
+                    positions[axis_index] = i64::try_from(position).map_err(|_| {
+                        ProgramError::MalformedProgram(format!(
+                            "`parallel_ragged_all_to_all` group position {position} cannot be represented as an `i64` \
+                             backend attribute",
+                        ))
+                    })?;
+                }
+            }
+            let positions_type = (ArrayType::new_static(DataType::I64, [self.axis_size()])).lower(context, location)?;
+            let positions = context.dense_i64_elements_attribute(positions_type, positions.as_slice())?;
+            let positions = block.append_operation(stable_hlo::constant(positions, location)?)?;
+            let positions = positions.result(0).unwrap().as_ref();
+            let position =
+                block.append_operation(stable_hlo::dynamic_slice(positions, &[source_axis_index], &[1], location)?)?;
+            let position = position.result(0).unwrap().as_ref();
+            let position = block.append_operation(stable_hlo::convert(
+                position,
+                ArrayType::new_static(DataType::U64, [1]).lower(context, location)?,
+                location,
+            )?)?;
+            let position = position.result(0).unwrap().as_ref();
+            let position = block.append_operation(stable_hlo::reshape_with_output_type(
+                position,
+                ArrayType::scalar(DataType::U64).lower(context, location)?,
+                location,
+            )?)?;
+            position.result(0).unwrap().as_ref()
+        } else {
+            source_axis_index
+        };
+        let source_copy_base = block.append_operation(stable_hlo::multiply(
+            source_group_position,
+            transfers_per_participant_value,
+            location,
+        )?)?;
+        let source_copy_base = source_copy_base.result(0).unwrap().as_ref();
+        let source_copy_base =
+            block.append_operation(stable_hlo::broadcast(source_copy_base, metadata_tensor_type, &[], location)?)?;
+        let source_copy_base = source_copy_base.result(0).unwrap().as_ref();
+        let copy_indices = block.append_operation(stable_hlo::add(source_copy_base, transfer_slots, location)?)?;
+        let copy_indices = copy_indices.result(0).unwrap().as_ref();
+        let copy_stride = DataType::U64.lower_constant_elements_attribute(
+            metadata_tensor_type,
+            i64::try_from(output_extent).map_err(|_| {
+                ProgramError::MalformedProgram(format!(
+                    "`parallel_ragged_all_to_all` output extent {output_extent} cannot be represented by its metadata",
+                ))
+            })?,
+            context,
+        )?;
+        let copy_stride = block.append_operation(stable_hlo::constant(copy_stride, location)?)?;
+        let copy_stride = copy_stride.result(0).unwrap().as_ref();
+        let copy_offsets = block.append_operation(stable_hlo::multiply(copy_indices, copy_stride, location)?)?;
+        let copy_offsets = copy_offsets.result(0).unwrap().as_ref();
+        let output_offsets = block.append_operation(stable_hlo::add(metadata[2], copy_offsets, location)?)?;
+        let output_offsets = output_offsets.result(0).unwrap().as_ref();
+        let transfer_inputs = [input_values[0], expanded_output, metadata[0], metadata[1], output_offsets, metadata[3]];
+        let expanded = emit_parallel_ragged_all_to_all_custom_call(
             collective_state,
             replica_groups.as_slice(),
-            input_values,
+            transfer_inputs.as_slice(),
             block,
             context,
             location,
-        )?]);
-    }
-
-    let metadata_length = input_types[2].shape().dimensions()[0].value().ok_or_else(|| {
-        ProgramError::MalformedProgram(
-            "`parallel_ragged_all_to_all` additive lowering requires a static metadata length".to_string(),
-        )
-    })?;
-    if metadata_length % effective_axis_size != 0 {
-        return Err(ProgramError::MalformedProgram(format!(
-            "`parallel_ragged_all_to_all` metadata length {metadata_length} is not divisible by group size \
-             {effective_axis_size}",
-        ))
-        .into());
-    }
-    let transfers_per_participant = metadata_length / effective_axis_size;
-    let output_extent = input_types[1].shape().dimensions()[0].value().ok_or_else(|| {
-        ProgramError::MalformedProgram(
-            "`parallel_ragged_all_to_all` additive lowering requires a static output leading dimension".to_string(),
-        )
-    })?;
-    let expanded_extent = metadata_length.checked_mul(output_extent).ok_or_else(|| {
-        ProgramError::MalformedProgram(
-            "`parallel_ragged_all_to_all` additive lowering overflowed its expanded output extent".to_string(),
-        )
-    })?;
-    let mut expanded_dimensions = input_types[1].shape().dimensions().to_vec();
-    expanded_dimensions[0] = Dimension::Static(expanded_extent);
-    let expanded_output_type = input_types[1].clone().with_shape(Shape::new(expanded_dimensions));
-    let expanded_output = if expanded_output_type.static_shape().is_some() {
-        lower_constant_output(std::slice::from_ref(&expanded_output_type), 0, block, context, location)?.remove(0)
-    } else {
-        let physical_type = physical_bound_type(&expanded_output_type)?;
-        let zero = lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
-        let dimension_sources =
-            (0..expanded_output_type.rank()).map(|axis| (input_values[1], axis)).collect::<Vec<_>>();
-        lower_restore_dynamic_dimensions(
-            zero,
-            &expanded_output_type,
-            dimension_sources.as_slice(),
+        )?;
+        let mut copy_dimensions = input_types[1].shape().dimensions().to_vec();
+        copy_dimensions[0] = Dimension::Static(output_extent);
+        copy_dimensions.insert(0, Dimension::Static(metadata_length));
+        let copy_type = (input_types[1].clone().with_shape(Shape::new(copy_dimensions))).lower(context, location)?;
+        let copies = block.append_operation(stable_hlo::reshape_with_output_type(expanded, copy_type, location)?)?;
+        let copies = copies.result(0).unwrap().as_ref();
+        let contribution = ReductionKind::Sum.lower(
+            &[0],
+            copies,
+            &input_types[1],
+            FloatExtremumForm::TotalOrder,
             block,
             context,
             location,
-        )?
-    };
-
-    let metadata_type = input_types[2].clone().with_data_type(DataType::U64);
-    let metadata_tensor_type = lower_tensor_type(&metadata_type, context, location)?;
-    let metadata = input_values[2..]
-        .iter()
-        .zip(&input_types[2..])
-        .map(|(&value, r#type)| {
-            if r#type.data_type() == DataType::U64 {
-                return Ok(value);
-            }
-            let converted = block.append_operation(stable_hlo::convert(value, metadata_tensor_type, location)?)?;
-            Ok(converted.result(0).unwrap().as_ref())
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
-    let metadata_indices = block.append_operation(stable_hlo::iota(metadata_tensor_type, 0, location)?)?;
-    let metadata_indices = metadata_indices.result(0).unwrap().as_ref();
-    let transfers_per_participant_value = lower_u64_scalar_constant(
-        u64::try_from(transfers_per_participant).map_err(|_| {
-            ProgramError::MalformedProgram(
-                "`parallel_ragged_all_to_all` transfers per participant cannot be represented as `u64`".to_string(),
-            )
-        })?,
-        block,
-        context,
-        location,
-    )?;
-    let transfer_count = block.append_operation(stable_hlo::broadcast(
-        transfers_per_participant_value,
-        metadata_tensor_type,
-        &[],
-        location,
-    )?)?;
-    let transfer_count = transfer_count.result(0).unwrap().as_ref();
-    let transfer_slots = block.append_operation(stable_hlo::remainder(metadata_indices, transfer_count, location)?)?;
-    let transfer_slots = transfer_slots.result(0).unwrap().as_ref();
-    let source_axis_index = lower_axis_index_to_coordinate(
-        &AxisIndexOperation::new(operation.axis_name().to_string()),
-        collective_state,
-        block,
-        context,
-        location,
-    )?;
-    let source_group_position = if let Some(groups) = operation.axis_index_groups() {
-        let mut positions = vec![0i64; operation.axis_size()];
-        for group in groups {
-            for (position, &axis_index) in group.iter().enumerate() {
-                positions[axis_index] = i64::try_from(position).map_err(|_| {
-                    ProgramError::MalformedProgram(format!(
-                        "`parallel_ragged_all_to_all` group position {position} cannot be represented as an `i64` \
-                         backend attribute",
-                    ))
-                })?;
-            }
-        }
-        let positions_type =
-            lower_tensor_type(&ArrayType::new_static(DataType::I64, [operation.axis_size()]), context, location)?;
-        let positions = context.dense_i64_elements_attribute(positions_type, positions.as_slice())?;
-        let positions = block.append_operation(stable_hlo::constant(positions, location)?)?;
-        let positions = positions.result(0).unwrap().as_ref();
-        let position =
-            block.append_operation(stable_hlo::dynamic_slice(positions, &[source_axis_index], &[1], location)?)?;
-        let position = position.result(0).unwrap().as_ref();
-        let position = block.append_operation(stable_hlo::convert(
-            position,
-            lower_tensor_type(&ArrayType::new_static(DataType::U64, [1]), context, location)?,
-            location,
-        )?)?;
-        let position = position.result(0).unwrap().as_ref();
-        let position = block.append_operation(stable_hlo::reshape_with_output_type(
-            position,
-            lower_tensor_type(&ArrayType::scalar(DataType::U64), context, location)?,
-            location,
-        )?)?;
-        position.result(0).unwrap().as_ref()
-    } else {
-        source_axis_index
-    };
-    let source_copy_base = block.append_operation(stable_hlo::multiply(
-        source_group_position,
-        transfers_per_participant_value,
-        location,
-    )?)?;
-    let source_copy_base = source_copy_base.result(0).unwrap().as_ref();
-    let source_copy_base =
-        block.append_operation(stable_hlo::broadcast(source_copy_base, metadata_tensor_type, &[], location)?)?;
-    let source_copy_base = source_copy_base.result(0).unwrap().as_ref();
-    let copy_indices = block.append_operation(stable_hlo::add(source_copy_base, transfer_slots, location)?)?;
-    let copy_indices = copy_indices.result(0).unwrap().as_ref();
-    let copy_stride = lower_constant_elements_attribute(
-        DataType::U64,
-        metadata_tensor_type,
-        i64::try_from(output_extent).map_err(|_| {
-            ProgramError::MalformedProgram(format!(
-                "`parallel_ragged_all_to_all` output extent {output_extent} cannot be represented by its metadata",
-            ))
-        })?,
-        context,
-    )?;
-    let copy_stride = block.append_operation(stable_hlo::constant(copy_stride, location)?)?;
-    let copy_stride = copy_stride.result(0).unwrap().as_ref();
-    let copy_offsets = block.append_operation(stable_hlo::multiply(copy_indices, copy_stride, location)?)?;
-    let copy_offsets = copy_offsets.result(0).unwrap().as_ref();
-    let output_offsets = block.append_operation(stable_hlo::add(metadata[2], copy_offsets, location)?)?;
-    let output_offsets = output_offsets.result(0).unwrap().as_ref();
-    let transfer_inputs = [input_values[0], expanded_output, metadata[0], metadata[1], output_offsets, metadata[3]];
-    let expanded = emit_parallel_ragged_all_to_all_custom_call(
-        collective_state,
-        replica_groups.as_slice(),
-        transfer_inputs.as_slice(),
-        block,
-        context,
-        location,
-    )?;
-    let mut copy_dimensions = input_types[1].shape().dimensions().to_vec();
-    copy_dimensions[0] = Dimension::Static(output_extent);
-    copy_dimensions.insert(0, Dimension::Static(metadata_length));
-    let copy_type =
-        lower_tensor_type(&input_types[1].clone().with_shape(Shape::new(copy_dimensions)), context, location)?;
-    let copies = block.append_operation(stable_hlo::reshape_with_output_type(expanded, copy_type, location)?)?;
-    let copies = copies.result(0).unwrap().as_ref();
-    let contribution = lower_reduce_to_mlir(
-        ReductionKind::Sum,
-        &[0],
-        copies,
-        &input_types[1],
-        FloatExtremumForm::TotalOrder,
-        block,
-        context,
-        location,
-    )?;
-    let sum = block.append_operation(stable_hlo::add(input_values[1], contribution, location)?)?;
-    Ok(vec![sum.result(0).unwrap().as_ref()])
+        )?;
+        let sum = block.append_operation(stable_hlo::add(input_values[1], contribution, location)?)?;
+        Ok(vec![sum.result(0).unwrap().as_ref()])
+    }
 }
 
 #[cfg(test)]
@@ -680,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_ragged_all_to_all_operation_lower_batched_over_an_unrelated_axis() {
+    fn test_parallel_ragged_all_to_all_operation_lower_inside_named_batch_over_an_unrelated_axis() {
         // A named batch over `y` inside a manual region over `x` adds a batch dimension to the exchange, which the
         // lowering flattens into one native exchange. The offsets of the second batch item are rebased by its three
         // `operand` and four `output` rows, and the metadata are transposed before they are flattened, so that the
@@ -1425,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_ragged_all_to_all_operation_lower_rejects_batching_internal_physical_representation() {
+    fn test_parallel_ragged_all_to_all_operation_lower_to_mlir_rejects_batching_internal_physical_representation() {
         let operation = bind_batched_parallel_ragged_all_to_all("x");
         assert!(operation.is_physical());
 
@@ -1434,8 +1445,7 @@ mod tests {
         let module = mlir_context.module(location).unwrap();
         let mut block = module.body().unwrap();
         assert!(matches!(
-            lower_parallel_ragged_all_to_all_to_mlir(
-                &operation,
+            operation.lower_to_mlir(
                 &CollectiveLoweringState::new(),
                 &[],
                 &[],
@@ -1447,15 +1457,14 @@ mod tests {
                 core_error.as_ref(),
                 CoreError::Program(ProgramError::MalformedProgram(message))
                     if *message
-                        == "`parallel_ragged_all_to_all` lowering does not support the batching-internal \
-                            physical operand \
-                            representation",
+                        == "`parallel_ragged_all_to_all` lowering does not support the batching-internal physical \
+                            operand representation",
             ),
         ));
     }
 
     #[test]
-    fn test_lower_batched_parallel_ragged_all_to_all_rejects_dynamic_shapes() {
+    fn test_parallel_ragged_all_to_all_operation_lower_batched_rejects_dynamic_shapes() {
         // Flattening the batch items of an exchange into one native exchange requires static input shapes.
         let operation = bind_batched_parallel_ragged_all_to_all("y");
         assert_eq!(operation.batch_dimension_count(), 1);
@@ -1468,8 +1477,7 @@ mod tests {
         let module = mlir_context.module(location).unwrap();
         let mut block = module.body().unwrap();
         assert!(matches!(
-            lower_batched_parallel_ragged_all_to_all(
-                &operation,
+            operation.lower_batched(
                 &CollectiveLoweringState::new(),
                 &[],
                 &[

@@ -1,7 +1,7 @@
 use ryft_core::{ArrayType, TransferToMemoryOperation};
 use ryft_mlir::ValueRef;
 
-use crate::lowering::types::lower_transfer_to_memory;
+use crate::lowering::types::MemoryLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for TransferToMemoryOperation {
@@ -13,13 +13,8 @@ impl LowerableOperation for TransferToMemoryOperation {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (input_types, output_types);
-        lower_transfer_to_memory(
-            self.destination(),
-            input_values,
-            &mut lowerer.block(),
-            lowerer.context(),
-            lowerer.location(),
-        )
+        self.destination()
+            .lower_transfer(input_values, &mut lowerer.block(), lowerer.context(), lowerer.location())
     }
 }
 

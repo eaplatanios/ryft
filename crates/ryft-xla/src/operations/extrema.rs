@@ -153,10 +153,11 @@ impl LowerableOperation for ClampOperation<ArrayType> {
 pub(crate) enum FloatExtremumForm {
     /// Explicit `TOTALORDER` comparison and selection, which orders the signed zeros on every XLA backend. XLA's
     /// dynamic padder rejects such comparisons over bounded dynamic arrays, and the Triton code generation of its GPU
-    /// compiler fails on them, so this is the form of scalar combiner bodies (e.g., of reductions) that are not
-    /// lowered for CUDA. XLA can only distribute a reduction whose combiner is a single operation, so
-    /// [`lower_reduce_to_mlir`](crate::operations::reductions::lower_reduce_to_mlir) lowers the extrema of this form
-    /// as reductions of integer keys that have the same order, for the floating-point types that have such keys.
+    /// compiler fails on them, so this is the form of scalar combiner bodies (e.g., of reductions) that are not lowered
+    /// for CUDA. XLA can only distribute a reduction whose combiner is a single operation, so
+    /// [`ReductionKindLoweringExtension::lower`](crate::operations::reductions::ReductionKindLoweringExtension::lower)
+    /// lowers the extrema of this form as reductions of integer keys that have the same order, for the floating-point
+    /// types that have such keys.
     TotalOrder,
 
     /// Ordinary `FLOAT` comparison and selection, with a tie between two zeros resolved by arithmetic that orders the

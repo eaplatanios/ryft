@@ -8,7 +8,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::states::CollectiveLoweringState;
-use crate::lowering::types::lower_tensor_type;
+use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::operations::collectives::{collapse_singleton_axis, refine_collective_result_dimensions};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation, Type};
 
@@ -37,8 +37,7 @@ impl LowerableOperation for ParallelAllToAllOperation {
                 operation.infer_output_types(input_types, &[])
             },
         )?;
-        lower_parallel_all_to_all_to_mlir(
-            self,
+        self.lower_to_mlir(
             &collective_state,
             input_values[0],
             &input_types[0],
@@ -87,83 +86,88 @@ impl MemberLowerableOperation<Type> for ParallelAllToAllOperation {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
         let output_type = <&ArrayType>::try_from(output_type)?;
-        let result = lower_parallel_all_to_all_to_mlir(
-            self,
-            collective_state,
-            *input,
-            input_type,
-            output_type,
-            block,
-            context,
-            location,
-        )?
-        .remove(0);
+        let result = self
+            .lower_to_mlir(collective_state, *input, input_type, output_type, block, context, location)?
+            .remove(0);
         refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
     }
 }
 
-/// Lowers one traced `parallel_all_to_all` to a channeled `stablehlo.all_to_all` over the named mesh axis's replica
-/// groups.
-fn lower_parallel_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &ParallelAllToAllOperation,
-    collective_state: &CollectiveLoweringState,
-    input_value: ValueRef<'b, 'c, 't>,
-    input_array_type: &ArrayType,
-    output_array_type: &ArrayType,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let (replica_groups, axis_size) = collective_state.replica_groups(
-        operation.axes(),
-        operation.axis_size(),
-        operation.options().axis_index_groups(),
-    )?;
-    let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
-    let (input_value, split_axis, concatenation_axis) = match operation.options().mode() {
-        CollectiveMode::Tiled => (input_value, operation.split_axis(), operation.concatenation_axis()),
-        CollectiveMode::Untiled if operation.split_axis() == operation.concatenation_axis() => {
-            (input_value, operation.split_axis(), operation.concatenation_axis())
-        }
-        CollectiveMode::Untiled => {
-            let mut split_axis = operation.split_axis();
-            let mut concatenation_axis = operation.concatenation_axis();
-            if split_axis < concatenation_axis {
-                concatenation_axis += 1;
-            } else {
-                split_axis += 1;
+/// Lowering of a [`ParallelAllToAllOperation`] for one value.
+trait ParallelAllToAllOperationLoweringExtension {
+    /// Lowers one traced `parallel_all_to_all` to a channeled `stablehlo.all_to_all` over the named mesh axis's replica
+    /// groups.
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_value: ValueRef<'b, 'c, 't>,
+        input_array_type: &ArrayType,
+        output_array_type: &ArrayType,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl ParallelAllToAllOperationLoweringExtension for ParallelAllToAllOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_value: ValueRef<'b, 'c, 't>,
+        input_array_type: &ArrayType,
+        output_array_type: &ArrayType,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let (replica_groups, axis_size) =
+            collective_state.replica_groups(self.axes(), self.axis_size(), self.options().axis_index_groups())?;
+        let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
+        let (input_value, split_axis, concatenation_axis) = match self.options().mode() {
+            CollectiveMode::Tiled => (input_value, self.split_axis(), self.concatenation_axis()),
+            CollectiveMode::Untiled if self.split_axis() == self.concatenation_axis() => {
+                (input_value, self.split_axis(), self.concatenation_axis())
             }
-            let expanded_type = input_array_type
-                .with_inserted_dimension(concatenation_axis, Dimension::Static(1))
-                .map_err(ProgramError::from)?;
-            let expanded_type = lower_tensor_type(&expanded_type, context, location)?;
-            let broadcast_dimensions =
-                (0..input_array_type.rank() + 1).filter(|&axis| axis != concatenation_axis).collect::<Vec<_>>();
-            let expanded = block.append_operation(stable_hlo::broadcast(
-                input_value,
-                expanded_type,
-                broadcast_dimensions.as_slice(),
-                location,
-            )?)?;
-            (expanded.result(0).unwrap().as_ref(), split_axis, concatenation_axis)
+            CollectiveMode::Untiled => {
+                let mut split_axis = self.split_axis();
+                let mut concatenation_axis = self.concatenation_axis();
+                if split_axis < concatenation_axis {
+                    concatenation_axis += 1;
+                } else {
+                    split_axis += 1;
+                }
+                let expanded_type = input_array_type
+                    .with_inserted_dimension(concatenation_axis, Dimension::Static(1))
+                    .map_err(ProgramError::from)?;
+                let expanded_type = expanded_type.lower(context, location)?;
+                let broadcast_dimensions =
+                    (0..input_array_type.rank() + 1).filter(|&axis| axis != concatenation_axis).collect::<Vec<_>>();
+                let expanded = block.append_operation(stable_hlo::broadcast(
+                    input_value,
+                    expanded_type,
+                    broadcast_dimensions.as_slice(),
+                    location,
+                )?)?;
+                (expanded.result(0).unwrap().as_ref(), split_axis, concatenation_axis)
+            }
+        };
+        let result = block.append_operation(stable_hlo::all_to_all(
+            &[input_value],
+            split_axis,
+            axis_size,
+            concatenation_axis,
+            stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
+            Some(collective_state.next_channel_id()),
+            Some(stable_hlo::ChannelHandleType::DeviceToDevice),
+            true,
+            location,
+        )?)?;
+        let result = result.result(0).unwrap().as_ref();
+        if self.options().mode() == CollectiveMode::Tiled || split_axis == concatenation_axis {
+            return Ok(vec![result]);
         }
-    };
-    let result = block.append_operation(stable_hlo::all_to_all(
-        &[input_value],
-        split_axis,
-        axis_size,
-        concatenation_axis,
-        stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-        Some(collective_state.next_channel_id()),
-        Some(stable_hlo::ChannelHandleType::DeviceToDevice),
-        true,
-        location,
-    )?)?;
-    let result = result.result(0).unwrap().as_ref();
-    if operation.options().mode() == CollectiveMode::Tiled || split_axis == concatenation_axis {
-        return Ok(vec![result]);
+        Ok(vec![collapse_singleton_axis(result, output_array_type, block, context, location)?])
     }
-    Ok(vec![collapse_singleton_axis(result, output_array_type, block, context, location)?])
 }
 
 #[cfg(test)]
@@ -179,7 +183,7 @@ mod tests {
     use ryft_pjrt::{BufferType, Program};
 
     use crate::lowering::tests::{static_sharded_array_type, test_manual_mesh};
-    use crate::lowering::types::lower_array_ir_type;
+    use crate::lowering::types::TypeLoweringExtension;
     use crate::operations::Operation;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayTracer, ExecutionArguments, FromPjrt, LowerableProgram, Session, TracedProgram, trace};
@@ -457,7 +461,7 @@ mod tests {
             let location = context.unknown_location();
             let mlir_types = input_types
                 .iter()
-                .map(|r#type| (lower_array_ir_type(r#type, &context, location).unwrap(), location))
+                .map(|r#type| (r#type.lower(&context, location).unwrap(), location))
                 .collect::<Vec<_>>();
             let block = context.block(&mlir_types);
             let inputs =

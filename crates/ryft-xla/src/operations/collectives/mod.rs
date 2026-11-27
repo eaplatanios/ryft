@@ -5,7 +5,7 @@ use ryft_mlir::{
 };
 
 use crate::Error;
-use crate::lowering::types::lower_tensor_type;
+use crate::lowering::types::ArrayTypeLoweringExtension;
 
 /// StableHLO lowering of `axis_index`.
 pub(crate) mod axis_index;
@@ -36,7 +36,7 @@ fn collapse_singleton_axis<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let output_type = lower_tensor_type(output_array_type, context, location)?;
+    let output_type = output_array_type.lower(context, location)?;
     let reshape = block.append_operation(stable_hlo::reshape_with_output_type(value, output_type, location)?)?;
     Ok(reshape.result(0).unwrap().as_ref())
 }
@@ -54,7 +54,7 @@ fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
         return Err(ProgramError::InvalidInputCount { expected: output_type.rank(), actual: extents.len() }.into());
     }
     let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
-    let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+    let output_tensor_type = output_type.lower(context, location)?;
     for (axis, &extent) in extents.iter().enumerate() {
         if !matches!(output_type.shape().dimensions()[axis], Dimension::Dynamic(_)) {
             continue;
@@ -110,7 +110,7 @@ mod tests {
     ) -> Result<(), Error> {
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let tensor_type = lower_tensor_type(&input_type, &context, location)?;
+        let tensor_type = input_type.lower(&context, location)?;
         let block = context.block(&[(tensor_type, location)]);
         let input = block.argument(0).unwrap().as_ref();
         let mut lowerer: Lowerer<'_, '_, '_, Operation> =
@@ -477,7 +477,7 @@ mod tests {
                 let output_types = vec![input_type.clone()];
                 let context = MlirContext::new();
                 let location = context.unknown_location();
-                let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
+                let tensor_type = input_type.lower(&context, location).unwrap();
                 let block = context.block(&[(tensor_type, location)]);
                 let input = block.argument(0).unwrap().as_ref();
                 let state = CollectiveLoweringState::new().enter_manual_region(boundary.clone());

@@ -26,23 +26,23 @@ use crate::devices::MemoryExtension;
 use crate::lowering::emissions::{emitted_regions, partition_session_constants, unread_entry_arguments};
 use crate::lowering::extensions::{ProgramLoweringOptions, ShardingLoweringExtension};
 use crate::lowering::reductions::{
-    lower_pending_reduction_constraint, validate_declared_pending_reduction, validate_partial_completion,
+    ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
     validate_pending_reduction_change,
 };
 use crate::lowering::regions::lower_program_outputs_with_inputs;
 use crate::lowering::signatures::ExecutableSignature;
 use crate::lowering::states::CollectiveLoweringState;
 use crate::lowering::types::{
-    lower_boundary_layout, lower_runtime_dimension_size_i64, lower_tensor_type, lower_unplaced_constant_output,
+    ArrayTypeLoweringExtension, lower_runtime_dimension_size_i64, lower_unplaced_constant_output,
     validate_boundary_memory,
 };
 use crate::lowering::{EffectTokens, LowerableOperationFamily, LoweringError};
 use crate::operations::call::{CallFunctionMap, collect_call_functions, emit_call_function};
 use crate::operations::composites::{collect_named_composition_functions, emit_named_composition_function};
-use crate::sharding::{OpenDimensions, ShardySharding};
+use crate::sharding::{LogicalMeshExtension, OpenDimensions, ShardingExtension};
 use crate::{
     CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME,
-    ToMlir, Type, normalize_runtime_requirements,
+    Type, normalize_runtime_requirements,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -144,7 +144,7 @@ impl LoweredModule {
         }
         let mesh = collect_nested_sharding_mesh(program, signature_mesh, target_platform)?;
         if let Some(mesh) = mesh.as_ref() {
-            let mesh_operation = mesh.to_mlir(location)?;
+            let mesh_operation = mesh.lower(location)?;
             module.body()?.append_operation(mesh_operation)?;
         }
 
@@ -571,10 +571,10 @@ pub(crate) fn cast_changes_explicit_placement(input_type: &ArrayType, output_typ
 
 /// Removes every `stablehlo.constant` operation whose result has no uses from `module`, including those in nested
 /// regions. Lowering materializes first-class dimension extents eagerly (refer to
-/// [`lower_dimension_extent`](crate::lowering::types::lower_dimension_extent)), while their consumers
-/// often read them only for dynamic axes (e.g., the explicit-extent collectives only refine dynamic result axes), so a
-/// static extent would otherwise remain in the lowered module as a dead constant. Constants are pure, so removing an
-/// unused one never changes the semantics of the module.
+/// [`DimensionValueLoweringExtension::lower`](crate::lowering::types::DimensionValueLoweringExtension::lower)), while
+/// their consumers often read them only for dynamic axes (e.g., the explicit-extent collectives only refine dynamic
+/// result axes), so a static extent would otherwise remain in the lowered module as a dead constant. Constants are
+/// pure, so removing an unused one never changes the semantics of the module.
 pub(crate) fn remove_unused_constants(module: &Module<'_, '_>) -> Result<(), Error> {
     remove_unused_constants_in_block(module.body()?)
 }
@@ -1003,14 +1003,14 @@ fn entry_function_attributes<'c, 't>(
     let EntryBoundary { signature, physical_argument_types, physical_output_types, aliases, .. } = boundary;
     let mut physical_argument_tensor_types = physical_argument_types
         .iter()
-        .map(|array_type| lower_tensor_type(array_type, context, location).map(|r#type| r#type.as_ref()))
+        .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     if signature.has_ordered_io() {
         physical_argument_tensor_types.push(context.stable_hlo_token_type()?.as_ref());
     }
     let mut physical_output_tensor_types = physical_output_types
         .iter()
-        .map(|array_type| lower_tensor_type(array_type, context, location).map(|r#type| r#type.as_ref()))
+        .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     if signature.has_ordered_io() {
         physical_output_tensor_types.push(context.stable_hlo_token_type()?.as_ref());
@@ -1018,10 +1018,10 @@ fn entry_function_attributes<'c, 't>(
     let mut argument_sharding_attributes = signature
         .physical_optional_input_shardings(argument_shardings)
         .iter()
-        .map(|sharding| sharding.as_ref().map(|sharding| sharding.to_mlir(location)).transpose())
+        .map(|sharding| sharding.as_ref().map(|sharding| sharding.lower(OpenDimensions::None, location)).transpose())
         .collect::<Result<Vec<_>, _>>()?;
     // Results whose placement over auto mesh axes the compiler chooses are open over those axes, like JAX lowers the
-    // shardings of output types without `out_shardings` (refer to `ShardySharding`).
+    // shardings of output types without `out_shardings` (refer to `ShardingExtension::lower`).
     let physical_open_outputs =
         if open_outputs.is_empty() { Vec::new() } else { signature.project_outputs(open_outputs) };
     let mut result_sharding_attributes = signature
@@ -1031,10 +1031,7 @@ fn entry_function_attributes<'c, 't>(
         .map(|(index, sharding)| {
             let open = physical_open_outputs.get(index).copied().unwrap_or(false);
             let open_dimensions = if open { OpenDimensions::All } else { OpenDimensions::None };
-            sharding
-                .as_ref()
-                .map(|sharding| ShardySharding::new(sharding, open_dimensions).to_mlir(location))
-                .transpose()
+            sharding.as_ref().map(|sharding| sharding.lower(open_dimensions, location)).transpose()
         })
         .collect::<Result<Vec<_>, _>>()?;
     // The effect token of a signature side is annotated when any value of that side is, as each device threads its
@@ -1081,7 +1078,7 @@ fn entry_function_attributes<'c, 't>(
                 );
             }
             if let Some(array_type) = physical_argument_types.get(index)
-                && let Some(layout) = lower_boundary_layout(array_type, "input", context)?
+                && let Some(layout) = array_type.lower_boundary_layout("input", context)?
             {
                 attributes.insert("mhlo.layout_mode".into(), layout);
             }
@@ -1105,7 +1102,7 @@ fn entry_function_attributes<'c, 't>(
                 );
             }
             if let Some(array_type) = physical_output_types.get(index)
-                && let Some(layout) = lower_boundary_layout(array_type, "output", context)?
+                && let Some(layout) = array_type.lower_boundary_layout("output", context)?
             {
                 attributes.insert("mhlo.layout_mode".into(), layout);
             }
@@ -1167,7 +1164,7 @@ where
                     let operation = function_block_ref.append_operation(stable_hlo::set_dimension_size(
                         value,
                         size,
-                        lower_tensor_type(&refined_type, context, location)?,
+                        refined_type.lower(context, location)?,
                         input_dimension.axis(),
                         location,
                     )?)?;
@@ -1195,7 +1192,7 @@ where
                 value
             }
         };
-        debug_assert_eq!(value.r#type()?, lower_tensor_type(array_type, context, location)?.as_ref());
+        debug_assert_eq!(value.r#type()?, array_type.lower(context, location)?.as_ref());
         // An argument that arrives with a pending reduction that its type does not record (i.e., over auto mesh
         // axes, which an input sharding override states and types never record, refer to
         // `receivable_argument_sharding` in `crate::compilation::domains`) is reduced where it enters, because
@@ -1232,7 +1229,7 @@ where
                 validate_partial_completion(data_type, kind, sharding, completed, kept, "input_shardings")?;
                 let reduced = sharding.clone().with_unreduced_axes(array_type.unreduced_axes().iter().cloned())?;
                 let block = &mut function_block_ref;
-                lower_pending_reduction_constraint(value, &reduced, &[], block, location.as_ref())?
+                reduced.lower_pending_reduction_constraint(value, &[], block, location.as_ref())?
             }
             _ => value,
         };
@@ -1382,7 +1379,7 @@ where
         }
     }
     if let Some(mesh) = &mesh {
-        module.body()?.insert_operation(mesh.to_mlir(location)?, 0)?;
+        module.body()?.insert_operation(mesh.lower(location)?, 0)?;
     }
     Ok(mesh)
 }

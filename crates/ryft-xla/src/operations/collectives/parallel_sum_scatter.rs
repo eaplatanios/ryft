@@ -10,7 +10,7 @@ use ryft_mlir::{
 
 use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
 use crate::lowering::states::CollectiveLoweringState;
-use crate::lowering::types::lower_tensor_type;
+use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::operations::collectives::{collapse_singleton_axis, refine_collective_result_dimensions};
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::build_reduce_body_region;
@@ -41,8 +41,7 @@ impl LowerableOperation for ParallelSumScatterOperation {
                 operation.infer_output_types(input_types, &[])
             },
         )?;
-        lower_parallel_sum_scatter_to_mlir(
-            self,
+        self.lower_to_mlir(
             &collective_state,
             input_values[0],
             &output_types[0],
@@ -86,75 +85,85 @@ impl MemberLowerableOperation<Type> for ParallelSumScatterOperation {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
         let output_type = <&ArrayType>::try_from(output_type)?;
-        let result =
-            lower_parallel_sum_scatter_to_mlir(self, collective_state, *input, output_type, block, context, location)?
-                .remove(0);
+        let result = self.lower_to_mlir(collective_state, *input, output_type, block, context, location)?.remove(0);
         refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
     }
 }
 
-/// Lowers one traced `parallel_sum_scatter` to a channeled `stablehlo.reduce_scatter` with a sum reduction over the
-/// named mesh axis's replica groups. The reduce-scatter adds with the combiner of XLA that the all-reduce of a
-/// `parallel_reduce` sum and the completion of a pending sum use, so a data type for which that sum is not what the
-/// data type means (e.g., one-bit integers, which XLA adds as predicates) is rejected before anything is compiled, by
-/// the rule that every collective that reduces shares (refer to [`compiled_reduction_rejection`]). The transpose of a
-/// `parallel_all_gather` is such a sum scatter, so it reaches the same check.
-fn lower_parallel_sum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &ParallelSumScatterOperation,
-    collective_state: &CollectiveLoweringState,
-    input_value: ValueRef<'b, 'c, 't>,
-    output_array_type: &ArrayType,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let data_type = output_array_type.data_type();
-    if let Some(reason) = compiled_reduction_rejection(data_type, ReductionChange::Complete(UnreducedKind::Sum)) {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{}` cannot sum `{data_type}` values over mesh axis `{}`, because {reason}",
-                operation.name(),
-                operation.axes(),
-            ),
+/// Lowering of a [`ParallelSumScatterOperation`] for one value.
+trait ParallelSumScatterOperationLoweringExtension {
+    /// Lowers one traced `parallel_sum_scatter` to a channeled `stablehlo.reduce_scatter` with a sum reduction over the
+    /// named mesh axis's replica groups. The reduce-scatter adds with the combiner of XLA that the all-reduce of a
+    /// `parallel_reduce` sum and the completion of a pending sum use, so a data type for which that sum is not what the
+    /// data type means (e.g., one-bit integers, which XLA adds as predicates) is rejected before anything is compiled,
+    /// by the rule that every collective that reduces shares (refer to [`compiled_reduction_rejection`]). The transpose
+    /// of a `parallel_all_gather` is such a sum scatter, so it reaches the same check.
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_value: ValueRef<'b, 'c, 't>,
+        output_array_type: &ArrayType,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl ParallelSumScatterOperationLoweringExtension for ParallelSumScatterOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        collective_state: &CollectiveLoweringState,
+        input_value: ValueRef<'b, 'c, 't>,
+        output_array_type: &ArrayType,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let data_type = output_array_type.data_type();
+        if let Some(reason) = compiled_reduction_rejection(data_type, ReductionChange::Complete(UnreducedKind::Sum)) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{}` cannot sum `{data_type}` values over mesh axis `{}`, because {reason}",
+                    self.name(),
+                    self.axes(),
+                ),
+            }
+            .into());
         }
-        .into());
+        let (replica_groups, _) =
+            collective_state.replica_groups(self.axes(), self.axis_size(), self.options().axis_index_groups())?;
+        let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
+        let computation = build_reduce_body_region(
+            ReductionKind::Sum,
+            output_array_type.data_type(),
+            FloatExtremumForm::TotalOrder,
+            context,
+            location,
+        )?;
+        let native_output_type = match self.options().mode() {
+            CollectiveMode::Tiled => output_array_type.clone(),
+            CollectiveMode::Untiled => output_array_type
+                .with_inserted_dimension(self.scatter_axis(), Dimension::Static(1))
+                .map_err(ProgramError::from)?,
+        };
+        let output_type = native_output_type.lower(context, location)?;
+        let result = block.append_operation(stable_hlo::reduce_scatter(
+            input_value,
+            self.scatter_axis(),
+            stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
+            Some(collective_state.next_channel_id()),
+            Some(stable_hlo::ChannelHandleType::DeviceToDevice),
+            true,
+            computation,
+            output_type,
+            location,
+        )?)?;
+        let result = result.result(0).unwrap().as_ref();
+        if self.options().mode() == CollectiveMode::Tiled {
+            return Ok(vec![result]);
+        }
+        Ok(vec![collapse_singleton_axis(result, output_array_type, block, context, location)?])
     }
-    let (replica_groups, _) = collective_state.replica_groups(
-        operation.axes(),
-        operation.axis_size(),
-        operation.options().axis_index_groups(),
-    )?;
-    let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
-    let computation = build_reduce_body_region(
-        ReductionKind::Sum,
-        output_array_type.data_type(),
-        FloatExtremumForm::TotalOrder,
-        context,
-        location,
-    )?;
-    let native_output_type = match operation.options().mode() {
-        CollectiveMode::Tiled => output_array_type.clone(),
-        CollectiveMode::Untiled => output_array_type
-            .with_inserted_dimension(operation.scatter_axis(), Dimension::Static(1))
-            .map_err(ProgramError::from)?,
-    };
-    let output_type = lower_tensor_type(&native_output_type, context, location)?;
-    let result = block.append_operation(stable_hlo::reduce_scatter(
-        input_value,
-        operation.scatter_axis(),
-        stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-        Some(collective_state.next_channel_id()),
-        Some(stable_hlo::ChannelHandleType::DeviceToDevice),
-        true,
-        computation,
-        output_type,
-        location,
-    )?)?;
-    let result = result.result(0).unwrap().as_ref();
-    if operation.options().mode() == CollectiveMode::Tiled {
-        return Ok(vec![result]);
-    }
-    Ok(vec![collapse_singleton_axis(result, output_array_type, block, context, location)?])
 }
 
 #[cfg(test)]

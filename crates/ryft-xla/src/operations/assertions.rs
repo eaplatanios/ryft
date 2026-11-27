@@ -20,11 +20,11 @@ use ryft_pjrt::extensions::ffi::{
 use ryft_pjrt::{Client, Error as PjrtError};
 
 use crate::lowering::types::{
-    lower_compare_to_mlir, lower_physical_bound_value, lower_runtime_dimension_size_i64, lower_static_index_constants,
-    lower_tensor_type,
+    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, lower_runtime_dimension_size_i64,
+    lower_static_index_constants,
 };
 use crate::lowering::{EffectTokens, current_or_new_token};
-use crate::operations::manipulation::conversions::lower_cast_shape;
+use crate::operations::manipulation::conversions::TypeCastLoweringExtension;
 use crate::sessions::effects::EffectCallbackGuard;
 use crate::{
     Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, RuntimeExtension,
@@ -180,7 +180,7 @@ pub(crate) fn lower_deliberately_false_assertion_predicate<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let zero = lower_static_index_constants(&[0], block, context, location)?[0];
-    lower_compare_to_mlir(ComparisonDirection::LessThan, value, zero, block, location)
+    ComparisonDirection::LessThan.lower_comparison(value, zero, block, location)
 }
 
 /// Validates the extent operands of a complete output signature against the static extents to which type inference
@@ -223,7 +223,7 @@ pub(crate) fn lower_output_extent_validation<'b, 'c: 'b, 't: 'c>(
         }
         checked.push((value, extent));
         let expected = lower_static_index_constants(&[extent], block, context, location)?.remove(0);
-        let predicate = lower_compare_to_mlir(ComparisonDirection::Equal, value, expected, block, location)?;
+        let predicate = ComparisonDirection::Equal.lower_comparison(value, expected, block, location)?;
         lower_assert_to_custom_call(
             name,
             &format!("input dimension `{variable}` expected {extent}"),
@@ -376,7 +376,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
                            effect_tokens: &mut EffectTokens<'b, 'c, 't>,
                            block: &mut BlockRef<'b, 'c, 't>|
      -> Result<(), Error> {
-        let predicate = lower_compare_to_mlir(ComparisonDirection::Equal, actual, expected, block, location)?;
+        let predicate = ComparisonDirection::Equal.lower_comparison(actual, expected, block, location)?;
         lower_assert_to_custom_call(
             actor,
             &message,
@@ -772,7 +772,7 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
                 DataType::U1 | DataType::U2 | DataType::U4 => DataType::U8,
                 _ => continue,
             };
-            let tensor_type = lower_tensor_type(&input_type.clone().with_data_type(carrier), context, location)?;
+            let tensor_type = input_type.clone().with_data_type(carrier).lower(context, location)?;
             let converted = block.append_operation(stable_hlo::convert(*value, tensor_type, location)?)?;
             *value = converted.result(0).unwrap().as_ref();
             if data_type == DataType::I1 {
@@ -800,14 +800,10 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
                 DataType::U1 | DataType::U2 | DataType::U4 => DataType::U8,
                 data_type => data_type,
             };
-            *value = lower_physical_bound_value(
-                *value,
-                &input_type.clone().with_data_type(data_type),
-                0.0,
-                block,
-                context,
-                location,
-            )?;
+            *value = input_type
+                .clone()
+                .with_data_type(data_type)
+                .lower_physical_bound_value(*value, 0.0, block, context, location)?;
         }
     }
     lower_assertion_custom_call(
@@ -857,8 +853,8 @@ fn output_extent_checks<'o>(
 }
 
 /// Lowers a [`GuardOperation`] instruction by emitting its check with [`lower_guard`], making every output depend on
-/// the check, and converting each input's shape with [`lower_cast_shape`]. The conversions only re-describe values
-/// that the check has related, including outputs that narrow some axes and give others a
+/// the check, and converting each input's shape with [`TypeCastLoweringExtension::lower_cast_shape`]. The conversions
+/// only re-describe values that the check has related, including outputs that narrow some axes and give others a
 /// [retained](GuardOperation::retained_identities) identity. Guards preserve their inputs' layout and sharding.
 fn lower_guard_with_outputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     boundary: &str,
@@ -891,14 +887,7 @@ fn lower_guard_with_outputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         .zip(input_types)
         .zip(output_types)
         .map(|((&value, input_type), output_type)| {
-            lower_cast_shape(
-                value,
-                input_type,
-                output_type,
-                &mut lowerer.block(),
-                lowerer.context(),
-                lowerer.location(),
-            )
+            input_type.lower_cast_shape(value, output_type, &mut lowerer.block(), lowerer.context(), lowerer.location())
         })
         .collect()
 }

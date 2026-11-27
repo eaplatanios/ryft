@@ -14,7 +14,7 @@ use ryft_pjrt::extensions::ffi::{
 };
 use ryft_pjrt::{BufferType, Client, Error as PjrtError};
 
-use crate::lowering::types::{lower_signed_one_bit_to_mlir, lower_tensor_type};
+use crate::lowering::types::{ArrayTypeLoweringExtension, lower_signed_one_bit_to_mlir};
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::sessions::effects::EffectCallbackGuard;
 use crate::{
@@ -281,7 +281,7 @@ fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
             _ => None,
         };
         if let Some(carrier) = carrier {
-            let carrier_type = lower_tensor_type(&value_type.clone().with_data_type(carrier), context, location)?;
+            let carrier_type = value_type.clone().with_data_type(carrier).lower(context, location)?;
             block
                 .append_operation(stable_hlo::convert(value, carrier_type, location)?)?
                 .result(0)

@@ -12,8 +12,8 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    lower_compare_to_mlir, lower_element_type, lower_physical_bound_value, lower_restore_dynamic_dimensions,
-    lower_tensor_type, lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type,
+    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, DataTypeLoweringExtension,
+    lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type,
 };
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, RaggedDotLoweringStrategy};
 
@@ -93,7 +93,7 @@ impl LowerableOperation for DotOperation {
             DotInputPrecision::Highest => Precision::Highest,
         };
         let (left_precision, right_precision) = precision.input_precisions();
-        let algorithm = lower_dot_algorithm(precision, left_type, right_type, lowerer.context())?;
+        let algorithm = precision.lower(left_type, right_type, lowerer.context())?;
         let result_tensor_type = lowerer.lower_tensor_type(&output_type.clone().with_data_type(result_type))?;
         let result = lowerer.block().append_operation(stable_hlo::dot_general(
             inputs[0],
@@ -149,7 +149,7 @@ impl LowerableOperation for RaggedDotOperation {
                 input_values[2],
                 attribute,
                 Some((chlo::Precision::Default, chlo::Precision::Default)),
-                lower_tensor_type(&output_types[0], lowerer.context(), lowerer.location())?,
+                output_types[0].lower(lowerer.context(), lowerer.location())?,
                 lowerer.location(),
             )?)?;
             return Ok(vec![result.result(0).unwrap().as_ref()]);
@@ -263,86 +263,98 @@ impl LowerableOperation for RaggedDotOperation {
     }
 }
 
-/// Lowers the algorithm that `precision` requests to a StableHLO `algorithm` attribute for a `dot_general` whose
-/// inputs have the computation element types `left_type` and `right_type`, which [`DotPrecision::computation_types`]
-/// selects. Per-input precisions request no algorithm.
-fn lower_dot_algorithm<'c, 't>(
-    precision: DotPrecision,
-    left_type: DataType,
-    right_type: DataType,
-    context: &'c MlirContext<'t>,
-) -> Result<Option<DotAlgorithmAttributeRef<'c, 't>>, Error> {
-    let float_type = |data_type: DataType| {
-        lower_element_type(data_type, context)?.cast::<FloatTypeRef>().ok_or_else(|| {
-            Error::Lowering(LoweringError::UnsupportedOperation {
-                operation: DOT_OPERATION_NAME.to_string(),
-                reason: format!("the algorithm type `{data_type}` is not a floating-point type"),
-            })
-        })
-    };
-    let float8_type = |data_type: DataType| {
-        lower_element_type(data_type, context)?.cast::<Float8TypeRef>().ok_or_else(|| {
-            Error::Lowering(LoweringError::UnsupportedOperation {
-                operation: DOT_OPERATION_NAME.to_string(),
-                reason: format!("the algorithm input type `{data_type}` is not an 8-bit floating-point type"),
-            })
-        })
-    };
-    let preset = match precision {
-        DotPrecision::Inputs { .. } => return Ok(None),
-        DotPrecision::Algorithm(algorithm) => {
-            return Ok(Some(context.stable_hlo_dot_algorithm(
-                float_type(algorithm.lhs_precision_type())?,
-                float_type(algorithm.rhs_precision_type())?,
-                float_type(algorithm.accumulation_type())?,
-                algorithm.lhs_component_count(),
-                algorithm.rhs_component_count(),
-                algorithm.primitive_operation_count(),
-                algorithm.allow_imprecise_accumulation(),
-            )?));
-        }
-        DotPrecision::Preset(preset) => preset,
-    };
+/// Lowering of a [`DotPrecision`] to a StableHLO dot algorithm.
+trait DotPrecisionLoweringExtension {
+    /// Lowers the algorithm that this precision requests to a StableHLO `algorithm` attribute for a `dot_general` whose
+    /// inputs have the computation element types `left_type` and `right_type`, which
+    /// [`DotPrecision::computation_types`] selects. Per-input precisions request no algorithm.
+    fn lower<'c, 't>(
+        self,
+        left_type: DataType,
+        right_type: DataType,
+        context: &'c MlirContext<'t>,
+    ) -> Result<Option<DotAlgorithmAttributeRef<'c, 't>>, Error>;
+}
 
-    // The `Any_F8` presets name the 8-bit input types of the operation and always declare `f32` accumulation, which
-    // is what JAX emits for all four of them. The fast variants allow imprecise accumulation. JAX sets that flag only
-    // for the `F32` fast variant, which makes its `ANY` fast variant identical to the precise one.
-    let preset = match preset {
-        DotAlgorithmPreset::Any_F8_Any_F8_F32 => stable_hlo::DotAlgorithmPreset::Any_F8_Any_F8_F32 {
-            lhs_precision_type: float8_type(left_type)?,
-            rhs_precision_type: float8_type(right_type)?,
-        },
-        DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation => {
-            stable_hlo::DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation {
+impl DotPrecisionLoweringExtension for DotPrecision {
+    fn lower<'c, 't>(
+        self,
+        left_type: DataType,
+        right_type: DataType,
+        context: &'c MlirContext<'t>,
+    ) -> Result<Option<DotAlgorithmAttributeRef<'c, 't>>, Error> {
+        let float_type = |data_type: DataType| {
+            data_type.lower(context)?.cast::<FloatTypeRef>().ok_or_else(|| {
+                Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: DOT_OPERATION_NAME.to_string(),
+                    reason: format!("the algorithm type `{data_type}` is not a floating-point type"),
+                })
+            })
+        };
+        let float8_type = |data_type: DataType| {
+            data_type.lower(context)?.cast::<Float8TypeRef>().ok_or_else(|| {
+                Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: DOT_OPERATION_NAME.to_string(),
+                    reason: format!("the algorithm input type `{data_type}` is not an 8-bit floating-point type"),
+                })
+            })
+        };
+        let preset = match self {
+            DotPrecision::Inputs { .. } => return Ok(None),
+            DotPrecision::Algorithm(algorithm) => {
+                return Ok(Some(context.stable_hlo_dot_algorithm(
+                    float_type(algorithm.lhs_precision_type())?,
+                    float_type(algorithm.rhs_precision_type())?,
+                    float_type(algorithm.accumulation_type())?,
+                    algorithm.lhs_component_count(),
+                    algorithm.rhs_component_count(),
+                    algorithm.primitive_operation_count(),
+                    algorithm.allow_imprecise_accumulation(),
+                )?));
+            }
+            DotPrecision::Preset(preset) => preset,
+        };
+
+        // The `Any_F8` presets name the 8-bit input types of the operation and always declare `f32` accumulation, which
+        // is what JAX emits for all four of them. The fast variants allow imprecise accumulation. JAX sets that flag
+        // only for the `F32` fast variant, which makes its `ANY` fast variant identical to the precise one.
+        let preset = match preset {
+            DotAlgorithmPreset::Any_F8_Any_F8_F32 => stable_hlo::DotAlgorithmPreset::Any_F8_Any_F8_F32 {
                 lhs_precision_type: float8_type(left_type)?,
                 rhs_precision_type: float8_type(right_type)?,
+            },
+            DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation => {
+                stable_hlo::DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation {
+                    lhs_precision_type: float8_type(left_type)?,
+                    rhs_precision_type: float8_type(right_type)?,
+                }
             }
-        }
-        DotAlgorithmPreset::Any_F8_Any_F8_Any => stable_hlo::DotAlgorithmPreset::Any_F8_Any_F8_Any {
-            lhs_precision_type: float8_type(left_type)?,
-            rhs_precision_type: float8_type(right_type)?,
-            accumulation_type: float_type(DataType::F32)?,
-        },
-        DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation => {
-            stable_hlo::DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation {
+            DotAlgorithmPreset::Any_F8_Any_F8_Any => stable_hlo::DotAlgorithmPreset::Any_F8_Any_F8_Any {
                 lhs_precision_type: float8_type(left_type)?,
                 rhs_precision_type: float8_type(right_type)?,
                 accumulation_type: float_type(DataType::F32)?,
+            },
+            DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation => {
+                stable_hlo::DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation {
+                    lhs_precision_type: float8_type(left_type)?,
+                    rhs_precision_type: float8_type(right_type)?,
+                    accumulation_type: float_type(DataType::F32)?,
+                }
             }
-        }
-        DotAlgorithmPreset::F16_F16_F16 => stable_hlo::DotAlgorithmPreset::F16_F16_F16,
-        DotAlgorithmPreset::F16_F16_F32 => stable_hlo::DotAlgorithmPreset::F16_F16_F32,
-        DotAlgorithmPreset::BF16_BF16_BF16 => stable_hlo::DotAlgorithmPreset::BF16_BF16_BF16,
-        DotAlgorithmPreset::BF16_BF16_F32 => stable_hlo::DotAlgorithmPreset::BF16_BF16_F32,
-        DotAlgorithmPreset::BF16_BF16_F32_X3 => stable_hlo::DotAlgorithmPreset::BF16_BF16_F32_X3,
-        DotAlgorithmPreset::BF16_BF16_F32_X6 => stable_hlo::DotAlgorithmPreset::BF16_BF16_F32_X6,
-        DotAlgorithmPreset::BF16_BF16_F32_X9 => stable_hlo::DotAlgorithmPreset::BF16_BF16_F32_X9,
-        DotAlgorithmPreset::TF32_TF32_F32 => stable_hlo::DotAlgorithmPreset::TF32_TF32_F32,
-        DotAlgorithmPreset::TF32_TF32_F32_X3 => stable_hlo::DotAlgorithmPreset::TF32_TF32_F32_X3,
-        DotAlgorithmPreset::F32_F32_F32 => stable_hlo::DotAlgorithmPreset::F32_F32_F32,
-        DotAlgorithmPreset::F64_F64_F64 => stable_hlo::DotAlgorithmPreset::F64_F64_F64,
-    };
-    Ok(context.stable_hlo_dot_algorithm_from_preset(preset)?)
+            DotAlgorithmPreset::F16_F16_F16 => stable_hlo::DotAlgorithmPreset::F16_F16_F16,
+            DotAlgorithmPreset::F16_F16_F32 => stable_hlo::DotAlgorithmPreset::F16_F16_F32,
+            DotAlgorithmPreset::BF16_BF16_BF16 => stable_hlo::DotAlgorithmPreset::BF16_BF16_BF16,
+            DotAlgorithmPreset::BF16_BF16_F32 => stable_hlo::DotAlgorithmPreset::BF16_BF16_F32,
+            DotAlgorithmPreset::BF16_BF16_F32_X3 => stable_hlo::DotAlgorithmPreset::BF16_BF16_F32_X3,
+            DotAlgorithmPreset::BF16_BF16_F32_X6 => stable_hlo::DotAlgorithmPreset::BF16_BF16_F32_X6,
+            DotAlgorithmPreset::BF16_BF16_F32_X9 => stable_hlo::DotAlgorithmPreset::BF16_BF16_F32_X9,
+            DotAlgorithmPreset::TF32_TF32_F32 => stable_hlo::DotAlgorithmPreset::TF32_TF32_F32,
+            DotAlgorithmPreset::TF32_TF32_F32_X3 => stable_hlo::DotAlgorithmPreset::TF32_TF32_F32_X3,
+            DotAlgorithmPreset::F32_F32_F32 => stable_hlo::DotAlgorithmPreset::F32_F32_F32,
+            DotAlgorithmPreset::F64_F64_F64 => stable_hlo::DotAlgorithmPreset::F64_F64_F64,
+        };
+        Ok(context.stable_hlo_dot_algorithm_from_preset(preset)?)
+    }
 }
 
 /// Builds capped cumulative group starts and ends in `u64`. Signed inputs are clamped to zero before widening, bounded
@@ -375,7 +387,7 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
         group_sizes
     };
     let wide_group_sizes_type = group_sizes_type.clone().with_data_type(DataType::U64);
-    let wide_group_sizes_tensor_type = lower_tensor_type(&wide_group_sizes_type, context, location)?;
+    let wide_group_sizes_tensor_type = wide_group_sizes_type.lower(context, location)?;
     let wide_group_sizes = if group_sizes_type.data_type() == DataType::U64 {
         group_sizes
     } else {
@@ -384,7 +396,7 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
         converted.result(0).unwrap().as_ref()
     };
     let wide_group_sizes =
-        lower_physical_bound_value(wide_group_sizes, &wide_group_sizes_type, 0.0, block, context, location)?;
+        wide_group_sizes_type.lower_physical_bound_value(wide_group_sizes, 0.0, block, context, location)?;
     let physical_ragged_extent = u64::try_from(physical_ragged_extent).unwrap();
     if group_count == 0 {
         return Ok((wide_group_sizes, wide_group_sizes));
@@ -396,7 +408,7 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
     // physical extent and the saturating reducer remains associative.
     let capped_group_sizes = block.append_operation(stable_hlo::clamp(zero, wide_group_sizes, extent, location)?)?;
     let capped_group_sizes = capped_group_sizes.result(0).unwrap().as_ref();
-    let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(DataType::U64), context, location)?;
+    let scalar_tensor_type = ArrayType::scalar(DataType::U64).lower(context, location)?;
     let reducer_block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
     let mut reducer_region = context.region();
     let mut reducer_block = reducer_region.append_block(reducer_block)?;
@@ -478,7 +490,7 @@ fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
     intermediate_dimensions.push(group_count.clone());
     intermediate_dimensions.extend(remaining_axes.iter().map(|axis| input_type.dimension(*axis)));
     let intermediate_type = input_type.clone().with_shape(Shape::new(intermediate_dimensions));
-    let intermediate_tensor_type = lower_tensor_type(&intermediate_type, context, location)?;
+    let intermediate_tensor_type = intermediate_type.lower(context, location)?;
     let input_broadcast_dimensions =
         (0..prefix_axes.len()).chain((prefix_axes.len() + 1)..intermediate_type.rank()).collect::<Vec<_>>();
     let input = block.append_operation(stable_hlo::broadcast(
@@ -493,7 +505,7 @@ fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
         if group_sizes_type.rank() == 1 { vec![prefix_axes.len()] } else { (0..=prefix_axes.len()).collect() };
     let metadata_type = intermediate_type.clone().with_data_type(DataType::U64);
     let physical_metadata_type = physical_bound_type(&metadata_type)?;
-    let physical_metadata_tensor_type = lower_tensor_type(&physical_metadata_type, context, location)?;
+    let physical_metadata_tensor_type = physical_metadata_type.lower(context, location)?;
     let dimension_sources = (0..metadata_type.rank()).map(|axis| (input, axis)).collect::<Vec<_>>();
     let group_starts = block.append_operation(stable_hlo::broadcast(
         group_starts,
@@ -514,14 +526,12 @@ fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
     let indices =
         block.append_operation(stable_hlo::iota(physical_metadata_tensor_type, ragged_intermediate_axis, location)?)?;
     let indices = indices.result(0).unwrap().as_ref();
-    let after_start =
-        lower_compare_to_mlir(ComparisonDirection::LessThanOrEqual, group_starts, indices, block, location)?;
-    let before_end = lower_compare_to_mlir(ComparisonDirection::LessThan, indices, group_ends, block, location)?;
+    let after_start = ComparisonDirection::LessThanOrEqual.lower_comparison(group_starts, indices, block, location)?;
+    let before_end = ComparisonDirection::LessThan.lower_comparison(indices, group_ends, block, location)?;
     let mask = block.append_operation(stable_hlo::and(after_start, before_end, location)?)?;
     let mask = mask.result(0).unwrap().as_ref();
-    let mask = lower_restore_dynamic_dimensions(
+    let mask = metadata_type.with_data_type(DataType::Boolean).lower_restore_dynamic_dimensions(
         mask,
-        &metadata_type.with_data_type(DataType::Boolean),
         dimension_sources.as_slice(),
         block,
         context,
@@ -583,7 +593,7 @@ fn lower_dense_ragged_dot<'b, 'c: 'b, 't: 'c>(
         dimensions,
         Some((Precision::Default, Precision::Default)),
         None,
-        lower_tensor_type(output_type, context, location)?,
+        output_type.lower(context, location)?,
         location,
     )?)?;
     Ok(dot.result(0).unwrap().as_ref())

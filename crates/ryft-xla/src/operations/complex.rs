@@ -6,7 +6,7 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
+use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ComplexOperation<ArrayType> {
@@ -97,7 +97,7 @@ pub(crate) fn lower_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
     } else {
         DataType::F64
     });
-    let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+    let part_tensor_type = part_type.lower(context, location)?;
     let real = block.append_operation(stable_hlo::real(value, location)?)?.result(0).unwrap().as_ref();
     let imaginary = block.append_operation(stable_hlo::imag(value, location)?)?.result(0).unwrap().as_ref();
     let sine = block
