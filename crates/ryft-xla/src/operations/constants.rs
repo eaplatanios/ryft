@@ -682,7 +682,7 @@ mod tests {
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::sessions::tests::read_first_shard;
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
-    use crate::{ArrayConstant, Constant, LowerableProgram, ProgramLoweringOptions, Session};
+    use crate::{ArrayConstant, Constant, ProgramLoweringExtension, ProgramLoweringOptions, Session};
 
     use super::*;
 

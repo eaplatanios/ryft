@@ -705,7 +705,7 @@ mod tests {
         execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::types::DataTypeExtension;
-    use crate::{Array, ArrayConstant, Constant, LowerableProgram, Options, Session, Type, Value};
+    use crate::{Array, ArrayConstant, Constant, Options, ProgramLoweringExtension, Session, Type, Value};
 
     use super::*;
 

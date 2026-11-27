@@ -32,7 +32,7 @@ mod tests {
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, Error, LowerableProgram, LoweringError,
+        Array, ArrayConstant, CompiledFunction, Constant, Error, LoweringError, ProgramLoweringExtension,
         ProgramLoweringOptions, Session, compile,
     };
 

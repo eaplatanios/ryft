@@ -621,8 +621,8 @@ mod tests {
     };
     use crate::{
         Array, ArrayConstant, ArrayTracer, Constant, ExecutionArguments, FromPjrt, KernelEmbeddingError,
-        LowerableProgram, ProgramLoweringOptions, RuntimeError, RuntimeRequirement, Session, TracedProgram, Type,
-        Value, trace,
+        ProgramLoweringExtension, ProgramLoweringOptions, RuntimeError, RuntimeRequirement, Session, TracedProgram,
+        Type, Value, trace,
     };
 
     use super::*;

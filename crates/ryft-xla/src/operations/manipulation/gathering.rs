@@ -288,7 +288,7 @@ mod tests {
         execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::types::DataTypeExtension;
-    use crate::{Array, ArrayConstant, LowerableProgram, Options, Session, Type};
+    use crate::{Array, ArrayConstant, Options, ProgramLoweringExtension, Session, Type};
 
     #[test]
     fn test_gather_operation_lower() {

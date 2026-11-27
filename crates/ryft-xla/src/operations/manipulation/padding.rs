@@ -377,7 +377,7 @@ mod tests {
     use crate::lowering::types::lower_static_index_constants;
     use crate::operations::Operation;
     use crate::tests::{execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
-    use crate::{ArrayConstant, Constant, LowerableProgram, ToPjrt};
+    use crate::{ArrayConstant, Constant, ProgramLoweringExtension, ToPjrt};
 
     use super::*;
 

@@ -419,7 +419,7 @@ mod tests {
         Reduce, Shape, Sharding, associative_scan,
     };
 
-    use crate::lowering::programs::{LowerableProgram, ProgramLoweringOptions};
+    use crate::lowering::programs::{ProgramLoweringExtension, ProgramLoweringOptions};
     use crate::lowering::tests::{
         ProgramBuilder, lowered_unary_module, to_mlir_module_for_plain_program, unproject_plain_program,
     };

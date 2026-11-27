@@ -289,7 +289,7 @@ mod tests {
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, Constant, Error, LowerableOperation, LowerableProgram, Lowerer, LoweringError,
+        Array, ArrayConstant, Constant, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringExtension,
         ProgramLoweringOptions, Session, Type,
     };
 

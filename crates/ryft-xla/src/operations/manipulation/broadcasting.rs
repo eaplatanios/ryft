@@ -309,7 +309,8 @@ mod tests {
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, ArrayTracer, CompileTracer, CompiledFunction, Constant, ExecutionArguments, FromPjrt,
-        LowerableProgram, ProgramLoweringOptions, Session, TracedProgram, Type, Value, compile, trace_with_context,
+        ProgramLoweringExtension, ProgramLoweringOptions, Session, TracedProgram, Type, Value, compile,
+        trace_with_context,
     };
 
     use super::*;

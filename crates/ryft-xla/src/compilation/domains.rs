@@ -37,8 +37,8 @@ use crate::lowering::emissions::{
 };
 use crate::lowering::modules::{contains_unresolved_references, contains_unresolved_state, value_shardings};
 use crate::lowering::programs::{
-    LowerableProgram, OutputShardingSource, ProgramLoweringExtension, ProgramLoweringOptions, entry_output_shardings,
-    entry_outputs_with_compiler_chosen_placement,
+    OutputShardingSource, ProgramLoweringAnalysisExtension, ProgramLoweringExtension, ProgramLoweringOptions,
+    entry_output_shardings, entry_outputs_with_compiler_chosen_placement,
 };
 use crate::lowering::signatures::ExecutableSignature;
 use crate::{
@@ -105,7 +105,7 @@ impl CompilationDomain for Session {
         let output_shardings = options.output_shardings().into_iter().flatten().cloned().map(Some).collect();
         // No session is at hand here, so the callee is read for no target, and the pruning of the program that
         // lowering emits for its target drops the mesh of a call whose callee names devices only inside a body that
-        // the target replaces (refer to `ProgramLoweringExtension::pruned_for_lowering`).
+        // the target replaces (refer to `ProgramLoweringAnalysisExtension::pruned_for_lowering`).
         let mesh = requests_placement(callee, options, None, false).then(|| options.mesh());
         let call = call.with_boundary(mesh, input_shardings, output_shardings).with_function_mesh(options.mesh());
         if dispatched && options.input_shardings().is_none() { call.with_kept_input_placements() } else { call }
@@ -305,7 +305,7 @@ impl Session {
     ) -> Result<ProgramLowering, Error> {
         validate_mesh_devices(self, options.mesh())?;
         // Every step below sees the program that lowering emits, without its dead instructions (refer to
-        // `ProgramLoweringExtension::pruned_for_lowering`), as the analysis of its placement requests does.
+        // `ProgramLoweringAnalysisExtension::pruned_for_lowering`), as the analysis of its placement requests does.
         let target_platform = Some(self.target()?.platform_name());
         self.lower_pruned_program(&program.pruned_for_lowering(target_platform)?, capture_count, options, function)
     }
@@ -677,16 +677,16 @@ impl Session {
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        // A public output that a `place` in the entry region or in the callee of a `call` produces, directly or
-        // through operations that return its value and placement unchanged, has the placement of its target, which
-        // states the placement along every mesh axis, and one that returns an argument in the same way is placed where
-        // that argument enters the executable (refer to `ProgramLoweringExtension::output_sharding_sources`). Its
+        // A public output that a `place` in the entry region or in the callee of a `call` produces, directly or through
+        // operations that return its value and placement unchanged, has the placement of its target, which states the
+        // placement along every mesh axis, and one that returns an argument in the same way is placed where that
+        // argument enters the executable (refer to `ProgramLoweringAnalysisExtension::output_sharding_sources`). Its
         // type drops the auto mesh axes of that placement, and its result has no physical buffer whose placement the
         // compiler could report when it has the zero data type, so the placement is carried to the boundary instead.
         // Outputs follow the output override first, then the placement from the program, both including over auto mesh
-        // axes, and otherwise their types. The StableHLO export of traced programs follows the same rule
-        // (refer to `entry_output_shardings`). The arguments of the program are its captures and its public inputs,
-        // between which the executable receives the arrays of session constants.
+        // axes, and otherwise their types. The StableHLO export of traced programs follows the same rule (refer to
+        // `entry_output_shardings`). The arguments of the program are its captures and its public inputs, between which
+        // the executable receives the arrays of session constants.
         let constant_shardings = session_constants
             .iter()
             .map(|binding| (binding.source(), binding.argument().sharding()))
@@ -756,17 +756,16 @@ impl Session {
         // this a property of the whole function rather than of the outputs that the request reaches. The function
         // requests a placement through an input or output sharding override, or through a `place` with a target or a
         // `constrain_sharding` in any region that lowering emits (refer to
-        // `ProgramLoweringExtension::has_placement_requests`). Every output of a function compiled for more than one
-        // device is committed as well, including its hidden reference states, as JAX commits every result of a
-        // computation on more than one device (refer to
-        // `lower_sharding_computation` in `jax._src.interpreters.pxla`), whereas a function that is compiled for a
-        // single device leaves its outputs to the other rules. Every public output of a function compiled for a named
-        // mesh (`function`) is committed too, as JAX commits every result of a `jit` function under `set_mesh` (refer
-        // to `commits_public_outputs`). Other outputs are committed when a public argument of an execution is. The
-        // arrays that a function captures never commit its outputs, committed or not, as JAX returns
-        // `jit(lambda x: x + c)(x)` uncommitted for an uncommitted `x` whatever the commitment of `c`. Eager
-        // operations and compiled reshards set the commitment of their results themselves, so these flags do not
-        // reach them.
+        // `ProgramLoweringAnalysisExtension::has_placement_requests`). Every output of a function compiled for more
+        // than one device is committed as well, including its hidden reference states, as JAX commits every result of a
+        // computation on more than one device (refer to `lower_sharding_computation` in `jax._src.interpreters.pxla`),
+        // whereas a function that is compiled for a single device leaves its outputs to the other rules. Every public
+        // output of a function compiled for a named mesh (`function`) is committed too, as JAX commits every result of
+        // a `jit` function under `set_mesh` (refer to `commits_public_outputs`). Other outputs are committed when a
+        // public argument of an execution is. The arrays that a function captures never commit its outputs, committed
+        // or not, as JAX returns `jit(lambda x: x + c)(x)` uncommitted for an uncommitted `x` whatever the commitment
+        // of `c`. Eager operations and compiled reshards set the commitment of their results themselves, so these flags
+        // do not reach them.
         let commits_public_outputs = commits_public_outputs(
             options.mesh(),
             function,
@@ -1374,15 +1373,14 @@ pub(crate) fn commits_public_outputs(mesh: &DeviceMesh, function_mesh: bool, req
 
 /// Returns whether a function whose program is `program` and whose options are `options` requests the placement of a
 /// value explicitly, through an input or output sharding override or anywhere in its program (refer to
-/// [`ProgramLoweringExtension::has_placement_requests`]), with or without the requests that only move a value to
-/// another memory, as `includes_memory_requests` selects. Every request commits every public output of the function,
-/// so commitment counts them all. A request that names devices (i.e., every request except one that only moves a
-/// value to another memory) also makes the function name the devices of the mesh of `options`, which every execution
-/// and every call of it runs on whatever its inputs. Any other function has a program that is agnostic of devices, and
-/// the inputs of a call decide where the call runs, as JAX runs a `jit` function whose body only moves a value to
-/// another memory where its arguments are. The arrays that the function captures are not among them, whether they are
-/// committed or not, as JAX ignores where the arrays that a `jit` function closes over live (refer to
-/// `CallOperation`).
+/// [`ProgramLoweringAnalysisExtension::has_placement_requests`]), with or without the requests that only move a value
+/// to another memory, as `includes_memory_requests` selects. Every request commits every public output of the function,
+/// so commitment counts them all. A request that names devices (i.e., every request except one that only moves a value
+/// to another memory) also makes the function name the devices of the mesh of `options`, which every execution and
+/// every call of it runs on whatever its inputs. Any other function has a program that is agnostic of devices, and the
+/// inputs of a call decide where the call runs, as JAX runs a `jit` function whose body only moves a value to another
+/// memory where its arguments are. The arrays that the function captures are not among them, whether they are committed
+/// or not, as JAX ignores where the arrays that a `jit` function closes over live (refer to `CallOperation`).
 fn requests_placement(
     program: &FlatProgram<Session>,
     options: &Options,
@@ -1658,7 +1656,7 @@ fn contains_shard_map(program: &FlatProgram<Session>, target_platform: Option<&s
 /// Regions that lowering never reaches (e.g., the rule regions of composites, the transpose region of a `linear_call`,
 /// a body that a backend implementation replaces, or the body of a scan whose length admits no iteration) are not
 /// checked, because they are not part of the compiled program. Entry points that lower a program without compiling it
-/// for a device mesh (e.g., [`LowerableProgram::to_mlir_module`]) know no devices
+/// for a device mesh (e.g., [`ProgramLoweringExtension::to_mlir_module`]) know no devices
 /// and do not run it.
 ///
 /// # Errors

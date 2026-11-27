@@ -545,7 +545,7 @@ mod tests {
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, LowerableProgram, LoweringError,
+        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, LoweringError, ProgramLoweringExtension,
         ProgramLoweringOptions, Session, Type, compile,
     };
 

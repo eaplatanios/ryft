@@ -238,7 +238,8 @@ mod tests {
     use crate::operations::Operation;
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, LowerableProgram, Session, ToPjrt, Type, compile,
+        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, ProgramLoweringExtension, Session, ToPjrt, Type,
+        compile,
     };
 
     use super::*;

@@ -573,7 +573,7 @@ mod tests {
     use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
-    use crate::{Array, Constant, LowerableProgram, ProgramLoweringOptions, Session, Tracer};
+    use crate::{Array, Constant, ProgramLoweringExtension, ProgramLoweringOptions, Session, Tracer};
 
     use super::*;
 

@@ -1,7 +1,7 @@
 //! General XLA program tracing. The [`trace`] entry point stages an arbitrary function over [`ArrayTracer`]s in a fresh
 //! root tracing context of [`Session`]. Its result is a staged [`Program`] of `ryft-core` (refer to [`TracedProgram`]),
-//! which [`LowerableProgram`](crate::LowerableProgram) lowers to a StableHLO/Shardy MLIR module. [`Error`] reports
-//! the failures of both tracing and lowering.
+//! which [`ProgramLoweringExtension`](crate::ProgramLoweringExtension) lowers to a StableHLO/Shardy MLIR module.
+//! [`Error`] reports the failures of both tracing and lowering.
 //!
 //! Traced functions may compose `shard_map` with other transforms (e.g., differentiation or batching). The logical
 //! semantics of `shard_map` (i.e., boundary metadata, validation, closure tracing, and transform rules) are owned by
@@ -10,9 +10,9 @@
 //! simply a traced function whose body binds one `shard_map` (e.g., through [`ShardMap`](ryft_core::ShardMap) on the
 //! context that [`trace_with_context`] passes to it). The lowered function signature carries the sharding of every
 //! global input and output type that has one (refer to
-//! [`LowerableProgram::to_mlir_module`](crate::LowerableProgram::to_mlir_module)). Tracing such a function over input
-//! types that carry the input shardings of its `shard_map` therefore yields function arguments and results placed
-//! as the `shard_map` boundary specifies.
+//! [`ProgramLoweringExtension::to_mlir_module`](crate::ProgramLoweringExtension::to_mlir_module)). Tracing such a
+//! function over input types that carry the input shardings of its `shard_map` therefore yields function arguments and
+//! results placed as the `shard_map` boundary specifies.
 //!
 //! Core failures use [`Error::Core`], and concrete lowering failures have their own [`Error`] variants. Logical
 //! `shard_map` errors raised while tracing or lowering remain [`ProgramError::Custom`] payloads, recoverable through
@@ -38,11 +38,11 @@ pub type ArrayTracer = ProjectedValue<ArrayType, Tracer>;
 /// [`trace_with_context`] on the structure of the traced outputs name this type instead.
 type NormalizedArrayTracer = ProjectedValue<ArrayType, CoreTracer<TracingContext<Constant, Operation>>>;
 
-/// Traced XLA program over global array types structured as `Input` and `Output`, as returned by [`trace`]. It is
-/// the staged [`Program`] of `ryft-core` itself, whose entry region carries the global input and output types, which
+/// Traced XLA program over global array types structured as `Input` and `Output`, as returned by [`trace`]. It is the
+/// staged [`Program`] of `ryft-core` itself, whose entry region carries the global input and output types, which
 /// describe the whole logical arrays at the function boundary. For example, a global array of shape `[8]` split evenly
-/// across two devices has shape `[4]` on each device. [`LowerableProgram`](crate::LowerableProgram) exports the program
-/// as a StableHLO/Shardy MLIR module.
+/// across two devices has shape `[4]` on each device. [`ProgramLoweringExtension`](crate::ProgramLoweringExtension)
+/// exports the program as a StableHLO/Shardy MLIR module.
 pub type TracedProgram<Input, Output> = Program<
     Constant,
     Operation,

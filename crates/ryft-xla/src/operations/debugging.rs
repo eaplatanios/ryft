@@ -585,7 +585,7 @@ mod tests {
         cpu_client, execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayConstant, CompiledFunction, FromPjrt, LowerableProgram, Options, ProgramLoweringOptions,
+        Array, ArrayConstant, CompiledFunction, FromPjrt, Options, ProgramLoweringExtension, ProgramLoweringOptions,
         RuntimeError, Session, compile,
     };
 

@@ -1448,8 +1448,8 @@ mod tests {
     use crate::sessions::tests::{domain_mesh, read_first_shard, read_sharded_f32_array, two_device_mesh};
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, CompileTracer, CompiledFunction, Constant, CustomCallOperationExtension, Error, FromPjrt,
-        LowerableProgram, Options, ProgramLoweringOptions, RuntimeRequirement, StagedFunction, ToPjrt, Type, Value,
+        Array, CompileTracer, CompiledFunction, Constant, CustomCallOperationExtension, Error, FromPjrt, Options,
+        ProgramLoweringExtension, ProgramLoweringOptions, RuntimeRequirement, StagedFunction, ToPjrt, Type, Value,
         compile, compile_with_options, stage,
     };
 

@@ -165,7 +165,7 @@ mod tests {
     };
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
-    use crate::{ArrayConstant, LowerableProgram, Session};
+    use crate::{ArrayConstant, ProgramLoweringExtension, Session};
 
     use super::*;
 

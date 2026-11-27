@@ -266,8 +266,8 @@ pub(crate) mod tests {
     use crate::operations::Operation;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, Constant, ExecutionArguments, FromPjrt, LowerableProgram, ProgramLoweringOptions, Session,
-        TracedProgram, Type, trace,
+        Array, ArrayTracer, Constant, ExecutionArguments, FromPjrt, ProgramLoweringExtension, ProgramLoweringOptions,
+        Session, TracedProgram, Type, trace,
     };
 
     use super::*;

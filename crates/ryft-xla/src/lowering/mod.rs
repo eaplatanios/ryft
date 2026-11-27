@@ -2,15 +2,15 @@
 //!
 //! # Exporting Programs
 //!
-//! [`LowerableProgram`] lowers a staged program over any [`LowerableOperationFamily`].
-//! [`LowerableProgram::to_mlir_module`] renders the module with the default [`ProgramLoweringOptions`], which read the
-//! entry signature from the global input and output types of the program, pass the arrays that the program imports as
-//! hidden arguments that precede its inputs, and prune the program first.
-//! [`LowerableProgram::to_mlir_module_with_options`] takes options that replace those types, attach `sdy.sharding`
-//! attributes to the arguments and results of the entry function, or lower the program as it is.
-//! [`LowerableProgram::lower`] returns the [`LoweredModule`], which pairs the module with what executing it requires.
-//! Programs must have their references and mutable state discharged before lowering. Failures that only lowering can
-//! detect are reported as [`LoweringError`]s wrapped in [`Error::Lowering`].
+//! [`ProgramLoweringExtension`] lowers a staged program over any [`LowerableOperationFamily`].
+//! [`ProgramLoweringExtension::to_mlir_module`] renders the module with the default [`ProgramLoweringOptions`], which
+//! read the entry signature from the global input and output types of the program, pass the arrays that the program
+//! imports as hidden arguments that precede its inputs, and prune the program first.
+//! [`ProgramLoweringExtension::to_mlir_module_with_options`] takes options that replace those types, attach
+//! `sdy.sharding` attributes to the arguments and results of the entry function, or lower the program as it is.
+//! [`ProgramLoweringExtension::lower`] returns the [`LoweredModule`], which pairs the module with what executing it
+//! requires. Programs must have their references and mutable state discharged before lowering. Failures that only
+//! lowering can detect are reported as [`LoweringError`]s wrapped in [`Error::Lowering`].
 //!
 //! # Lowering Custom Operations
 //!
@@ -188,7 +188,7 @@ pub(crate) mod types;
 
 pub use admission::DataDependentPaddingDiscipline;
 pub use modules::LoweredModule;
-pub use programs::{EntryShardingOverride, LowerableProgram, ProgramLoweringOptions};
+pub use programs::{EntryShardingOverride, ProgramLoweringExtension, ProgramLoweringOptions};
 pub use sharding::{
     LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension, UnreducedKindExtension,
 };
@@ -520,9 +520,9 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
 /// [`ArrayOperation`](ryft_core::ArrayOperation) and [`Operation`]) implement this trait by dispatching each variant to
 /// its payload through [`lower_operation_variants`](crate::lower_operation_variants), which also handles payloads that
 /// a family stores as projected or mixed members. A family whose type universe is [`Type`] and that implements
-/// [`OperationPayloadProjection`] is a [`LowerableOperationFamily`] whose programs [`LowerableProgram`] lowers, so
-/// downstream crates extend lowering by implementing this trait for their own operations and families, just like they
-/// extend the transformation traits of `ryft-core`.
+/// [`OperationPayloadProjection`] is a [`LowerableOperationFamily`] whose programs [`ProgramLoweringExtension`] lowers,
+/// so downstream crates extend lowering by implementing this trait for their own operations and families, just like
+/// they extend the transformation traits of `ryft-core`.
 ///
 /// Operations with attached regions lower them through the lowerer (e.g., [`Lowerer::lower_region_inline`]) rather
 /// than through bounds on their own family, so the bounds of a family implementation stay finite.
@@ -1174,8 +1174,8 @@ pub(crate) mod tests {
 
     use crate::lowering::sharding::LogicalMeshExtension;
     use crate::{
-        ArrayConstant, ArrayTracer, CompileTracer, CompiledFunction, Constant, Error, FromPjrt, LowerableProgram,
-        Operation, Options, Session, Type, compile, trace_with_context,
+        ArrayConstant, ArrayTracer, CompileTracer, CompiledFunction, Constant, Error, FromPjrt, Operation, Options,
+        ProgramLoweringExtension, Session, Type, compile, trace_with_context,
     };
 
     use crate::devices::MemoryExtension;

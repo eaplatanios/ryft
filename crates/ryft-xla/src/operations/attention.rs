@@ -1018,7 +1018,7 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use crate::tests::values_from_bytes;
     use crate::tests::{cpu_client, execution_client, replicated_array, values_to_bytes};
-    use crate::{Array, LowerableProgram, ProgramLoweringOptions, Session, Tracer};
+    use crate::{Array, ProgramLoweringExtension, ProgramLoweringOptions, Session, Tracer};
 
     use super::*;
 

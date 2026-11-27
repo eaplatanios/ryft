@@ -8028,7 +8028,7 @@ mod tests {
         // The gradient of the caller constrains the input to the boundary of its call of the function as well, which
         // is replicated too. Neither gradient constrains the residual `%3` (respectively `%4`), and neither lowers the
         // primal output of the function that differentiation drops (refer to
-        // `ProgramLoweringExtension::pruned_for_lowering`).
+        // `ProgramLoweringAnalysisExtension::pruned_for_lowering`).
         let direct = indoc! {r#"
             module {
               sdy.mesh @mesh = <["x"=2]>

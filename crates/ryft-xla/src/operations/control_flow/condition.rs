@@ -171,7 +171,7 @@ mod tests {
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::sessions::tests::{domain_mesh, program_array, read_first_shard};
     use crate::tests::{execution_client, replicated_array, test_compilation_options, values_to_bytes};
-    use crate::{Constant, LowerableProgram, ProgramLoweringOptions, Session, Value};
+    use crate::{Constant, ProgramLoweringExtension, ProgramLoweringOptions, Session, Value};
 
     use super::*;
 

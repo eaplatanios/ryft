@@ -424,8 +424,8 @@ pub(crate) mod tests {
     use crate::sessions::tests::{read_sharded_f32_array, two_device_mesh};
     use crate::tests::{cpu_client, loopback_address, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, ArrayShard, ArrayTracer, DistributedRuntime, ExecutionArguments, FromPjrt,
-        LowerableProgram, Options, PlacementOptions, Platform, ProgramLoweringOptions, Reference, Session,
+        Array, ArrayConstant, ArrayShard, ArrayTracer, DistributedRuntime, ExecutionArguments, FromPjrt, Options,
+        PlacementOptions, Platform, ProgramLoweringExtension, ProgramLoweringOptions, Reference, Session,
         TracedProgram, Tracer, Value, compile_statefully, trace, trace_with_context,
     };
 

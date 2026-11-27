@@ -143,9 +143,9 @@ mod tests {
     use crate::sessions::tests::{f32_vector, two_device_mesh};
     use crate::tests::{cpu_client, native_buffer_addresses, shard_values, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, LowerableProgram, Options,
-        PlacementOptions, Session, StatefulCompileTracer, TracedProgram, Type, Value, compile, compile_statefully,
-        compile_with_options, trace,
+        Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, Options, PlacementOptions,
+        ProgramLoweringExtension, Session, StatefulCompileTracer, TracedProgram, Type, Value, compile,
+        compile_statefully, compile_with_options, trace,
     };
 
     use super::*;

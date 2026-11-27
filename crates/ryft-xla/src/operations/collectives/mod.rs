@@ -94,8 +94,8 @@ mod tests {
     use crate::operations::sharding::shard_map::tests::execute_inputs_on_cpu_devices;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, ExecutionArguments, FromPjrt, LowerableOperation, LowerableProgram, Lowerer, Session,
-        TracedProgram, trace, trace_with_context,
+        Array, ArrayTracer, ExecutionArguments, FromPjrt, LowerableOperation, Lowerer, ProgramLoweringExtension,
+        Session, TracedProgram, trace, trace_with_context,
     };
 
     use super::*;

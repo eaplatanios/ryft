@@ -625,8 +625,8 @@ mod tests {
         cpu_client, execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::{
-        Array, ArrayConstant, ArrayTracer, Constant, LowerableProgram, Options, ProgramLoweringOptions, Session,
-        ToPjrt, TracedProgram, Type, trace,
+        Array, ArrayConstant, ArrayTracer, Constant, Options, ProgramLoweringExtension, ProgramLoweringOptions,
+        Session, ToPjrt, TracedProgram, Type, trace,
     };
 
     use super::*;

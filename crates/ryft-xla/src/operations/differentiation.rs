@@ -144,7 +144,7 @@ mod tests {
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type};
     use crate::tests::{execution_client, values_to_bytes};
     use crate::{
-        Array, CompiledFunction, Constant, LowerableProgram, ProgramLoweringOptions, Session, Tracer, compile,
+        Array, CompiledFunction, Constant, ProgramLoweringExtension, ProgramLoweringOptions, Session, Tracer, compile,
     };
 
     use super::*;

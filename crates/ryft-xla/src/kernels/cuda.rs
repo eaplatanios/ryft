@@ -691,7 +691,7 @@ mod tests {
 
     use crate::kernels::CompiledKernel;
     use crate::kernels::tests::definition;
-    use crate::lowering::programs::{LowerableProgram, ProgramLoweringOptions};
+    use crate::lowering::programs::{ProgramLoweringExtension, ProgramLoweringOptions};
     use crate::{Constant, Operation};
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
     use crate::{Platform, RuntimeError};

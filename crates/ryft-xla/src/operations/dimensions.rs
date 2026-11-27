@@ -432,7 +432,7 @@ mod tests {
     use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_scalar_type};
     use crate::tests::{cpu_client, execution_client};
-    use crate::{Array, Constant, LowerableProgram, Options, ProgramLoweringOptions, Session};
+    use crate::{Array, Constant, Options, ProgramLoweringExtension, ProgramLoweringOptions, Session};
 
     use super::*;
 

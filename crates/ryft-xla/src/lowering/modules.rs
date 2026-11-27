@@ -48,7 +48,8 @@ use crate::{
 // TODO(eaplatanios): Review this module.
 
 /// StableHLO/Shardy MLIR module that a staged [`Program`] lowers to (refer to
-/// [`LowerableProgram::lower`](crate::LowerableProgram::lower)), paired with what executing it requires.
+/// [`ProgramLoweringExtension::lower`](crate::ProgramLoweringExtension::lower)), paired with what executing it
+/// requires.
 pub struct LoweredModule {
     /// Textual StableHLO/Shardy module.
     stable_hlo: String,
@@ -70,7 +71,7 @@ pub struct LoweredModule {
 
 impl LoweredModule {
     /// Lowers `program` to a StableHLO/Shardy MLIR module whose entry function is named `function_name`, validating
-    /// its reference state aliases and entry boundary. The boundary is the one that [`LowerableProgram::lower`]
+    /// its reference state aliases and entry boundary. The boundary is the one that [`ProgramLoweringExtension::lower`]
     /// resolves from its options, which this function takes as it is.
     ///
     /// # Parameters
@@ -88,7 +89,7 @@ impl LoweredModule {
     ///   - `options`: Options that provide the target platform, the reference states, the donated and unread inputs,
     ///     the ragged dot lowering strategy, and whether the entry function exports its ordered I/O token chain.
     ///
-    /// [`LowerableProgram::lower`]: crate::LowerableProgram::lower
+    /// [`ProgramLoweringExtension::lower`]: crate::ProgramLoweringExtension::lower
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<O, ProgramInput, ProgramOutput>(
         program: &Program<Constant, O, ProgramInput, ProgramOutput>,
@@ -1505,7 +1506,7 @@ mod tests {
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
 
     use super::*;
-    use crate::lowering::programs::LowerableProgram;
+    use crate::lowering::programs::ProgramLoweringExtension;
 
     #[test]
     fn test_contains_unresolved_state_ignores_dormant_regions() {

@@ -173,7 +173,7 @@ mod tests {
     use crate::lowering::tests::static_sharded_array_type;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, ExecutionArguments, FromPjrt, LowerableProgram, ProgramLoweringOptions, Session,
+        Array, ArrayTracer, ExecutionArguments, FromPjrt, ProgramLoweringExtension, ProgramLoweringOptions, Session,
         TracedProgram, trace,
     };
 

@@ -836,8 +836,8 @@ mod tests {
 
     use crate::arrays::host::ReductionChange;
     use crate::{
-        ArrayTracer, CompileTracer, CompiledFunction, Constant, Error, FromPjrt, LowerableProgram, Operation, Options,
-        ProgramLoweringOptions, Session, TracedProgram, compile, compile_with_options, trace,
+        ArrayTracer, CompileTracer, CompiledFunction, Constant, Error, FromPjrt, Operation, Options,
+        ProgramLoweringExtension, ProgramLoweringOptions, Session, TracedProgram, compile, compile_with_options, trace,
     };
 
     use crate::lowering::LoweringError;

@@ -1374,7 +1374,7 @@ mod tests {
     };
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes, vector_type};
-    use crate::{Array, ArrayConstant, ArrayTracer, Constant, LowerableProgram, Session, Tracer, Type};
+    use crate::{Array, ArrayConstant, ArrayTracer, Constant, ProgramLoweringExtension, Session, Tracer, Type};
 
     use super::*;
 

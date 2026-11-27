@@ -541,7 +541,8 @@ mod tests {
     use crate::operations::Operation;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ExecutionArguments, FromPjrt, LowerableProgram, ProgramLoweringOptions, RuntimeRequirement, Session,
+        Array, ExecutionArguments, FromPjrt, ProgramLoweringExtension, ProgramLoweringOptions, RuntimeRequirement,
+        Session,
     };
 
     use super::*;

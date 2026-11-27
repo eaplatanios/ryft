@@ -975,7 +975,9 @@ mod tests {
     };
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type, two_device_mesh};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, ArrayConstant, CompiledFunction, LowerableProgram, ProgramLoweringOptions, Session, compile};
+    use crate::{
+        Array, ArrayConstant, CompiledFunction, ProgramLoweringExtension, ProgramLoweringOptions, Session, compile,
+    };
 
     use super::*;
 

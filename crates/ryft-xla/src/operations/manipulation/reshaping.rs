@@ -340,7 +340,7 @@ mod tests {
     use crate::operations::Operation;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::tests::{execution_client, test_compilation_options, values_to_bytes};
-    use crate::{ArrayConstant, ArrayTracer, Constant, LowerableProgram, ProgramLoweringOptions, Session};
+    use crate::{ArrayConstant, ArrayTracer, Constant, ProgramLoweringExtension, ProgramLoweringOptions, Session};
 
     use super::*;
 
