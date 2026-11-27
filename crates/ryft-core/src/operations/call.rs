@@ -557,12 +557,64 @@ impl<T: ArrayMemberType> CallOperation<T> {
     /// application of a backend, staging, and the transforms of a call) accepts the same inputs. An execution
     /// of the callee by a backend accepts a reduced argument as well, because it reshards its arguments.
     ///
+    /// Returns the logical mesh and the manual mesh axes along which the inputs vary beyond their callee input types,
+    /// if any (refer to [`CallOperation::input_variation`]), which is the union over the inputs of the axes of one
+    /// mesh. Every array output of the call varies along those axes too, so every context that binds a call infers
+    /// the same outputs.
+    ///
     /// # Errors
     ///
     /// Returns a [`TypeError`] that names the first input that the call rejects.
-    #[inline]
-    pub fn validate_input_types(&self, callee_input_types: &[T], input_types: &[T]) -> Result<(), TypeError> {
-        validate_call_input_types(CALL_OPERATION_NAME, callee_input_types, input_types).map(|_| ())
+    pub fn validate_input_types(
+        &self,
+        callee_input_types: &[T],
+        input_types: &[T],
+    ) -> Result<Option<(LogicalMesh, BTreeSet<String>)>, TypeError> {
+        if callee_input_types.len() != input_types.len() {
+            return Err(TypeError::invalid(format!(
+                "`{}` expected {} input(s) but got {}",
+                CALL_OPERATION_NAME,
+                callee_input_types.len(),
+                input_types.len(),
+            )));
+        }
+
+        let mut variation = None::<(LogicalMesh, BTreeSet<String>)>;
+        for (index, (expected, actual)) in callee_input_types.iter().zip(input_types).enumerate() {
+            if expected == actual {
+                continue;
+            }
+
+            let accepted = match (expected.as_array_type(), actual.as_array_type()) {
+                (Ok(expected), Ok(actual)) => {
+                    CallOperation::input_variation(expected, actual).map(|axes| (actual, axes))
+                }
+                _ => None,
+            };
+
+            let Some((actual, axes)) = accepted else {
+                return Err(TypeError::invalid(format!(
+                    "`{CALL_OPERATION_NAME}` input #{index} expected {expected} but got {actual}",
+                )));
+            };
+
+            let Some(mesh) = actual.sharding().map(Sharding::mesh).filter(|_| !axes.is_empty()) else {
+                continue;
+            };
+
+            match &mut variation {
+                None => variation = Some((mesh.clone(), axes)),
+                Some((variation_mesh, variation_axes)) if *variation_mesh == *mesh => variation_axes.extend(axes),
+                Some((variation_mesh, _)) => {
+                    return Err(TypeError::invalid(format!(
+                        "`{CALL_OPERATION_NAME}` input #{index} varies along manual mesh axes of mesh `{mesh}`, \
+                         but an earlier input varies along those of mesh `{variation_mesh}`",
+                    )));
+                }
+            }
+        }
+
+        Ok(variation)
     }
 
     /// Returns the effective boundary sharding of callee input `index`, an input of type `actual` for a callee input of
@@ -644,7 +696,7 @@ impl<T: ArrayMemberType> CallOperation<T> {
         }
 
         let Ok(declared) = declared.as_array_type() else { return None };
-        if !call_input_variation(declared, actual).is_some_and(|axes| axes.is_empty()) {
+        if !CallOperation::input_variation(declared, actual).is_some_and(|axes| axes.is_empty()) {
             return None;
         }
 
@@ -751,6 +803,58 @@ impl CallOperation<ArrayIrType> {
         self.names_devices(|| callee_requests().has_requests(false)).is_some() || callee_requests().has_requests(true)
     }
 
+    /// Returns the manual mesh axes along which an input of type `actual` varies beyond `declared`, the type of the
+    /// callee input that receives it, when a call accepts that input, or [`None`] when it rejects it. The type of the
+    /// input must refine the declared type up to the placement that their shardings describe, which a call may change
+    /// because it does not change the values. What a sharding states about the values must agree, because a call,
+    /// unlike an execution of its callee by a backend, does not reshard its inputs. These are the unreduced and reduced
+    /// axes, with the kind of reduction, where a declared type without a sharding describes a fully reduced value. The
+    /// input may vary along more manual mesh axes than the declared type, which a value of a `shard_map` body does
+    /// where the callee declares none, as a JAX `jit` function called on such a value is retraced at its varying type,
+    /// and the outputs of the call then vary along those axes too. When both types have shardings, the declared
+    /// sharding's mesh must define every axis that carries manual variation or reduction state as the input mesh
+    /// defines it. This preserves the meaning of the axis across the call boundary. Other axes may differ.
+    fn input_variation(declared: &ArrayType, actual: &ArrayType) -> Option<BTreeSet<String>> {
+        fn components(
+            sharding: Option<&Sharding>,
+        ) -> (&BTreeSet<String>, Option<UnreducedKind>, &BTreeSet<String>, &BTreeSet<String>) {
+            let no_axes = const { &BTreeSet::new() };
+            match sharding {
+                Some(sharding) => (
+                    sharding.unreduced_axes(),
+                    (!sharding.unreduced_axes().is_empty()).then(|| sharding.unreduced_kind()),
+                    sharding.reduced_axes(),
+                    sharding.varying_manual_axes(),
+                ),
+                None => (no_axes, None, no_axes, no_axes),
+            }
+        }
+
+        let (declared_unreduced, declared_kind, declared_reduced, declared_variation) = components(declared.sharding());
+        let (actual_unreduced, actual_kind, actual_reduced, actual_variation) = components(actual.sharding());
+        if (declared_unreduced, declared_kind, declared_reduced) != (actual_unreduced, actual_kind, actual_reduced)
+            || !declared_variation.is_subset(actual_variation)
+        {
+            return None;
+        }
+
+        if let (Some(declared_sharding), Some(actual_sharding)) = (declared.sharding(), actual.sharding()) {
+            validate_preserved_mesh_axes(
+                CALL_OPERATION_NAME,
+                actual_sharding.mesh(),
+                actual_variation.iter().chain(actual_unreduced).chain(actual_reduced),
+                declared_sharding.mesh(),
+            )
+            .ok()?;
+        }
+
+        let declared_without_sharding = declared.clone().with_sharding(None).ok()?;
+        let actual_without_sharding = actual.clone().with_sharding(None).ok()?;
+        declared_without_sharding
+            .is_refined_by(&actual_without_sharding)
+            .then(|| actual_variation.difference(declared_variation).cloned().collect())
+    }
+
     /// Interprets this call in `context` on `inputs` by the reference semantics of a call. The type rule of the
     /// call validates the complete application first,  because direct eager binding does not pass through program
     /// construction, so that interpretation accepts exactly the inputs that staging accepts. Each array input is then
@@ -833,7 +937,7 @@ impl CallOperation<ArrayIrType> {
 
                 let variation = match (actual, declared) {
                     (ArrayIrType::Array(actual), ArrayIrType::Array(declared)) => {
-                        call_input_variation(declared, actual)
+                        Self::input_variation(declared, actual)
                     }
                     _ => None,
                 };
@@ -1261,16 +1365,16 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
 
         // Inputs that instantiate identities of the callee rename them in the callee, whose inputs otherwise
         // keep their declared types, because the call accepts inputs whose types only refine them (refer to
-        // `validate_call_input_types`), as an execution of the callee accepts its arguments.
+        // `CallOperation::validate_input_types`), as an execution of the callee accepts its arguments.
         match T::derive_identity_renaming(declared, input_types) {
             Ok(renaming) if !renaming.is_identity() => {
                 let renamed =
                     declared.iter().map(|r#type| r#type.rename_identities(&renaming)).collect::<Result<Vec<_>, _>>()?;
-                validate_call_input_types(self.name(), &renamed, input_types)?;
+                self.validate_input_types(&renamed, input_types)?;
                 Ok(vec![Some(renamed)])
             }
             _ => {
-                validate_call_input_types(self.name(), declared, input_types)?;
+                self.validate_input_types(declared, input_types)?;
                 Ok(vec![None])
             }
         }
@@ -1291,7 +1395,7 @@ impl<T: ArrayMemberType + From<ArrayType>> Operation for CallOperation<T> {
 
         let callee_interface = &region_interfaces[0];
         self.validate_capture_prefix(callee_interface.input_types().len())?;
-        let variation = validate_call_input_types(self.name(), callee_interface.input_types(), input_types)?;
+        let variation = self.validate_input_types(callee_interface.input_types(), input_types)?;
 
         self.output_renaming(callee_interface.input_types(), callee_interface.output_types())?;
         let output_types = if let Some(types) = &self.output_types {
@@ -3154,118 +3258,18 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Kind of a split of the callee of a `call` that [`CallOperation::split`] retains.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CallSplitKind {
-    /// Split of a call whose inputs are partially known, marked in input order (refer to
-    /// [`PartialEvaluationDriver::partition_program`]).
+    /// Split of a call whose inputs are partially known, marked in input order.
     Knownness(Vec<bool>),
 
     /// Split of an all-known call on residual demand for the outputs of the callee that the residual planner demands,
-    /// marked in output order (refer to [`PartialEvaluationContext::partition_residual_demand`]).
+    /// marked in output order.
     ResidualDemand(Vec<bool>),
 }
 
-/// Returns the manual mesh axes along which an input of type `actual` varies beyond `declared`, the type of the callee
-/// input that receives it, when a call accepts that input, or [`None`] when it rejects it. The type of the input must
-/// refine the declared type up to the placement that their shardings describe, which a call may change because it
-/// does not change the values. What a sharding states about the values must agree, because a call, unlike an
-/// execution of its callee by a backend, does not reshard its inputs. These are the unreduced and reduced axes,
-/// with the kind of reduction, where a declared type without a sharding describes a fully reduced value. The input may
-/// vary along more manual mesh axes than the declared type, which a value of a `shard_map` body does where the callee
-/// declares none, as a JAX `jit` function called on such a value is retraced at its varying type, and the outputs of
-/// the call then vary along those axes too. When both types have shardings, the declared sharding's mesh must define
-/// every axis that carries manual variation or reduction state as the input mesh defines it. This preserves the
-/// meaning of the axis across the call boundary. Other axes may differ (refer to `validate_preserved_mesh_axes`).
-fn call_input_variation(declared: &ArrayType, actual: &ArrayType) -> Option<BTreeSet<String>> {
-    fn components(
-        sharding: Option<&Sharding>,
-    ) -> (&BTreeSet<String>, Option<UnreducedKind>, &BTreeSet<String>, &BTreeSet<String>) {
-        let no_axes = const { &BTreeSet::new() };
-        match sharding {
-            Some(sharding) => (
-                sharding.unreduced_axes(),
-                (!sharding.unreduced_axes().is_empty()).then(|| sharding.unreduced_kind()),
-                sharding.reduced_axes(),
-                sharding.varying_manual_axes(),
-            ),
-            None => (no_axes, None, no_axes, no_axes),
-        }
-    }
-
-    let (declared_unreduced, declared_kind, declared_reduced, declared_variation) = components(declared.sharding());
-    let (actual_unreduced, actual_kind, actual_reduced, actual_variation) = components(actual.sharding());
-    if (declared_unreduced, declared_kind, declared_reduced) != (actual_unreduced, actual_kind, actual_reduced)
-        || !declared_variation.is_subset(actual_variation)
-    {
-        return None;
-    }
-    if let (Some(declared_sharding), Some(actual_sharding)) = (declared.sharding(), actual.sharding()) {
-        validate_preserved_mesh_axes(
-            CALL_OPERATION_NAME,
-            actual_sharding.mesh(),
-            actual_variation.iter().chain(actual_unreduced).chain(actual_reduced),
-            declared_sharding.mesh(),
-        )
-        .ok()?;
-    }
-    let declared_without_sharding = declared.clone().with_sharding(None).ok()?;
-    let actual_without_sharding = actual.clone().with_sharding(None).ok()?;
-    declared_without_sharding
-        .is_refined_by(&actual_without_sharding)
-        .then(|| actual_variation.difference(declared_variation).cloned().collect())
-}
-
-/// Validates that a call accepts `input_types` as the inputs of a callee whose input types are `expected_types`, in
-/// count and position, and reports the first input that it rejects as a type error naming `operation_name`. A call
-/// accepts an input of exactly the callee input type and every input that `call_input_variation` accepts. If any inputs
-/// vary beyond their callee input types, returns the logical mesh they share and the union of their additional manual
-/// axes. Every array output of the call varies along those axes too, so every context that binds a call infers the
-/// same outputs. This implements the rule that [`CallOperation::validate_input_types`] owns.
-fn validate_call_input_types<T: ArrayMemberType>(
-    operation_name: &'static str,
-    expected_types: &[T],
-    input_types: &[T],
-) -> Result<Option<(LogicalMesh, BTreeSet<String>)>, TypeError> {
-    if expected_types.len() != input_types.len() {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` expected {} input(s) but got {}",
-            expected_types.len(),
-            input_types.len(),
-        )));
-    }
-    let mut variation = None::<(LogicalMesh, BTreeSet<String>)>;
-    for (index, (expected, actual)) in expected_types.iter().zip(input_types).enumerate() {
-        if expected == actual {
-            continue;
-        }
-        let accepted = match (expected.as_array_type(), actual.as_array_type()) {
-            (Ok(expected), Ok(actual)) => call_input_variation(expected, actual).map(|axes| (actual, axes)),
-            _ => None,
-        };
-        let Some((actual, axes)) = accepted else {
-            return Err(TypeError::invalid(format!(
-                "`{operation_name}` input #{index} expected {expected} but got {actual}",
-            )));
-        };
-        let Some(mesh) = actual.sharding().map(Sharding::mesh).filter(|_| !axes.is_empty()) else {
-            continue;
-        };
-        match &mut variation {
-            None => variation = Some((mesh.clone(), axes)),
-            Some((variation_mesh, variation_axes)) if *variation_mesh == *mesh => variation_axes.extend(axes),
-            Some((variation_mesh, _)) => {
-                return Err(TypeError::invalid(format!(
-                    "`{operation_name}` input #{index} varies along manual mesh axes of mesh `{mesh}`, but an earlier \
-                     input varies along those of mesh `{variation_mesh}`",
-                )));
-            }
-        }
-    }
-    Ok(variation)
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the callee of a `call` bound over `callee` as a shared program, which is the program that `callee` was
 /// interned from, if any, and otherwise a copy of `callee` that the region transform cache of `callee` retains.
@@ -3398,12 +3402,12 @@ fn batched_boundary_sharding(
 /// Returns `value`, a tangent or cotangent that a derived call of a callee returns at a type of the callee boundary, at
 /// `refined`, the type that the value has in the caller (e.g., the tangent type of a primal output, or the cotangent
 /// type of a primal input). A call accepts inputs whose types refine the callee input types (refer to
-/// `validate_call_input_types`), so a primal that a partial evaluation computes from such inputs (e.g., an eager array,
-/// whose type records its sharding) can refine the type of the callee boundary, while the derived call that computes
-/// the tangent or the cotangent of that primal returns it at the type of the callee boundary. The value has the shape
-/// and placement of the primal, so an unchecked cast in `context` states its refined type. A value that a call whose
-/// callee names devices on `mesh` returns lives on those devices, so it is cast only to a type over a mesh of the same
-/// topology. A value whose refined type names a different mesh is returned unchanged.
+/// `CallOperation::validate_input_types`), so a primal that a partial evaluation computes from such inputs (e.g.,
+/// an eager array, whose type records its sharding) can refine the type of the callee boundary, while the derived call
+/// that computes the tangent or the cotangent of that primal returns it at the type of the callee boundary. The value
+/// has the shape and placement of the primal, so an unchecked cast in `context` states its refined type. A value that a
+/// call whose callee names devices on `mesh` returns lives on those devices, so it is cast only to a type over a mesh
+/// of the same topology. A value whose refined type names a different mesh is returned unchanged.
 ///
 /// A value whose type differs from `refined` in its sharding only in dimensions that one of them leaves unconstrained
 /// (i.e., `{?}`) and the other replicates is cast to `refined` as
@@ -3415,12 +3419,11 @@ fn batched_boundary_sharding(
 /// unconstrained dimension of any value that it exchanges.
 ///
 /// A value whose type tracks a sharding, where `refined` tracks none, is cast to `refined` as well when a call accepts
-/// an input of type `refined` for a callee input of the type of the value, as
-/// the cotangent of an input that a staged caller of untracked type passes to a callee with an input sharding override
-/// is. This mirrors the forward direction, where the call takes that input as it is (refer to `call_input_variation`)
-/// and its lowering constrains the input to the override, so the derivative returns to the type of the caller input.
-/// The cast only stops tracking the placement of the value, which a type without a sharding states nothing about, and
-/// keeps its values and buffers.
+/// an input of type `refined` for a callee input of the type of the value, as the cotangent of an input that a staged
+/// caller of untracked type passes to a callee with an input sharding override is. This mirrors the forward direction,
+/// where the call takes that input as it is (refer to `CallOperation::input_variation`) and its lowering constrains the
+/// input to the override, so the derivative returns to the type of the caller input. The cast only stops tracking the
+/// placement of the value, which a type without a sharding states nothing about, and keeps its values and buffers.
 ///
 /// A value whose type differs from `refined` only in the placement that its sharding tracks over a mesh of the same
 /// topology (e.g., the cotangent of a replicated argument of a callee that declares that input split, which the call
@@ -3511,7 +3514,7 @@ where
                     && declared.sharding().is_some_and(|sharding| {
                         sharding.dimensions().iter().all(|dimension| dimension.manual_axes(sharding.mesh()).is_empty())
                     })
-                    && call_input_variation(declared, refined).is_some();
+                    && CallOperation::input_variation(declared, refined).is_some();
 
                 is_refined_up_to_unconstrained_dimensions || is_untracked_refinement
             }
@@ -4410,7 +4413,7 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let placed = f32_vector_type(4).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
         let call = CallOperation::<ArrayType>::new(0);
-        assert_eq!(call.validate_input_types(&[f32_vector_type(4)], &[placed]), Ok(()));
+        assert_eq!(call.validate_input_types(&[f32_vector_type(4)], &[placed]), Ok(None));
         assert_eq!(
             call.validate_input_types(&[f32_vector_type(4)], &[f32_vector_type(3)]),
             Err(TypeError::invalid(format!("`{CALL_OPERATION_NAME}` input #0 expected f32[4] but got f32[3]"))),
@@ -4463,7 +4466,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             call.validate_input_types(&[typed(&other_wide_mesh, varying_x)], &[typed(&wide_mesh, varying_x)]),
-            Ok(())
+            Ok(None),
         );
 
         // Manual mesh axes along which the input varies beyond the callee input type carry state into the call too, so
@@ -4480,7 +4483,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             call.validate_input_types(&[typed(&manual_mesh, varying_x)], &[typed(&manual_mesh, varying_x_y)]),
-            Ok(())
+            Ok(Some((manual_mesh.clone(), BTreeSet::from(["y".to_string()])))),
         );
         for declared in [typed(&other_manual_mesh, varying_x), typed(&mesh, varying_x)] {
             let actual = typed(&manual_mesh, varying_x_y);
