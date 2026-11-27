@@ -488,17 +488,8 @@ pub(super) struct ShardContribution {
     /// Slice of the shard in global array coordinates.
     slice: Vec<Range<usize>>,
 
-    /// Ordinal of the contribution of the shard to the pending reduction of its slice, which is the row-major index
-    /// of the coordinates of its device along the unreduced axes of the sharding in mesh order (i.e., a mixed-radix
-    /// number whose digits are those coordinates), and zero without unreduced axes. The host readback combines the
-    /// contributions of one tile in ascending lexicographic order of those coordinates, which is the order of these
-    /// ordinals, so two placements with the same unreduced kind and the same number of contributions correspond by
-    /// ordinal, whatever the names, sizes, and order of their unreduced axes.
-    unreduced_ordinal: usize,
-
-    /// Coordinates of the device of the shard along the varying manual axes of the sharding, in mesh order unless
-    /// [`ShardContribution::ordered`] supplies other axes or another order.
-    varying_manual_coordinates: Vec<usize>,
+    /// Member of the sequence of arrays formed by the contributions, shared by all its slices.
+    member: ShardContributionMember,
 }
 
 impl ShardContribution {
@@ -521,7 +512,44 @@ impl ShardContribution {
         shard: &ShardDescriptor,
         varying_manual_axes: &[S],
     ) -> Self {
-        let coordinates = mesh.device_coordinates(shard.index()).unwrap_or_default();
+        Self {
+            slice: shard.slice().to_vec(),
+            member: ShardContributionMember::ordered(mesh, sharding, shard.index(), varying_manual_axes),
+        }
+    }
+
+    /// Consumes this contribution and returns its slice, unreduced ordinal, and varying manual coordinates.
+    pub(super) fn into_parts(self) -> (Vec<Range<usize>>, usize, Vec<usize>) {
+        (self.slice, self.member.unreduced_ordinal, self.member.varying_manual_coordinates)
+    }
+}
+
+/// Identifies one member of the sequence of arrays formed by the contributions of a placement. Every shard of that
+/// member shares this identity regardless of the slice it holds.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ShardContributionMember {
+    /// Ordinal of the contribution of the shard to the pending reduction of its slice, which is the row-major index
+    /// of the coordinates of its device along the unreduced axes of the sharding in mesh order (i.e., a mixed-radix
+    /// number whose digits are those coordinates), and zero without unreduced axes. The host readback combines the
+    /// contributions of one tile in ascending lexicographic order of those coordinates, which is the order of these
+    /// ordinals, so two placements with the same unreduced kind and the same number of contributions correspond by
+    /// ordinal, whatever the names, sizes, and order of their unreduced axes.
+    unreduced_ordinal: usize,
+
+    /// Coordinates of the device of the shard along the varying manual axes, in the order supplied by the caller.
+    varying_manual_coordinates: Vec<usize>,
+}
+
+impl ShardContributionMember {
+    /// Returns the contribution member for `shard_index` on `mesh`, using `sharding` for the unreduced axes and
+    /// `varying_manual_axes` for the ordered manual coordinates.
+    pub(super) fn ordered<S: AsRef<str>>(
+        mesh: &DeviceMesh,
+        sharding: &Sharding,
+        shard_index: ShardIndex,
+        varying_manual_axes: &[S],
+    ) -> Self {
+        let coordinates = mesh.device_coordinates(shard_index).unwrap_or_default();
         let axes = mesh.logical_mesh().axes();
         let unreduced_ordinal = axes
             .iter()
@@ -533,19 +561,7 @@ impl ShardContribution {
             .filter_map(|name| axes.iter().position(|axis| axis.name() == name.as_ref()))
             .filter_map(|index| coordinates.get(index).copied())
             .collect();
-        Self { slice: shard.slice().to_vec(), unreduced_ordinal, varying_manual_coordinates }
-    }
-
-    /// Returns which array of the sequence of arrays that the contributions of a placement form the shard belongs to
-    /// (i.e., its unreduced ordinal and its coordinates along the varying manual axes), which the shards with other
-    /// slices of the same array share.
-    pub(super) fn member(&self) -> (usize, &[usize]) {
-        (self.unreduced_ordinal, self.varying_manual_coordinates.as_slice())
-    }
-
-    /// Consumes this contribution and returns its slice, unreduced ordinal, and varying manual coordinates.
-    pub(super) fn into_parts(self) -> (Vec<Range<usize>>, usize, Vec<usize>) {
-        (self.slice, self.unreduced_ordinal, self.varying_manual_coordinates)
+        Self { unreduced_ordinal, varying_manual_coordinates }
     }
 }
 
@@ -1210,11 +1226,17 @@ mod tests {
             .unwrap();
         assert_eq!(
             ShardContribution::new(&mesh, &sharding, &ShardDescriptor::new(6, Device::new(6, 0), vec![0..2])),
-            ShardContribution { slice: vec![0..2], unreduced_ordinal: 2, varying_manual_coordinates: vec![] },
+            ShardContribution {
+                slice: vec![0..2],
+                member: ShardContributionMember { unreduced_ordinal: 2, varying_manual_coordinates: vec![] },
+            },
         );
         assert_eq!(
             ShardContribution::new(&mesh, &sharding, &ShardDescriptor::new(11, Device::new(11, 0), vec![4..6])),
-            ShardContribution { slice: vec![4..6], unreduced_ordinal: 3, varying_manual_coordinates: vec![] },
+            ShardContribution {
+                slice: vec![4..6],
+                member: ShardContributionMember { unreduced_ordinal: 3, varying_manual_coordinates: vec![] },
+            },
         );
 
         // The coordinates along the varying manual axes are in mesh order, whatever order the sharding was given.
@@ -1224,7 +1246,10 @@ mod tests {
         let sharding = Sharding::replicated(logical_mesh, 1).with_varying_manual_axes(["n", "m"]).unwrap();
         assert_eq!(
             ShardContribution::new(&mesh, &sharding, &ShardDescriptor::new(5, Device::new(5, 0), vec![0..4])),
-            ShardContribution { slice: vec![0..4], unreduced_ordinal: 0, varying_manual_coordinates: vec![1, 2] },
+            ShardContribution {
+                slice: vec![0..4],
+                member: ShardContributionMember { unreduced_ordinal: 0, varying_manual_coordinates: vec![1, 2] },
+            },
         );
     }
 
@@ -1243,25 +1268,26 @@ mod tests {
         // The coordinates follow the order of the named axes, and a name that is not a mesh axis adds none.
         assert_eq!(
             ShardContribution::ordered(&mesh, &sharding, &shard, &["n", "m"]),
-            ShardContribution { slice: vec![0..4], unreduced_ordinal: 0, varying_manual_coordinates: vec![2, 1] },
+            ShardContribution {
+                slice: vec![0..4],
+                member: ShardContributionMember { unreduced_ordinal: 0, varying_manual_coordinates: vec![2, 1] },
+            },
         );
         assert_eq!(
             ShardContribution::ordered(&mesh, &sharding, &shard, &["n", "q"]),
-            ShardContribution { slice: vec![0..4], unreduced_ordinal: 0, varying_manual_coordinates: vec![2] },
+            ShardContribution {
+                slice: vec![0..4],
+                member: ShardContributionMember { unreduced_ordinal: 0, varying_manual_coordinates: vec![2] },
+            },
         );
-    }
-
-    #[test]
-    fn test_shard_contribution_member() {
-        let contribution =
-            ShardContribution { slice: vec![2..4], unreduced_ordinal: 3, varying_manual_coordinates: vec![1, 0] };
-        assert_eq!(contribution.member(), (3, [1, 0].as_slice()));
     }
 
     #[test]
     fn test_shard_contribution_into_parts() {
-        let contribution =
-            ShardContribution { slice: vec![2..4], unreduced_ordinal: 3, varying_manual_coordinates: vec![1, 0] };
+        let contribution = ShardContribution {
+            slice: vec![2..4],
+            member: ShardContributionMember { unreduced_ordinal: 3, varying_manual_coordinates: vec![1, 0] },
+        };
         assert_eq!(contribution.into_parts(), (vec![2..4], 3, vec![1, 0]));
     }
 

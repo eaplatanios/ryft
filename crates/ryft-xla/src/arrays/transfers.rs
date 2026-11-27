@@ -203,7 +203,8 @@ use crate::arrays::host::{
 };
 use crate::arrays::metadata::ArrayMetadata;
 use crate::arrays::shards::{
-    ArrayShard, ShardContribution, ShardDescriptor, ShardIndex, ShardLayout, read_shard_to_host,
+    ArrayShard, ShardContribution, ShardContributionMember, ShardDescriptor, ShardIndex, ShardLayout,
+    read_shard_to_host,
 };
 use crate::arrays::{Array, ArrayError};
 use crate::devices::{PjrtDeviceExtension, devices_span_processes};
@@ -2695,8 +2696,9 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             });
         }
 
-        // Validate the device programs from shared metadata before any process posts transfers or compiles. Keep
-        // the result here so a limit of the partitioner can still lead to shard regions or a host round trip.
+        // Validate the device programs from shared metadata before any process posts transfers or compiles.
+        // The immediately invoked closure keeps `?` and `return Err(...)` inside validation, so the strategy
+        // can inspect `compiled` and choose shard regions or a host round trip for a partitioner limitation.
         let compiled = (|| -> Result<Option<HostRoundTripCause>, Error> {
             let data_type = self.data_type();
             let cause = if self.mesh() == mesh {
@@ -2941,11 +2943,11 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         let mut moves = Vec::new();
         let mut received = HashSet::new();
         for target in targets {
-            let member = contribution_member(mesh, sharding, target, target_axes);
+            let (target_slice, member) = source_replica_key(mesh, sharding, target, target_axes);
 
             // Combine intersecting ranges across dimensions to find candidate source slices.
             let mut candidates = vec![Vec::new()];
-            for (ranges, target_range) in source_ranges.iter().zip(target.slice()) {
+            for (ranges, target_range) in source_ranges.iter().zip(target_slice) {
                 // The ranges that intersect `target_range` end after it starts and start before it ends.
                 let first = ranges.partition_point(|range| range.end <= target_range.start);
                 let last = ranges.partition_point(|range| range.start < target_range.end).max(first);
@@ -2970,7 +2972,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
 
                 let slice = source_slice
                     .iter()
-                    .zip(target.slice())
+                    .zip(target_slice)
                     .map(|(source, target)| source.start.max(target.start)..source.end.min(target.end))
                     .collect::<Vec<_>>();
 
@@ -2979,13 +2981,13 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
 
             // The regions of one member are disjoint, so they cover the target shard exactly when they hold as many
             // elements.
-            let target_elements = elements(target.slice())?;
+            let target_elements = elements(target_slice)?;
             if total(&mut regions.iter().map(|(_, slice)| elements(slice)))? != target_elements {
                 return Ok(None);
             }
 
             if target_elements > 0 {
-                received.insert((target.slice(), member));
+                received.insert((target_slice, member));
             }
 
             // Emit each target's moves in order of their starts, which the executor uses to assemble the shard.
@@ -3487,8 +3489,6 @@ struct PlacementCompletion {
     fences: Vec<ExecutionFence>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl PlacementCompletion {
     /// Records the readiness of `buffer`, which the placement created.
     fn track_buffer(&mut self, buffer: &Buffer<'_>) -> Result<(), Error> {
@@ -3496,8 +3496,8 @@ impl PlacementCompletion {
         Ok(())
     }
 
-    /// Records the readiness of every buffer of `array` on this process whose shard has no elements. Nothing reads such
-    /// a buffer, but the work that produced it can still fail, so the result of the placement reports it.
+    /// Records the readiness of every buffer of `array` on this process whose shard has no elements. Nothing reads
+    /// such a buffer, but the work that produced it can still fail, so the result of the placement reports it.
     fn track_empty_shard_buffers(&mut self, array: &Array) -> Result<(), Error> {
         for shard in array.addressable_shards().filter(|shard| shard.slice().iter().any(Range::is_empty)) {
             if let Some(buffer) = shard.buffer() {
@@ -3507,8 +3507,8 @@ impl PlacementCompletion {
         Ok(())
     }
 
-    /// Records `buffer`, which the placement has just created, in `work` and then with [`Self::track_buffer`], and
-    /// returns it as a shared buffer.
+    /// Records `buffer`, which the placement has just created, in `work` and then with [`Self::track_buffer`],
+    /// and returns it as a shared buffer.
     fn track_new(
         &mut self,
         work: &mut WorkReservation,
@@ -3537,8 +3537,8 @@ impl PlacementCompletion {
     }
 }
 
-/// Part that one process takes in a [`ShardMove`], which follows from the processes of its two devices alone, so that
-/// every process derives the parts of all processes alike.
+/// Part that one process takes in a [`ShardMove`], which follows from the processes of its two devices alone,
+/// so that every process derives the parts of all processes alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MoveRole {
     /// The process owns both devices and shares the moved data on one device or copies it between its devices.
@@ -3551,13 +3551,16 @@ enum MoveRole {
     Receive,
 }
 
+/// Borrowed slice and optional contribution member that identify a group of source replicas. When there is one value
+/// per slice, the slice alone identifies the group.
+type SourceReplicaKey<'o> = (&'o [Range<usize>], Option<ShardContributionMember>);
+
 /// Replicas of one source slice (i.e., the source shards that cover it), indexed so that a plan finds the preferred
-/// replica for each target shard without scanning all of them again (e.g., when a replicated array moves to
-/// another mesh, where every target shard has the slice of every source shard).
-///
-/// The preference is deterministic and depends only on global shard metadata, so that every process chooses the same
-/// source shard for a given target shard. It prefers a source shard on the device of the target shard, then
-/// a source shard on the process of the target shard, and finally breaks ties by device ID and shard index.
+/// replica for each target shard without scanning all of them again (e.g., when a replicated array moves to another
+/// mesh, where every target shard has the slice of every source shard). The preference is deterministic and depends
+/// only on global shard metadata, so that every process chooses the same source shard for a given target shard. It
+/// prefers a source shard on the device of the target shard, then a source shard on the process of the target shard,
+/// and finally breaks ties by device ID and shard index.
 struct SourceReplicas<'o> {
     /// Replica with the lowest shard index on each device.
     by_device: HashMap<Device, &'o ShardDescriptor>,
@@ -3570,7 +3573,7 @@ struct SourceReplicas<'o> {
 }
 
 impl<'o> SourceReplicas<'o> {
-    /// Indexes `replicas`, which must not be empty.
+    /// Indexes `replicas`, which must not be empty, creating a new [`SourceReplicas`] instance.
     fn new(replicas: &[&'o ShardDescriptor]) -> Self {
         let order = |shard: &&ShardDescriptor| (shard.device().id(), shard.index());
         let mut by_device = HashMap::<Device, &ShardDescriptor>::new();
@@ -3591,17 +3594,16 @@ impl<'o> SourceReplicas<'o> {
     }
 
     /// Groups `shards`, which are placed on `mesh` according to `sharding`, into the replicas of each slice and
-    /// contribution member (refer to [`contribution_member`], which reads `axes`).
+    /// contribution member.
     fn by_contribution(
         mesh: &DeviceMesh,
         sharding: &Sharding,
         shards: impl IntoIterator<Item = &'o ShardDescriptor>,
         axes: Option<&[String]>,
-    ) -> HashMap<(&'o [Range<usize>], Option<(usize, Vec<usize>)>), Self> {
-        let mut shards_by_contributions =
-            HashMap::<(&[Range<usize>], Option<(usize, Vec<usize>)>), Vec<&ShardDescriptor>>::new();
+    ) -> HashMap<SourceReplicaKey<'o>, Self> {
+        let mut shards_by_contributions = HashMap::<SourceReplicaKey<'o>, Vec<&ShardDescriptor>>::new();
         for shard in shards {
-            let key = (shard.slice(), contribution_member(mesh, sharding, shard, axes));
+            let key = source_replica_key(mesh, sharding, shard, axes);
             shards_by_contributions.entry(key).or_default().push(shard);
         }
         shards_by_contributions
@@ -3620,6 +3622,8 @@ impl<'o> SourceReplicas<'o> {
             .unwrap_or(self.lowest)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Names of the varying manual axes that are not unreduced of the two ends of a placement whose contributions
 /// correspond (refer to [`moves_contributions`]), in the order in which their coordinates are compared. The unreduced
@@ -3763,7 +3767,7 @@ fn is_standalone_session(session: &Session, process_index: ProcessIndex) -> Resu
 /// values along a varying manual axis that does not split the array). The placement must move each contribution
 /// unchanged (refer to [`moves_contributions`]). The target shard receives the source shard that has the same
 /// slices and belongs to the corresponding member of the sequence of arrays formed by the contributions (refer to
-/// [`contribution_member`]). No arithmetic changes the contributions, and the host readback combines them in the
+/// [`source_replica_key`]). No arithmetic changes the contributions, and the host readback combines them in the
 /// same order. Each process creates its own empty shards, which hold no contribution (refer to
 /// [`Array::place_exact_shards`]).
 ///
@@ -3803,7 +3807,7 @@ fn plan_exact_shard_put<'o>(
         if target_shard.slice().iter().any(Range::is_empty) {
             continue;
         }
-        let key = (target_shard.slice(), contribution_member(mesh, sharding, target_shard, target_axes));
+        let key = source_replica_key(mesh, sharding, target_shard, target_axes);
         let Some(replicas) = replicas_by_contributions.get(&key) else {
             return Ok(None);
         };
@@ -3829,7 +3833,7 @@ fn plan_exact_shard_put<'o>(
 /// [`plan_exact_shard_put`] and [`PlacementPlanningView::shard_region_plan`] read: `Some(None)` when both hold one
 /// value per slice (refer to [`Sharding::holds_one_value_per_slice`]), so that any shard with the same elements
 /// corresponds, `Some(Some(axes))` when the placement only moves contributions (refer to [`moves_contributions`]), so a
-/// shard corresponds to the shards with the same elements and contribution member (refer to [`contribution_member`]),
+/// shard corresponds to the shards with the same elements and contribution member (refer to [`source_replica_key`]),
 /// and `None` otherwise.
 fn corresponding_shards(input: &Sharding, output: &Sharding) -> Option<Option<ContributionAxes>> {
     if input.holds_one_value_per_slice() && output.holds_one_value_per_slice() {
@@ -3850,21 +3854,16 @@ fn contribution_axes(sharding: &Sharding) -> (Vec<&MeshAxis>, Vec<&MeshAxis>) {
     (unreduced, varying_manual)
 }
 
-/// Returns the member of the sequence of arrays that the contributions of a placement on `mesh` with `sharding` form
-/// to which `shard` belongs (refer to [`ShardContribution::member`]), with its coordinates along the varying manual
-/// axes named `axes` in that order, or `None` without `axes`, when the shards correspond by their elements alone (refer
-/// to [`corresponding_shards`]).
-fn contribution_member(
+/// Returns the key for finding source replicas that correspond to `shard`. The key borrows the shard's slice and
+/// includes the contribution member with its manual coordinates ordered by `axes` when supplied.
+fn source_replica_key<'o>(
     mesh: &DeviceMesh,
     sharding: &Sharding,
-    shard: &ShardDescriptor,
+    shard: &'o ShardDescriptor,
     axes: Option<&[String]>,
-) -> Option<(usize, Vec<usize>)> {
-    axes.map(|axes| {
-        let contribution = ShardContribution::ordered(mesh, sharding, shard, axes);
-        let (ordinal, coordinates) = contribution.member();
-        (ordinal, coordinates.to_vec())
-    })
+) -> SourceReplicaKey<'o> {
+    let member = axes.map(|axes| ShardContributionMember::ordered(mesh, sharding, shard.index(), axes));
+    (shard.slice(), member)
 }
 
 /// Returns whether a placement of a value placed as `input` with the sharding `output` only moves its contributions
@@ -8370,6 +8369,37 @@ mod tests {
             moves,
             vec![(0, 0, vec![0..2]), (1, 0, vec![2..3]), (1, 1, vec![3..4]), (2, 1, vec![4..5]), (3, 1, vec![5..6])],
         );
+    }
+
+    #[test]
+    fn test_source_replicas_by_contribution() {
+        let logical_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("r", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), (0..8).map(|index| Device::new(index, 0)).collect()).unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 1);
+        let layout = ShardLayout::new(&StaticShape::new(vec![4]), &mesh, &sharding).unwrap();
+        let shards = layout.descriptors();
+
+        let groups = SourceReplicas::by_contribution(&mesh, &sharding, shards, None);
+        assert_eq!(groups.len(), 1);
+        let (key, replicas) = groups.get_key_value(&(shards[7].slice(), None)).unwrap();
+        assert!(std::ptr::eq(key.0, shards[0].slice()));
+        assert_eq!(replicas.preferred(&shards[7]).index(), 7);
+
+        // Every shard still covers the same slice, and only the two shards along `r` in each member are replicas.
+        let sharding = sharding.with_unreduced_axes(["x"]).unwrap().with_varying_manual_axes(["m"]).unwrap();
+        let axes = ["m".to_string()];
+        let groups = SourceReplicas::by_contribution(&mesh, &sharding, shards, Some(&axes));
+        assert_eq!(groups.len(), 4);
+        let key = source_replica_key(&mesh, &sharding, &shards[7], Some(&axes));
+        let (key, replicas) = groups.get_key_value(&key).unwrap();
+        assert!(std::ptr::eq(key.0, shards[6].slice()));
+        assert_eq!(replicas.preferred(&shards[0]).index(), 6);
+        assert_eq!(replicas.preferred(&shards[7]).index(), 7);
     }
 
     #[test]
