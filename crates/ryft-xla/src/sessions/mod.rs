@@ -111,11 +111,11 @@ use ryft_core::{
     DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue, DiskCache, Domain,
     DomainTracer, EagerContext, EffectClass, EmptyRegionDriver, FlatProgram, ImportingContext, InputRegionProvenance,
     InterpretableOperation, LogicalMesh, MeshAxis, MeshAxisType, MeshContext, NamedAxes, NamedAxis,
-    NestedTracingContext, Operation as CoreOperation, OperationProvider, Placeholder, Placement, ProgramBuilder,
-    ProgramError, Provenance, ProvenanceScope, Region, RegionDriver, RegionKey, RegionPlacementRequests, RegionRole,
-    RequestedPlacement, Sharding, SpecializationCache, SpecializationCacheEntry, SpecializationCacheStatistics,
-    TracingContext, Transform, TransformArtifact, Type as CoreType, TypeError, Typed, TypedProgram, ValueProjection,
-    Zero, ZeroOperation, decode_logical_bytes,
+    NestedTracingContext, Operation as CoreOperation, OperationProvider, Placeholder, Placement, ProcessIndex,
+    ProgramBuilder, ProgramError, Provenance, ProvenanceScope, Region, RegionDriver, RegionKey,
+    RegionPlacementRequests, RegionRole, RequestedPlacement, Sharding, SpecializationCache, SpecializationCacheEntry,
+    SpecializationCacheStatistics, TracingContext, Transform, TransformArtifact, Type as CoreType, TypeError, Typed,
+    TypedProgram, ValueProjection, Zero, ZeroOperation, decode_logical_bytes,
 };
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Client, ClientOptions, Error as PjrtError, MemoryStatistics, Plugin};
@@ -484,6 +484,32 @@ impl Session {
     #[inline]
     pub fn distributed_runtime(&self) -> Option<&DistributedRuntime> {
         self.state.distributed_runtime.as_ref()
+    }
+
+    /// Returns whether this session has no declared or listed peers and its client has no coordination store.
+    /// A standalone cross-client bridge may treat distinct process indices as two names for the current process.
+    ///
+    /// # Parameters
+    ///
+    ///   - `process_index`: The already queried process index of this session's client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Pjrt`] if the client's devices or their process indices cannot be queried.
+    pub(crate) fn is_standalone(&self, process_index: ProcessIndex) -> Result<bool, Error> {
+        let client = self.client();
+
+        if !self.remote_devices().is_empty() || client.key_value_store().is_some() {
+            return Ok(false);
+        }
+
+        for device in client.devices()? {
+            if device.process_index()? != process_index {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     /// Returns the default [`CompilationOptions`] that every compilation of this [`Session`] forwards to

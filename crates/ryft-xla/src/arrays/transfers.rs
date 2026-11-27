@@ -1218,7 +1218,7 @@ impl Array {
         };
 
         // A shard without elements holds no contribution, so the plan moves nothing to it (refer to
-        // `plan_exact_shard_put`), and this process creates its own empty target shards after its transfers, as
+        // `plan_exact_shard_moves`), and this process creates its own empty target shards after its transfers, as
         // shard regions do. The buffers of its empty source shards, which no move reads, still report their failures.
         let client = session.client();
         let process_index = client.process_index()?;
@@ -1767,7 +1767,7 @@ impl Array {
             let (shape, element_type) = (self.shape(), self.data_type().executable_buffer_type());
             let sources = self.shards().iter().map(ArrayShard::descriptor);
             let source_sharding = self.sharding();
-            let moved = plan_exact_shard_put(
+            let moved = plan_exact_shard_moves(
                 element_type,
                 sources,
                 self.mesh(),
@@ -1964,8 +1964,8 @@ impl Array {
             let source_process = self.client().process_index()?;
             if source_process != owner
                 && self.mesh().devices().iter().all(|device| device.process_index() == source_process)
-                && is_standalone_session(self.session(), source_process)?
-                && is_standalone_session(session, owner)?
+                && self.session().is_standalone(source_process)?
+                && session.is_standalone(owner)?
             {
                 self.validate_host_readback()?;
                 return Ok(());
@@ -2564,7 +2564,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         // another order of the same devices) keeps every contribution as it is, and introduces or completes nothing.
         let shape = self.shape();
         let element_type = self.data_type().executable_buffer_type();
-        let exact = plan_exact_shard_put(
+        let exact = plan_exact_shard_moves(
             element_type,
             self.shards.clone(),
             self.mesh(),
@@ -2849,7 +2849,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
 
         // Both shardings replicate the whole value and keep the same contributions, so every target shard has the
         // slices of every source shard of the same contribution.
-        let replicas = plan_exact_shard_put(
+        let replicas = plan_exact_shard_moves(
             element_type,
             replica_layout.descriptors(),
             self.mesh(),
@@ -3740,51 +3740,30 @@ impl LocalReplicas {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Returns whether `session` has no declared or listed peers and its client has no coordination store. A
-/// standalone cross-client bridge may treat distinct process indices as two names for the current process.
-fn is_standalone_session(session: &Session, process_index: ProcessIndex) -> Result<bool, Error> {
-    let client = session.client();
-    if !session.remote_devices().is_empty() || client.key_value_store().is_some() {
-        return Ok(false);
-    }
-    for device in client.devices()? {
-        if device.process_index()? != process_index {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 /// Plans the moves of whole shards that place an array of `shape` whose shards are `source_shards`, placed on
 /// `source_mesh` according to `source_sharding`, on `mesh` according to `sharding`, for every process, with buffers of
 /// `element_type`. The plan depends only on global metadata (i.e., on the slices and devices of the source shards, on
-/// the meshes, and on the shardings, refer to [`ShardMovePlan`]).
+/// the meshes, and on the shardings).
 ///
-/// Each target shard with elements receives a source shard that holds the same contribution (refer to
-/// [`ShardContribution`]), and the plan may move any replica of it, and a missing one is served from another replica of
-/// the same contribution (refer to [`Array::local_replica_shard`]). When both shardings hold one value per slice (refer to
-/// [`Sharding::holds_one_value_per_slice`]), that is any source shard with the slices of the target shard.
-/// Otherwise, shards of one slice can hold different contributions (e.g., the summands of an unreduced value or the
-/// values along a varying manual axis that does not split the array). The placement must move each contribution
-/// unchanged (refer to [`moves_contributions`]). The target shard receives the source shard that has the same
-/// slices and belongs to the corresponding member of the sequence of arrays formed by the contributions (refer to
-/// [`source_replica_key`]). No arithmetic changes the contributions, and the host readback combines them in the
-/// same order. Each process creates its own empty shards, which hold no contribution (refer to
-/// [`Array::place_exact_shards`]).
+/// Each target shard with elements receives a source shard that holds the same contribution and the plan may move any
+/// replica of it, and a missing one is served from another replica of the same contribution. When both shardings hold
+/// one value per slice, that is any source shard with the slices of the target shard. Otherwise, shards of one slice
+/// can hold different contributions (e.g., the summands of an unreduced value or the values along a varying manual axis
+/// that does not split the array). The placement must move each contribution unchanged. The target shard receives the
+/// source shard that has the same slices and belongs to the corresponding member of the sequence of arrays formed by
+/// the contributions. No arithmetic changes the contributions, and the host readback combines them in the same order.
+/// Each process creates its own empty shards, which hold no contribution.
 ///
-/// Returns `None` when a target shard with elements has no such source shard, which needs slicing or
-/// concatenating shards, or when the shards of one slice can hold different contributions and the placement changes
-/// them.
+/// Returns `None` when a target shard with elements has no such source shard, which needs slicing or concatenating
+/// shards, or when the shards of one slice can hold different contributions and the placement changes them.
 ///
 /// # Errors
 ///
-/// Returns the error of [`validate_kept_contributions`] when the target would leave a distinct source
-/// contribution with elements out, and the error of [`ShardMovePlan::new`] for a device identifier that cross-host
-/// transfers cannot represent. The plan covers the moves of every process, so every process returns these errors
-/// before any of them submits a transfer.
-fn plan_exact_shard_put<'o>(
+/// Returns the error of [`validate_kept_contributions`] when the target would leave a distinct source contribution
+/// with elements out, and the error of [`ShardMovePlan::new`] for a device identifier that cross-host transfers cannot
+/// represent. The plan covers the moves of every process, so every process returns these errors before any of them
+/// submits a transfer.
+fn plan_exact_shard_moves<'o>(
     element_type: BufferType,
     source_shards: impl IntoIterator<Item = &'o ShardDescriptor>,
     source_mesh: &DeviceMesh,
@@ -3796,6 +3775,7 @@ fn plan_exact_shard_put<'o>(
     let Some(axes) = corresponding_shards(source_sharding, sharding) else {
         return Ok(None);
     };
+
     let source_axes = axes.as_ref().map(|axes| axes.source.as_slice());
     let target_axes = axes.as_ref().map(|axes| axes.target.as_slice());
     let replicas_by_contributions =
@@ -3810,10 +3790,12 @@ fn plan_exact_shard_put<'o>(
         if target_shard.slice().iter().any(Range::is_empty) {
             continue;
         }
+
         let key = source_replica_key(mesh, sharding, target_shard, target_axes);
         let Some(replicas) = replicas_by_contributions.get(&key) else {
             return Ok(None);
         };
+
         received.insert(key);
         let source_shard = replicas.preferred(target_shard);
         moves.push(ShardMove {
@@ -3825,15 +3807,20 @@ fn plan_exact_shard_put<'o>(
             transfer_key: exact_shard_transfer_key(source_shard.index(), target_shard.index(), target_shard_count)?,
         });
     }
-    // Every target key names a distinct source key, so the target keeps every source contribution exactly
-    // when it receives as many distinct ones.
+
+    // Every target key names a distinct source key, so the target keeps every source contribution exactly when it
+    // receives as many distinct ones.
     let sources = replicas_by_contributions.keys().filter(|(slice, _)| !slice.iter().any(Range::is_empty)).count();
+
     validate_kept_contributions(source_sharding, sources == received.len())?;
+
     Ok(Some(ShardMovePlan::new(element_type, moves)?))
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Returns how the shards of a placement of a value placed as `input` with the sharding `output` correspond, which
-/// [`plan_exact_shard_put`] and [`PlacementPlanningView::shard_region_plan`] read: `Some(None)` when both hold one
+/// [`plan_exact_shard_moves`] and [`PlacementPlanningView::shard_region_plan`] read: `Some(None)` when both hold one
 /// value per slice (refer to [`Sharding::holds_one_value_per_slice`]), so that any shard with the same elements
 /// corresponds, `Some(Some(axes))` when the placement only moves contributions (refer to [`moves_contributions`]), so a
 /// shard corresponds to the shards with the same elements and contribution member (refer to [`source_replica_key`]),
@@ -3894,7 +3881,7 @@ fn source_replica_key<'o>(
 ///
 /// The contributions of both ends then correspond by their slices and their members, so the placement changes no value
 /// (e.g., onto another order of the same devices or onto other devices, in any memory and layout), and
-/// [`plan_exact_shard_put`] or [`PlacementPlanningView::shard_region_plan`] moves each contribution as it is.
+/// [`plan_exact_shard_moves`] or [`PlacementPlanningView::shard_region_plan`] moves each contribution as it is.
 ///
 /// Returns the corresponding varying manual axes of both ends, or `None` when the placement does not only move
 /// contributions.
@@ -7040,7 +7027,7 @@ mod tests {
         let sources = source.shards().iter().map(ArrayShard::descriptor);
         let (source_mesh, source_sharding, shape) = (source.mesh(), source.sharding(), source.shape());
         let plan =
-            plan_exact_shard_put(BufferType::F32, sources, source_mesh, source_sharding, &shape, &mesh, &replicated);
+            plan_exact_shard_moves(BufferType::F32, sources, source_mesh, source_sharding, &shape, &mesh, &replicated);
         let plan = plan.unwrap().unwrap();
         assert_eq!(
             plan.moves_with_role(0, MoveRole::Send).map(|movement| movement.target_device).collect::<Vec<_>>(),
@@ -7418,7 +7405,7 @@ mod tests {
         let target_sharding =
             Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let sources = held.shards().iter().map(ArrayShard::descriptor);
-        let plan = plan_exact_shard_put(
+        let plan = plan_exact_shard_moves(
             BufferType::F32,
             sources,
             held.mesh(),
@@ -8449,7 +8436,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_exact_shard_put() {
+    fn test_plan_exact_shard_moves() {
         // Process 0 holds the first half of an `f32[4]` and process 1 the second half, and the target swaps them.
         let (local, remote) = (Device::new(0, 0), Device::new(1, 1));
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -8460,7 +8447,7 @@ mod tests {
         let sources = ShardLayout::new(&shape, &source_mesh, &sharding).unwrap();
         let sources = sources.descriptors().iter();
         let plan =
-            plan_exact_shard_put(BufferType::F32, sources, &source_mesh, &sharding, &shape, &target_mesh, &sharding);
+            plan_exact_shard_moves(BufferType::F32, sources, &source_mesh, &sharding, &shape, &target_mesh, &sharding);
         let send = ShardMove {
             source_shard_index: 0,
             source_device: local,
@@ -8491,7 +8478,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_exact_shard_put_rejects_invalid_cross_host_device_ids_on_every_process() {
+    fn test_plan_exact_shard_moves_rejects_invalid_cross_host_device_ids_on_every_process() {
         // Process 0 sends the halves of an `f32[4]` to a valid device of process 2 and to a device of process 1 whose
         // identifier PJRT cross-host transfers cannot represent. The plan covers the moves of every process, so every
         // process rejects it before any transfer, including process 2, which would otherwise wait for a send that
@@ -8504,7 +8491,7 @@ mod tests {
         let shape = StaticShape::new(vec![4]);
         let sources = ShardLayout::new(&shape, &source_mesh, &sharding).unwrap();
         let sources = sources.descriptors().iter();
-        let plan = plan_exact_shard_put(BufferType::F32, sources, &source_mesh, &sharding, &shape, &mesh, &sharding);
+        let plan = plan_exact_shard_moves(BufferType::F32, sources, &source_mesh, &sharding, &shape, &mesh, &sharding);
         assert_eq!(
             plan.map_err(|error| error.to_string()),
             Err(format!(
