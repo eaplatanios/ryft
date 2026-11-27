@@ -3931,27 +3931,23 @@ fn moves_contributions(input: &Sharding, output: &Sharding) -> Option<Contributi
     })
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Returns whether a value placed as `input`, which has a pending reduction or manual variation within a tile (i.e.,
-/// does not hold one value per slice, refer to [`Sharding::holds_one_value_per_slice`]), keeps its contributions
-/// when placed with the sharding `output` (refer to [`moves_contributions`]). Such a placement only moves bytes, so no
-/// strategy of it may read back the combined value of its contributions and upload it again (i.e., neither the host
-/// round trip nor any other host fallback, refer to [`keeps_some_contributions`]).
+/// does not hold one value per slice), keeps its contributions when placed with the sharding `output`. Such a placement
+/// only moves bytes, so no strategy of it may read back the combined value of its contributions and upload it again
+/// (i.e., neither the host round trip nor any other host fallback).
 fn keeps_contributions(input: &Sharding, output: &Sharding) -> bool {
     !input.holds_one_value_per_slice() && moves_contributions(input, output).is_some()
 }
 
-/// Returns whether a placement of a value placed as `input` with the sharding `output` keeps some of its contributions
-/// apart, which is the one rule that admits a host fallback. Every host fallback (i.e., the planned
+/// Returns whether a placement of a value placed as `input` with the sharding `output` keeps some of its
+/// contributions apart, which is the one rule that admits a host fallback. Every host fallback (i.e., the planned
 /// [`DevicePlacementStrategy::HostRoundTrip`], the host fallback of [`Array::place_within_client`], and the readback
 /// of [`Array::place_process_local_value`]) reads back the combined value of all contributions and uploads it again,
-/// which is valid only when the placement keeps none of them. It keeps all of them when it only moves them (refer to
-/// [`keeps_contributions`]), and some of them when it keeps a pending reduction along a mesh axis of size greater than
-/// one while it changes the reduction along others (refer to [`kept_unreduced_axes`]), whose partial results the
-/// combined value would replace (e.g., completing `y` of a sum along `x` and `y` of the `f32` contributions `MAX`, `0`,
-/// `MAX`, and `-MAX` leaves `MAX` and `0` along `x`, while the combined value is infinite). An axis of size one holds
-/// one contribution, which combining leaves as it is.
+/// which is valid only when the placement keeps none of them. It keeps all of them when it only moves them, and some
+/// of them when it keeps a pending reduction along a mesh axis of size greater than one while it changes the reduction
+/// along others, whose partial results the combined value would replace (e.g., completing `y` of a sum along `x` and
+/// `y` of the `f32` contributions `MAX`, `0`, `MAX`, and `-MAX` leaves `MAX` and `0` along `x`, while the combined
+/// value is infinite). An axis of size one holds one contribution, which combining leaves as it is.
 fn keeps_some_contributions(input: &Sharding, output: &Sharding) -> bool {
     let has_distinct_contributions = input.mesh().axes().iter().any(|axis| {
         axis.size() > 1
@@ -3970,8 +3966,7 @@ fn keeps_some_contributions(input: &Sharding, output: &Sharding) -> bool {
 /// the equality of the meshes, and the remaining unreduced axes of `input` are completed and those of `output`
 /// introduced. An unreduced axis that the target renames has no common name and is not kept, so a placement that
 /// keeps it while it changes another part of the reduction state completes it and introduces it again. A placement
-/// whose whole reduction state corresponds under other names is a move instead (refer to [`moves_contributions`]),
-/// which never gets here.
+/// whose whole reduction state corresponds under other names is a move instead, which never gets here.
 fn kept_unreduced_axes<'o>(input: &Sharding, output: &'o Sharding) -> Vec<&'o str> {
     if input.unreduced_kind() != output.unreduced_kind() {
         return Vec::new();
@@ -3987,13 +3982,13 @@ fn kept_unreduced_axes<'o>(input: &Sharding, output: &'o Sharding) -> Vec<&'o st
     .collect()
 }
 
-/// Checks that a placement of a value placed as `input` keeps every distinct contribution with elements of its source
-/// (refer to [`ShardContribution`]), which is the case when `keeps_all` holds. A placement whose contributions
-/// correspond (refer to [`corresponding_shards`]) takes each target contribution from the source contribution
-/// with the same elements and member, so it can leave a source contribution out only along a varying manual axis that
-/// splits a dimension at one end and not at the other (e.g., the values `10`, `11`, `20`, and `21` of a vector of two
-/// elements split along `x` and varying along `m`, placed so that `m` splits it, which keeps only `10` and `21`). The
-/// target cannot represent that value, so the placement is rejected rather than planned another way.
+/// Checks that a placement of a value placed as `input` keeps every distinct contribution with elements of its source,
+/// which is the case when `keeps_all` holds. A placement whose contributions correspond takes each target contribution
+/// from the source contribution with the same elements and member, so it can leave a source contribution out only along
+/// a varying manual axis that splits a dimension at one end and not at the other (e.g., the values `10`, `11`, `20`,
+/// and `21` of a vector of two elements split along `x` and varying along `m`, placed so that `m` splits it, which
+/// keeps only `10` and `21`). The target cannot represent that value, so the placement is rejected rather than
+/// planned another way.
 ///
 /// # Errors
 ///
@@ -4005,8 +4000,8 @@ fn validate_kept_contributions(input: &Sharding, keeps_all: bool) -> Result<(), 
     let axes = input.varying_manual_axes().iter().map(|axis| format!("`{axis}`")).collect::<Vec<_>>();
     Err(ProgramError::InvalidArgument {
         message: format!(
-            "cannot place an array that varies along the manual mesh axes {} onto this sharding, because the placement \
-             would discard values that differ along those axes",
+            "cannot place an array that varies along the manual mesh axes {} onto this sharding, \
+             because the placement would discard values that differ along those axes",
             axes.join(", "),
         ),
     }
@@ -4031,12 +4026,12 @@ fn cross_host_shape(shard_index: ShardIndex, shape: &StaticShape) -> Result<Vec<
         .collect()
 }
 
-/// Returns a lazy resolver for the default layout that a cross-host receive allocates. Each lookup checks for the
-/// PJRT cross-host transfers extension, then asks the plugin for its default layout. A missing default layout
-/// query returns [`None`], and an unrepresentable shape reports the target shard and dimension.
+/// Returns a lazy resolver for the default layout that a cross-host receive allocates. Each lookup checks for the PJRT
+/// cross-host transfers extension, then asks the plugin for its default layout. A missing default layout query returns
+/// [`None`], and an unrepresentable shape reports the target shard and dimension.
 fn cross_host_layout_resolver<'o>(
     client: &'o Client<'_>,
-) -> impl Fn(BufferType, ShardIndex, &StaticShape) -> Result<Option<ryft_pjrt::Layout>, Error> + 'o {
+) -> impl 'o + Fn(BufferType, ShardIndex, &StaticShape) -> Result<Option<ryft_pjrt::Layout>, Error> {
     move |element_type, shard_index, shape| {
         client.cross_host_transfers_extension()?;
         let dimensions = cross_host_shape(shard_index, shape)?
@@ -4051,11 +4046,11 @@ fn cross_host_layout_resolver<'o>(
     }
 }
 
-/// Uses `layout_resolver` to obtain the default layout for buffers of `element_type` with each shape of
-/// `shards` (i.e., of pairs of the index of a target shard and a shape that crosses processes for it), or `None`
-/// when `shards` is not empty and the plugin lacks the cross-host transfers extension or cannot report one of those
-/// layouts. The first shard with each shape supplies the index for a single lookup of that shape. Every process derives
-/// the same `shards` for a placement and queries the same plugin, so all of them get the same result.
+/// Uses `layout_resolver` to obtain the default layout for buffers of `element_type` with each shape of `shards` (i.e.,
+/// of pairs of the index of a target shard and a shape that crosses processes for it), or `None` when `shards` is not
+/// empty and the plugin lacks the cross-host transfers extension or cannot report one of those layouts. The first shard
+/// with each shape supplies the index for a single lookup of that shape. Every process derives the same `shards` for a
+/// placement and queries the same plugin, so all of them get the same result.
 fn cross_host_layouts(
     layout_resolver: &CrossHostLayoutResolver<'_>,
     element_type: BufferType,
@@ -4076,9 +4071,9 @@ fn cross_host_layouts(
     Ok(Some(layouts))
 }
 
-/// Returns the deterministic cross-host transfer key for moving data from `source_shard_index` to the
-/// target shard `target_shard_index`, which is `source_shard_index * target_shard_count +
-/// target_shard_index`, so that every pair of source and target shards gets a unique key.
+/// Returns the deterministic cross-host transfer key for moving data from `source_shard_index` to the target shard
+/// `target_shard_index`, which is `source_shard_index * target_shard_count + target_shard_index`, so that every pair
+/// of source and target shards gets a unique key.
 ///
 /// # Errors
 ///
@@ -4093,15 +4088,20 @@ fn exact_shard_transfer_key(
         .and_then(|key| key.checked_add(target_shard_index))
         .ok_or_else(|| Error::SizeLimitExceeded {
             message: format!(
-                "cross-host transfer key for source shard #{source_shard_index} and target shard \
-                 #{target_shard_index} exceeds the maximum allowed size of {}",
+                "cross-host transfer key for source shard #{} and target shard #{} \
+                 exceeds the maximum allowed size of {}",
+                source_shard_index,
+                target_shard_index,
                 usize::MAX,
             ),
         })?;
     i64::try_from(transfer_key).map_err(|_| Error::SizeLimitExceeded {
         message: format!(
-            "cross-host transfer key {transfer_key} for source shard #{source_shard_index} and target shard \
-             #{target_shard_index} exceeds the maximum allowed size of {}",
+            "cross-host transfer key {} for source shard #{} and target shard #{} \
+             exceeds the maximum allowed size of {}",
+            transfer_key,
+            source_shard_index,
+            target_shard_index,
             i64::MAX,
         ),
     })
@@ -4110,33 +4110,36 @@ fn exact_shard_transfer_key(
 /// Returns the PJRT cross-host global device ID for `device_id`.
 fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, Error> {
     i32::try_from(device_id).map_err(|_| Error::SizeLimitExceeded {
-        message: format!("cross-host transfer device ID {device_id} exceeds the maximum allowed value of {}", i32::MAX),
+        message: format!(
+            "cross-host transfer device ID {} exceeds the maximum allowed value of {}",
+            device_id,
+            i32::MAX,
+        ),
     })
 }
 
 /// Issues `transfers`, which are the cross-host transfers that the current process takes part in for one placement,
-/// and returns a fence for the sends and the received buffers with their transfer keys and device IDs.
+/// and returns a fence for the sends and the received buffers with their transfer keys and device IDs. PJRT delivers
+/// a received buffer to the default memory of its target device, which every device has. When `memory` is another
+/// memory, each received buffer is therefore copied on its device to `memory` once every transfer is issued, and the
+/// copy is returned in its place. That copy is local to the device and does not wait for the transfer, so it does not
+/// affect the order described below.
 ///
-/// PJRT delivers a received buffer to the default memory of its target device, which every device has. When
-/// `memory` is another memory, each received buffer is therefore copied on its device to `memory` once every transfer
-/// is issued, and the copy is returned in its place. That copy is local to the device and does not wait for the
-/// transfer, so it does not affect the order described below.
-///
-/// The transfers are issued one at a time in the order of their source and then target device IDs, keeping the
-/// given order of the transfers between the same two devices. The CUDA plugin carries the transfers between two
-/// devices over a communicator of that pair and pairs them by the order in which both sides issue them, ignoring their
-/// transfer keys, and the first transfer between two devices blocks the calling thread until the peer process issues
-/// its matching transfer. Two processes that each send before they receive would therefore deadlock when they swap
-/// shards. Every process derives the same transfers from global metadata and issues its own in this one global order,
-/// so the first pair of devices with a pending transfer always has both of its processes waiting for it.
+/// The transfers are issued one at a time in the order of their source and then target device IDs, keeping the given
+/// order of the transfers between the same two devices. The CUDA plugin carries the transfers between two devices over
+/// a communicator of that pair and pairs them by the order in which both sides issue them, ignoring their transfer
+/// keys, and the first transfer between two devices blocks the calling thread until the peer process issues its
+/// matching transfer. Two processes that each send before they receive would therefore deadlock when they swap shards.
+/// Every process derives the same transfers from global metadata and issues its own in this one global order, so the
+/// first pair of devices with a pending transfer always has both of its processes waiting for it.
 ///
 /// A process that stops after issuing some of its transfers leaves its peers waiting for the rest, and the transfers
-/// that it did issue are paired with the next transfers between the same devices. This function therefore validates
-/// the device IDs of every transfer, which every process checks alike for the transfers that it shares with a peer,
-/// before it issues the first one. It issues every transfer before it looks up `memory` or copies a received buffer
-/// to it, because only the receiving process can look up the memories of its devices. A memory that a device does not
-/// have or a failed copy is therefore returned only after every transfer of this process has been issued, so the peers
-/// of this process complete their transfers and only this process reports the failure.
+/// that it did issue are paired with the next transfers between the same devices. This function therefore validates the
+/// device IDs of every transfer, which every process checks alike for the transfers that it shares with a peer, before
+/// it issues the first one. It issues every transfer before it looks up `memory` or copies a received buffer to it,
+/// because only the receiving process can look up the memories of its devices. A memory that a device does not have or
+/// a failed copy is therefore returned only after every transfer of this process has been issued, so the peers of this
+/// process complete their transfers and only this process reports the failure.
 fn issue_cross_host_transfers(
     session: &Session,
     mut transfers: Vec<CrossHostTransfer<'_>>,
@@ -4145,6 +4148,7 @@ fn issue_cross_host_transfers(
     if transfers.is_empty() {
         return Ok((None, Vec::new()));
     }
+
     transfers.sort_by_key(|transfer| (transfer.source(), transfer.target()));
     let transfers = transfers
         .into_iter()
@@ -4154,6 +4158,7 @@ fn issue_cross_host_transfers(
             Ok((source, target, transfer))
         })
         .collect::<Result<Vec<_>, Error>>()?;
+
     let client = session.client();
     let mut sends = session.reserve_work();
     let mut receives = session.reserve_work();
@@ -4179,6 +4184,7 @@ fn issue_cross_host_transfers(
             }
         }
     }
+
     let send_fence = sends.finish();
     let received_buffers = received_buffers
         .into_iter()
@@ -4190,8 +4196,11 @@ fn issue_cross_host_transfers(
             Ok(received)
         })
         .collect::<Result<Vec<_>, Error>>()?;
+
     Ok((send_fence, received_buffers))
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the dense row-major [`Layout`] of rank `rank` (i.e., the tiled layout without tiles whose minor-to-major
 /// order is the reverse of the order of the dimensions), which is the default layout of dense buffers of the CPU and
