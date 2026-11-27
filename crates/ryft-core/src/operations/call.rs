@@ -4781,7 +4781,15 @@ mod tests {
         assert_eq!(refined(&[Some(replicated.clone()), None]), Ok(None));
         assert_eq!(refined(&[None, None]), Ok(None));
         assert_eq!(refined(&[None, Some(replicated.clone().with_unreduced_axes(["x"]).unwrap())]), Ok(None));
-        assert_eq!(refined(&[None, Some(replicated)]), Ok(Some(indoc! {""}.to_string())));
+        assert_eq!(
+            refined(&[None, Some(replicated)]),
+            Ok(Some(
+                indoc! {"
+                    lambda %0:dimension<size ∈ [1, 9)>, %1:f32[4][sharding={mesh<['x'=2:explicit]>, [{}]}] .
+                    in (%1)"}
+                .to_string(),
+            )),
+        );
     }
 
     #[test]
@@ -4830,7 +4838,9 @@ mod tests {
         // A batch split along an axis along which each item is split already conflicts with the item placement.
         assert_eq!(
             batched(Some(&sharding(vec![split.clone()])), &BatchAxis::new(0), Some(&packed(vec![split, replicated]))),
-            Err(BatchingError::MisalignedBatchAxes { message: String::new() }),
+            Err(BatchingError::MisalignedBatchAxes {
+                message: "mesh axis name `x` appears more than once".to_string(),
+            }),
         );
     }
 
@@ -10158,11 +10168,7 @@ mod tests {
 
     #[test]
     fn test_call_operation_batch() {
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let callee = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+        let callee = build_program(vec![ArrayType::scalar(DataType::F32).into()], |_, inputs| inputs.to_vec());
         let callees = [Arc::new(callee)];
         let regions = AttachedRegions::Callees(&callees);
         let driver = RecursiveBatchingDriver::new(&regions);
@@ -10209,16 +10215,10 @@ mod tests {
                 .unwrap();
         let batch_type =
             ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 4]).with_sharding(batch_split).unwrap());
-        let callee = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let input = builder.add_input(item.into());
-            let output = builder
-                .add_instruction(ArrayOperation::from(SinOperation::new()), Vec::new(), vec![input], None)
-                .unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
+        let callee = build_program(vec![item.into()], |builder, inputs| {
+            let sine = ArrayOperation::from(SinOperation::new());
+            builder.add_instruction(sine, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
+        });
         let callees = [Arc::new(callee)];
         let regions = AttachedRegions::Callees(&callees);
         let driver = RecursiveBatchingDriver::new(&regions);
@@ -10316,7 +10316,19 @@ mod tests {
             vec![scalar_type],
         )
         .unwrap();
-        assert_eq!(program.to_string(), indoc! {""});
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:dimension<3> = const 3
+                    %2:f32[] = call [keeps_input_placements=true] %0 [
+                        callee={
+                            lambda %0:f32[] .
+                            in (%0)
+                        },
+                    ]
+                in (%2)"},
+        );
     }
 
     #[test]
@@ -10352,14 +10364,28 @@ mod tests {
             vec![scalar_type],
         )
         .unwrap();
-        assert_eq!(program.to_string(), indoc! {""});
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:dimension<3> = const 3
+                    %2:u64[3], %3:f32[] = call [capture_count=1, derived_input_shardings=[_, _]] %1 %0 [
+                        callee={
+                            lambda %0:dimension<3>, %1:f32[] .
+                            let %2:u64[3] = iota [type=u64[3], dimension=0]
+                            in (%2, %1)
+                        },
+                    ]
+                in (%2, %3)"},
+        );
     }
 
     #[test]
     fn test_call_operation_batch_adds_the_batch_dimension_to_boundary_overrides() {
         // The boundary overrides of a call place each batch item, so the batched call places the batch dimension of
-        // each overridden value as the batched value places it (i.e., split along `x`), and the leading extent input
-        // has no override.
+        // each overridden value as the type of the batched value records it. The batched input is split along `x`,
+        // while the output of the batched callee records no sharding, so the batch dimension of its override is
+        // replicated. The leading extent input has no override.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
         let batch_split =
@@ -10391,7 +10417,26 @@ mod tests {
             vec![batch_type],
         )
         .unwrap();
-        assert_eq!(program.to_string(), indoc! {""});
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 4][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] .
+                let %1:dimension<2> = const 2
+                    %2:f32[2, 4] = call [
+                        capture_count=1,
+                        input_shardings=[_, {mesh<['x'=2:explicit]>, [{'x'}, {}]}],
+                        output_shardings=[{mesh<['x'=2:explicit]>, [{}, {}]}],
+                        derived_input_shardings=[_, _],
+                        devices=[0, 1],
+                    ] %1 %0 [
+                        callee={
+                            lambda %0:dimension<2>, %1:f32[2, 4] .
+                            let %2:f32[2, 4] = sin %1
+                            in (%2)
+                        },
+                    ]
+                in (%2)"},
+        );
     }
 
     #[test]
@@ -10419,7 +10464,21 @@ mod tests {
             vec![scalar_type, ArrayIrType::Array(f32_vector_type(3))],
         )
         .unwrap();
-        assert_eq!(program.to_string(), indoc! {""});
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[3] .
+                let %2:dimension<3> = const 3
+                    %3:f32[3] = call [capture_count=2, derived_input_shardings=[_, _, _]] %2 %0 %1 [
+                        callee={
+                            lambda %0:dimension<3>, %1:f32[], %2:f32[3] .
+                            let %3:f32[3] = broadcast [output_axes=[]] %1 %0
+                                %4:f32[3] = mul %3 %2
+                            in (%4)
+                        },
+                    ]
+                in (%3)"},
+        );
     }
 
     #[test]
@@ -10444,7 +10503,18 @@ mod tests {
             vec![f32_vector_type(3)],
         )
         .unwrap();
-        assert_eq!(program.to_string(), indoc! {""});
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[3] .
+                let %1:f32[3] = call [derived_input_shardings=[_]] %0 [
+                    callee={
+                        lambda %0:f32[3] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
+        );
     }
 
     #[test]
@@ -10469,13 +10539,25 @@ mod tests {
             vec![ArrayType::scalar(DataType::F32)],
         )
         .unwrap();
-        assert_eq!(program.to_string(), indoc! {""});
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = call [derived_input_shardings=[_]] %0 [
+                    callee={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
+        );
     }
 
     #[test]
     fn test_call_operation_batch_under_array_batching_policy_adds_the_batch_dimension_to_boundary_overrides() {
         // As under the array IR batching policy, the batched call places the batch dimension of each overridden value
-        // as the batched value places it (i.e., split along `x`).
+        // as the type of the batched value records it (i.e., split along `x` for the input and replicated for the
+        // output, whose type in the batched callee records no sharding).
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
         let batch_split =
@@ -10503,7 +10585,23 @@ mod tests {
             vec![ArrayType::new_static(DataType::F32, [2, 4]).with_sharding(batch_split).unwrap()],
         )
         .unwrap();
-        assert_eq!(program.to_string(), indoc! {""});
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 4][sharding={mesh<['x'=2:explicit]>, [{'x'}, {}]}] .
+                let %1:f32[2, 4] = call [
+                    input_shardings=[{mesh<['x'=2:explicit]>, [{'x'}, {}]}],
+                    output_shardings=[{mesh<['x'=2:explicit]>, [{}, {}]}],
+                    derived_input_shardings=[_],
+                    devices=[0, 1],
+                ] %0 [
+                    callee={
+                        lambda %0:f32[2, 4] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
+        );
     }
 
     #[test]
@@ -10565,7 +10663,21 @@ mod tests {
         }));
         let program =
             build_program(vec![input_type.into()], |builder, inputs| vec![add_call(builder, &callee, inputs.to_vec())]);
-        assert_eq!(program.jvp().unwrap().to_string(), indoc! {""});
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[], %3:f32[] = call [derived_input_shardings=[_, _]] %0 %1 [
+                    callee={
+                        lambda %0:f32[], %1:f32[] .
+                        let %2:f32[] = sin %0
+                            %3:f32[] = cos %0
+                            %4:f32[] = mul %3 %1
+                        in (%2, %4)
+                    },
+                ]
+                in (%2, %3)"},
+        );
     }
 
     #[test]
@@ -10635,29 +10747,15 @@ mod tests {
         let dimension_type =
             ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
         let array_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
-
-        let mut callee_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let dimension = callee_builder.add_input(dimension_type.clone());
-        let array = callee_builder.add_input(array_type.clone());
-        let callee = callee_builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![dimension, array], vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let dimension = builder.add_input(dimension_type);
-        let array = builder.add_input(array_type);
-        let callee = builder.import_region(callee.entry_region_ref());
-        let outputs = builder
-            .add_instruction(TestOperation::Call(CallOperation::new(0)), vec![callee], vec![dimension, array], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-
-        let jvp = program.jvp().unwrap();
+        let input_types = vec![dimension_type, array_type];
+        let callee = build_program(input_types.clone(), |_, inputs| inputs.to_vec());
+        let program = build_program(input_types, |builder, inputs| {
+            let callee = builder.import_region(callee.entry_region_ref());
+            let call = TestOperation::Call(CallOperation::new(0));
+            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
+        });
         assert_eq!(
-            jvp.to_string(),
+            program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:dimension<size ∈ [1, 9)>, %1:f64[], %2:f64[] .
                 let %3:dimension<size ∈ [1, 9)>, %4:f64[], %5:f64[] = call [derived_input_shardings=[_, _, _]] %0 %1 %2 [
@@ -10985,33 +11083,22 @@ mod tests {
         });
         let linearization = program.linearize_with_respect_to(&[1]).unwrap();
         assert_eq!(linearization.residual_count(), 0);
-        assert_eq!(format!("{}\n{}", linearization.primal(), linearization.tangent()), indoc! {""});
-    }
-
-    #[test]
-    fn test_call_operation_jvp_keeps_the_function_mesh_of_fused_and_primal_calls() {
-        // The fused call replaces the whole call, so it keeps the function mesh, and so does the primal call of a
-        // linearization, while the tangent call of a staged linearization follows its caller and has none. The
-        // function mesh does not render, so the payloads are inspected.
-        let device_mesh = DeviceMesh::new(LogicalMesh::single_device(), vec![Device::new(0, 0)]).unwrap();
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let callee = build_program(vec![scalar_type.clone()], |builder, inputs| {
-            let sine = ArrayOperation::from(SinOperation::new());
-            builder.add_instruction(sine, Vec::new(), vec![inputs[0]], None).unwrap().to_vec()
-        });
-        let program = build_program(vec![scalar_type], |builder, inputs| {
-            let callee = builder.import_program(callee);
-            let call = TestOperation::Call(CallOperation::new(0).with_function_mesh(&device_mesh));
-            builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
-        });
-        let function_mesh = |program: &TestProgram| {
-            let call = program.instructions()[0].operation().projected_payload::<CallOperation<ArrayIrType>>();
-            call.unwrap().function_mesh().cloned()
-        };
-        assert_eq!(function_mesh(&program.jvp().unwrap()), Some(device_mesh.clone()));
-        let linearization = program.linearize().unwrap();
-        assert_eq!(function_mesh(linearization.primal()), Some(device_mesh));
-        assert_eq!(function_mesh(linearization.tangent()), None);
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4] .
+                let %2:f64[4] = call %0 %1 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:f64[4] = sin %0
+                        in (%2)
+                    },
+                ]
+                in (%2)
+                lambda %0:f64[4] .
+                let %1:f64[4] = zero [type=f64[4]]
+                in (%1)"},
+        );
     }
 
     #[test]
@@ -11052,10 +11139,7 @@ mod tests {
             program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:i64[], %2:f32[] .
-                let %3:f32[rows], %4:f32[rows] = call [
-                    output_types=[f32[rows], f32[rows]],
-                    derived_input_shardings=[_, _, _],
-                ] %0 %1 %2 [
+                let %3:f32[rows], %4:f32[rows] = call [output_types=[f32[rows], f32[rows]], derived_input_shardings=[_, _, _]] %0 %1 %2 [
                     callee={
                         lambda %0:f32[], %1:i64[], %2:f32[] .
                         let %3:dimension<rows ∈ [0, 8)> = dimension_from_scalar [bounds=[0, 8)] %1
@@ -11121,9 +11205,60 @@ mod tests {
                 .unwrap()
                 .to_vec()
         });
-        assert_eq!(program.jvp().unwrap().to_string(), indoc! {""});
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[4], %1:f32[4] .
+                let %2:f32[4], %3:f32[4] = call [
+                    input_shardings=[{mesh<['x'=2:auto]>, [{'x'}]}, {mesh<['x'=2:auto]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:auto]>, [{'x'}]}, {mesh<['x'=2:auto]>, [{'x'}]}],
+                    derived_input_shardings=[_, _],
+                    devices=[0, 1],
+                ] %0 %1 [
+                    callee={
+                        lambda %0:f32[4], %1:f32[4] .
+                        let %2:f32[4] = sin %0
+                            %3:f32[4] = cos %0
+                            %4:f32[4] = mul %3 %1
+                        in (%2, %4)
+                    },
+                ]
+                in (%2, %3)"},
+        );
         let linearization = program.linearize().unwrap();
-        assert_eq!(format!("{}\n{}", linearization.primal(), linearization.tangent()), indoc! {""});
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f32[4] .
+                let %1:f32[4], %2:f32[4] = call [
+                    input_shardings=[{mesh<['x'=2:auto]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:auto]>, [{'x'}]}],
+                    derived_input_shardings=[_],
+                    devices=[0, 1],
+                ] %0 [
+                    callee={
+                        lambda %0:f32[4] .
+                        let %1:f32[4] = sin %0
+                            %2:f32[4] = cos %0
+                        in (%1, %2)
+                    },
+                ]
+                in (%1, %2)
+                lambda %0:f32[4], %1:f32[4] .
+                let %2:f32[4] = call [
+                    input_shardings=[{mesh<['x'=2:auto]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:auto]>, [{'x'}]}],
+                    derived_input_shardings=[_],
+                    devices=[0, 1],
+                ] %0 %1 [
+                    callee={
+                        lambda %0:f32[4], %1:f32[4] .
+                        let %2:f32[4] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)"},
+        );
     }
 
     #[test]
@@ -11234,7 +11369,72 @@ mod tests {
             [[5, 11, 31], [7, 15, 41], [11, 19, 51], [19, 23, 61]],
         );
         let linearization = nested(1, None).linearize_with_respect_to(&[0, 1]).unwrap();
-        assert_eq!(format!("{}\n{}", linearization.primal(), linearization.tangent()), indoc! {""});
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
+                let %3:f32[2, 2], %4:f32[2, 2], %5:f32[2, 2], %6:f32[2, 2], %7:f32[2, 2], %8:f32[2, 2], %9:f32[2, 2], %10:f32[2, 2], %11:f32[2, 2], %12:f32[2, 2], %13:f32[2, 2], %14:f32[2, 2] = call [derived_input_shardings=[_, _]] %1 %2 [
+                    callee={
+                        lambda %0:f32[2, 2], %1:f32[2, 2] .
+                        let %2:f32[2, 2], %3:f32[2, 2], %4:f32[2, 2], %5:f32[2, 2], %6:f32[2, 2], %7:f32[2, 2] = call [derived_input_shardings=[_, _]] %0 %1 [
+                            callee=^0={
+                                lambda %0:f32[2, 2], %1:f32[2, 2] .
+                                let %2:f32[2, 2] = dot [
+                                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                                ] %0 %1
+                                    %3:f32[2, 2] = sin %2
+                                    %4:f32[2, 2] = cos %2
+                                    %5:f32[2, 2] = mul %3 %4
+                                    %6:f32[2, 2] = add %5 %0
+                                    %7:f32[2, 2] = cos %2
+                                    %8:f32[2, 2] = sin %2
+                                in (%6, %1, %7, %8, %4, %3)
+                            },
+                        ]
+                            %8:f32[2, 2] = sin %0
+                            %9:f32[2, 2], %10:f32[2, 2], %11:f32[2, 2], %12:f32[2, 2], %13:f32[2, 2], %14:f32[2, 2] = call [derived_input_shardings=[_, _]] %8 %1 [
+                                callee=^0,
+                            ]
+                            %15:f32[2, 2] = add %2 %9
+                            %16:f32[2, 2] = cos %0
+                        in (%15, %3, %4, %5, %6, %7, %16, %10, %11, %12, %13, %14)
+                    },
+                ]
+                    %15:f32[2, 2] = mul %0 %3
+                in (%15, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %3, %0)
+                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2], %3:f32[2, 2], %4:f32[2, 2], %5:f32[2, 2], %6:f32[2, 2], %7:f32[2, 2], %8:f32[2, 2], %9:f32[2, 2], %10:f32[2, 2], %11:f32[2, 2], %12:f32[2, 2], %13:f32[2, 2], %14:f32[2, 2] .
+                let %15:f32[2, 2] = mul %13 %0
+                    %16:f32[2, 2] = call [derived_input_shardings=[_]] %1 %2 %3 %4 %5 %6 %7 %8 %9 %10 %11 %12 [
+                        callee={
+                            lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2], %3:f32[2, 2], %4:f32[2, 2], %5:f32[2, 2], %6:f32[2, 2], %7:f32[2, 2], %8:f32[2, 2], %9:f32[2, 2], %10:f32[2, 2], %11:f32[2, 2] .
+                            let %12:f32[2, 2] = call [derived_input_shardings=[_]] %0 %1 %2 %3 %4 %5 [
+                                callee=^0={
+                                    lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2], %3:f32[2, 2], %4:f32[2, 2], %5:f32[2, 2] .
+                                    let %6:f32[2, 2] = dot [
+                                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                                    ] %0 %1
+                                        %7:f32[2, 2] = mul %2 %6
+                                        %8:f32[2, 2] = mul %4 %7
+                                        %9:f32[2, 2] = mul %3 %6
+                                        %10:f32[2, 2] = neg %9
+                                        %11:f32[2, 2] = mul %5 %10
+                                        %12:f32[2, 2] = add %8 %11
+                                        %13:f32[2, 2] = add %12 %0
+                                    in (%13)
+                                },
+                            ]
+                                %13:f32[2, 2] = mul %6 %0
+                                %14:f32[2, 2] = call [derived_input_shardings=[_]] %13 %7 %8 %9 %10 %11 [
+                                    callee=^0,
+                                ]
+                                %15:f32[2, 2] = add %12 %14
+                            in (%15)
+                        },
+                    ]
+                    %17:f32[2, 2] = mul %14 %16
+                    %18:f32[2, 2] = add %15 %17
+                in (%18)"},
+        );
 
         // Neither sharing nor rematerialization changes the primal value or the derivatives, which match those of the
         // same function with every level inlined. The shared callees accumulate the cotangents in another order than
@@ -11882,8 +12082,8 @@ mod tests {
     #[test]
     fn test_call_operation_transpose_places_known_inputs_at_their_input_overrides() {
         // The callee `(w, a) ↦ w * a` is transposed with respect to `a`, so `w` is a known input of the transposed
-        // call, which places it at its own input override, while the seed and `ā` take the cotangent shardings of the
-        // overrides of their primals.
+        // call, which places it at its own input override, while `ā` takes the cotangent sharding of the override of
+        // `a`, and the seed has no override, because the call has no output override.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
         let split = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -11902,7 +12102,24 @@ mod tests {
                 .unwrap()
                 .to_vec()
         });
-        assert_eq!(program.transpose_with_respect_to(&[1], &[]).unwrap().to_string(), indoc! {""});
+        assert_eq!(
+            program.transpose_with_respect_to(&[1], &[]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[4], %1:f32[4] .
+                let %2:f32[4] = call [
+                    input_shardings=[_, {mesh<['x'=2:auto]>, [{'x'}]}],
+                    output_shardings=[{mesh<['x'=2:auto]>, [{}]}],
+                    derived_input_shardings=[_, _],
+                    devices=[0, 1],
+                ] %0 %1 [
+                    callee={
+                        lambda %0:f32[4], %1:f32[4] .
+                        let %2:f32[4] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)"},
+        );
     }
 
     #[test]
@@ -11915,7 +12132,18 @@ mod tests {
             let call = TestOperation::Call(CallOperation::new(0).with_kept_input_placements());
             builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
         });
-        assert_eq!(program.transpose_with_respect_to(&[0], &[]).unwrap().to_string(), indoc! {""});
+        assert_eq!(
+            program.transpose_with_respect_to(&[0], &[]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = call [derived_input_shardings=[_], keeps_input_placements=true] %0 [
+                    callee={
+                        lambda %0:f64[] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
+        );
     }
 
     #[test]
@@ -12015,8 +12243,33 @@ mod tests {
             let call = TestOperation::Call(CallOperation::new(0));
             builder.add_instruction(call, vec![callee], inputs.to_vec(), None).unwrap().to_vec()
         });
-        assert_eq!(program.transpose_with_respect_to(&[0], &[]).unwrap().to_string(), indoc! {""});
-        assert_eq!(program.transpose_with_respect_to(&[1], &[]).unwrap().to_string(), indoc! {""});
+        assert_eq!(
+            program.transpose_with_respect_to(&[0], &[]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %1:f32[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                let %2:f32[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = call [derived_input_shardings=[_, _]] %0 %1 [
+                    callee={
+                        lambda %0:f32[1], %1:f32[1] .
+                        let %2:f32[1] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                    %3:f32[1][sharding={mesh<['x'=2:manual]>, [{}]}] = parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual]] %2
+                in (%3)"},
+        );
+        assert_eq!(
+            program.transpose_with_respect_to(&[1], &[]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f32[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %1:f32[1][sharding={mesh<['x'=2:manual]>, [{}]}] .
+                let %2:f32[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = call [derived_input_shardings=[_, {mesh<['x'=2:manual]>, [{}]}]] %0 %1 [
+                    callee={
+                        lambda %0:f32[1], %1:f32[1] .
+                        let %2:f32[1] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)"},
+        );
     }
 
     #[test]

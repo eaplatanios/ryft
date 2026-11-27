@@ -4228,8 +4228,6 @@ fn sharding_on_mesh(sharding: &Sharding, mesh: &LogicalMesh) -> Result<Sharding,
         .with_varying_manual_axes(sharding.varying_manual_axes().clone())?)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Validates that a compiled reshard on `mesh` takes a value of `data_type` placed as `input` to `output` with the
 /// value that the meaning of its reduction state gives, as far as the reduction state along each non-manual mesh axis
 /// goes. That meaning is owned by [`crate::arrays::host`], whose section on pending reductions also states the contract
@@ -4262,28 +4260,28 @@ fn validate_reduction_transition(
     output: &Sharding,
 ) -> Option<HostRoundTripCause> {
     let sum = ReductionState::Unreduced(UnreducedKind::Sum);
-    let sum_axes = |completed: bool| {
-        mesh.logical_mesh()
-            .axes()
-            .iter()
-            .filter(move |axis| {
-                axis.r#type() != MeshAxisType::Manual
-                    && ReductionState::of(input, axis.name()) == sum
-                    && (ReductionState::of(output, axis.name()) == sum) != completed
-            })
-            .map(|axis| (axis.name(), axis.size()))
-    };
-    if let Some(transition) =
-        partial_completion_rejection(data_type, UnreducedKind::Sum, sum_axes(true), sum_axes(false))
-    {
+    let input_sum_axes = mesh
+        .logical_mesh()
+        .axes()
+        .iter()
+        .filter(|axis| axis.r#type() != MeshAxisType::Manual && ReductionState::of(input, axis.name()) == sum);
+    let completed = input_sum_axes
+        .clone()
+        .filter_map(|axis| (ReductionState::of(output, axis.name()) != sum).then_some((axis.name(), axis.size())));
+    let pending = input_sum_axes
+        .filter_map(|axis| (ReductionState::of(output, axis.name()) == sum).then_some((axis.name(), axis.size())));
+
+    if let Some(transition) = partial_completion_rejection(data_type, UnreducedKind::Sum, completed, pending) {
         let remedy = "complete the sum along every mesh axis while the devices of one process hold the value";
         return Some(HostRoundTripCause::Reduction { transition, remedy });
     }
+
     for axis in mesh.logical_mesh().axes() {
         let (from, to) = (ReductionState::of(input, axis.name()), ReductionState::of(output, axis.name()));
         if axis.r#type() == MeshAxisType::Manual || from == to {
             continue;
         }
+
         let completion = match from {
             ReductionState::Unreduced(kind) if axis.size() > 1 => {
                 let classification = collective_reduction(data_type, ReductionChange::Complete(kind));
@@ -4297,6 +4295,7 @@ fn validate_reduction_transition(
             }
             _ => None,
         };
+
         let rejection = match (completion, to) {
             (Some(rejection), _) => Some(rejection),
             (None, ReductionState::Unreduced(kind @ (UnreducedKind::Max | UnreducedKind::Min))) => {
@@ -4308,15 +4307,20 @@ fn validate_reduction_transition(
             }
             _ => None,
         };
+
         if let Some((reason, remedy)) = rejection {
             let transition = format!(
-                "cannot take `{data_type}` values from {from} to {to} along mesh axis `{}` on the devices, because \
-                 {reason}",
+                "cannot take `{}` values from {} to {} along mesh axis `{}` on the devices, because {}",
+                data_type,
+                from,
+                to,
                 axis.name(),
+                reason,
             );
             return Some(HostRoundTripCause::Reduction { transition, remedy });
         }
     }
+
     None
 }
 
