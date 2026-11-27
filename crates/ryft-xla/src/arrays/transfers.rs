@@ -2862,8 +2862,6 @@ impl Display for ReductionState {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Why a placement takes [`DevicePlacementStrategy::HostRoundTrip`], which every process tells from the metadata that
 /// they share, so that every process takes the same decision (i.e., the owner does the round trip, every other process
 /// returns the metadata of the placement, and without an owner every process returns the same error).
@@ -2881,15 +2879,15 @@ enum HostRoundTripCause {
     },
 
     /// Error of the compiled reshard where shard regions do not apply either (i.e.,
-    /// [`ArrayError::ManualReshardingAxis`] or [`ArrayError::UnevenReshardingShards`], refer to
-    /// [`PlacementPlanningView::validate_compiled_reshard`]), which a process without the round trip returns as it is.
+    /// [`ArrayError::ManualReshardingAxis`] or [`ArrayError::UnevenReshardingShards`]),
+    /// which a process without the round trip returns as it is.
     Device(Error),
 }
 
 impl HostRoundTripCause {
     /// Returns the error of a placement (e.g., [`Array::to_placement`]) that no process can make with a host round
     /// trip, which needs one process that owns every device of the target and can read the source back from its
-    /// own devices (refer to [`PlacementPlanningView::host_round_trip`]).
+    /// own devices.
     fn across_processes(&self) -> Error {
         match self {
             Self::Reduction { transition, remedy } => Error::from(ProgramError::UnsupportedOperation {
@@ -2919,6 +2917,8 @@ impl HostRoundTripCause {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Buffer- and session-independent source of a placement plan.
 pub(super) struct PlacementPlanningView<'a, Shards> {
