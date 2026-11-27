@@ -713,6 +713,80 @@ impl<T: ArrayMemberType> CallOperation<T> {
 
         (includes_single_device || sharding.mesh().device_count() > 1).then_some(sharding)
     }
+
+    /// Returns `callee`, the callee of a call whose effective boundary is `boundary`, with each input type that
+    /// declares no sharding refined to the sharding of its boundary, as far as a type records it, or [`None`] when no
+    /// input type changes. The batching rules of a call batch this callee rather than the original one, so that type
+    /// inference records the placement that the batch dimension of each mapped input has at the boundary of the batched
+    /// call on the values that the batched callee computes, as it does for a callee whose input type declares that
+    /// sharding (e.g., the batch split along an explicit mesh axis of a callee compiled for an item type without a
+    /// sharding stays on its outputs instead of being gathered). The batched callee is a derived program whose input
+    /// types are only traced types, so refining them changes no boundary of the original call. A sharding over auto
+    /// mesh axes refines a type only as far as types record it (i.e., with those axes replicated), and a sharding that
+    /// does not refine the type (e.g., one with a pending reduction) is not applied.
+    fn callee_with_boundary_input_types<V, O>(
+        callee: RegionRef<'_, V, O>,
+        boundary: &[Option<Sharding>],
+    ) -> Result<Option<Program<V, O, Vec<V>, Vec<V>>>, ProgramError>
+    where
+        T: From<ArrayType>,
+        V: Value<Type = T>,
+        O: Operation<Type = T>,
+        TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
+    {
+        let declared = callee.input_types();
+        let mut refined = None::<Vec<T>>;
+        for (index, (declared_type, sharding)) in declared.iter().zip(boundary).enumerate() {
+            let (Ok(array_type), Some(sharding)) = (declared_type.as_array_type(), sharding) else { continue };
+
+            // A boundary that states more than a placement (e.g., a pending reduction) does not refine a type without
+            // a sharding, which describes a reduced value, and is left to the boundary of the batched call.
+            let Some(boundary_type) = CallOperation::boundary_input_type(array_type, sharding) else { continue };
+            refined.get_or_insert_with(|| declared.to_vec())[index] = T::from(boundary_type);
+        }
+        refined.map(|refined| callee.to_program().specialize(&refined)).transpose()
+    }
+
+    /// Returns `sharding`, the boundary sharding of each item of a value that batching maps along `axis`, with the
+    /// batch dimension inserted at that axis, `sharding` itself for an unmapped value, and [`None`] without a sharding
+    /// or when the batch dimension cannot be inserted. The per-item override states nothing about the batch dimension,
+    /// because an explicit placement under batching applies to each batch item, so the batch dimension keeps the
+    /// placement that `packed`, the type of the batched value, records for it (e.g., split along a mesh axis by the
+    /// batch specification), and is replicated when that type records none (e.g., over auto mesh axes, which types
+    /// never record).
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of [`Sharding::batched`] for a batch placement that conflicts with `sharding` (e.g., a batch
+    /// split along a mesh axis along which `sharding` already splits each item), which no placement of the batched
+    /// value can satisfy, as the batching of a compiled function by a backend rejects it.
+    fn batched_boundary_sharding(
+        sharding: Option<&Sharding>,
+        axis: &BatchAxis,
+        packed: Option<&ArrayType>,
+    ) -> Result<Option<Sharding>, BatchingError> {
+        let Some(sharding) = sharding else {
+            return Ok(None);
+        };
+
+        let Some(axis) = axis.axis() else {
+            return Ok(Some(sharding.clone()));
+        };
+
+        let rank = sharding.dimensions().len() as i128 + 1;
+        let position = if axis.value() < 0 { axis.value() + rank } else { axis.value() };
+
+        let Some(position) = usize::try_from(position).ok().filter(|&position| (position as i128) < rank) else {
+            return Ok(None);
+        };
+
+        let batch_dimension = packed
+            .and_then(ArrayType::sharding)
+            .filter(|packed| packed.rank() as i128 == rank && packed.mesh().has_same_topology(sharding.mesh()))
+            .map_or(ShardingDimension::Replicated, |packed| packed.dimensions()[position].clone());
+
+        sharding.batched(position, batch_dimension).map(Some)
+    }
 }
 
 impl CallOperation<ArrayIrType> {
@@ -1324,6 +1398,137 @@ impl CallOperation<ArrayIrType> {
                 || r#type.identities().next().is_some()
                 || atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
         })
+    }
+
+    /// Returns `value`, a tangent or cotangent that a derived call of a callee returns at a type of the callee
+    /// boundary, at `refined`, the type that the value has in the caller (e.g., the tangent type of a primal output,
+    /// or the cotangent type of a primal input). A call accepts inputs whose types refine the callee input types,
+    /// so a primal that a partial evaluation computes from such inputs (e.g., an eager array, whose type records its
+    /// sharding) can refine the type of the callee boundary, while the derived call that computes the tangent or the
+    /// cotangent of that primal returns it at the type of the callee boundary. The value has the shape and placement
+    /// of the primal, so an unchecked cast in `context` states its refined type. A value that a call whose callee names
+    /// devices returns lives on those devices, so it is cast only to a type over a mesh of the same topology. A value
+    /// whose refined type names a different mesh is returned unchanged.
+    ///
+    /// A value whose type differs from `refined` in its sharding only in dimensions that one of them leaves
+    /// unconstrained (i.e., `{?}`) and the other replicates is cast to `refined` as well (e.g., the cotangent of an
+    /// input that a call takes through an unconstrained input override). This is an unchecked cast rather than a
+    /// `reshard`, because the value is already placed as `refined` states. A runtime array stores an unconstrained
+    /// dimension replicated, so its buffers are those of `refined`. Inside a compiled program, the cast emits no
+    /// sharding constraint, because an unconstrained and a replicated dimension do not conflict over explicit mesh
+    /// axes and types record no placement over auto mesh axes, and the entry boundary of the program replicates an
+    /// unconstrained dimension of any value that it exchanges.
+    ///
+    /// A value whose type tracks a sharding, where `refined` tracks none, is cast to `refined` as well when a call
+    /// accepts an input of type `refined` for a callee input of the type of the value, as the cotangent of an input
+    /// that a staged caller of untracked type passes to a callee with an input sharding override is. This mirrors the
+    /// forward direction, where the call takes that input as it is and its lowering constrains the input to the
+    /// override, so the derivative returns to the type of the caller input. The cast only stops tracking the placement
+    /// of the value, which a type without a sharding states nothing about, and keeps its values and buffers.
+    ///
+    /// A value whose type differs from `refined` only in the placement that its sharding tracks over a mesh of the same
+    /// topology (e.g., the cotangent of a replicated argument of a callee that declares that input split, which the
+    /// call places at its effective boundary) is resharded to `refined`, so that it combines with the other cotangents
+    /// of that argument.
+    fn refine_derived_value<C>(
+        &self,
+        context: &C,
+        refined: ArrayIrType,
+        value: C::Value,
+    ) -> Result<C::Value, ProgramError>
+    where
+        C: Context<
+                Type = ArrayIrType,
+                Operation: From<CastOperation<ArrayIrType>>
+                               + OperationProjection<ArrayType, Projected: From<ReshardOperation>>,
+            >,
+    {
+        let declared = value.r#type().into_owned();
+        let moves_devices = self.mesh().is_some_and(|mesh| match &refined {
+            ArrayIrType::Array(refined) => {
+                refined.sharding().is_some_and(|sharding| !sharding.mesh().has_same_topology(mesh.logical_mesh()))
+            }
+            _ => false,
+        });
+
+        // Two distinct shardings place an array alike when they have the same logical mesh, rank, reduction state, and
+        // manual variation, and each of their dimensions is either equal in both or unconstrained (i.e., `{?}`) in one
+        // and replicated in the other, because a runtime array stores an unconstrained dimension replicated. The final
+        // comparison establishes everything but the dimensions, by giving one sharding the dimensions of the other.
+        let shardings = match (&declared, &refined) {
+            (ArrayIrType::Array(declared), ArrayIrType::Array(refined)) => declared.sharding().zip(refined.sharding()),
+            _ => None,
+        };
+        let replicates_unconstrained_dimensions = shardings.is_some_and(|(declared, refined)| {
+            declared != refined
+                && declared.rank() == refined.rank()
+                && declared.dimensions().iter().zip(refined.dimensions()).all(|dimensions| match dimensions {
+                    (ShardingDimension::Unconstrained, ShardingDimension::Replicated)
+                    | (ShardingDimension::Replicated, ShardingDimension::Unconstrained) => true,
+                    (declared, refined) => declared == refined,
+                })
+                && declared.with_dimensions(refined.dimensions().to_vec()).is_ok_and(|declared| &declared == refined)
+        });
+
+        // A value whose sharding differs from the refined one only in the placement that it tracks, over a mesh of the
+        // same topology, is resharded. Shardings that place the value alike need no reshard and are cast below.
+        if let (ArrayIrType::Array(declared), ArrayIrType::Array(refined)) = (&declared, &refined)
+            && let (Some(declared_sharding), Some(refined_sharding)) = (declared.sharding(), refined.sharding())
+            && !moves_devices
+            && declared_sharding != refined_sharding
+            && !replicates_unconstrained_dimensions
+            && declared_sharding.mesh().has_same_topology(refined_sharding.mesh())
+            && declared_sharding.unreduced_axes() == refined_sharding.unreduced_axes()
+            && declared_sharding.reduced_axes() == refined_sharding.reduced_axes()
+            && declared_sharding.varying_manual_axes() == refined_sharding.varying_manual_axes()
+            && declared.clone().with_sharding(refined_sharding.clone()).is_ok_and(|declared| &declared == refined)
+        {
+            let reshard = ReshardOperation::new(refined_sharding.clone());
+            let reshard = <<C::Operation as OperationProjection<ArrayType>>::Projected>::from(reshard);
+            return Ok(context.bind(reshard, Vec::new(), &[value])?.remove(0));
+        }
+
+        if moves_devices || refined.is_interchangeable_with(&declared) {
+            return Ok(value);
+        }
+
+        // The value is cast when the refined type refines its type as it is, and in the two cases below,
+        // which the refinement of types alone does not cover.
+        let casts = declared.is_refined_by(&refined)
+            || match (&declared, &refined) {
+                (ArrayIrType::Array(declared), ArrayIrType::Array(refined)) => {
+                    // The refined type refines the type of the value once its sharding is replaced by that of the
+                    // value, where the two shardings place the value alike.
+                    let is_refined_up_to_unconstrained_dimensions = replicates_unconstrained_dimensions && {
+                        let resharded = refined.clone().with_sharding(declared.sharding().cloned());
+                        declared.is_refined_by(&resharded.map_err(TypeError::from)?)
+                    };
+
+                    // The refined type tracks no sharding and is a type that a call accepts for a callee input of the
+                    // type of the value without varying along more manual mesh axes, which is when the type of the
+                    // value has the shape that the refined type refines and a sharding without reduction state and
+                    // without manual variation. A sharding that partitions a dimension along manual mesh axes is
+                    // excluded, because a cast cannot change placement over manual mesh axes, which inside a manual
+                    // region also determines the shape of the local value.
+                    let is_untracked_refinement = refined.sharding().is_none()
+                        && declared.sharding().is_some_and(|sharding| {
+                            sharding
+                                .dimensions()
+                                .iter()
+                                .all(|dimension| dimension.manual_axes(sharding.mesh()).is_empty())
+                        })
+                        && CallOperation::input_variation(declared, refined).is_some();
+
+                    is_refined_up_to_unconstrained_dimensions || is_untracked_refinement
+                }
+                _ => false,
+            };
+        if casts {
+            let cast = CastOperation::unchecked(refined, vec![declared])?;
+            return Ok(context.bind(cast, Vec::new(), &[value])?.remove(0));
+        }
+
+        Ok(value)
     }
 }
 
@@ -2018,7 +2223,7 @@ where
             &original.input_types(),
             inputs.iter().map(|input| Cow::Owned(input.unbatched_type())),
         );
-        let refined = with_boundary_input_types(original, &boundary)?;
+        let refined = Self::callee_with_boundary_input_types(original, &boundary)?;
         let original = refined.as_ref().map_or(original, Program::entry_region_ref);
         let (callee, axes) = driver
             .batch_program(context, original, &axes, ProgramBatchingOutputAxesPolicy::Natural)?
@@ -2033,16 +2238,16 @@ where
             _ => None,
         };
 
-        // The batched callee is created by this transform, so its declared input types are only traced types, and
-        // the batched call is a derived call in every case, which places each input at the effective boundary of the
+        // The batched callee is created by this transform, so its declared input types are only traced types, and the
+        // batched call is a derived call in every case, which places each input at the effective boundary of the
         // original call for its items (refer to `with_derived_boundary_shardings`). The boundary shardings gain the
-        // batch dimension of each batched value (refer to `batched_boundary_sharding`), and the leading extent input
-        // has none.
+        // batch dimension of each batched value (refer to `CallOperation::batched_boundary_sharding`), and the leading
+        // extent input has none.
         let derived_input_shardings = Some(
             std::iter::once(Ok(None))
                 .chain(inputs.iter().zip(&boundary).map(|(input, sharding)| {
                     let packed = array_type(&input.value().r#type());
-                    batched_boundary_sharding(sharding.as_ref(), &input.batch_axis(), packed.as_ref())
+                    Self::batched_boundary_sharding(sharding.as_ref(), &input.batch_axis(), packed.as_ref())
                 }))
                 .collect::<Result<_, _>>()?,
         );
@@ -2057,7 +2262,7 @@ where
             let input_shardings = std::iter::once(Ok(None))
                 .chain(inputs.iter().enumerate().map(|(index, input)| {
                     let packed = array_type(&input.value().r#type());
-                    batched_boundary_sharding(self.input_sharding(index), &input.batch_axis(), packed.as_ref())
+                    Self::batched_boundary_sharding(self.input_sharding(index), &input.batch_axis(), packed.as_ref())
                 }))
                 .collect::<Result<_, _>>()?;
             let output_types = callee.output_types();
@@ -2066,7 +2271,7 @@ where
                 .enumerate()
                 .map(|(index, axis)| {
                     let packed = output_types.get(index).and_then(array_type);
-                    batched_boundary_sharding(self.output_sharding(index), axis, packed.as_ref())
+                    Self::batched_boundary_sharding(self.output_sharding(index), axis, packed.as_ref())
                 })
                 .collect::<Result<_, _>>()?;
             operation.with_boundary(Some(mesh), input_shardings, output_shardings)
@@ -2118,7 +2323,7 @@ where
                 .map(|input| BatchAxis::from_optional_position(input.batch_axis_position()))
                 .collect::<Vec<_>>();
             let original = driver.region(0)?;
-            let refined = with_boundary_input_types(original, &boundary)?;
+            let refined = Self::callee_with_boundary_input_types(original, &boundary)?;
             let (batched_callee, output_axes) = driver
                 .batch_program(
                     context,
@@ -2151,7 +2356,7 @@ where
                 .map(|(input, sharding)| {
                     let axis = BatchAxis::from_optional_position(input.batch_axis_position());
                     let packed = input.value().r#type();
-                    batched_boundary_sharding(sharding.as_ref(), &axis, Some(packed.as_ref()))
+                    Self::batched_boundary_sharding(sharding.as_ref(), &axis, Some(packed.as_ref()))
                 })
                 .collect::<Result<_, _>>()?,
         );
@@ -2169,7 +2374,7 @@ where
                 .map(|(index, input)| {
                     let axis = BatchAxis::from_optional_position(input.batch_axis_position());
                     let packed = input.value().r#type();
-                    batched_boundary_sharding(self.input_sharding(index), &axis, Some(packed.as_ref()))
+                    Self::batched_boundary_sharding(self.input_sharding(index), &axis, Some(packed.as_ref()))
                 })
                 .collect::<Result<_, _>>()?;
             let output_types = batched_callee.output_types();
@@ -2178,7 +2383,7 @@ where
                 .enumerate()
                 .map(|(index, axis)| {
                     let axis = BatchAxis::from_optional_position(*axis);
-                    batched_boundary_sharding(self.output_sharding(index), &axis, output_types.get(index))
+                    Self::batched_boundary_sharding(self.output_sharding(index), &axis, output_types.get(index))
                 })
                 .collect::<Result<_, _>>()?;
             operation.with_boundary(Some(mesh), input_shardings, output_shardings)
@@ -2456,8 +2661,8 @@ where
 
         // Only the tangent call of an eager linearization keeps the mesh of the function, because only an eager context
         // applies it and the transposed call that a pullback derives from it, so that transposition may read that mesh
-        // as where its cotangents live (refer to `refined_derived_value`). The tangent call of a staged linearization
-        // is nested in a program and follows its caller.
+        // as where its cotangents live (refer to `CallOperation::refine_derived_value`). The tangent call of a staged
+        // linearization is nested in a program and follows its caller.
         let function_mesh = self.function_mesh.clone().filter(|_| context.primal().is_eager());
         let tangent_call = C::Operation::from(CallOperation {
             function_mesh,
@@ -2485,7 +2690,7 @@ where
                 } else {
                     let tangent = tangent_outputs.next().unwrap();
                     let refined = primal.r#type().tangent()?;
-                    let tangent = refined_derived_value(context.tangent(), self.mesh(), refined, tangent)?;
+                    let tangent = self.refine_derived_value(context.tangent(), refined, tangent)?;
                     DifferentiationDual::new(primal, tangent)
                 }
             })
@@ -2748,7 +2953,7 @@ where
                             }
                         }
 
-                        let cotangent = refined_derived_value(&**context, self.mesh(), refined, cotangent);
+                        let cotangent = self.refine_derived_value(&**context, refined, cotangent);
                         return Ok(MaybeZero::Value(cotangent?));
                     }
                     Some(cotangent) if !input.r#type().is_reference() => return Ok(cotangent),
@@ -3297,203 +3502,6 @@ enum CallSplitKind {
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Returns `callee`, the callee of a call whose effective boundary is `boundary` (refer to
-/// `CallOperation::effective_input_boundary`), with each input type that declares no sharding refined to the
-/// sharding of its boundary, as far as a type records it, or [`None`] when no input type changes. The batching rules
-/// of a call batch this callee rather than the original one, so that type inference records the placement that the
-/// batch dimension of each mapped input has at the boundary of the batched call on the values that the batched callee
-/// computes, as it does for a callee whose input type declares that sharding (e.g., the batch split along an explicit
-/// mesh axis of a callee compiled for an item type without a sharding stays on its outputs instead of being gathered).
-/// The batched callee is a derived program whose input types are only traced types, so refining them changes no
-/// boundary of the original call. A sharding over auto mesh axes refines a type only as far as types record it (i.e.,
-/// with those axes replicated), and a sharding that does not refine the type (e.g., one with a pending reduction) is
-/// not applied.
-fn with_boundary_input_types<T, V, O>(
-    callee: RegionRef<'_, V, O>,
-    boundary: &[Option<Sharding>],
-) -> Result<Option<Program<V, O, Vec<V>, Vec<V>>>, ProgramError>
-where
-    T: ArrayMemberType + From<ArrayType>,
-    V: Value<Type = T>,
-    O: Operation<Type = T>,
-    TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
-{
-    let declared = callee.input_types();
-    let mut refined = None::<Vec<T>>;
-    for (index, (declared_type, sharding)) in declared.iter().zip(boundary).enumerate() {
-        let (Ok(array_type), Some(sharding)) = (declared_type.as_array_type(), sharding) else { continue };
-        // A boundary that states more than a placement (e.g., a pending reduction) does not refine a type without a
-        // sharding, which describes a reduced value, and is left to the boundary of the batched call.
-        let Some(boundary_type) = CallOperation::boundary_input_type(array_type, sharding) else { continue };
-        refined.get_or_insert_with(|| declared.to_vec())[index] = T::from(boundary_type);
-    }
-    refined.map(|refined| callee.to_program().specialize(&refined)).transpose()
-}
-
-/// Returns `sharding`, the boundary sharding of each item of a value that batching maps along `axis`, with the batch
-/// dimension inserted at that axis, `sharding` itself for an unmapped value, and [`None`] without a sharding or when
-/// the batch dimension cannot be inserted. The per-item override states nothing about the batch dimension, because an
-/// explicit placement under batching applies to each batch item, so the batch dimension keeps the placement that
-/// `packed`, the type of the batched value, records for it (e.g., split along a mesh axis by the batch specification),
-/// and is replicated when that type records none (e.g., over auto mesh axes, which types never record).
-///
-/// # Errors
-///
-/// Returns the error of [`Sharding::batched`] for a batch placement that conflicts with `sharding` (e.g., a batch split
-/// along a mesh axis along which `sharding` already splits each item), which no placement of the batched value can
-/// satisfy, as the batching of a compiled function by a backend rejects it.
-fn batched_boundary_sharding(
-    sharding: Option<&Sharding>,
-    axis: &BatchAxis,
-    packed: Option<&ArrayType>,
-) -> Result<Option<Sharding>, BatchingError> {
-    let Some(sharding) = sharding else {
-        return Ok(None);
-    };
-    let Some(axis) = axis.axis() else {
-        return Ok(Some(sharding.clone()));
-    };
-    let rank = sharding.dimensions().len() as i128 + 1;
-    let position = if axis.value() < 0 { axis.value() + rank } else { axis.value() };
-    let Some(position) = usize::try_from(position).ok().filter(|&position| (position as i128) < rank) else {
-        return Ok(None);
-    };
-    let batch_dimension = packed
-        .and_then(ArrayType::sharding)
-        .filter(|packed| packed.rank() as i128 == rank && packed.mesh().has_same_topology(sharding.mesh()))
-        .map_or(ShardingDimension::Replicated, |packed| packed.dimensions()[position].clone());
-    sharding.batched(position, batch_dimension).map(Some)
-}
-
-/// Returns `value`, a tangent or cotangent that a derived call of a callee returns at a type of the callee boundary, at
-/// `refined`, the type that the value has in the caller (e.g., the tangent type of a primal output, or the cotangent
-/// type of a primal input). A call accepts inputs whose types refine the callee input types (refer to
-/// `CallOperation::validate_input_types`), so a primal that a partial evaluation computes from such inputs (e.g.,
-/// an eager array, whose type records its sharding) can refine the type of the callee boundary, while the derived call
-/// that computes the tangent or the cotangent of that primal returns it at the type of the callee boundary. The value
-/// has the shape and placement of the primal, so an unchecked cast in `context` states its refined type. A value that a
-/// call whose callee names devices on `mesh` returns lives on those devices, so it is cast only to a type over a mesh
-/// of the same topology. A value whose refined type names a different mesh is returned unchanged.
-///
-/// A value whose type differs from `refined` in its sharding only in dimensions that one of them leaves unconstrained
-/// (i.e., `{?}`) and the other replicates is cast to `refined` as
-/// well (e.g., the cotangent of an input that a call takes through an unconstrained input override). This is an
-/// unchecked cast rather than a `reshard`, because the value is already placed as `refined` states. A runtime array
-/// stores an unconstrained dimension replicated, so its buffers are those of `refined`. Inside a compiled program, the
-/// cast emits no sharding constraint, because an unconstrained and a replicated dimension do not conflict over explicit
-/// mesh axes and types record no placement over auto mesh axes, and the entry boundary of the program replicates an
-/// unconstrained dimension of any value that it exchanges.
-///
-/// A value whose type tracks a sharding, where `refined` tracks none, is cast to `refined` as well when a call accepts
-/// an input of type `refined` for a callee input of the type of the value, as the cotangent of an input that a staged
-/// caller of untracked type passes to a callee with an input sharding override is. This mirrors the forward direction,
-/// where the call takes that input as it is (refer to `CallOperation::input_variation`) and its lowering constrains the
-/// input to the override, so the derivative returns to the type of the caller input. The cast only stops tracking the
-/// placement of the value, which a type without a sharding states nothing about, and keeps its values and buffers.
-///
-/// A value whose type differs from `refined` only in the placement that its sharding tracks over a mesh of the same
-/// topology (e.g., the cotangent of a replicated argument of a callee that declares that input split, which the call
-/// places at its effective boundary, refer to [`CallOperation::boundary_input_sharding`]) is resharded to `refined`,
-/// so that it combines with the other cotangents of that argument, as JAX returns the cotangent of a `jit` argument
-/// with the sharding of that argument.
-fn refined_derived_value<C>(
-    context: &C,
-    mesh: Option<&DeviceMesh>,
-    refined: ArrayIrType,
-    value: C::Value,
-) -> Result<C::Value, ProgramError>
-where
-    C: Context<
-            Type = ArrayIrType,
-            Operation: From<CastOperation<ArrayIrType>>
-                           + OperationProjection<ArrayType, Projected: From<ReshardOperation>>,
-        >,
-{
-    let declared = value.r#type().into_owned();
-    let moves_devices = mesh.is_some_and(|mesh| match &refined {
-        ArrayIrType::Array(refined) => {
-            refined.sharding().is_some_and(|sharding| !sharding.mesh().has_same_topology(mesh.logical_mesh()))
-        }
-        _ => false,
-    });
-
-    // Two distinct shardings place an array alike when they have the same logical mesh, rank, reduction state, and
-    // manual variation, and each of their dimensions is either equal in both or unconstrained (i.e., `{?}`) in one and
-    // replicated in the other, because a runtime array stores an unconstrained dimension replicated. The final
-    // comparison establishes everything but the dimensions, by giving one sharding the dimensions of the other.
-    let shardings = match (&declared, &refined) {
-        (ArrayIrType::Array(declared), ArrayIrType::Array(refined)) => declared.sharding().zip(refined.sharding()),
-        _ => None,
-    };
-    let replicates_unconstrained_dimensions = shardings.is_some_and(|(declared, refined)| {
-        declared != refined
-            && declared.rank() == refined.rank()
-            && declared.dimensions().iter().zip(refined.dimensions()).all(|dimensions| match dimensions {
-                (ShardingDimension::Unconstrained, ShardingDimension::Replicated)
-                | (ShardingDimension::Replicated, ShardingDimension::Unconstrained) => true,
-                (declared, refined) => declared == refined,
-            })
-            && declared.with_dimensions(refined.dimensions().to_vec()).is_ok_and(|declared| &declared == refined)
-    });
-
-    // A value whose sharding differs from the refined one only in the placement that it tracks, over a mesh of the
-    // same topology, is resharded. Shardings that place the value alike need no reshard and are cast below.
-    if let (ArrayIrType::Array(declared), ArrayIrType::Array(refined)) = (&declared, &refined)
-        && let (Some(declared_sharding), Some(refined_sharding)) = (declared.sharding(), refined.sharding())
-        && !moves_devices
-        && declared_sharding != refined_sharding
-        && !replicates_unconstrained_dimensions
-        && declared_sharding.mesh().has_same_topology(refined_sharding.mesh())
-        && declared_sharding.unreduced_axes() == refined_sharding.unreduced_axes()
-        && declared_sharding.reduced_axes() == refined_sharding.reduced_axes()
-        && declared_sharding.varying_manual_axes() == refined_sharding.varying_manual_axes()
-        && declared.clone().with_sharding(refined_sharding.clone()).is_ok_and(|declared| &declared == refined)
-    {
-        let reshard = ReshardOperation::new(refined_sharding.clone());
-        let reshard = <<C::Operation as OperationProjection<ArrayType>>::Projected>::from(reshard);
-        return Ok(context.bind(reshard, Vec::new(), &[value])?.remove(0));
-    }
-
-    if moves_devices || refined.is_interchangeable_with(&declared) {
-        return Ok(value);
-    }
-
-    // The value is cast when the refined type refines its type as it is, and in the two cases below, which the
-    // refinement of types alone does not cover.
-    let casts = declared.is_refined_by(&refined)
-        || match (&declared, &refined) {
-            (ArrayIrType::Array(declared), ArrayIrType::Array(refined)) => {
-                // The refined type refines the type of the value once its sharding is replaced by that of the value,
-                // where the two shardings place the value alike.
-                let is_refined_up_to_unconstrained_dimensions = replicates_unconstrained_dimensions && {
-                    let resharded = refined.clone().with_sharding(declared.sharding().cloned());
-                    declared.is_refined_by(&resharded.map_err(TypeError::from)?)
-                };
-
-                // The refined type tracks no sharding and is a type that a call accepts for a callee input of the type
-                // of the value without varying along more manual mesh axes, which is when the type of the value has the
-                // shape that the refined type refines and a sharding without reduction state and without manual
-                // variation. A sharding that partitions a dimension along manual mesh axes is excluded, because a cast
-                // cannot change placement over manual mesh axes, which inside a manual region also determines the shape
-                // of the local value.
-                let is_untracked_refinement = refined.sharding().is_none()
-                    && declared.sharding().is_some_and(|sharding| {
-                        sharding.dimensions().iter().all(|dimension| dimension.manual_axes(sharding.mesh()).is_empty())
-                    })
-                    && CallOperation::input_variation(declared, refined).is_some();
-
-                is_refined_up_to_unconstrained_dimensions || is_untracked_refinement
-            }
-            _ => false,
-        };
-    if casts {
-        let cast = CastOperation::unchecked(refined, vec![declared])?;
-        return Ok(context.bind(cast, Vec::new(), &[value])?.remove(0));
-    }
-
-    Ok(value)
-}
 
 #[cfg(test)]
 mod tests {
@@ -11030,7 +11038,7 @@ mod tests {
     }
 
     #[test]
-    fn test_refined_derived_value() {
+    fn test_call_operation_refine_derived_value() {
         // Each case stages the value of a derived call at its `declared` type and states the `refined` type that it has
         // in the caller, over a mesh with an explicit axis `x` and a manual axis `y`.
         let axes = |axis_type: MeshAxisType| {
@@ -11045,7 +11053,8 @@ mod tests {
         let stage = |declared: &ArrayType, refined: &ArrayType, call_mesh: Option<&DeviceMesh>| {
             let context = TracingContext::<TestValue, TestOperation>::new();
             let value = context.input(ArrayIrType::Array(declared.clone()));
-            let value = refined_derived_value(&context, call_mesh, ArrayIrType::Array(refined.clone()), value).unwrap();
+            let call = CallOperation::<ArrayIrType>::new(0).with_boundary(call_mesh, Vec::new(), Vec::new());
+            let value = call.refine_derived_value(&context, ArrayIrType::Array(refined.clone()), value).unwrap();
             context
                 .builder()
                 .borrow()

@@ -2694,12 +2694,9 @@ impl ShardMove {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Program that a placement compiles and runs on the devices of one mesh to reshard an array there, which is the
-/// identity with sharding annotations on its input and its output (refer to [`Self::compile`]). The strategy of a
-/// placement fixes its programs from information that every process shares, so every process that runs one of them
-/// runs the same program.
+/// identity with sharding annotations on its input and its output. The strategy of a placement fixes its programs
+/// from information that every process shares, so every process that runs one of them runs the same program.
 #[derive(Clone, Debug, PartialEq)]
 struct ReshardProgram {
     /// Mesh whose devices run the program, which is the mesh of its input and of its output.
@@ -2713,27 +2710,26 @@ struct ReshardProgram {
 }
 
 impl ReshardProgram {
-    /// Returns whether the process with index `process_index` runs this program, which is the case exactly when it
-    /// owns a device of its mesh. Any other process holds no buffer that the program reads or writes and takes part in
-    /// none of its collectives, and its PJRT client cannot compile a program for devices that it does not address, so
-    /// it compiles and runs nothing and only derives the metadata of the output (refer to [`Self::execute`]).
+    /// Returns whether the process with index `process_index` runs this program, which is the case exactly when it owns
+    /// a device of its mesh. Any other process holds no buffer that the program reads or writes and takes part in none
+    /// of its collectives, and its PJRT client cannot compile a program for devices that it does not address, so it
+    /// compiles and runs nothing and only derives the metadata of the output.
     fn runs_on(&self, process_index: usize) -> bool {
         self.mesh.devices().iter().any(|device| device.process_index() == process_index)
     }
 
     /// Returns the mesh over which this program is compiled, which is [`Self::mesh`] with the explicit axes along which
-    /// the program changes the reduction state (refer to [`ReductionState`]) typed as auto, and the auto axes along
-    /// which it keeps a pending reduction typed as explicit. The program only moves data, so the types of the axes of
-    /// its shardings change nothing that it computes, but over an explicit axis a type records reduction state, which
-    /// no staged operation may change (i.e., a `reshard` keeps it, refer to
-    /// [`ReshardOperation`](ryft_core::ReshardOperation)). Over an auto axis the type omits it, so the lowering makes
-    /// the change instead (i.e., it completes a pending reduction where the input enters the program, and the output
-    /// sharding introduces a pending sum or a completed reduction), with the arithmetic of XLA, which
-    /// [`validate_reduction_transition`] compares with the meaning of the reduction before a program is planned. A
-    /// pending reduction that the program keeps therefore moves over an explicit axis, as its contributions, without
+    /// the program changes the [`ReductionState`] typed as auto, and the auto axes along which it keeps a pending
+    /// reduction typed as explicit. The program only moves data, so the types of the axes of its shardings change
+    /// nothing that it computes, but over an explicit axis a type records reduction state, which no staged operation
+    /// may change (i.e., a [`reshard`](ryft_core::ReshardOperation) keeps it). Over an auto axis the type omits it,
+    /// so the lowering makes the change instead (i.e., it completes a pending reduction where the input enters the
+    /// program, and the output sharding introduces a pending sum or a completed reduction), with the arithmetic of XLA,
+    /// which [`validate_reduction_transition`] compares with the meaning of the reduction before a program is planned.
+    /// A pending reduction that the program keeps therefore moves over an explicit axis, as its contributions, without
     /// being completed and introduced again, which preserves the value of every data type and needs no collective.
     /// Every other axis keeps its type.
-    fn compiled_mesh(&self) -> Result<DeviceMesh, Error> {
+    fn compilation_mesh(&self) -> Result<DeviceMesh, Error> {
         let logical_mesh = self.mesh.logical_mesh();
         let (mut changed_axes, mut kept_axes) = (Vec::new(), Vec::new());
         for axis in logical_mesh.axes() {
@@ -2747,24 +2743,26 @@ impl ReshardProgram {
                 _ => {}
             }
         }
+
         if changed_axes.is_empty() && kept_axes.is_empty() {
             return Ok(self.mesh.clone());
         }
+
         let logical_mesh = logical_mesh
             .with_axis_types(changed_axes, MeshAxisType::Auto)?
             .with_axis_types(kept_axes, MeshAxisType::Explicit)?;
+
         Ok(DeviceMesh::new(logical_mesh, self.mesh.devices().to_vec())?)
     }
 
-    /// Compiles this program, the identity that reshards `array`, which must be on the mesh of this program with its
-    /// input sharding, to its output sharding, or returns `None` when this process does not run this program (refer to
-    /// [`Self::runs_on`]). The program is compiled over [`Self::compiled_mesh`], which types the explicit mesh axes
-    /// along which it changes the reduction state as auto, and [`Self::execute`] then moves `array` onto that mesh and
-    /// its result back. The input and the output of the program are declared in the memory of `array`, so the program
-    /// accepts `array` and returns its result in the same memory. If `donate` is `true`, the input of the program is
-    /// marked as donated so that PJRT can reuse the memory of its buffers for the output buffers. The compilation
-    /// cache is keyed by the complete lowered computation, including its input and output sharding annotations and
-    /// PJRT options.
+    /// Compiles the reshard as an identity program with sharding annotations on its input and output. The input
+    /// `array` must already be on this program's mesh with the declared input sharding. Returns [`None`] on a process
+    /// that owns none of the mesh's devices. Compilation uses [`Self::compilation_mesh`], which types the explicit mesh
+    /// axes along which the program changes the reduction state as auto. [`Self::execute`] moves `array` onto that mesh
+    /// and moves the result back. The input and output are declared in the memory of `array`, so the program accepts
+    /// `array` and returns its result in the same memory. If `donate` is `true`, the input of the program is marked as
+    /// donated so that PJRT can reuse the memory of its buffers for the output buffers. The compilation cache is keyed
+    /// by the complete lowered computation, including its input and output sharding annotations and PJRT options.
     fn compile(&self, array: &Array, donate: bool) -> Result<Option<CompiledFunction<ArrayType, ArrayType>>, Error> {
         let session = array.session();
         if !self.runs_on(session.client().process_index()?) {
@@ -2774,9 +2772,8 @@ impl ReshardProgram {
         // Build the bare input type, which has no sharding, for tracing. The input and output shardings are attached
         // as `sdy.sharding` attributes through `Options::with_input_shardings` and `Options::with_output_shardings`.
         // The type keeps the memory of the array, which the identity carries over to the output.
-        let bare_input_type =
-            ArrayType::new(array.data_type(), array.shape().into()).with_memory(array.r#type().memory());
-        let mesh = self.compiled_mesh()?;
+        let input_type = ArrayType::new(array.data_type(), array.shape().into()).with_memory(array.r#type().memory());
+        let mesh = self.compilation_mesh()?;
         let (input, output) = if mesh == self.mesh {
             (self.input.clone(), self.output.clone())
         } else {
@@ -2788,18 +2785,16 @@ impl ReshardProgram {
             .with_input_shardings(vec![input])
             .with_output_shardings(vec![output])
             .with_donate(donate);
-        let staged = stage(|input| input, bare_input_type, options)?;
+        let staged = stage(|input| input, input_type, options)?;
 
         Ok(Some(session.compile_staged_function(staged)?))
     }
 
     /// Executes `compiled`, which [`Self::compile`] compiled from this program for `array`, on `array`. Without
     /// `compiled` (i.e., in a process that does not run this program), this function runs nothing and returns the
-    /// metadata of the output of this program (refer to [`Array::place_without_local_buffers`]). The execution fence
-    /// of the result joins the execution fence of `array` with the fence of the launch (refer to the documentation of
-    /// this module). This function takes `array` by value so that a donation takes effect.
-    ///
-    /// The executable runs on [`Self::compiled_mesh`], so when that mesh types an axis differently, `array` enters it
+    /// metadata of the output of this program. The execution fence of the result joins the execution fence of `array`
+    /// with the fence of the launch. This function takes `array` by value so that a donation takes effect. The
+    /// executable runs on [`Self::compilation_mesh`], so when that mesh types an axis differently, `array` enters it
     /// as the same shards on that mesh, and its result leaves it as the same shards on the mesh of this program. Both
     /// conversions preserve pending reductions, storage, and completion fences.
     fn execute(&self, array: Array, compiled: Option<&CompiledFunction<ArrayType, ArrayType>>) -> Result<Array, Error> {
@@ -2810,7 +2805,7 @@ impl ReshardProgram {
         let mut completion = PlacementCompletion::default();
         completion.track_fence(array.execution_fence());
         let session = array.session().clone();
-        let mesh = self.compiled_mesh()?;
+        let mesh = self.compilation_mesh()?;
         let mut output = if mesh == self.mesh {
             compiled.executable().execute(&session, array)?
         } else {
@@ -2829,6 +2824,45 @@ impl ReshardProgram {
         Ok(output)
     }
 }
+
+/// Reduction state of a value along one mesh axis, which a [`Sharding`] records per axis (with one [`UnreducedKind`]
+/// for all of its unreduced axes), and which a [`ReshardProgram`] keeps or changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReductionState {
+    /// The devices along the axis hold contributions that combine with a pending reduction of this kind.
+    Unreduced(UnreducedKind),
+
+    /// The devices along the axis hold the result of a completed reduction.
+    Reduced,
+
+    /// The axis carries no reduction state.
+    Free,
+}
+
+impl ReductionState {
+    /// Returns the reduction state of a value placed as `sharding` along the mesh axis named `axis`.
+    fn of(sharding: &Sharding, axis: &str) -> Self {
+        if sharding.unreduced_axes().contains(axis) {
+            Self::Unreduced(sharding.unreduced_kind())
+        } else if sharding.reduced_axes().contains(axis) {
+            Self::Reduced
+        } else {
+            Self::Free
+        }
+    }
+}
+
+impl Display for ReductionState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreduced(kind) => write!(formatter, "a pending `{kind}` reduction"),
+            Self::Reduced => write!(formatter, "a completed reduction"),
+            Self::Free => write!(formatter, "no reduction state"),
+        }
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Why a placement takes [`DevicePlacementStrategy::HostRoundTrip`], which every process tells from the metadata that
 /// they share, so that every process takes the same decision (i.e., the owner does the round trip, every other process
@@ -3559,43 +3593,6 @@ impl PlacementCompletion {
     }
 }
 
-/// Reduction state of a value along one mesh axis, which a [`Sharding`] records per axis (with one
-/// [`UnreducedKind`] for all of its unreduced axes), and which a [`ReshardProgram`] keeps or changes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReductionState {
-    /// The devices along the axis hold contributions that combine with a pending reduction of this kind.
-    Unreduced(UnreducedKind),
-
-    /// The devices along the axis hold the result of a completed reduction.
-    Reduced,
-
-    /// The axis carries no reduction state.
-    Free,
-}
-
-impl ReductionState {
-    /// Returns the reduction state of a value placed as `sharding` along the mesh axis named `axis`.
-    fn of(sharding: &Sharding, axis: &str) -> Self {
-        if sharding.unreduced_axes().contains(axis) {
-            Self::Unreduced(sharding.unreduced_kind())
-        } else if sharding.reduced_axes().contains(axis) {
-            Self::Reduced
-        } else {
-            Self::Free
-        }
-    }
-}
-
-impl Display for ReductionState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unreduced(kind) => write!(formatter, "a pending `{kind}` reduction"),
-            Self::Reduced => write!(formatter, "a completed reduction"),
-            Self::Free => write!(formatter, "no reduction state"),
-        }
-    }
-}
-
 /// Part that one process takes in a [`ShardMove`], which follows from the processes of its two devices alone, so that
 /// every process derives the parts of all processes alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4298,7 +4295,7 @@ fn sharding_on_mesh(sharding: &Sharding, mesh: &LogicalMesh) -> Result<Sharding,
 /// (refer to [`ReductionState`]) along each non-manual mesh axis goes. That meaning is owned by
 /// [`crate::arrays::host`], whose section on pending reductions also states the contract of floating point sums. The
 /// program keeps the state of an axis as its contributions, which preserves every value, and it makes every other
-/// change with a collective of XLA (refer to [`ReshardProgram::compiled_mesh`]). The device path is taken exactly when
+/// change with a collective of XLA (refer to [`ReshardProgram::compilation_mesh`]). The device path is taken exactly when
 /// that collective computes that meaning up to that contract, which is the case as follows.
 ///
 ///   - **Completing a pending reduction:** Exact only where [`collective_reduction`] classifies the completion as
@@ -8978,7 +8975,7 @@ mod tests {
         // Every change of reduction state that the planner leaves to a compiled reshard lowers, because the lowering
         // rejects the changes that the same classification (`collective_reduction`) does not let the planner make on
         // the devices. Each such cell lowers the program that `ReshardProgram::compile` stages, over the
-        // mesh of `ReshardProgram::compiled_mesh`, for every data type with values, both axis types, and every pair of
+        // mesh of `ReshardProgram::compilation_mesh`, for every data type with values, both axis types, and every pair of
         // states (none, a pending sum, maximum, or minimum, and a completed reduction). A cell that introduces a
         // pending sum plans the program of its placement without that sum, whose identities are written without a
         // program. Only lowering runs, so that a wrong plan cannot abort the test process.
@@ -9060,9 +9057,9 @@ mod tests {
                         }
                         let program =
                             ReshardProgram { mesh: mesh.clone(), input: input.clone(), output: output.clone() };
-                        let compiled_mesh = program.compiled_mesh().unwrap();
-                        let logical_mesh = compiled_mesh.logical_mesh().clone();
-                        let options = Options::new(compiled_mesh)
+                        let compilation_mesh = program.compilation_mesh().unwrap();
+                        let logical_mesh = compilation_mesh.logical_mesh().clone();
+                        let options = Options::new(compilation_mesh)
                             .with_input_shardings(vec![input.with_mesh(logical_mesh.clone()).unwrap()])
                             .with_output_shardings(vec![output.with_mesh(logical_mesh).unwrap()]);
                         let r#type = ArrayType::new_static(data_type, [4]);
