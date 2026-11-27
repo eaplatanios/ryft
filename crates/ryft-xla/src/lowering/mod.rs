@@ -1172,9 +1172,7 @@ pub(crate) mod tests {
 
     use crate::devices::MemoryExtension;
     use crate::lowering::LoweringError;
-    use crate::lowering::modules::{
-        merge_logical_meshes, normalize_function_name, remove_unused_constants, serialize_lowered_module,
-    };
+    use crate::lowering::modules::{merge_logical_meshes, normalize_function_name, serialize_lowered_module};
 
     use crate::lowering::regions::tests::lower_plain_program_outputs;
 
@@ -1229,7 +1227,7 @@ pub(crate) mod tests {
         let function_name = normalize_function_name(function_name.as_ref())?;
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let module = context.module(location)?;
+        let mut module = context.module(location)?;
         // This entry point lowers one whole module, so the program lowering state is scoped to that module.
         let lowering_state =
             ProgramLoweringState::new().with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy);
@@ -1322,7 +1320,7 @@ pub(crate) mod tests {
             )?
         })?;
 
-        remove_unused_constants(&module)?;
+        module.remove_unused_stable_hlo_constants()?;
         if !module.verify()? {
             return Err(Error::Lowering(LoweringError::VerificationFailure));
         }

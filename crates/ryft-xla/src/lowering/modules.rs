@@ -15,15 +15,13 @@ use ryft_core::{
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
-    Attribute, Block, BlockRef, Context as MlirContext, DetachedBlock, Location, LocationRef, Module,
-    Operation as MlirOperation, OperationPrintingFlags, Region, Type as MlirType, TypeAndAttributes,
-    Value as MlirValue, WalkOrder, WalkResult,
+    Attribute, Block, Context as MlirContext, DetachedBlock, Location, LocationRef, Module, Operation as MlirOperation,
+    OperationPrintingFlags, Type as MlirType, TypeAndAttributes, Value as MlirValue, WalkOrder, WalkResult,
 };
 
 use crate::arrays::host::ReductionChange;
 use crate::devices::MemoryExtension;
 use crate::lowering::emissions::{emitted_regions, partition_session_constants, unread_entry_arguments};
-use crate::lowering::programs::{MlirProgram, ProgramLoweringOptions};
 use crate::lowering::reductions::{
     ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
     validate_pending_reduction_change,
@@ -37,200 +35,10 @@ use crate::lowering::types::{
     validate_boundary_memory,
 };
 use crate::lowering::{EffectTokens, LowerableOperationFamily, LoweringError};
-use crate::operations::call::{CallFunctionMap, collect_call_functions, emit_call_function};
-use crate::operations::composites::{collect_named_composition_functions, emit_named_composition_function};
-use crate::{
-    CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement, SHARDY_MESH_SYMBOL_NAME,
-    Type, normalize_runtime_requirements,
-};
+use crate::operations::call::CallFunctionMap;
+use crate::{CompilationError, Constant, Error, ExecutionError, RetainedArray, SHARDY_MESH_SYMBOL_NAME, Type};
 
 // TODO(eaplatanios): Review this module.
-
-/// Lowers `program` to a StableHLO/Shardy MLIR module whose entry function is named `function_name`, validating
-/// its reference state aliases and entry boundary. The boundary is the one that [`ProgramLoweringExtension::to_mlir`]
-/// resolves from its options, which this function takes as it is.
-///
-/// # Parameters
-///
-///   - `program`: Program to lower, as lowering emits it (i.e., already pruned when pruning is requested).
-///   - `function_name`: Symbol name of the entry function.
-///   - `capture_types`: Types of the hidden capture arguments that precede the inputs, which end with the types of
-///     the session constants of `program`.
-///   - `input_types`: Global types of the inputs.
-///   - `output_types`: Global types of the outputs.
-///   - `argument_shardings`: Optional sharding of each entry function argument (i.e., captures first).
-///   - `output_shardings`: Optional sharding of each entry function result.
-///   - `open_outputs`: Whether each result is lowered open over auto mesh axes, so that the compiler chooses its
-///     placement over those axes (i.e., one flag per result, or none at all).
-///   - `options`: Options that provide the target platform, the reference states, the donated and unread inputs,
-///     the ragged dot lowering strategy, and whether the entry function exports its ordered I/O token chain.
-///
-/// [`ProgramLoweringExtension::to_mlir`]: crate::ProgramLoweringExtension::to_mlir
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_mlir_program<O, ProgramInput, ProgramOutput>(
-    program: &Program<Constant, O, ProgramInput, ProgramOutput>,
-    function_name: &str,
-    capture_types: &[ArrayType],
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-    argument_shardings: &[Option<Sharding>],
-    output_shardings: &[Option<Sharding>],
-    open_outputs: &[bool],
-    options: &ProgramLoweringOptions,
-) -> Result<MlirProgram, Error>
-where
-    O: LowerableOperationFamily,
-    ProgramInput: Parameterized<Constant>,
-    ProgramOutput: Parameterized<Constant>,
-{
-    let target_platform = options.target_platform();
-    let supports_shardy = options.supports_shardy();
-    let reference_states = options.reference_bindings();
-    let donated_inputs = options.donated_inputs();
-    let unread_inputs = options.unread_inputs();
-    let ragged_dot_lowering_strategy = options.ragged_dot_lowering_strategy();
-    let export_effects = options.exports_effects();
-    let boundary = plan_entry_boundary(
-        program,
-        capture_types,
-        input_types,
-        output_types,
-        function_name,
-        argument_shardings,
-        output_shardings,
-        target_platform,
-        reference_states,
-        donated_inputs,
-        unread_inputs,
-        open_outputs,
-        export_effects,
-    )?;
-
-    let context = MlirContext::new();
-    let location = context.unknown_location();
-    let module = context.module(location)?;
-
-    // Emit `sdy.mesh` declarations for any sharding referenced either by inner operations or by the optional
-    // signature shardings, so the `func.func` attributes can refer to `@mesh`.
-    let mut signature_mesh = None;
-    for sharding in argument_shardings.iter().chain(output_shardings).flatten() {
-        signature_mesh = Some(match signature_mesh.take() {
-            Some(existing_mesh) => merge_logical_meshes(existing_mesh, sharding.mesh())?,
-            None => sharding.mesh().clone(),
-        });
-    }
-    let mesh = collect_nested_sharding_mesh(program, signature_mesh, target_platform)?;
-    if let Some(mesh) = mesh.as_ref() {
-        let mesh_operation = mesh.lower(location)?;
-        module.body()?.append_operation(mesh_operation)?;
-    }
-
-    // Trace each distinct named semantic decomposition once and retain it in the lowering state of the module, so
-    // that the entry and nested function bodies resolve the same private symbol.
-    let named_compositions = Rc::new(collect_named_composition_functions(program, target_platform)?);
-
-    // Module-scoped lowering state, shared between the entry function body and private functions below so channel
-    // ids stay unique and target, representation policy, named compositions, and provenance state reach nested
-    // bodies. The arrays that the program only passes on to calls that never read them follow the session constants
-    // in the table, and the entry function binds them to values that require no buffer (refer to
-    // `partition_session_constants`).
-    let lowering_state = ProgramLoweringState::new()
-        .with_target_platform(target_platform)
-        .with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy)
-        .with_named_compositions(named_compositions.clone())
-        .with_session_constants(
-            &[boundary.session_constants.as_slice(), boundary.passed_on_constants.as_slice()].concat(),
-        );
-
-    // Deduplicate `call` callees that occur more than once into shared private `func.func`s, so repeated nested
-    // programs (e.g., identical transformer blocks or the per-block primal and pullback programs of `grad`) lower
-    // to one function plus N `func.call`s instead of N inlined copies. The map is empty for modules without
-    // repeated calls, in which case every `call` inlines exactly as before.
-    let nested_functions = Rc::new(collect_call_functions(program, target_platform)?);
-    {
-        let mut module_block = module.body()?;
-        for key in named_compositions.order() {
-            let function = named_compositions.functions().get(key).unwrap();
-            emit_named_composition_function(&mut module_block, function, &lowering_state, &context, location.as_ref())?;
-        }
-        for key in nested_functions.order() {
-            let function = nested_functions.functions().get(key).unwrap();
-            emit_call_function(
-                &mut module_block,
-                function,
-                &nested_functions,
-                &lowering_state,
-                &context,
-                location.as_ref(),
-            )?;
-        }
-    }
-
-    let (function_arguments, function_results) = entry_function_attributes(
-        &boundary,
-        argument_shardings,
-        output_shardings,
-        open_outputs,
-        mesh.is_some(),
-        supports_shardy,
-        target_platform,
-        &context,
-        location.as_ref(),
-    )?;
-    module.body()?.append_operation({
-        let argument_types = function_arguments.iter().map(|argument| (argument.r#type, location)).collect::<Vec<_>>();
-        let function_block = context.block(argument_types.as_slice());
-        lower_entry_function_body(
-            program,
-            &boundary,
-            capture_types.len(),
-            argument_shardings,
-            supports_shardy,
-            &function_block,
-            &nested_functions,
-            &lowering_state,
-            &context,
-            location.as_ref(),
-        )?;
-        let mut function_region = context.region();
-        function_region.append_block(function_block)?;
-        func::func(
-            boundary.function_name.as_str(),
-            func::FuncAttributes { arguments: function_arguments, results: function_results, ..Default::default() },
-            function_region,
-            location,
-        )?
-    })?;
-    let mut signature = boundary.signature;
-    let mesh = declare_constrained_mesh(&module, program, mesh, target_platform, location.as_ref())?;
-    if !supports_shardy {
-        remove_shardy_operations(&module)?;
-    }
-
-    remove_unused_constants(&module)?;
-    if !module.verify()? {
-        return Err(Error::Lowering(LoweringError::VerificationFailure));
-    }
-    if lowering_state.has_assertions() {
-        signature.require_assertion_handler();
-    }
-    let requires_assertion_handler = signature.requires_assertion_handler();
-    let mut runtime_requirements = lowering_state.runtime_requirements();
-    if requires_assertion_handler {
-        runtime_requirements.push(RuntimeRequirement::builtin("ryft.assert"));
-    }
-    if signature.has_ordered_io() {
-        runtime_requirements.push(RuntimeRequirement::builtin("ryft.ordered-io"));
-    }
-    let runtime_requirements = normalize_runtime_requirements(runtime_requirements)?.into();
-    Ok(MlirProgram::new(
-        serialize_lowered_module(&module, &lowering_state)?,
-        signature,
-        requires_assertion_handler,
-        runtime_requirements,
-        mesh,
-    ))
-}
 
 /// Returns `true` if any operation in a region of `program` that lowering emits (i.e., its entry region and the
 /// executed nested regions of that region) carries unresolved ordered state.
@@ -512,27 +320,34 @@ pub(crate) fn cast_changes_explicit_placement(input_type: &ArrayType, output_typ
     }
 }
 
-/// Removes every `stablehlo.constant` operation whose result has no uses from `module`, including those in nested
-/// regions. Lowering materializes first-class dimension extents eagerly (refer to
-/// [`DimensionValueLoweringExtension::lower`](crate::lowering::types::DimensionValueLoweringExtension::lower)), while
-/// their consumers often read them only for dynamic axes (e.g., the explicit-extent collectives only refine dynamic
-/// result axes), so a static extent would otherwise remain in the lowered module as a dead constant. Constants are
-/// pure, so removing an unused one never changes the semantics of the module.
-pub(crate) fn remove_unused_constants(module: &Module<'_, '_>) -> Result<(), Error> {
-    remove_unused_constants_in_block(module.body()?)
-}
-
-/// Removes every Shardy operation from `module`, including those in nested regions, for a plugin that cannot compile
-/// with Shardy. Each `sdy.sharding_constraint` is replaced by its operand and the `sdy.mesh` declaration is erased.
-/// Ryft runs programs on such targets on a single device. Every sharding then holds the whole array, so removing
-/// these constraints preserves the result.
+/// Removes every Shardy operation from `module` (refer to [`Module::remove_shardy_operations`]), for a plugin that
+/// cannot compile with Shardy. Ryft runs programs on such targets on a single device. Every sharding then holds the
+/// whole array, so removing its constraints preserves the result.
 ///
 /// # Errors
 ///
 /// Returns [`LoweringError::UnsupportedOperation`] for any other Shardy operation (e.g., the `sdy.manual_computation`
 /// of a `shard_map`), which has no equivalent without the dialect.
-pub(crate) fn remove_shardy_operations(module: &Module<'_, '_>) -> Result<(), Error> {
-    remove_shardy_operations_in_block(module.body()?)
+pub(crate) fn remove_shardy_operations(module: &mut Module<'_, '_>) -> Result<(), Error> {
+    let Err(error) = module.remove_shardy_operations() else {
+        return Ok(());
+    };
+    // Name the operation that cannot be removed, which is the first one other than the two that can.
+    let mut unsupported = None;
+    module.as_operation()?.walk(WalkOrder::PreOrder, |operation| match operation.name().as_str() {
+        Ok(name) if name.starts_with("sdy.") && name != "sdy.sharding_constraint" && name != "sdy.mesh" => {
+            unsupported = Some(name.to_string());
+            WalkResult::Interrupt
+        }
+        _ => WalkResult::Advance,
+    });
+    Err(match unsupported {
+        Some(operation) => Error::Lowering(LoweringError::UnsupportedOperation {
+            operation,
+            reason: "the target plugin cannot compile with Shardy".to_string(),
+        }),
+        None => error.into(),
+    })
 }
 
 /// Normalizes an MLIR symbol name provided by the user by trimming surrounding whitespace and one leading `@`.
@@ -604,19 +419,19 @@ pub(crate) fn value_shardings(shardings: Option<&[Sharding]>, count: usize) -> V
 
 /// Boundary of the entry function of a lowered module, which [`plan_entry_boundary`] derives from a program before
 /// anything is emitted.
-struct EntryBoundary {
+pub(super) struct EntryBoundary {
     /// Name of the entry function.
-    function_name: String,
+    pub(super) function_name: String,
 
     /// Signature that maps the logical boundary of the program to the physical boundary of its executable.
-    signature: ExecutableSignature,
+    pub(super) signature: ExecutableSignature,
 
     /// Session constants of the program, which the entry function receives as its trailing capture arguments.
-    session_constants: Vec<RetainedArray>,
+    pub(super) session_constants: Vec<RetainedArray>,
 
     /// Arrays that the program only passes on to calls that never read them, which the entry function binds to values
     /// that require no buffer.
-    passed_on_constants: Vec<RetainedArray>,
+    pub(super) passed_on_constants: Vec<RetainedArray>,
 
     /// Types of the logical arguments (i.e., of the captures followed by the public inputs).
     logical_argument_types: Vec<ArrayType>,
@@ -632,9 +447,10 @@ struct EntryBoundary {
 }
 
 /// Validates the entry boundary of `program` and returns its [`EntryBoundary`], without emitting anything. The
-/// arguments are those of [`emit_mlir_program`] and of its options.
+/// arguments are those of [`ProgramLoweringExtension::to_mlir`](crate::ProgramLoweringExtension::to_mlir) and of its
+/// options.
 #[allow(clippy::too_many_arguments)]
-fn plan_entry_boundary<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+pub(super) fn plan_entry_boundary<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
     capture_types: &[ArrayType],
     global_input_types: &[ArrayType],
@@ -932,7 +748,7 @@ fn entry_aliases(
 ///
 /// Returns [`LoweringError::UnsupportedBoundaryMemory`] for a boundary memory that `target_platform` cannot use.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn entry_function_attributes<'c, 't>(
+pub(super) fn entry_function_attributes<'c, 't>(
     boundary: &EntryBoundary,
     argument_shardings: &[Option<Sharding>],
     output_shardings: &[Option<Sharding>],
@@ -1062,7 +878,7 @@ fn entry_function_attributes<'c, 't>(
 /// ones, completes the pending reductions that arguments arrive with, lowers `program`, and projects its outputs onto
 /// the physical results. The first `capture_count` logical arguments are captures.
 #[allow(clippy::too_many_arguments)]
-fn lower_entry_function_body<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+pub(super) fn lower_entry_function_body<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
     boundary: &EntryBoundary,
     capture_count: usize,
@@ -1283,7 +1099,7 @@ where
 /// # Errors
 ///
 /// Returns [`LoweringError::MismatchedMeshTopology`] when the shardings of those types disagree on the topology.
-fn declare_constrained_mesh<'c, 't, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+pub(super) fn declare_constrained_mesh<'c, 't, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     module: &Module<'c, 't>,
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
     mesh: Option<LogicalMesh>,
@@ -1344,66 +1160,6 @@ pub(super) fn merge_logical_meshes(existing: LogicalMesh, incoming: &LogicalMesh
     Ok(existing)
 }
 
-/// Removes every Shardy operation from `block` and from the regions nested in its operations, as
-/// [`remove_shardy_operations`] describes.
-fn remove_shardy_operations_in_block<'b, 'c: 'b, 't: 'c>(block: BlockRef<'b, 'c, 't>) -> Result<(), Error> {
-    let mut shardy_operations = Vec::new();
-    for operation in block.operations()? {
-        let operation = operation?;
-        // An operation is classified before its regions are visited, so that an unsupported operation is reported
-        // rather than the Shardy terminator of its body.
-        let name = operation.name();
-        match name.as_str() {
-            Ok("sdy.sharding_constraint") => {
-                operation.result(0)?.replace_uses(operation.operand_value(0)?);
-                shardy_operations.push(operation);
-            }
-            Ok("sdy.mesh") => shardy_operations.push(operation),
-            Ok(name) if name.starts_with("sdy.") => {
-                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                    operation: name.to_string(),
-                    reason: "the target plugin cannot compile with Shardy".to_string(),
-                }));
-            }
-            _ => {}
-        }
-        for region in operation.regions() {
-            for nested_block in region?.blocks()? {
-                remove_shardy_operations_in_block(nested_block?)?;
-            }
-        }
-    }
-    for operation in shardy_operations {
-        // SAFETY: the uses of a removed constraint were replaced by its operand and a mesh declaration has no results,
-        // so no remaining operation references a result of the removed operation, and dropping the detached operation
-        // that `remove_operation` returns destroys it.
-        unsafe { block.remove_operation(operation)? };
-    }
-    Ok(())
-}
-
-/// Removes every unused `stablehlo.constant` operation from `block` and from the regions nested in its operations.
-fn remove_unused_constants_in_block<'b, 'c: 'b, 't: 'c>(block: BlockRef<'b, 'c, 't>) -> Result<(), Error> {
-    let mut unused_constants = Vec::new();
-    for operation in block.operations()? {
-        let operation = operation?;
-        for region in operation.regions() {
-            for nested_block in region?.blocks()? {
-                remove_unused_constants_in_block(nested_block?)?;
-            }
-        }
-        if operation.name().as_str() == Ok("stablehlo.constant") && operation.result(0)?.uses()?.next().is_none() {
-            unused_constants.push(operation);
-        }
-    }
-    for constant in unused_constants {
-        // SAFETY: the removed constant has no uses, so no remaining operation references its result, and dropping the
-        // detached operation that `remove_operation` returns destroys it.
-        unsafe { block.remove_operation(constant)? };
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -1448,7 +1204,7 @@ mod tests {
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
 
     use super::*;
-    use crate::lowering::programs::ProgramLoweringExtension;
+    use crate::lowering::programs::{MlirProgram, ProgramLoweringExtension, ProgramLoweringOptions};
 
     #[test]
     fn test_contains_unresolved_state_ignores_dormant_regions() {
@@ -2049,53 +1805,16 @@ mod tests {
 
     #[test]
     fn test_remove_shardy_operations() {
-        // Constraints are replaced by their operands in nested regions as well, and the mesh declaration is erased.
         let context = MlirContext::new();
         context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         context.load_dialect(DialectHandle::stable_hlo().unwrap()).unwrap();
         context.load_dialect(DialectHandle::shardy().unwrap()).unwrap();
-        let module = context
-            .parse_module(indoc! {r#"
-                module {
-                  sdy.mesh @mesh = <["x"=1]>
-                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<i32>) -> tensor<4xf32> {
-                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}], replicated={"x"}> : tensor<4xf32>
-                    %1 = "stablehlo.case"(%arg1) ({
-                      %2 = sdy.sharding_constraint %0 <@mesh, [{"x"}]> : tensor<4xf32>
-                      %3 = stablehlo.negate %2 : tensor<4xf32>
-                      stablehlo.return %3 : tensor<4xf32>
-                    }, {
-                      stablehlo.return %0 : tensor<4xf32>
-                    }) : (tensor<i32>) -> tensor<4xf32>
-                    return %1 : tensor<4xf32>
-                  }
-                }
-            "#})
-            .unwrap();
-        remove_shardy_operations(&module).unwrap();
-        assert!(module.verify().unwrap());
-        assert_eq!(
-            module.to_string(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<i32>) -> tensor<4xf32> {
-                    %0 = "stablehlo.case"(%arg1) ({
-                      %1 = stablehlo.negate %arg0 : tensor<4xf32>
-                      stablehlo.return %1 : tensor<4xf32>
-                    }, {
-                      stablehlo.return %arg0 : tensor<4xf32>
-                    }) : (tensor<i32>) -> tensor<4xf32>
-                    return %0 : tensor<4xf32>
-                  }
-                }
-            "#},
-        );
 
         // A manual computation has no equivalent without the dialect.
         let body = unproject_plain_program(neg_branch(test_vector_type(4)));
-        let module = context.parse_module(lower_replicated_shard_map_body(body, 1).unwrap()).unwrap();
+        let mut module = context.parse_module(lower_replicated_shard_map_body(body, 1).unwrap()).unwrap();
         assert!(matches!(
-            remove_shardy_operations(&module),
+            remove_shardy_operations(&mut module),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
                 if operation == "sdy.manual_computation"
                     && reason == "the target plugin cannot compile with Shardy",

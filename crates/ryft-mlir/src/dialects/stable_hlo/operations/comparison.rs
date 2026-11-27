@@ -1,6 +1,6 @@
 use crate::{
-    Attribute, DetachedOp, DialectHandle, Error, Location, Operation, OperationBuilder, Value, ValueRef,
-    mlir_enum_attribute, mlir_op, mlir_op_trait,
+    Attribute, DetachedOp, DialectHandle, Error, FloatTypeRef, IntegerTypeRef, Location, Operation, OperationBuilder,
+    TensorTypeRef, Type, TypeRef, Value, ValueRef, mlir_enum_attribute, mlir_op, mlir_op_trait,
 };
 
 mlir_enum_attribute!(
@@ -34,6 +34,29 @@ mlir_enum_attribute!(
     mlir_prefix = stablehlo,
     mlir_dialect_handle_constructor = stable_hlo,
 );
+
+impl ComparisonType {
+    /// Returns the [`ComparisonType`] with which StableHLO compares values of `type` numerically. A tensor type is
+    /// compared as its element type. Floating-point types are compared as [`ComparisonType::Float`], unsigned integers
+    /// and one-bit integers (i.e., the carriers of predicates) as [`ComparisonType::Unsigned`], and other integers as
+    /// [`ComparisonType::Signed`]. Every other type (e.g., a complex type) is compared as [`ComparisonType::Float`].
+    /// A one-bit integer that stands for a signed value must be widened first, because its type alone does not tell
+    /// it apart from a predicate.
+    pub fn for_type<'c, 't: 'c>(r#type: TypeRef<'c, 't>) -> Result<Self, Error> {
+        let element_type =
+            if let Some(tensor) = r#type.cast::<TensorTypeRef>() { tensor.element_type()? } else { r#type };
+        if element_type.is::<FloatTypeRef>() {
+            return Ok(Self::Float);
+        }
+        if let Some(integer) = element_type.cast::<IntegerTypeRef>() {
+            if integer.is_unsigned() || integer.bit_width() == 1 {
+                return Ok(Self::Unsigned);
+            }
+            return Ok(Self::Signed);
+        }
+        Ok(Self::Float)
+    }
+}
 
 /// Name of the [`Attribute`] that is used to store [`CompareOperation::comparison_direction`].
 pub const COMPARISON_DIRECTION_ATTRIBUTE: &str = "comparison_direction";
@@ -467,6 +490,21 @@ mod tests {
         let context = Context::new();
         let attribute = context.stable_hlo_comparison_type(ComparisonType::TotalOrder).unwrap();
         test_attribute_casting(attribute);
+    }
+
+    #[test]
+    fn test_comparison_type_for_type() {
+        let context = Context::new();
+        let comparison_type = |r#type: &str| ComparisonType::for_type(context.parse_type(r#type).unwrap()).unwrap();
+        assert_eq!(comparison_type("tensor<2xf32>"), ComparisonType::Float);
+        assert_eq!(comparison_type("tensor<2xi32>"), ComparisonType::Signed);
+        assert_eq!(comparison_type("tensor<2xui32>"), ComparisonType::Unsigned);
+        assert_eq!(comparison_type("tensor<2xi1>"), ComparisonType::Unsigned);
+        assert_eq!(comparison_type("tensor<2xcomplex<f32>>"), ComparisonType::Float);
+
+        // A type that is not a tensor is classified as it is.
+        assert_eq!(comparison_type("f64"), ComparisonType::Float);
+        assert_eq!(comparison_type("i64"), ComparisonType::Signed);
     }
 
     #[test]

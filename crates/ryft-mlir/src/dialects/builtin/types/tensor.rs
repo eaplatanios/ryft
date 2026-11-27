@@ -4,7 +4,9 @@ use ryft_xla_sys::bindings::{
     mlirUnrankedTensorTypeGetChecked, mlirUnrankedTensorTypeGetTypeID,
 };
 
-use crate::{Attribute, AttributeRef, Context, Error, Location, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
+use crate::{
+    Attribute, AttributeRef, Context, Error, Location, Type, TypeId, TypeRef, Value, ValueRef, mlir_subtype_trait_impls,
+};
 
 use super::{ShapedType, Size};
 
@@ -115,6 +117,18 @@ impl<'c, 't> ShapedType<'c, 't> for TensorTypeRef<'c, 't> {}
 
 mlir_subtype_trait_impls!(TensorTypeRef<'c, 't> as Type, mlir_type = Type, mlir_subtype = RankedTensor);
 
+impl ValueRef<'_, '_, '_> {
+    /// Returns the shape of this value when its type is a [`TensorTypeRef`], where [`None`] marks a dynamic
+    /// dimension. Returns [`None`] when the type of this value is not a [`TensorTypeRef`].
+    #[inline]
+    pub fn tensor_shape(&self) -> Result<Option<Vec<Option<usize>>>, Error> {
+        Ok(self
+            .r#type()?
+            .cast::<TensorTypeRef>()
+            .map(|r#type| r#type.dimensions().map(|size| size.value()).collect()))
+    }
+}
+
 impl<'t> Context<'t> {
     /// Creates a new [`TensorTypeRef`] owned by this [`Context`]. If any of the arguments are invalid, then this
     /// function will return an [`Error`] and will also emit the appropriate diagnostics at the provided location. For
@@ -215,6 +229,7 @@ impl<'t> Context<'t> {
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::Block;
     use crate::types::tests::{test_type_casting, test_type_display_and_debug};
 
     use super::*;
@@ -312,6 +327,16 @@ mod tests {
         let shape = vec![Size::Static(32), Size::Dynamic];
         let r#type = context.tensor_type(element_type, &shape, None, location).unwrap();
         test_type_casting(r#type);
+    }
+
+    #[test]
+    fn test_value_tensor_shape() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let tensor_type = context.parse_type("tensor<2x?xf32>").unwrap();
+        let block = context.block(&[(tensor_type, location), (context.index_type().as_ref(), location)]);
+        assert_eq!(block.argument(0).unwrap().as_ref().tensor_shape().unwrap(), Some(vec![Some(2), None]));
+        assert_eq!(block.argument(1).unwrap().as_ref().tensor_shape().unwrap(), None);
     }
 
     #[test]

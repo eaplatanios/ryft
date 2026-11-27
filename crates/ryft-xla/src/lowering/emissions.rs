@@ -134,7 +134,7 @@ pub(crate) fn emitted_regions_entering_calls<'r, V: Value<Type = Type>, O: Lower
 /// `lifted` is set), which names capture `k` through its input `k`. A capture that no emitted region reads (e.g., one
 /// that only the body of a scan with zero iterations reads) is neither admitted when a function is compiled nor passed
 /// to its executable, whose signature erases it (refer to
-/// `emit_mlir_program`), so that admission and lowering read this one
+/// `ProgramLoweringExtension::to_mlir`), so that admission and lowering read this one
 /// decision. A capture that a region only passes on to a call as a capture which the callee never reads is not read
 /// either (refer to [`visit_emitted_reads`]). The regions of the callees of calls are not visited, because their
 /// constants name the captures of those callees, which a callee reads only through the operands of its call (refer to

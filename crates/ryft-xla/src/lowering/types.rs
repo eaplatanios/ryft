@@ -28,7 +28,7 @@ pub trait ComparisonDirectionLoweringExtension {
     /// inside of combiner and comparator bodies. Both operands must already share one tensor type, because this
     /// function neither promotes nor broadcasts them, and the result has their shape with a Boolean element type. The
     /// comparison type (i.e., `FLOAT`, `SIGNED`, or `UNSIGNED`) follows the element type of the left-hand side input,
-    /// as [`comparison_type_for_mlir_type`] describes.
+    /// as [`stable_hlo::ComparisonType::for_type`] describes.
     fn lower_comparison<'b, 'c: 'b, 't: 'c>(
         self,
         left: ValueRef<'b, 'c, 't>,
@@ -58,7 +58,7 @@ impl ComparisonDirectionLoweringExtension for ComparisonDirection {
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         let direction = self.lower();
         let left_type = left.r#type()?;
-        let comparison_type = comparison_type_for_mlir_type(left_type)?;
+        let comparison_type = stable_hlo::ComparisonType::for_type(left_type)?;
         let result = block.append_operation(stable_hlo::compare(left, right, direction, comparison_type, location)?)?;
         Ok(result.result(0).unwrap().as_ref())
     }
@@ -1135,30 +1135,6 @@ where
     }
     let broadcast = block.append_operation(stable_hlo::broadcast(constant, output_tensor_type, &[], location)?)?;
     Ok(broadcast.result(0).unwrap().as_ref())
-}
-
-/// Picks the right StableHLO comparison semantic based on the element type of an MLIR value.
-///
-/// Tensor values are unwrapped to their element type, while scalar types that are not tensors are inspected directly.
-/// Floating-point types route to [`stable_hlo::ComparisonType::Float`], explicitly unsigned integers and one-bit
-/// predicate carriers route to [`stable_hlo::ComparisonType::Unsigned`], and other integers route to
-/// [`stable_hlo::ComparisonType::Signed`]. Every other element type (e.g., complex) routes to
-/// [`stable_hlo::ComparisonType::Float`]. Logical signed one-bit inputs must be widened before calling this function,
-/// because their MLIR carrier alone cannot distinguish them from Boolean inputs.
-fn comparison_type_for_mlir_type(r#type: TypeRef) -> Result<stable_hlo::ComparisonType, Error> {
-    let element_type = if let Some(tensor) = r#type.cast::<TensorTypeRef>() { tensor.element_type()? } else { r#type };
-    if element_type.is::<FloatTypeRef>() {
-        return Ok(stable_hlo::ComparisonType::Float);
-    }
-    if let Some(integer) = element_type.cast::<IntegerTypeRef>() {
-        if integer.is_unsigned() || integer.bit_width() == 1 {
-            return Ok(stable_hlo::ComparisonType::Unsigned);
-        }
-        return Ok(stable_hlo::ComparisonType::Signed);
-    }
-    // Other element types compare as floating-point values, which matches StableHLO's lenient handling of numeric
-    // types that are neither integers nor floating-point types (e.g., complex types).
-    Ok(stable_hlo::ComparisonType::Float)
 }
 
 #[cfg(test)]

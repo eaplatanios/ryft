@@ -162,14 +162,6 @@ const ELEMENTWISE_OPERATIONS: &[&str] = &[
     "stablehlo.xor",
 ];
 
-/// Returns the shape of `value` when it is a ranked tensor, where [`None`] marks a dynamic dimension.
-fn tensor_shape(value: ValueRef<'_, '_, '_>) -> Result<Option<Vec<Option<usize>>>, Error> {
-    Ok(value
-        .r#type()?
-        .cast::<TensorTypeRef>()
-        .map(|r#type| r#type.dimensions().map(|size| size.value()).collect()))
-}
-
 /// Returns the dimension shardings that the `sdy.sharding_constraint` that produces `value` declares, including along
 /// auto mesh axes, which no type records, or [`None`] when `value` is not the result of such a constraint or the
 /// constraint partitions a dimension along a part of an axis. An empty dimension is replicated when it is closed and
@@ -649,10 +641,10 @@ pub(super) fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
         }
         let result = operation.result(0)?.as_ref();
         let Some(dimensions) = find(result, &backward_dimensions) else { continue };
-        let shape = tensor_shape(result)?;
+        let shape = result.tensor_shape()?;
         for operand in operation.operand_values() {
             let operand = operand?;
-            if find(operand, &backward_dimensions).is_none() && tensor_shape(operand)? == shape {
+            if find(operand, &backward_dimensions).is_none() && operand.tensor_shape()? == shape {
                 backward_dimensions.push((operand, Rc::clone(&dimensions)));
             }
         }
@@ -724,12 +716,12 @@ pub(super) fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
             let result = operation.result(index)?.as_ref();
             let mut dimensions = None;
             if elementwise {
-                let shape = tensor_shape(result)?;
+                let shape = result.tensor_shape()?;
                 let mut operand_dimensions = Vec::new();
                 for operand in operation.operand_values() {
                     let operand = operand?;
                     if let Some(dimensions) = find(operand, &forward_dimensions)
-                        && tensor_shape(operand)? == shape
+                        && operand.tensor_shape()? == shape
                     {
                         operand_dimensions.push(dimensions);
                     }

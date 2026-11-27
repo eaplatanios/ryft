@@ -9,12 +9,21 @@ use ryft_core::{
     RegionPlacementRequests, RegionRef, RequestedPlacement, Sharding, ShardingDimension, StopGradientOperation,
     TagOperation, TransferToMemoryOperation, Type as CoreType, Typed, Value,
 };
+use ryft_mlir::dialects::func;
+use ryft_mlir::{Block, Context as MlirContext, Location, Region};
 
 use crate::lowering::emissions::{collect_session_constants, omits_regions};
-use crate::lowering::modules::{emit_mlir_program, render_devices};
+use crate::lowering::modules::{
+    collect_nested_sharding_mesh, declare_constrained_mesh, entry_function_attributes, lower_entry_function_body,
+    merge_logical_meshes, plan_entry_boundary, remove_shardy_operations, render_devices, serialize_lowered_module,
+};
+use crate::lowering::sharding::LogicalMeshExtension;
 use crate::lowering::signatures::ExecutableSignature;
+use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::{LowerableOperationFamily, LoweringError, RaggedDotLoweringStrategy};
-use crate::{Constant, Error, RetainedArray, RuntimeRequirement, Type};
+use crate::operations::call::{collect_call_functions, emit_call_function};
+use crate::operations::composites::{collect_named_composition_functions, emit_named_composition_function};
+use crate::{Constant, Error, RetainedArray, RuntimeRequirement, Type, normalize_runtime_requirements};
 
 // TODO(eaplatanios): Review this.
 /// StableHLO/Shardy MLIR module that a staged [`Program`] lowers to, paired with what executing it requires.
@@ -250,17 +259,165 @@ where
             }
         };
 
-        emit_mlir_program(
+        // TODO(eaplatanios): Review the rest of this implementation.
+        let function_name = function_name.as_ref();
+        let (capture_types, input_types, output_types) =
+            (capture_types.as_slice(), input_types.as_slice(), output_types.as_slice());
+        let (argument_shardings, output_shardings, open_outputs) =
+            (argument_shardings.as_slice(), output_shardings.as_slice(), open_outputs.as_slice());
+        let supports_shardy = options.supports_shardy();
+        let reference_states = options.reference_bindings();
+        let donated_inputs = options.donated_inputs();
+        let unread_inputs = options.unread_inputs();
+        let ragged_dot_lowering_strategy = options.ragged_dot_lowering_strategy();
+        let export_effects = options.exports_effects();
+        let boundary = plan_entry_boundary(
             program,
-            function_name.as_ref(),
-            &capture_types,
-            &input_types,
-            &output_types,
-            &argument_shardings,
-            &output_shardings,
-            &open_outputs,
-            options,
-        )
+            capture_types,
+            input_types,
+            output_types,
+            function_name,
+            argument_shardings,
+            output_shardings,
+            target_platform,
+            reference_states,
+            donated_inputs,
+            unread_inputs,
+            open_outputs,
+            export_effects,
+        )?;
+
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let mut module = context.module(location)?;
+
+        // Emit `sdy.mesh` declarations for any sharding referenced either by inner operations or by the optional
+        // signature shardings, so the `func.func` attributes can refer to `@mesh`.
+        let mut signature_mesh = None;
+        for sharding in argument_shardings.iter().chain(output_shardings).flatten() {
+            signature_mesh = Some(match signature_mesh.take() {
+                Some(existing_mesh) => merge_logical_meshes(existing_mesh, sharding.mesh())?,
+                None => sharding.mesh().clone(),
+            });
+        }
+        let mesh = collect_nested_sharding_mesh(program, signature_mesh, target_platform)?;
+        if let Some(mesh) = mesh.as_ref() {
+            let mesh_operation = mesh.lower(location)?;
+            module.body()?.append_operation(mesh_operation)?;
+        }
+
+        // Trace each distinct named semantic decomposition once and retain it in the lowering state of the module, so
+        // that the entry and nested function bodies resolve the same private symbol.
+        let named_compositions = Rc::new(collect_named_composition_functions(program, target_platform)?);
+
+        // Module-scoped lowering state, shared between the entry function body and private functions below so channel
+        // ids stay unique and target, representation policy, named compositions, and provenance state reach nested
+        // bodies. The arrays that the program only passes on to calls that never read them follow the session constants
+        // in the table, and the entry function binds them to values that require no buffer (refer to
+        // `partition_session_constants`).
+        let lowering_state = ProgramLoweringState::new()
+            .with_target_platform(target_platform)
+            .with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy)
+            .with_named_compositions(named_compositions.clone())
+            .with_session_constants(
+                &[boundary.session_constants.as_slice(), boundary.passed_on_constants.as_slice()].concat(),
+            );
+
+        // Deduplicate `call` callees that occur more than once into shared private `func.func`s, so repeated nested
+        // programs (e.g., identical transformer blocks or the per-block primal and pullback programs of `grad`) lower
+        // to one function plus N `func.call`s instead of N inlined copies. The map is empty for modules without
+        // repeated calls, in which case every `call` inlines exactly as before.
+        let nested_functions = Rc::new(collect_call_functions(program, target_platform)?);
+        {
+            let mut module_block = module.body()?;
+            for key in named_compositions.order() {
+                let function = named_compositions.functions().get(key).unwrap();
+                emit_named_composition_function(
+                    &mut module_block,
+                    function,
+                    &lowering_state,
+                    &context,
+                    location.as_ref(),
+                )?;
+            }
+            for key in nested_functions.order() {
+                let function = nested_functions.functions().get(key).unwrap();
+                emit_call_function(
+                    &mut module_block,
+                    function,
+                    &nested_functions,
+                    &lowering_state,
+                    &context,
+                    location.as_ref(),
+                )?;
+            }
+        }
+
+        let (function_arguments, function_results) = entry_function_attributes(
+            &boundary,
+            argument_shardings,
+            output_shardings,
+            open_outputs,
+            mesh.is_some(),
+            supports_shardy,
+            target_platform,
+            &context,
+            location.as_ref(),
+        )?;
+        module.body()?.append_operation({
+            let argument_types =
+                function_arguments.iter().map(|argument| (argument.r#type, location)).collect::<Vec<_>>();
+            let function_block = context.block(argument_types.as_slice());
+            lower_entry_function_body(
+                program,
+                &boundary,
+                capture_types.len(),
+                argument_shardings,
+                supports_shardy,
+                &function_block,
+                &nested_functions,
+                &lowering_state,
+                &context,
+                location.as_ref(),
+            )?;
+            let mut function_region = context.region();
+            function_region.append_block(function_block)?;
+            func::func(
+                boundary.function_name.as_str(),
+                func::FuncAttributes { arguments: function_arguments, results: function_results, ..Default::default() },
+                function_region,
+                location,
+            )?
+        })?;
+        let mut signature = boundary.signature;
+        let mesh = declare_constrained_mesh(&module, program, mesh, target_platform, location.as_ref())?;
+        if !supports_shardy {
+            remove_shardy_operations(&mut module)?;
+        }
+
+        module.remove_unused_stable_hlo_constants()?;
+        if !module.verify()? {
+            return Err(Error::Lowering(LoweringError::VerificationFailure));
+        }
+        if lowering_state.has_assertions() {
+            signature.require_assertion_handler();
+        }
+        let requires_assertion_handler = signature.requires_assertion_handler();
+        let mut runtime_requirements = lowering_state.runtime_requirements();
+        if requires_assertion_handler {
+            runtime_requirements.push(RuntimeRequirement::builtin("ryft.assert"));
+        }
+        if signature.has_ordered_io() {
+            runtime_requirements.push(RuntimeRequirement::builtin("ryft.ordered-io"));
+        }
+        let runtime_requirements = normalize_runtime_requirements(runtime_requirements)?.into();
+        Ok(MlirProgram::new(
+            serialize_lowered_module(&module, &lowering_state)?,
+            signature,
+            requires_assertion_handler,
+            runtime_requirements,
+            mesh,
+        ))
     }
 }
 
