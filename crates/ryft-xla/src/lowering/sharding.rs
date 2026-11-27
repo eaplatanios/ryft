@@ -66,6 +66,11 @@ pub enum OpenDimensions<'o> {
 }
 
 /// Provides lowering support for [`Sharding`]s to Shardy.
+///
+/// What these functions emit refers to the mesh of the module by [`SHARDY_MESH_SYMBOL_NAME`], and a module declares
+/// that mesh only when the lowering of an operation states that it refers to it. The lowering of an operation that
+/// calls these functions therefore declares the mesh of the sharding with
+/// [`Lowerer::require_mesh`](crate::Lowerer::require_mesh).
 pub trait ShardingExtension {
     /// Lowers this sharding to its Shardy tensor sharding attribute, in the [`Context`](ryft_mlir::Context) of
     /// `location`. The replicated and sharded dimensions of the attribute are closed (i.e., Shardy cannot shard them

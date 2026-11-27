@@ -2,18 +2,15 @@
 //! private functions that calls share, and the passes that run over the emitted module.
 
 use ryft_core::{
-    ArrayType, Device, Dimension, EffectClass, LogicalMesh, MeshAxisType, Parameterized, Program, Sharding,
-    ShardingDimension, Type as CoreType, Typed,
+    ArrayType, Device, Dimension, EffectClass, MeshAxisType, Parameterized, Program, Sharding, ShardingDimension,
+    Type as CoreType, Typed,
 };
-use ryft_mlir::{
-    Block, LocationRef, Module, Operation as MlirOperation, OperationPrintingFlags, WalkOrder, WalkResult,
-};
+use ryft_mlir::{Module, Operation as MlirOperation, OperationPrintingFlags, WalkOrder, WalkResult};
 
 use crate::lowering::emissions::emitted_regions;
-use crate::lowering::sharding::LogicalMeshExtension;
 use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::{LowerableOperationFamily, LoweringError};
-use crate::{Constant, Error, Type};
+use crate::{Constant, Error};
 
 // TODO(eaplatanios): Review this module.
 
@@ -228,81 +225,6 @@ pub(crate) fn value_shardings(shardings: Option<&[Sharding]>, count: usize) -> V
         Some(shardings) => shardings.iter().cloned().map(Some).collect(),
         None => vec![None; count],
     }
-}
-
-/// Returns the module mesh of `module`, which is the lowering of `program`, after declaring it when `mesh`, the mesh
-/// that the signature and `ProgramLoweringAnalysisExtension::nested_sharding_mesh` found before the program was
-/// lowered, is [`None`] but the lowered operations refer to a mesh anyway. This makes the declaration follow what
-/// lowering emitted rather than a list of the operations that emit sharding constraints, which a new constraint (e.g.,
-/// one that a lowering rule emits for the sharding of an output type) would otherwise have to join. Every Shardy
-/// operation other than the declaration itself refers to the module mesh, and the declared mesh is the one shared by
-/// the shardings of the array types of the regions that lowering emits for `target_platform` (refer to
-/// [`emitted_regions`]), which every constraint over the sharding of a type refers to. A constraint over a sharding
-/// that no type carries must be found by `ProgramLoweringAnalysisExtension::nested_sharding_mesh` instead, and
-/// verification of the module reports it otherwise.
-///
-/// # Errors
-///
-/// Returns [`LoweringError::MismatchedMeshTopology`] when the shardings of those types disagree on the topology.
-pub(super) fn declare_constrained_mesh<'c, 't, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
-    module: &Module<'c, 't>,
-    program: &Program<Constant, O, ProgramInput, ProgramOutput>,
-    mesh: Option<LogicalMesh>,
-    target_platform: Option<&str>,
-    location: LocationRef<'c, 't>,
-) -> Result<Option<LogicalMesh>, Error>
-where
-    ProgramInput: Parameterized<Constant>,
-    ProgramOutput: Parameterized<Constant>,
-{
-    if mesh.is_some() {
-        return Ok(mesh);
-    }
-    let mut refers_to_mesh = false;
-    module.as_operation()?.walk(WalkOrder::PreOrder, |operation| match operation.name().as_str() {
-        Ok(name) if name.starts_with("sdy.") && name != "sdy.mesh" => {
-            refers_to_mesh = true;
-            WalkResult::Interrupt
-        }
-        _ => WalkResult::Advance,
-    });
-    if !refers_to_mesh {
-        return Ok(None);
-    }
-    let mut mesh = None;
-    for region in emitted_regions(program.entry_region_ref(), target_platform) {
-        for atom in region.atoms() {
-            if let Type::Array(array_type) = atom.r#type().as_ref()
-                && let Some(sharding) = array_type.sharding()
-            {
-                mesh = Some(match mesh.take() {
-                    Some(existing_mesh) => merge_logical_meshes(existing_mesh, sharding.mesh())?,
-                    None => sharding.mesh().clone(),
-                });
-            }
-        }
-    }
-    if let Some(mesh) = &mesh {
-        module.body()?.insert_operation(mesh.lower(location)?, 0)?;
-    }
-    Ok(mesh)
-}
-
-/// Validates that `incoming` has the topology of the module mesh `existing`, which it returns. The module mesh keeps
-/// the axis types of the first mesh that declared it, because the emitted `sdy.mesh` records only axis names and sizes.
-///
-/// # Errors
-///
-/// Returns [`LoweringError::MismatchedMeshTopology`] when the axis names or sizes of the two meshes differ, including
-/// in order.
-pub(super) fn merge_logical_meshes(existing: LogicalMesh, incoming: &LogicalMesh) -> Result<LogicalMesh, Error> {
-    if !existing.has_same_topology(incoming) {
-        return Err(Error::Lowering(LoweringError::MismatchedMeshTopology {
-            expected: existing,
-            actual: incoming.clone(),
-        }));
-    }
-    Ok(existing)
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ use crate::arrays::host::{
     partial_completion_rejection,
 };
 use crate::lowering::LoweringError;
-use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
+use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::states::ProgramLoweringState;
 use crate::{Error, Type};
 
@@ -314,14 +314,15 @@ pub(super) trait ShardingReductionExtension {
     /// open there too. A dimension that is split along auto axes keeps that split (refer to
     /// [`constrain_unreduced_intermediates`]), so a closed constraint adds no communication for a value whose placement
     /// the program states. Over a mesh without auto axes, the two constraints are the same. Inside a manual region, the
-    /// constraint is the same, without the bound manual axes (refer to [`ShardingExtension::lower_sharding_constraint`]): with a
-    /// split dimension left open there, `y = x + x; y + y` of a value split along an auto axis and unreduced along an
-    /// explicit axis in a `shard_map` body all-reduced each operand over the explicit axis and restored the pending
-    /// state with a select.
+    /// constraint is the same, without the bound manual axes (refer to
+    /// [`ProgramLoweringState::lower_sharding_constraint`]): with a split dimension left open there, `y = x + x; y + y`
+    /// of a value split along an auto axis and unreduced along an explicit axis in a `shard_map` body all-reduced each
+    /// operand over the explicit axis and restored the pending state with a select. The constraint is lowered in the
+    /// scope of `lowering_state`, which also records its mesh as the mesh of the module.
     fn lower_pending_reduction_constraint<'b, 'c: 'b, 't: 'c>(
         &self,
         value: ValueRef<'b, 'c, 't>,
-        bound_manual_axes: &[String],
+        lowering_state: &ProgramLoweringState,
         block: &mut BlockRef<'b, 'c, 't>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error>;
@@ -331,12 +332,12 @@ impl ShardingReductionExtension for Sharding {
     fn lower_pending_reduction_constraint<'b, 'c: 'b, 't: 'c>(
         &self,
         value: ValueRef<'b, 'c, 't>,
-        bound_manual_axes: &[String],
+        lowering_state: &ProgramLoweringState,
         block: &mut BlockRef<'b, 'c, 't>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         let closed = self.with_unconstrained_dimensions_replicated();
-        closed.lower_sharding_constraint(value, OpenDimensions::None, bound_manual_axes, block, location)
+        lowering_state.lower_sharding_constraint(&closed, value, OpenDimensions::None, block, location)
     }
 }
 
@@ -741,8 +742,7 @@ pub(super) fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
                 continue;
             };
             let sharding = reduction.sharding(mesh, rank, dimensions.as_deref())?;
-            let constrained =
-                sharding.lower_pending_reduction_constraint(result, bound_manual_axes, block, location)?;
+            let constrained = sharding.lower_pending_reduction_constraint(result, lowering_state, block, location)?;
             let constraint = constrained.cast::<OperationResultRef>().unwrap().operation()?;
             // The constraint is appended to the block, and moved right after the operation that produces its operand
             // (or after the constraint of the previous result), so that it dominates every later use of that operand.
@@ -802,7 +802,7 @@ pub(super) fn constrain_unreduced_outputs<'b, 'c: 'b, 't: 'c>(
                 }
                 _ => sharding,
             };
-            *output = sharding.lower_pending_reduction_constraint(*output, bound_manual_axes, block, location)?;
+            *output = sharding.lower_pending_reduction_constraint(*output, lowering_state, block, location)?;
         }
     }
     Ok(())
@@ -819,8 +819,8 @@ mod tests {
     use ryft_core::{
         AddOperation, ArrayOperations, ArrayType, BroadcastOperation, Compare, Condition, ConstrainSharding, DataType,
         Device, DeviceMesh, Dimension, LogicalMesh, Max, MeshAxis, MeshAxisType, Placeholder, ProgramBuilder,
-        ProgramError, Reduce, ScanOptions, Shape, Sharding, ShardingDimension, UnreducedKind, ValueProjection,
-        WhileOptions, scan, r#while,
+        ProgramError, Reduce, ScanOptions, Shape, ShardMapBoundary, Sharding, ShardingDimension, UnreducedKind,
+        ValueProjection, WhileOptions, scan, r#while,
     };
 
     use ryft_mlir::{Context as MlirContext, Location};
@@ -1593,11 +1593,13 @@ mod tests {
         let location = location.as_ref();
 
         // Every dimension is closed, even over a mesh with the auto axis `y`, and an unconstrained one is replicated.
-        let output = sharding.lower_pending_reduction_constraint(input, &[], &mut block_ref, location).unwrap();
+        let state = ProgramLoweringState::new();
+        let output = sharding.lower_pending_reduction_constraint(input, &state, &mut block_ref, location).unwrap();
 
         // An axis that an enclosing manual region binds is left out of the constraint.
-        let bound = ["m".to_string()];
-        sharding.lower_pending_reduction_constraint(input, &bound, &mut block_ref, location).unwrap();
+        let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
+        let state = state.enter_manual_region(boundary);
+        sharding.lower_pending_reduction_constraint(input, &state, &mut block_ref, location).unwrap();
         let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(output, operations[0].result(0).unwrap().as_ref());
         assert_eq!(

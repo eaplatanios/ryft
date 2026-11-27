@@ -4,9 +4,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use ryft_core::{Provenance, ShardMapBoundary};
-use ryft_mlir::{AttributeRef, Context as MlirContext, Location, LocationRef, ValueRef};
+use ryft_core::{LogicalMesh, Provenance, ShardMapBoundary, Sharding};
+use ryft_mlir::{AttributeRef, BlockRef, Context as MlirContext, Location, LocationRef, ValueRef};
 
+use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::lowering::{LoweringError, RaggedDotLoweringStrategy};
 use crate::operations::composites::NamedCompositionFunctionMap;
 use crate::{Error, RetainedArray, RuntimeRequirement, normalize_runtime_requirements};
@@ -45,6 +46,7 @@ impl ProgramLoweringState {
                 has_provenance: Rc::new(Cell::new(false)),
                 has_assertions: Rc::new(Cell::new(false)),
                 runtime_requirements: Rc::new(RefCell::new(Vec::new())),
+                mesh: Rc::new(RefCell::new(None)),
             },
             scope: LoweringScopeState::default(),
         }
@@ -129,6 +131,14 @@ impl ProgramLoweringState {
         self.shared.runtime_requirements.borrow().clone()
     }
 
+    /// Returns the mesh that lowering has recorded for this module so far (refer to
+    /// [`require_mesh`](Self::require_mesh)), which is the mesh that the module declares, or [`None`] when nothing
+    /// that lowering has emitted refers to a mesh.
+    #[inline]
+    pub(super) fn mesh(&self) -> Option<LogicalMesh> {
+        self.shared.mesh.borrow().clone()
+    }
+
     /// Records that lowering has emitted an assertion in this module.
     #[inline]
     pub(super) fn record_assertion(&self) {
@@ -147,6 +157,34 @@ impl ProgramLoweringState {
         updated.push(requirement);
         *requirements = normalize_runtime_requirements(updated)?;
         Ok(())
+    }
+
+    /// Records `mesh` as the mesh that this module declares, which everything that lowering emits over a mesh (i.e.,
+    /// the sharding of a signature value, of a constraint, or of the boundary of a manual computation) refers to by
+    /// one symbol. Whatever lowers a sharding records its mesh here, so the module declares a mesh exactly when
+    /// something that lowering emitted refers to one, rather than when an analysis of the program predicts that. The
+    /// module keeps the first mesh that is recorded, including its axis types, because the emitted `sdy.mesh` records
+    /// only axis names and sizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoweringError::MismatchedMeshTopology`] when the axis names or sizes of `mesh` differ from those of
+    /// the recorded mesh, including in order.
+    pub(crate) fn require_mesh(&self, mesh: &LogicalMesh) -> Result<(), Error> {
+        let mut recorded = self.shared.mesh.borrow_mut();
+        match recorded.as_ref() {
+            Some(recorded) if !recorded.has_same_topology(mesh) => {
+                Err(Error::Lowering(LoweringError::MismatchedMeshTopology {
+                    expected: recorded.clone(),
+                    actual: mesh.clone(),
+                }))
+            }
+            Some(_) => Ok(()),
+            None => {
+                *recorded = Some(mesh.clone());
+                Ok(())
+            }
+        }
     }
 
     /// Returns the axes bound by every enclosing manual region, excluded from shard-local placement constraints.
@@ -174,6 +212,39 @@ impl ProgramLoweringState {
     /// region of the scope, which cannot reach the session constants of the enclosing scope.
     pub(crate) fn enter_manual_region(&self, boundary: ShardMapBoundary) -> Self {
         Self { shared: self.shared.clone(), scope: self.scope.entering_manual_region(boundary) }
+    }
+
+    /// Lowers a tensor placement constraint of `input_value` to `sharding` in this scope and returns the constrained
+    /// value. The constraint is that of [`ShardingExtension::lower_sharding_constraint`] without the mesh axes that
+    /// the enclosing manual regions bind, and the mesh of `sharding` is recorded as the mesh of the module (refer to
+    /// [`require_mesh`](Self::require_mesh)).
+    pub(crate) fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
+        &self,
+        sharding: &Sharding,
+        input_value: ValueRef<'b, 'c, 't>,
+        open_dimensions: OpenDimensions<'_>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        self.require_mesh(sharding.mesh())?;
+        sharding.lower_sharding_constraint(input_value, open_dimensions, self.bound_manual_axes(), block, location)
+    }
+
+    /// Lowers a tensor placement constraint that replicates `input_value`, whose tracked placement is `sharding`,
+    /// along `axes` in this scope and returns the constrained value. The constraint is that of
+    /// [`ShardingExtension::lower_replication_constraint`] without the mesh axes that the enclosing manual regions
+    /// bind, and the mesh of `sharding` is recorded as the mesh of the module (refer to
+    /// [`require_mesh`](Self::require_mesh)).
+    pub(crate) fn lower_replication_constraint<'b, 'c: 'b, 't: 'c>(
+        &self,
+        sharding: &Sharding,
+        input_value: ValueRef<'b, 'c, 't>,
+        axes: &[usize],
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        self.require_mesh(sharding.mesh())?;
+        sharding.lower_replication_constraint(input_value, axes, self.bound_manual_axes(), block, location)
     }
 
     /// Returns the value of `constant` in a scope whose captured values are `captured_values`.
@@ -263,6 +334,10 @@ struct SharedLoweringState {
 
     /// Runtime contracts declared by emitted operations across every nested lowering scope.
     runtime_requirements: Rc<RefCell<Vec<RuntimeRequirement>>>,
+
+    /// Mesh that the emitted shardings of every nested lowering scope refer to, which the module declares, or [`None`]
+    /// while nothing that lowering has emitted refers to a mesh.
+    mesh: Rc<RefCell<Option<LogicalMesh>>>,
 }
 
 /// State of one lowering scope in a [`ProgramLoweringState`] (e.g., the entry function of the module, or the body of an
@@ -308,11 +383,54 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, ParallelReduce, ReductionKind, Shape,
-        ShardMapOptions, Sharding, ShardingDimension, shard_map,
+        ArrayType, DataType, Dimension, MeshAxis, MeshAxisType, ParallelReduce, ReductionKind, Shape, ShardMapOptions,
+        ShardingDimension, shard_map,
     };
+    use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue};
 
+    use crate::lowering::sharding::tests::{test_input_type, test_mesh};
+    use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::{ArrayTracer, ProgramLoweringExtension, ProgramLoweringOptions, TracedProgram, trace};
+
+    use super::*;
+
+    #[test]
+    fn test_program_lowering_state_require_mesh() {
+        let mesh = |axes: [(&str, usize); 2], r#type: MeshAxisType| {
+            LogicalMesh::new(axes.map(|(name, size)| MeshAxis::new(name, size, r#type).unwrap()).to_vec()).unwrap()
+        };
+        let explicit = mesh([("x", 2), ("y", 2)], MeshAxisType::Explicit);
+        let state = ProgramLoweringState::new();
+        assert_eq!(state.mesh(), None);
+        state.require_mesh(&explicit).unwrap();
+        assert_eq!(state.mesh(), Some(explicit.clone()));
+
+        // A mesh that differs only in axis types shares the module mesh, which keeps the axis types of its first mesh.
+        let manual = mesh([("x", 2), ("y", 2)], MeshAxisType::Manual);
+        state.require_mesh(&manual).unwrap();
+        assert_eq!(state.mesh(), Some(explicit.clone()));
+
+        // Device ids follow the order of the axes of the module mesh, so a reordered mesh is another topology, as is a
+        // mesh with other axis names or sizes. The module mesh stays the recorded one.
+        for other in [
+            mesh([("y", 2), ("x", 2)], MeshAxisType::Explicit),
+            mesh([("x", 2), ("z", 2)], MeshAxisType::Explicit),
+            mesh([("x", 2), ("y", 4)], MeshAxisType::Explicit),
+        ] {
+            assert!(matches!(
+                state.require_mesh(&other),
+                Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
+                    if expected == explicit && actual == other,
+            ));
+        }
+        assert_eq!(state.mesh(), Some(explicit));
+
+        // Every lowering scope of a program records into the same module, including the body of a manual region.
+        let state = ProgramLoweringState::new();
+        let boundary = ShardMapBoundary::new(manual.clone(), Vec::new(), Vec::new(), vec!["x".to_string()]).unwrap();
+        state.enter_manual_region(boundary).require_mesh(&manual).unwrap();
+        assert_eq!(state.mesh(), Some(manual));
+    }
 
     #[test]
     fn test_program_lowering_state_next_channel_id() {
@@ -377,6 +495,83 @@ mod tests {
                   }
                 }
             "#},
+        );
+    }
+
+    #[test]
+    fn test_program_lowering_state_lower_sharding_constraint() {
+        // The constraints are rendered outside any function, so their detached inputs print as unknown SSA values.
+        let input_type = test_input_type();
+        let sharding = input_type.sharding().unwrap();
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = input_type.lower(&context, location).unwrap();
+        let block = context.block(&[(tensor_type, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let mut block_ref = block.as_ref();
+        let location = location.as_ref();
+        let state = ProgramLoweringState::new();
+        let output = state
+            .lower_sharding_constraint(sharding, input, OpenDimensions::None, &mut block_ref, location)
+            .unwrap();
+        assert_eq!(state.mesh(), Some(test_mesh()));
+
+        // An axis that an enclosing manual region binds is left out of the constraint, whose mesh is still recorded.
+        let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
+        let state = ProgramLoweringState::new().enter_manual_region(boundary);
+        state
+            .lower_sharding_constraint(sharding, input, OpenDimensions::None, &mut block_ref, location)
+            .unwrap();
+        assert_eq!(state.mesh(), Some(test_mesh()));
+
+        // A sharding over a mesh of another topology cannot be lowered into the module, and nothing is emitted for it.
+        let other = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let other_sharding = Sharding::replicated(other.clone(), 2);
+        assert!(matches!(
+            state.lower_sharding_constraint(&other_sharding, input, OpenDimensions::None, &mut block_ref, location),
+            Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
+                if expected == test_mesh() && actual == other,
+        ));
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output, operations[0].result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{"x"}, {}], replicated={"m"}> : tensor<4x2xf32>"#,
+                r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{"x"}, {}]> : tensor<4x2xf32>"#,
+            ],
+        );
+    }
+
+    #[test]
+    fn test_program_lowering_state_lower_replication_constraint() {
+        // The constraints are rendered outside any function, so their detached inputs print as unknown SSA values.
+        let input_type = test_input_type();
+        let sharding = input_type.sharding().unwrap();
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = input_type.lower(&context, location).unwrap();
+        let block = context.block(&[(tensor_type, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let mut block_ref = block.as_ref();
+        let location = location.as_ref();
+        let state = ProgramLoweringState::new();
+        let output = state.lower_replication_constraint(sharding, input, &[0], &mut block_ref, location).unwrap();
+        assert_eq!(state.mesh(), Some(test_mesh()));
+
+        // An axis that an enclosing manual region binds is left out of the constraint, whose mesh is still recorded.
+        let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
+        let state = ProgramLoweringState::new().enter_manual_region(boundary);
+        state.lower_replication_constraint(sharding, input, &[0], &mut block_ref, location).unwrap();
+        assert_eq!(state.mesh(), Some(test_mesh()));
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output, operations[0].result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{}, {?}], replicated={"m", "x"}> : tensor<4x2xf32>"#,
+                r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{}, {?}], replicated={"x"}> : tensor<4x2xf32>"#,
+            ],
         );
     }
 }

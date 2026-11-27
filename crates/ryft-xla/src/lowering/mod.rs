@@ -436,6 +436,21 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
         self.lowering_state.require_runtime(requirement)
     }
 
+    /// Declares `mesh` as the mesh that this emitted operation refers to (e.g., through the Shardy attribute of a
+    /// [`Sharding`](ryft_core::Sharding) that it lowers with [`ShardingExtension`]).
+    ///
+    /// A module declares one mesh, under [`SHARDY_MESH_SYMBOL_NAME`], which every nested lowering scope shares, and it
+    /// declares that mesh only when an emitted operation refers to it. An operation that lowers a sharding itself must
+    /// therefore declare the mesh of that sharding here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoweringError::MismatchedMeshTopology`] when the axis names or sizes of `mesh` differ from those of
+    /// the mesh that the module already refers to, including in order.
+    pub fn require_mesh(&mut self, mesh: &LogicalMesh) -> Result<(), Error> {
+        self.lowering_state.require_mesh(mesh)
+    }
+
     /// Returns the StableHLO tensor type that represents values of `array_type`.
     ///
     /// # Errors
@@ -1173,7 +1188,7 @@ pub(crate) mod tests {
 
     use crate::devices::MemoryExtension;
     use crate::lowering::LoweringError;
-    use crate::lowering::modules::{merge_logical_meshes, normalize_function_name, serialize_lowered_module};
+    use crate::lowering::modules::{normalize_function_name, serialize_lowered_module};
 
     use crate::lowering::regions::tests::lower_plain_program_outputs;
 
@@ -1232,23 +1247,6 @@ pub(crate) mod tests {
         // This entry point lowers one whole module, so the program lowering state is scoped to that module.
         let lowering_state =
             ProgramLoweringState::new().with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy);
-        let mut mesh = None;
-        for region in program.regions().iter() {
-            for atom in region.atoms() {
-                let atom_type = atom.r#type();
-                let Some(sharding) = atom_type.sharding() else {
-                    continue;
-                };
-                mesh = Some(match mesh.take() {
-                    Some(existing_mesh) => merge_logical_meshes(existing_mesh, sharding.mesh())?,
-                    None => sharding.mesh().clone(),
-                });
-            }
-        }
-        if let Some(mesh) = mesh {
-            module.body()?.append_operation(mesh.lower(location)?)?;
-        }
-
         let input_tensor_types = program
             .input_ids()
             .iter()
@@ -1320,6 +1318,10 @@ pub(crate) mod tests {
                 location,
             )?
         })?;
+
+        if let Some(mesh) = lowering_state.mesh() {
+            module.body()?.insert_operation(mesh.lower(location)?, 0)?;
+        }
 
         module.remove_unused_stable_hlo_constants()?;
         if !module.verify()? {

@@ -15,7 +15,7 @@ use ryft_mlir::{
 
 use crate::lowering::emissions::emitted_regions;
 use crate::lowering::regions::NestedProgramLoweringExtension;
-use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
+use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, dimension_extent_i64, lower_unplaced_constant_output, physical_bound_type,
@@ -495,13 +495,13 @@ pub(crate) fn threaded_effect_token_values<'b, 'c: 'b, 't: 'c>(
 /// that mesh. Nothing inside a region needs to pin the placement of an output over a mesh with explicit axes (e.g., a
 /// region may return a replicated constant), so propagation could otherwise assign the output a placement other than
 /// the one that its type states. Outputs without a sharding, outputs whose mesh has no explicit axis (e.g., only `Auto`
-/// or `Manual` axes), references, and first-class dimensions remain unconstrained. Mesh axes in `bound_manual_axes`,
-/// which enclosing manual regions bind, are excluded from the constraints that [`ShardingExtension::lower_sharding_constraint`]
-/// emits.
+/// or `Manual` axes), references, and first-class dimensions remain unconstrained. The constraints are lowered in the
+/// scope of `lowering_state` (refer to [`ProgramLoweringState::lower_sharding_constraint`]), which excludes the mesh
+/// axes that the enclosing manual regions bind and records the mesh of each constraint as the mesh of the module.
 pub(crate) fn lower_explicit_sharding_constraints<'b, 'c: 'b, 't: 'c>(
     outputs: Vec<ValueRef<'b, 'c, 't>>,
     output_types: &[Type],
-    bound_manual_axes: &[String],
+    lowering_state: &ProgramLoweringState,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
@@ -515,7 +515,7 @@ pub(crate) fn lower_explicit_sharding_constraints<'b, 'c: 'b, 't: 'c>(
         };
         constrained.push(match explicit_sharding {
             Some(sharding) => {
-                sharding.lower_sharding_constraint(output, OpenDimensions::All, bound_manual_axes, block, location)?
+                lowering_state.lower_sharding_constraint(sharding, output, OpenDimensions::All, block, location)?
             }
             None => output,
         });

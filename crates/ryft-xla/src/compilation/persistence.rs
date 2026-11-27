@@ -809,7 +809,7 @@ impl Session {
                 reason: "output commitment metadata does not match the output count".into(),
             }));
         }
-        let physical_input_count = signature.array_input_count();
+        let physical_input_count = signature.input_array_count();
         if expected_input_shardings.len() != physical_input_count {
             return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
                 reason: "expected input shardings do not match the physical input count".into(),
@@ -896,7 +896,7 @@ impl Session {
             &LoadOptions::default(),
         )?;
         let output_types_physical = executable.executable()?.output_element_types()?;
-        if output_types_physical.len() != signature.physical_output_count()
+        if output_types_physical.len() != signature.output_count()
             || signature
                 .ordered_io_output_index()
                 .is_some_and(|index| output_types_physical[index] != BufferType::Token)

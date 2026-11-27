@@ -131,13 +131,7 @@ impl LowerableOperation for ConditionOperation<Type> {
             operation.result(output_count + offset).unwrap().as_ref()
         });
         let outputs = (0..output_count).map(|index| operation.result(index).unwrap().as_ref()).collect();
-        lower_explicit_sharding_constraints(
-            outputs,
-            output_types,
-            lowering_state.bound_manual_axes(),
-            &mut block,
-            location,
-        )
+        lower_explicit_sharding_constraints(outputs, output_types, lowering_state, &mut block, location)
     }
 }
 

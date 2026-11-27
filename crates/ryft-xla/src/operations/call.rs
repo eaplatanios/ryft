@@ -6,8 +6,8 @@
 //! nested call follows its caller. Each entry point of this crate honors the boundary of a call as follows:
 //!
 //!   - Lowering constrains the inputs and the outputs that have overrides where the call executes, as an execution of
-//!     the function annotates its inputs and outputs, and mesh discovery declares the mesh of these constraints (refer
-//!     to `ProgramLoweringAnalysisExtension::nested_sharding_mesh`). Compiling a caller for other devices than those of
+//!     the function annotates its inputs and outputs, and the module declares the mesh of these constraints (refer to
+//!     `ProgramLoweringState::require_mesh`). Compiling a caller for other devices than those of
 //!     a call that names devices, or for the replicas of a bounded dynamic program while an override splits a value,
 //!     fails with an exact error (refer to `validate_placements`), as JAX rejects a nested `jit` with an incompatible
 //!     device assignment. Lowering emits each callee inline or, when it occurs more than once, as a call of one shared

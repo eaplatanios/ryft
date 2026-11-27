@@ -281,7 +281,7 @@ impl LowerableOperation for ScanOperation<Type> {
         // length, which the output types of the scan may refine (e.g., to the trip count of an exact runtime length).
         let results =
             lower_refined_region_outputs(results, &region_output_types, output_types, block, context, location)?;
-        lower_explicit_sharding_constraints(results, output_types, lowering_state.bound_manual_axes(), block, location)
+        lower_explicit_sharding_constraints(results, output_types, lowering_state, block, location)
     }
 }
 

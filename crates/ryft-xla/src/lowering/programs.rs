@@ -152,16 +152,18 @@ pub struct MlirProgramSignature {
     requires_assertion_handler: bool,
 }
 
-// TODO(eaplatanios): Review this.
 impl MlirProgramSignature {
     /// Derives the executable boundary mapping for the provided logical input and output types.
     pub(crate) fn new(input_types: &[ArrayType], output_types: &[ArrayType]) -> Self {
-        fn mapping(types: &[ArrayType]) -> Arc<[Option<usize>]> {
+        /// Maps each flattened logical type to its executable array slot. Statically shaped [`DataType::Zero`]
+        /// entries receive [`None`]. All other entries get consecutive slots starting at zero, in signature order.
+        /// This includes dynamically shaped zeros, whose slots carry their runtime shape.
+        fn array_slot_mapping(types: &[ArrayType]) -> Arc<[Option<usize>]> {
             let mut physical_index = 0;
             types
                 .iter()
                 .map(|r#type| {
-                    if !MlirProgramSignature::materializes(r#type) {
+                    if r#type.data_type().is_zero() && r#type.static_shape().is_some() {
                         None
                     } else {
                         let index = physical_index;
@@ -171,7 +173,8 @@ impl MlirProgramSignature {
                 })
                 .collect()
         }
-        let input_mapping = mapping(input_types);
+
+        let input_mapping = array_slot_mapping(input_types);
         let mut physical_input_index = input_mapping.iter().flatten().count();
         let mut input_dimensions = Vec::new();
         for (logical_input_index, input_type) in input_types.iter().enumerate() {
@@ -186,7 +189,8 @@ impl MlirProgramSignature {
                 }
             }
         }
-        let output_mapping = mapping(output_types);
+
+        let output_mapping = array_slot_mapping(output_types);
         let mut physical_output_index = output_mapping.iter().flatten().count();
         let mut output_dimensions = Vec::new();
         for (logical_output_index, output_type) in output_types.iter().enumerate() {
@@ -201,6 +205,7 @@ impl MlirProgramSignature {
                 }
             }
         }
+
         Self {
             input_mapping,
             output_mapping,
@@ -214,24 +219,18 @@ impl MlirProgramSignature {
         }
     }
 
-    /// Returns whether an executable boundary materializes an input or output of type `array_type` as a physical input
-    /// or output, which every type does except a statically shaped [`DataType::Zero`] type, whose values carry no
-    /// runtime payload.
-    #[inline]
-    pub fn materializes(array_type: &ArrayType) -> bool {
-        !array_type.data_type().is_zero() || array_type.static_shape().is_none()
-    }
-
     /// Erases the logical inputs that `unread_inputs` flags (i.e., one flag per logical input), which the executable
-    /// never reads (refer to `unread_entry_inputs` in `crate::lowering`), and records them, so that executions and
-    /// persisted copies of the executable read which inputs are unread rather than infer it from the mapping, which
-    /// cannot tell an unread input from a read one that has no buffer (e.g., of the zero data type). Every flagged
-    /// input must have a static shape. Flags that state no unread input leave the signature unchanged.
+    /// never reads, and records them, so that executions and persisted copies of the executable read which inputs are
+    /// unread rather than infer it from the mapping, which cannot tell an unread input from a read one that has no
+    /// buffer (e.g., of the zero data type). Every flagged input must have a static shape. Flags that state no unread
+    /// input leave the signature unchanged.
     pub(crate) fn with_unread_inputs(mut self, unread_inputs: &[bool]) -> Self {
         if !unread_inputs.contains(&true) {
             return self;
         }
+
         debug_assert_eq!(unread_inputs.len(), self.input_mapping.len());
+
         let mut physical_index = 0;
         self.input_mapping = self
             .input_mapping
@@ -245,6 +244,7 @@ impl MlirProgramSignature {
                 Some(physical_index - 1)
             })
             .collect();
+
         let input_dimensions =
             self.input_dimensions
                 .iter()
@@ -253,9 +253,16 @@ impl MlirProgramSignature {
                     physical_input_index: physical_index + offset,
                     ..*dimension
                 });
+
         self.input_dimensions = input_dimensions.collect();
         self.unread_inputs = unread_inputs.into();
         self
+    }
+
+    /// Records that lowering emitted a runtime assertion, so that executions need the runtime assertion handler.
+    #[inline]
+    pub(crate) fn require_assertion_handler(&mut self) {
+        self.requires_assertion_handler = true;
     }
 
     /// Attaches the effect metadata known at compilation time, also used when restoring persistent executable metadata.
@@ -380,17 +387,31 @@ impl MlirProgramSignature {
         self.output_array_count() + usize::from(self.ordered_io)
     }
 
-    /// Projects logical inputs into physical executable order.
+    /// Clones the entries in `inputs` for logical inputs that have an executable array slot. Supply one entry per
+    /// flattened logical input, including captures. For example, the input mapping `[Some(0), None, Some(1)]` maps
+    /// `[a, b, c]` to `[a, c]`. Hidden extent scalars and effect tokens have separate slots.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `inputs` has a different length from [`Self::input_mapping`].
     #[inline]
     pub fn project_inputs<T: Clone>(&self, inputs: &[T]) -> Vec<T> {
         Self::project(&self.input_mapping, inputs)
     }
 
-    /// Projects logical outputs into physical executable order.
+    /// Clones the entries in `outputs` for logical outputs that have an executable array slot. Supply one entry per
+    /// flattened logical output. For example, the output mapping `[None, Some(0)]` maps `[a, b]` to `[b]`. Hidden
+    /// extent scalars and effect tokens have separate slots.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `outputs` has a different length from [`Self::output_mapping`].
     #[inline]
     pub fn project_outputs<T: Clone>(&self, outputs: &[T]) -> Vec<T> {
         Self::project(&self.output_mapping, outputs)
     }
+
+    // TODO(eaplatanios): Review this.
 
     /// Projects logical data inputs to bounded physical tensor types and appends hidden extent scalars.
     /// Native effect tokens are separate from array types and are excluded.
@@ -467,13 +488,12 @@ impl MlirProgramSignature {
         physical
     }
 
-    /// Records that lowering emitted a runtime assertion, so that executions need the runtime assertion handler.
-    #[inline]
-    pub(crate) fn require_assertion_handler(&mut self) {
-        self.requires_assertion_handler = true;
-    }
-
-    /// Projects one logical sequence according to `mapping`.
+    /// Clones entries from `values` whose corresponding entries in `mapping` are `Some(_)`. The signature assigns
+    /// physical indices consecutively in logical order, so keeping these entries in sequence gives executable order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `mapping` and `values` have different lengths.
     fn project<T: Clone>(mapping: &[Option<usize>], values: &[T]) -> Vec<T> {
         assert_eq!(mapping.len(), values.len());
         mapping
@@ -2940,12 +2960,38 @@ mod tests {
         let output = builder.add_instruction(operation, regions, vec![input], None).unwrap()[0];
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder]);
         let program = program.unwrap();
+        // The signature is lowered without shardings, so that only the body can refer to a mesh.
         let lower = |target_platform| {
             let options = ProgramLoweringOptions::new().with_target_platform(Some(target_platform));
-            program.to_mlir("main", &options).unwrap()
+            program.to_mlir("main", &options.without_boundary_shardings()).unwrap()
         };
-        assert_eq!(lower("cuda").mesh(), None);
-        assert_eq!(lower("cpu").mesh(), Some(&other));
+        let lowered = lower("cuda");
+        assert_eq!(lowered.mesh(), None);
+        assert_eq!(
+            lowered.into_stable_hlo(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.multiply %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+        let lowered = lower("cpu");
+        assert_eq!(lowered.mesh(), Some(&other));
+        assert_eq!(
+            lowered.into_stable_hlo(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["other"=2]>
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}], replicated={"other"}> : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]

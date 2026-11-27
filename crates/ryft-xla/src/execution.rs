@@ -883,7 +883,7 @@ impl Session {
             addressable_device_ids: Arc::clone(&plan.addressable_device_ids),
             donation_flags,
             input_refinements,
-            physical_output_count: program.signature().array_output_count(),
+            physical_output_count: program.signature().output_array_count(),
             output_assignment: OutputAssignment { committed, locally_assigned },
         })
     }
@@ -1405,7 +1405,7 @@ impl Session {
             arguments
                 .inputs_by_device()
                 .iter()
-                .all(|inputs| inputs.len() == program.signature().physical_input_count())
+                .all(|inputs| inputs.len() == program.signature().input_count())
         );
         #[cfg(test)]
         if tests::take_stateful_failure_injection(tests::StatefulFailureInjection::BeforeSubmission) {
@@ -1428,8 +1428,8 @@ impl Session {
             .then(|| ExecutionFence::join(std::iter::once(fence.clone()).chain(input_fences)));
         // Reference publication must happen after every successful handoff, including a subsequent marshalling error.
         after_submission(joined_fence.as_ref().unwrap_or(&fence));
-        let output_count = program.signature().physical_output_count();
-        debug_assert_eq!(array_output_count, program.signature().array_output_count());
+        let output_count = program.signature().output_count();
+        debug_assert_eq!(array_output_count, program.signature().output_array_count());
         let invalid_outputs = device_outputs
             .iter()
             .find(|outputs| outputs.outputs.len() != output_count)
@@ -1700,7 +1700,7 @@ impl Session {
             let extent_scalar = Array::from_host_buffer(self, extent_type, mesh.clone(), None, extent.to_ne_bytes())?;
             physical_inputs.push(extent_scalar);
         }
-        assert_eq!(physical_inputs.len(), signature.array_input_count());
+        assert_eq!(physical_inputs.len(), signature.input_array_count());
         Ok(physical_inputs)
     }
 

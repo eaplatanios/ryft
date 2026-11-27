@@ -2301,7 +2301,7 @@ mod tests {
         assert!(!signature.has_unordered_io());
         assert_eq!(signature.ordered_io_input_index(), None);
         assert_eq!(signature.ordered_io_output_index(), None);
-        assert_eq!(signature.physical_input_count(), 2);
+        assert_eq!(signature.input_count(), 2);
         assert_eq!(
             stable_hlo,
             indoc! {"

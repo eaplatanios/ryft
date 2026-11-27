@@ -818,7 +818,7 @@ mod tests {
             assert!(!signature.requires_assertion_handler());
             assert_eq!(signature.ordered_io_input_index(), ordered.then_some(1));
             assert_eq!(signature.ordered_io_output_index(), ordered.then_some(0));
-            assert_eq!(signature.physical_input_count(), 1 + usize::from(ordered));
+            assert_eq!(signature.input_count(), 1 + usize::from(ordered));
             let expected = if ordered {
                 indoc! {"
                     module {

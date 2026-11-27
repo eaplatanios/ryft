@@ -36,7 +36,6 @@ use crate::lowering::emissions::{
     collect_session_constants, emitted_capture_reads, emitted_regions, omits_regions, unread_entry_inputs,
 };
 use crate::lowering::modules::{contains_unresolved_references, contains_unresolved_state, value_shardings};
-use crate::lowering::programs::MlirProgramSignature;
 use crate::lowering::programs::{
     OutputShardingSource, ProgramLoweringAnalysisExtension, ProgramLoweringExtension, ProgramLoweringOptions,
     entry_output_shardings, entry_outputs_with_compiler_chosen_placement,
@@ -1546,10 +1545,9 @@ fn runtime_output_sharding(annotation: &Sharding, declaration: Option<&Sharding>
 /// of one size and pads the last ones, so an uneven split (e.g., five elements over two devices) makes the executable
 /// expect or return buffers other than the exact shards (i.e., `[3]` and `[2]`) that the runtime placement describes,
 /// which launching the executable or reconstructing its outputs would reject. A dimension is split into as many shards
-/// as the product of the sizes of the mesh axes that it is sharded along. Dynamic extents are not checked here, and
-/// neither are values that the executable does not materialize (refer to [`MlirProgramSignature::materializes`]),
-/// because they have no buffers that the executable could expect or return (e.g., a `Zero[5]` split into shards of
-/// lengths 3 and 2).
+/// as the product of the sizes of the mesh axes that it is sharded along. The check applies to static extents of
+/// values with executable buffers. Statically shaped [`DataType::Zero`](ryft_core::DataType::Zero) values need no
+/// buffer, so their extents can split unevenly (e.g., a `Zero[5]` split into shards of lengths 3 and 2).
 ///
 /// # Errors
 ///
@@ -1560,7 +1558,7 @@ fn validate_even_sharding(
     array_type: &ArrayType,
     sharding: &Sharding,
 ) -> Result<(), Error> {
-    if !MlirProgramSignature::materializes(array_type) {
+    if array_type.data_type().is_zero() && array_type.static_shape().is_some() {
         return Ok(());
     }
     for (dimension, (extent, sharding_dimension)) in

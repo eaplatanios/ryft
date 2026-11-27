@@ -9,7 +9,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
+use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, lower_explicit_shape,
     lower_runtime_dimension_size_i64, lower_static_index_constants, lower_unplaced_constant_output,
@@ -40,10 +40,10 @@ impl LowerableOperation for ScatterOperation {
             return Ok(values);
         }
         check_count!("input", values, 1, ProgramError);
-        let value = output_types[0].sharding().unwrap().lower_sharding_constraint(
+        let value = lowerer.lowering_state().lower_sharding_constraint(
+            output_types[0].sharding().unwrap(),
             values[0],
             OpenDimensions::All,
-            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.location(),
         )?;

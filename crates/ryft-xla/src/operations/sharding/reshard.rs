@@ -2,7 +2,7 @@ use ryft_core::macros::check_count;
 use ryft_core::{ArrayType, ReshardOperation};
 use ryft_mlir::ValueRef;
 
-use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
+use crate::lowering::sharding::OpenDimensions;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ReshardOperation {
@@ -15,10 +15,10 @@ impl LowerableOperation for ReshardOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (input_types, output_types);
         check_count!("input", input_values, 1, ProgramError);
-        let value = self.sharding().lower_sharding_constraint(
+        let value = lowerer.lowering_state().lower_sharding_constraint(
+            self.sharding(),
             input_values[0],
             OpenDimensions::All,
-            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.location(),
         )?;

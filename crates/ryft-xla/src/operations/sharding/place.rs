@@ -100,6 +100,7 @@ impl LowerableOperation for PlaceOperation {
         };
         if let Some(sharding) = sharding {
             let location = lowerer.location();
+            lowerer.lowering_state().require_mesh(sharding.mesh())?;
             let sharding = sharding.lower(OpenDimensions::None, location)?;
             value = lowerer
                 .block()

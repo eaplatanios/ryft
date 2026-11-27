@@ -10,7 +10,8 @@ use ryft_mlir::{
 };
 
 use crate::lowering::MlirLowerableValue;
-use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
+use crate::lowering::sharding::OpenDimensions;
+use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, annotate_output_memory, lower_constant_output, physical_bound_type,
     stable_hlo_dynamic_dimension_bound,
@@ -196,7 +197,7 @@ impl LowerableOperation for IotaOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             vec![result],
             output_types.first(),
-            lowerer.lowering_state().bound_manual_axes(),
+            lowerer.lowering_state(),
             &mut lowerer.block(),
             lowerer.location(),
         )
@@ -250,7 +251,7 @@ impl LowerableOperation for FillLikeOperation<ArrayType> {
             result,
             input_values[0],
             &output_types[0],
-            lowerer.lowering_state().bound_manual_axes(),
+            lowerer.lowering_state(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -283,7 +284,7 @@ impl LowerableOperation for IotaLikeOperation<ArrayType> {
             result,
             input_values[0],
             &output_types[0],
-            lowerer.lowering_state().bound_manual_axes(),
+            lowerer.lowering_state(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -308,7 +309,7 @@ impl LowerableOperation for ZeroOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             output_types.first(),
-            lowerer.lowering_state().bound_manual_axes(),
+            lowerer.lowering_state(),
             &mut lowerer.block(),
             lowerer.location(),
         )
@@ -332,7 +333,7 @@ impl LowerableOperation for OneOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             output_types.first(),
-            lowerer.lowering_state().bound_manual_axes(),
+            lowerer.lowering_state(),
             &mut lowerer.block(),
             lowerer.location(),
         )
@@ -352,7 +353,7 @@ impl LowerableOperation for ZeroLikeOperation<ArrayType> {
             input_values,
             output_types,
             0,
-            lowerer.lowering_state().bound_manual_axes(),
+            lowerer.lowering_state(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -373,7 +374,7 @@ impl LowerableOperation for OneLikeOperation<ArrayType> {
             input_values,
             output_types,
             1,
-            lowerer.lowering_state().bound_manual_axes(),
+            lowerer.lowering_state(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -402,7 +403,7 @@ impl MemberLowerableOperation<Type> for ZeroOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             output_type,
-            lowerer.lowering_state().bound_manual_axes(),
+            lowerer.lowering_state(),
             &mut lowerer.block(),
             location,
         )
@@ -430,7 +431,7 @@ impl MemberLowerableOperation<Type> for OneOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             output_type,
-            lowerer.lowering_state().bound_manual_axes(),
+            lowerer.lowering_state(),
             &mut lowerer.block(),
             location,
         )
@@ -468,7 +469,7 @@ impl MemberLowerableOperation<Type> for IotaOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             Some(&output_type),
-            lowerer.lowering_state().bound_manual_axes(),
+            lowerer.lowering_state(),
             &mut lowerer.block(),
             location,
         )
@@ -480,7 +481,7 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     integer_value: i64,
-    bound_manual_axes: &[String],
+    lowering_state: &ProgramLoweringState,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -532,8 +533,7 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
         return Ok(result);
     };
     check_count!("input", result, 1, ProgramError);
-    let result =
-        sharding.lower_sharding_constraint(result[0], OpenDimensions::All, bound_manual_axes, block, location)?;
+    let result = lowering_state.lower_sharding_constraint(sharding, result[0], OpenDimensions::All, block, location)?;
     Ok(vec![result])
 }
 
@@ -545,7 +545,7 @@ fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
     result: ValueRef<'b, 'c, 't>,
     exemplar: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
-    bound_manual_axes: &[String],
+    lowering_state: &ProgramLoweringState,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -557,7 +557,7 @@ fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
     let result = output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)?;
     let result = match output_type.sharding() {
         Some(sharding) => {
-            sharding.lower_sharding_constraint(result, OpenDimensions::All, bound_manual_axes, block, location)?
+            lowering_state.lower_sharding_constraint(sharding, result, OpenDimensions::All, block, location)?
         }
         None => result,
     };
@@ -572,7 +572,7 @@ fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
 fn lower_constructor_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     result: Vec<ValueRef<'b, 'c, 't>>,
     output_type: Option<&ArrayType>,
-    bound_manual_axes: &[String],
+    lowering_state: &ProgramLoweringState,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
@@ -580,8 +580,7 @@ fn lower_constructor_sharding_constraint<'b, 'c: 'b, 't: 'c>(
         return Ok(result);
     };
     check_count!("input", result, 1, ProgramError);
-    let result =
-        sharding.lower_sharding_constraint(result[0], OpenDimensions::All, bound_manual_axes, block, location)?;
+    let result = lowering_state.lower_sharding_constraint(sharding, result[0], OpenDimensions::All, block, location)?;
     Ok(vec![result])
 }
 

@@ -11,7 +11,6 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::lowering::sharding::ShardingExtension;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, DataTypeLoweringExtension,
     lower_f64_constant_splat, lower_signed_one_bit_to_mlir, lower_unplaced_constant_output, physical_bound_type,
@@ -344,10 +343,10 @@ impl LowerableOperation for ReduceOperation {
         if let Some(sharding) = shardable_sharding
             && !has_distributable_combiner(self.kind(), element_type, form)
         {
-            input_value = sharding.lower_replication_constraint(
+            input_value = lowerer.lowering_state().lower_replication_constraint(
+                sharding,
                 input_value,
                 self.axes(),
-                lowerer.lowering_state().bound_manual_axes(),
                 &mut lowerer.block(),
                 lowerer.location(),
             )?;

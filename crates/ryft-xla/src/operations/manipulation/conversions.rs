@@ -9,7 +9,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::modules::cast_changes_explicit_placement;
-use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
+use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, lower_f64_constant_splat, lower_signed_one_bit_to_mlir, lower_unplaced_constant_output,
     physical_bound_type, static_dimensions,
@@ -511,10 +511,10 @@ fn lower_cast<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     if let Some(sharding) = output_type.sharding()
         && cast_changes_explicit_placement(input_type, output_type)
     {
-        result = sharding.lower_sharding_constraint(
+        result = lowerer.lowering_state().lower_sharding_constraint(
+            sharding,
             result,
             OpenDimensions::All,
-            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.location(),
         )?;
@@ -3850,8 +3850,8 @@ mod tests {
         // Carrying an existing sharding forward requests no redistribution. A cast that only changes the layout emits
         // no constraint, whereas a changed explicit placement emits the complete output sharding like `reshard`, with
         // its dimensions open over the auto axis `a`. Types record no placement over auto mesh axes, so neither type
-        // places anything over `a`. The plain program entry point declares the mesh of every sharded atom, so the mesh
-        // declaration below does not depend on the cast.
+        // places anything over `a`. A module declares its mesh only when something that lowering emits refers to it,
+        // so the module of the cast that only changes the layout declares none.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
@@ -3867,7 +3867,6 @@ mod tests {
                 input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]))),
                 indoc! {"
                     module {
-                      sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
                       func.func @main(%arg0: tensor<4x4xf64>) -> tensor<4x4xf64> {
                         %0 = stablehlo.custom_call @LayoutConstraint(%arg0) {\
                             operand_layouts = [dense<[0, 1]> : tensor<2xindex>], \

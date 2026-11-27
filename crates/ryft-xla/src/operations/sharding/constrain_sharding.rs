@@ -2,7 +2,7 @@ use ryft_core::macros::check_count;
 use ryft_core::{ArrayType, ConstrainShardingOperation, ProgramError};
 use ryft_mlir::ValueRef;
 
-use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
+use crate::lowering::sharding::OpenDimensions;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ConstrainShardingOperation {
@@ -20,10 +20,10 @@ impl LowerableOperation for ConstrainShardingOperation {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let sharding = self.lowered_sharding(&output_types[0]).map_err(ProgramError::from)?;
-        let value = sharding.lower_sharding_constraint(
+        let value = lowerer.lowering_state().lower_sharding_constraint(
+            &sharding,
             input_values[0],
             OpenDimensions::None,
-            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.location(),
         )?;

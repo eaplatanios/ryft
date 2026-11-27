@@ -487,7 +487,7 @@ impl LowerableOperation for WhileOperation<Type> {
         let results =
             (0..state_count).map(|index| operation.result(counter_offset + index).unwrap().as_ref()).collect();
         let results = lower_refined_region_outputs(results, &state_types, output_types, block, context, location)?;
-        lower_explicit_sharding_constraints(results, output_types, lowering_state.bound_manual_axes(), block, location)
+        lower_explicit_sharding_constraints(results, output_types, lowering_state, block, location)
     }
 }
 

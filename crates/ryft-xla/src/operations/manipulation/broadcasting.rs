@@ -7,7 +7,7 @@ use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{Block, Operation as MlirOperation, Type as MlirType, Value as MlirValue, ValueRef};
 
 use crate::lowering::modules::broadcast_changes_explicit_sharding;
-use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
+use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, dimension_extent_i64, lower_explicit_shape, lower_runtime_dimension_size_i64,
     lower_static_index_constants, physical_bound_type,
@@ -26,7 +26,7 @@ impl LowerableOperation for BroadcastOperation {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let bound_manual_axes = lowerer.lowering_state().bound_manual_axes();
+        let lowering_state = lowerer.lowering_state();
         let block = &mut lowerer.block();
         let (context, location) = (lowerer.context(), lowerer.location());
         check_count!("input", input_values, 1, ProgramError);
@@ -120,7 +120,7 @@ impl LowerableOperation for BroadcastOperation {
         };
         let result = if broadcast_changes_explicit_sharding(&input_types[0], &output_types[0], self.output_axes()) {
             let sharding = output_types[0].sharding().unwrap();
-            sharding.lower_sharding_constraint(result, OpenDimensions::All, bound_manual_axes, block, location)?
+            lowering_state.lower_sharding_constraint(sharding, result, OpenDimensions::All, block, location)?
         } else {
             result
         };
@@ -159,10 +159,10 @@ impl LowerableOperation for BroadcastLikeOperation {
         let sources = (0..output_type.rank()).map(|axis| (input_values[1], axis)).collect::<Vec<_>>();
         let result = output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)?;
         let result = if broadcast_changes_explicit_sharding(&input_types[0], output_type, self.output_axes()) {
-            output_type.sharding().unwrap().lower_sharding_constraint(
+            lowerer.lowering_state().lower_sharding_constraint(
+                output_type.sharding().unwrap(),
                 result,
                 OpenDimensions::All,
-                lowerer.lowering_state().bound_manual_axes(),
                 block,
                 location,
             )?
@@ -267,10 +267,10 @@ impl LowerableOperation for DynamicBroadcastOperation {
             }
         };
         let result = if broadcast_changes_explicit_sharding(input_type, output_type, self.output_axes()) {
-            output_type.sharding().unwrap().lower_sharding_constraint(
+            lowering_state.lower_sharding_constraint(
+                output_type.sharding().unwrap(),
                 result,
                 OpenDimensions::All,
-                lowering_state.bound_manual_axes(),
                 block,
                 location,
             )?

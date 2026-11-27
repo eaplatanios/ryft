@@ -9,7 +9,8 @@ use ryft_mlir::{
 };
 
 use crate::lowering::EffectTokens;
-use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
+use crate::lowering::sharding::OpenDimensions;
+use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, dimension_extent_i32, dimension_extent_i64, lower_explicit_reshape_shape,
     lower_runtime_dimension_size_i64, lower_static_index_constants, physical_bound_type,
@@ -34,7 +35,7 @@ impl LowerableOperation for ReshapeOperation {
             &input_types[0],
             input_values,
             output_types,
-            lowerer.lowering_state().bound_manual_axes(),
+            lowerer.lowering_state(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -154,14 +155,7 @@ impl LowerableOperation for DynamicReshapeOperation {
         };
         let result = if self.output_sharding().is_some() {
             let output_sharding = output_type.sharding().unwrap();
-            let bound_manual_axes = lowering_state.bound_manual_axes();
-            output_sharding.lower_sharding_constraint(
-                result,
-                OpenDimensions::All,
-                bound_manual_axes,
-                block,
-                location,
-            )?
+            lowering_state.lower_sharding_constraint(output_sharding, result, OpenDimensions::All, block, location)?
         } else {
             result
         };
@@ -180,7 +174,7 @@ trait ReshapeOperationLoweringExtension {
         input_type: &ArrayType,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
-        bound_manual_axes: &[String],
+        lowering_state: &ProgramLoweringState,
         block: &mut BlockRef<'b, 'c, 't>,
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
@@ -194,7 +188,7 @@ impl ReshapeOperationLoweringExtension for ReshapeOperation {
         input_type: &ArrayType,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
-        bound_manual_axes: &[String],
+        lowering_state: &ProgramLoweringState,
         block: &mut BlockRef<'b, 'c, 't>,
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
@@ -273,13 +267,7 @@ impl ReshapeOperationLoweringExtension for ReshapeOperation {
         };
         let result = if self.output_sharding().is_some() {
             let output_sharding = output_types[0].sharding().unwrap();
-            output_sharding.lower_sharding_constraint(
-                result,
-                OpenDimensions::All,
-                bound_manual_axes,
-                block,
-                location,
-            )?
+            lowering_state.lower_sharding_constraint(output_sharding, result, OpenDimensions::All, block, location)?
         } else {
             result
         };
@@ -1440,7 +1428,7 @@ mod tests {
                 &test_vector_type(4),
                 &[],
                 &[test_vector_type(4)],
-                &[],
+                &ProgramLoweringState::new(),
                 &mut block,
                 &context,
                 location.as_ref(),
@@ -1471,7 +1459,7 @@ mod tests {
                 &input_type,
                 &[input],
                 &[output_type],
-                &[],
+                &ProgramLoweringState::new(),
                 &mut block.as_ref(),
                 &context,
                 location.as_ref(),

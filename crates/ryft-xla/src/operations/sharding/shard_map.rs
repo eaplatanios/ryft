@@ -176,6 +176,8 @@ where
         .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let mut manual_inputs = outer_inputs.to_vec();
+    // The shardings of the boundary and of the effect tokens refer to the mesh of the boundary.
+    lowering_state.require_mesh(boundary.mesh())?;
     let enclosing_manual_axes = lowering_state.bound_manual_axes();
     let mut input_shardings = shardy_tensor_sharding_per_value(
         boundary.input_shardings(),
