@@ -18,6 +18,7 @@ use crate::{ArrayConstant, ArrayError, Constant, Error, ToPjrt, Type};
 
 // TODO(eaplatanios): Review this module.
 
+// TODO(eaplatanios): Should we move somewhere under `ryft_xla::operations`?
 /// Lowering of a [`ComparisonDirection`] to StableHLO.
 pub trait ComparisonDirectionLoweringExtension {
     /// Lowers this direction to the StableHLO comparison direction with the same meaning.
@@ -344,6 +345,7 @@ pub fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, Error> {
         .collect()
 }
 
+// TODO(eaplatanios): Should we move this to a new `ryft_xla::lowering::values` module?
 /// Lowering of a [`CaptureReference`] to StableHLO.
 pub(crate) trait CaptureReferenceLoweringExtension {
     /// Lowers this captured constant reference by forwarding its runtime value among `captured_values`.
@@ -365,6 +367,7 @@ impl<T: CoreType> CaptureReferenceLoweringExtension for CaptureReference<T> {
     }
 }
 
+// TODO(eaplatanios): Should we move this to a new `ryft_xla::lowering::values` module?
 /// Lowering of a [`DimensionValue`] to StableHLO.
 pub(crate) trait DimensionValueLoweringExtension {
     /// Lowers one first-class dimension extent to the scalar `i64` [`stablehlo.constant`](stable_hlo::constant) that

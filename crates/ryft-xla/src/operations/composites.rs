@@ -363,16 +363,11 @@ pub(crate) struct NamedCompositionFunctionMap {
 }
 
 impl NamedCompositionFunctionMap {
-    /// Returns the functions indexed by semantic operation and typed boundary.
+    /// Returns the functions in the stable order of the first occurrence of their keys, which is the order in which
+    /// a module emits them, so that the layout of the module is deterministic.
     #[inline]
-    pub(crate) fn functions(&self) -> &HashMap<NamedCompositionKey, NamedCompositionFunction> {
-        &self.functions
-    }
-
-    /// Returns the keys in the stable order of their first occurrence, used for deterministic function emission.
-    #[inline]
-    pub(crate) fn order(&self) -> &[NamedCompositionKey] {
-        &self.order
+    pub(crate) fn functions(&self) -> impl Iterator<Item = &NamedCompositionFunction> {
+        self.order.iter().map(|key| &self.functions[key])
     }
 
     /// Returns the registered decomposition for `operation` at the provided typed boundary, or `None` when no
@@ -1440,10 +1435,10 @@ mod tests {
         }
 
         assert_eq!(
-            registry.order().iter().map(|key| registry.functions()[key].symbol()).collect::<Vec<_>>(),
+            registry.functions().map(NamedCompositionFunction::symbol).collect::<Vec<_>>(),
             vec!["downstream.example", "downstream.example_1"],
         );
-        assert_eq!(registry.order()[1].input_types, vec![vector_type]);
+        assert_eq!(registry.order[1].input_types, vec![vector_type]);
     }
 
     #[test]
@@ -1475,7 +1470,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 5], vec![Placeholder; 5])
                 .unwrap();
             let map = NamedCompositionFunctionMap::for_program(&program, None).unwrap();
-            map.order().iter().map(|key| map.functions()[key].symbol().to_string()).collect::<Vec<_>>()
+            map.functions().map(|function| function.symbol().to_string()).collect::<Vec<_>>()
         };
         assert_eq!(symbols(0), Vec::<String>::new());
         assert_eq!(symbols(1), vec!["xla.scaled_dot".to_string()]);

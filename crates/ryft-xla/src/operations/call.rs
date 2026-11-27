@@ -174,16 +174,11 @@ impl<O: LowerableOperationFamily> CallFunctionMap<O> {
             .find(|function| function.input_types == input_types && function.output_types == output_types)
     }
 
-    /// Returns the shared functions keyed by callee identity.
+    /// Returns the shared functions in the order of the first occurrence of their callees, which is the order in
+    /// which a module emits them, so that the layout of the module is deterministic.
     #[inline]
-    pub(crate) fn functions(&self) -> &HashMap<CallProgramKey, CallFunction<O>> {
-        &self.functions
-    }
-
-    /// Returns the keys in first-occurrence order, so emitted symbol names and module layout are deterministic.
-    #[inline]
-    pub(crate) fn order(&self) -> &[CallProgramKey] {
-        &self.order
+    pub(crate) fn functions(&self) -> impl Iterator<Item = &CallFunction<O>> {
+        self.order.iter().map(|key| &self.functions[key])
     }
 }
 
@@ -1684,7 +1679,7 @@ mod tests {
             derived(vec![Some(sharded)]),
         ];
         let function_count =
-            |program: &FlatProgram<Session>| collect_call_functions(program, None).unwrap().functions().len();
+            |program: &FlatProgram<Session>| collect_call_functions(program, None).unwrap().functions().count();
         assert_eq!(function_count(&program(&base, &base)), 2);
         for variant in &variants {
             assert_eq!(function_count(&program(&base, variant)), 1, "{variant:?}");

@@ -815,30 +815,19 @@ where
         // repeated calls, in which case every `call` inlines exactly as before.
         let nested_functions = Rc::new(collect_call_functions(program, target_platform)?);
 
-        // TODO(eaplatanios): Why use a nested scope here? This feels weird. Can we avoid it?
-        {
-            let mut module_block = module.body()?;
-            for key in named_compositions.order() {
-                let function = named_compositions.functions().get(key).unwrap();
-                emit_named_composition_function(
-                    &mut module_block,
-                    function,
-                    &lowering_state,
-                    &context,
-                    location.as_ref(),
-                )?;
-            }
-            for key in nested_functions.order() {
-                let function = nested_functions.functions().get(key).unwrap();
-                emit_call_function(
-                    &mut module_block,
-                    function,
-                    &nested_functions,
-                    &lowering_state,
-                    &context,
-                    location.as_ref(),
-                )?;
-            }
+        let mut module_block = module.body()?;
+        for function in named_compositions.functions() {
+            emit_named_composition_function(&mut module_block, function, &lowering_state, &context, location.as_ref())?;
+        }
+        for function in nested_functions.functions() {
+            emit_call_function(
+                &mut module_block,
+                function,
+                &nested_functions,
+                &lowering_state,
+                &context,
+                location.as_ref(),
+            )?;
         }
 
         let (function_arguments, function_results) = boundary.lower_attributes(
@@ -851,7 +840,7 @@ where
             location.as_ref(),
         )?;
 
-        module.body()?.append_operation({
+        module_block.append_operation({
             let argument_types =
                 function_arguments.iter().map(|argument| (argument.r#type, location)).collect::<Vec<_>>();
             let function_block = context.block(argument_types.as_slice());
@@ -882,7 +871,7 @@ where
         // functions that refer to it.
         let mesh = lowering_state.mesh();
         if let Some(mesh) = &mesh {
-            module.body()?.insert_operation(mesh.lower(location)?, 0)?;
+            module_block.insert_operation(mesh.lower(location)?, 0)?;
         }
 
         if !supports_shardy {
@@ -1276,7 +1265,6 @@ pub enum EntryShardingOverride {
     Values(Vec<Option<Sharding>>),
 }
 
-// TODO(eaplatanios): Review this.
 /// Boundary of the entry function of a lowered module, which [`ProgramLoweringAnalysisExtension::entry_boundary`]
 /// derives from a program before anything is emitted.
 pub(crate) struct ProgramBoundary {
