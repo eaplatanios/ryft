@@ -3020,6 +3020,13 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
     }
 }
 
+/// Resolves the default layout that a cross-host receive allocates for a buffer of the given element type and shape.
+/// The target shard index identifies the shard in diagnostics. Returns `None` when the plugin cannot report the layout
+/// and [`PjrtError::Unimplemented`] when it lacks the cross-host transfers extension. All processes of a placement use
+/// the same plugin, so they resolve the same layouts.
+type CrossHostLayoutResolver<'o> =
+    dyn Fn(BufferType, ShardIndex, &StaticShape) -> Result<Option<ryft_pjrt::Layout>, Error> + 'o;
+
 /// Device work that places an [`Array`] on a mesh with a sharding, which [`Array::device_placement_strategy`] chooses
 /// from information that every process shares, so that the processes of a placement agree on it.
 #[allow(
@@ -3465,22 +3472,12 @@ impl HostRoundTripCause {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Resolves the default layout that a cross-host receive allocates for a buffer of the given element type and shape.
-/// The target shard index identifies the shard in diagnostics. Returns `None` when the plugin cannot report the
-/// layout and [`PjrtError::Unimplemented`] when it lacks the cross-host transfers extension. All processes of a
-/// placement use the same plugin, so they resolve the same layouts.
-type CrossHostLayoutResolver<'o> =
-    dyn Fn(BufferType, ShardIndex, &StaticShape) -> Result<Option<ryft_pjrt::Layout>, Error> + 'o;
-
 /// Completion of the device work that one placement starts to produce the buffers of its result (e.g., copies between
 /// memories or devices, cross-host receives, host uploads, and compiled conversions), which the execution fence of the
-/// result joins with the fence of the source.
-///
-/// A readback of an array reads only one replica of each tile, and the readiness functions of an array wait for its
-/// execution fence. The session tracks these buffers as well, but a buffer whose producing work failed would otherwise
-/// go unnoticed by a readback that happens to read another replica of the same tile.
+/// result joins with the fence of the source. A readback of an array reads only one replica of each tile, and the
+/// readiness functions of an array wait for its execution fence. The session tracks these buffers as well, but a buffer
+/// whose producing work failed would otherwise go unnoticed by a readback that happens to read another replica of the
+/// same tile.
 #[derive(Default)]
 struct PlacementCompletion {
     /// Ready events of the buffers that the placement created.
@@ -3489,6 +3486,8 @@ struct PlacementCompletion {
     /// Execution fences of the programs that produced buffers of the result.
     fences: Vec<ExecutionFence>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl PlacementCompletion {
     /// Records the readiness of `buffer`, which the placement created.
