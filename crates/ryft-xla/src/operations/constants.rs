@@ -196,7 +196,7 @@ impl LowerableOperation for IotaOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             vec![result],
             output_types.first(),
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.location(),
         )
@@ -250,7 +250,7 @@ impl LowerableOperation for FillLikeOperation<ArrayType> {
             result,
             input_values[0],
             &output_types[0],
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -283,7 +283,7 @@ impl LowerableOperation for IotaLikeOperation<ArrayType> {
             result,
             input_values[0],
             &output_types[0],
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -308,7 +308,7 @@ impl LowerableOperation for ZeroOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             output_types.first(),
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.location(),
         )
@@ -332,7 +332,7 @@ impl LowerableOperation for OneOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             output_types.first(),
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.location(),
         )
@@ -352,7 +352,7 @@ impl LowerableOperation for ZeroLikeOperation<ArrayType> {
             input_values,
             output_types,
             0,
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -373,7 +373,7 @@ impl LowerableOperation for OneLikeOperation<ArrayType> {
             input_values,
             output_types,
             1,
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -402,7 +402,7 @@ impl MemberLowerableOperation<Type> for ZeroOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             output_type,
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             location,
         )
@@ -430,7 +430,7 @@ impl MemberLowerableOperation<Type> for OneOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             output_type,
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             location,
         )
@@ -468,7 +468,7 @@ impl MemberLowerableOperation<Type> for IotaOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             Some(&output_type),
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             location,
         )
@@ -675,7 +675,7 @@ mod tests {
 
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, test_vector_type,
-        to_mlir_module_for_plain_program,
+        to_rendered_mlir_for_plain_program,
     };
     use crate::lowering::types::lower_f64_constant_splat;
     use crate::operations::Operation;
@@ -820,7 +820,7 @@ mod tests {
                 .unwrap()[0];
             let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
 
-            let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
             assert_eq!(stablehlo, expected);
         }
     }
@@ -837,7 +837,7 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
             .unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -858,7 +858,7 @@ mod tests {
             .add_instruction(ArrayOperation::Constant(ConstantOperation::new(literal)), Vec::new(), Vec::new(), None)
             .unwrap()[0];
         let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -934,7 +934,7 @@ mod tests {
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(outputs, Vec::new(), vec![Placeholder; cases.len()])
             .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -1058,7 +1058,7 @@ mod tests {
             let output = builder.add_constant(value);
             let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
 
-            let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
             assert_eq!(stablehlo, expected);
         }
     }
@@ -1156,7 +1156,7 @@ mod tests {
                 .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
                 .unwrap();
 
-            let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
             assert_eq!(stablehlo, expected_vector);
 
             let context = TracingContext::<Array, ArrayOperation<Array>>::new();
@@ -1169,7 +1169,7 @@ mod tests {
                 .clone()
                 .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
                 .unwrap();
-            let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
             assert_eq!(stablehlo, expected_scalar);
         }
     }
@@ -1233,7 +1233,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
             .unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -1293,7 +1293,7 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
                 .unwrap();
-            let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
             assert_eq!(module, expected);
 
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
@@ -1303,7 +1303,7 @@ mod tests {
                 builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
             let input_types: Vec<ArrayType> = Vec::new();
             let module = program
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .with_input_types(&input_types)
@@ -1349,7 +1349,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![zero, one], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -1388,7 +1388,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![zero, one], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(program.output_types(), vec![input_type.clone(), input_type]);
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -1452,7 +1452,7 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert!(matches!(
-                to_mlir_module_for_plain_program(&program, "main"),
+                to_rendered_mlir_for_plain_program(&program, "main"),
                 Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                     if reason == format!(
                            "`{name}` output dimension `size` needs a finite upper bound for physical buffer allocation",
@@ -1468,7 +1468,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let error = to_mlir_module_for_plain_program(&program, "main").unwrap_err();
+        let error = to_rendered_mlir_for_plain_program(&program, "main").unwrap_err();
         let Error::Core(core_error) = error else { unreachable!() };
         let CoreError::Type(error) = *core_error else { unreachable!() };
         assert_eq!(
@@ -1491,7 +1491,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![zero, one], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "like_dynamic").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "like_dynamic").unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -1682,7 +1682,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![fill, iota], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -1714,7 +1714,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![fill, iota], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -1754,7 +1754,7 @@ mod tests {
         // Byte strides do not carry across element widths, so the coordinates take the default layout.
         let iota_type = input_type.clone().with_data_type(DataType::I32).with_layout(None);
         assert_eq!(program.output_types(), vec![input_type, iota_type]);
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -1803,7 +1803,7 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let error = to_mlir_module_for_plain_program(&program, "main").unwrap_err();
+            let error = to_rendered_mlir_for_plain_program(&program, "main").unwrap_err();
             assert!(matches!(
                 error,
                 Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })
@@ -1888,7 +1888,7 @@ mod tests {
         assert_eq!(program.output_types(), vec![Type::Array(output_type.clone()); 3]);
         let input_types = vec![ArrayType::scalar(DataType::I64)];
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&input_types)
@@ -1979,7 +1979,7 @@ mod tests {
             .unwrap();
         let input_types = vec![ArrayType::scalar(DataType::I64)];
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&input_types)
@@ -2040,7 +2040,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&vec![ArrayType::scalar(DataType::I64); 2])
@@ -2093,7 +2093,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&vec![ArrayType::scalar(DataType::I64)])
@@ -2141,7 +2141,7 @@ mod tests {
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![], vec![Placeholder]).unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [3, 3]);
         assert_eq!(program.output_types(), vec![Type::Array(output_type.clone())]);
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -2199,7 +2199,7 @@ mod tests {
         let output_type = ArrayType::new_static(DataType::F64, [3, 3]);
         assert_eq!(program.output_types(), vec![Type::Array(output_type.clone()); 3]);
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&vec![ArrayType::scalar(DataType::I64)])
@@ -2265,7 +2265,7 @@ mod tests {
         let output_type = ArrayType::new_static(DataType::F64, [2, 2, 2]);
         assert_eq!(program.output_types(), vec![Type::Array(output_type.clone())]);
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&vec![ArrayType::scalar(DataType::I64)])

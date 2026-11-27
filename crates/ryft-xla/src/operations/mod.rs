@@ -916,7 +916,7 @@ impl LowerableOperation for Operation {
         // exactly once. A nested `shard_map` instead validates its boundary shardings against the enclosing
         // manual axes itself, reporting the more specific `ShardMapError::ShardingNamesEnclosingManualAxis`.
         if !matches!(self, Self::ShardMap(_)) {
-            validate_local_output_placement(self.name(), output_types, lowerer.collective_state().bound_manual_axes())?;
+            validate_local_output_placement(self.name(), output_types, lowerer.lowering_state().bound_manual_axes())?;
         }
         lower_operation_variants!(
             self, Operation, lowerer, input_values, input_types, output_types;
@@ -1173,7 +1173,7 @@ impl Transform<CoreRegion<Constant, Operation>> for UnreadLiftedCapturesAnalysis
 /// Returns, for each input of `callee`, the callee of a call whose first `capture_count` inputs are its lifted
 /// captures, whether it is a capture that an executable of the callee has no argument for (i.e., an array of a static
 /// shape that no region which lowering emits for `target_platform` reads, refer to [`emitted_capture_reads`] and
-/// `LoweredModule::new`), or [`None`] when the callee has no such
+/// `emit_mlir_program`), or [`None`] when the callee has no such
 /// capture. An eager application of the call (refer to `CallEagerExtension::eager_decision`) requires nothing of such a
 /// capture, as an execution of the callee requires nothing of it. The flags depend on the callee, the number of its
 /// captures, and the platform alone, so they are derived once for each of them and retained with the callee, and
@@ -1370,11 +1370,14 @@ mod tests {
 
     use crate::lowering::tests::{
         PlainProgram, ProgramBuilder as PlainProgramBuilder, UnreducedApplication, UnreducedInput,
-        lower_unreduced_application, lowered_unary_module, to_mlir_module_for_plain_program,
+        lower_unreduced_application, lowered_unary_module, to_rendered_mlir_for_plain_program,
     };
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes, vector_type};
-    use crate::{Array, ArrayConstant, ArrayTracer, Constant, ProgramLoweringExtension, Session, Tracer, Type};
+    use crate::{
+        Array, ArrayConstant, ArrayTracer, Constant, ProgramLoweringExtension, ProgramLoweringOptions, Session, Tracer,
+        Type,
+    };
 
     use super::*;
 
@@ -2232,7 +2235,7 @@ mod tests {
     #[test]
     fn test_normalize_elementwise_operand_in_plain_programs() {
         let program = elementwise_normalization_program();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_elementwise_operands_are_normalized(&stablehlo);
     }
 
@@ -2240,7 +2243,7 @@ mod tests {
     fn test_normalize_elementwise_operand_in_traced_programs() {
         let plain_program = elementwise_normalization_program();
         let program = plain_program.into_unprojected::<Constant, Operation>().unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_elementwise_operands_are_normalized(&stablehlo);
     }
 
@@ -2259,7 +2262,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<f32>, %arg1: tensor<0xf64>) -> tensor<0xf64> {

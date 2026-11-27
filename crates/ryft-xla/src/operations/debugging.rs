@@ -746,7 +746,7 @@ mod tests {
         let input_types = vec![array_type.clone()];
         let output_types = vec![array_type];
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -790,7 +790,7 @@ mod tests {
             let program =
                 builder.build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![Placeholder], vec![]).unwrap();
             let lowered = (unproject_plain_program(program))
-                .lower(
+                .to_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .without_pruning()

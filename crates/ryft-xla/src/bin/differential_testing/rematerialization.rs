@@ -274,7 +274,7 @@ macro_rules! stablehlo {
             },
             ($($input.r#type().into_owned()),+, $seed.r#type().into_owned()),
         )?;
-        traced.to_mlir_module("main")?
+        traced.to_rendered_mlir("main", &ProgramLoweringOptions::new())?
     }};
 }
 

@@ -324,7 +324,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let program = unproject_plain_program(program);
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             module,
@@ -361,7 +361,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let program = unproject_plain_program(program);
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             module,
@@ -402,7 +402,7 @@ mod tests {
             .unwrap();
         let bits_type = ArrayType::new_static(DataType::U32, [3]);
         assert_eq!(program.output_types()[1], Type::Array(bits_type.clone()));
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -456,7 +456,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&vec![ArrayType::scalar(DataType::I64)])
@@ -824,7 +824,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let program = unproject_plain_program(program);
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -860,7 +860,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"

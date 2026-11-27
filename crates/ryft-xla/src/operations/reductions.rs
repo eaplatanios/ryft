@@ -333,7 +333,7 @@ impl LowerableOperation for ReduceOperation {
             Some(_) if has_distributable_combiner(self.kind(), element_type, FloatExtremumForm::TotalOrder) => {
                 FloatExtremumForm::TotalOrder
             }
-            _ => FloatExtremumForm::for_combiner(lowerer.collective_state().target_platform()),
+            _ => FloatExtremumForm::for_combiner(lowerer.lowering_state().target_platform()),
         };
 
         // A combiner that XLA cannot distribute in any form reduces a copy of the input that is replicated along the
@@ -347,7 +347,7 @@ impl LowerableOperation for ReduceOperation {
             input_value = sharding.lower_replication_constraint(
                 input_value,
                 self.axes(),
-                lowerer.collective_state().bound_manual_axes(),
+                lowerer.lowering_state().bound_manual_axes(),
                 &mut lowerer.block(),
                 lowerer.location(),
             )?;
@@ -970,7 +970,7 @@ mod tests {
 
     use crate::lowering::tests::{
         ProgramBuilder, UnreducedApplication, UnreducedInput, lower_unreduced_application, lowered_reduce_module,
-        lowered_unary_module, test_matrix_type, test_vector_type, to_mlir_module_for_plain_program,
+        lowered_unary_module, test_matrix_type, test_vector_type, to_rendered_mlir_for_plain_program,
         unproject_plain_program,
     };
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type, two_device_mesh};
@@ -1836,7 +1836,7 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             (unproject_plain_program(program))
-                .lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda")))
+                .to_mlir("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda")))
                 .unwrap()
                 .into_stable_hlo()
         };
@@ -2120,7 +2120,7 @@ mod tests {
             let argument_shardings = [input_type.sharding().unwrap().clone()];
             let output_shardings = [output_type.sharding().unwrap().clone()];
             (unproject_plain_program(program))
-                .lower(
+                .to_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .without_pruning()
@@ -2241,7 +2241,7 @@ mod tests {
             let argument_shardings = [input_type.sharding().unwrap().clone()];
             let output_shardings = [output_type.sharding().unwrap().clone()];
             (unproject_plain_program(program))
-                .lower(
+                .to_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .without_pruning()
@@ -2385,7 +2385,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            to_mlir_module_for_plain_program(&program, "main"),
+            to_rendered_mlir_for_plain_program(&program, "main"),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "`reduce` with kind `log_sum_exp` requires a format with negative infinity but got `f8e4m3fn`",
         ));
@@ -2460,7 +2460,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -2493,7 +2493,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            to_mlir_module_for_plain_program(&program, "main"),
+            to_rendered_mlir_for_plain_program(&program, "main"),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "`reduce` mean over dynamically sized axis 0",
         ));
@@ -2516,7 +2516,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             module,
@@ -2566,7 +2566,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"

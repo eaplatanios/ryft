@@ -10,7 +10,7 @@
 //! simply a traced function whose body binds one `shard_map` (e.g., through [`ShardMap`](ryft_core::ShardMap) on the
 //! context that [`trace_with_context`] passes to it). The lowered function signature carries the sharding of every
 //! global input and output type that has one (refer to
-//! [`ProgramLoweringExtension::to_mlir_module`](crate::ProgramLoweringExtension::to_mlir_module)). Tracing such a
+//! [`ProgramLoweringExtension::to_rendered_mlir`](crate::ProgramLoweringExtension::to_rendered_mlir)). Tracing such a
 //! function over input types that carry the input shardings of its `shard_map` therefore yields function arguments and
 //! results placed as the `shard_map` boundary specifies.
 //!

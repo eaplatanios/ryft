@@ -180,7 +180,7 @@ impl CollectiveCase {
                 },
                 ArrayType::new_static(DataType::F32, global_shape.clone()),
             )?;
-            traced.to_mlir_module("main")?
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new())?
         } else {
             let traced: TracedProgram<(ArrayType, ArrayType), Vec<ArrayType>> = trace(
                 |inputs: (ArrayTracer, ArrayTracer)| {
@@ -199,7 +199,7 @@ impl CollectiveCase {
                     ArrayType::new_static(DataType::F32, seed_global_shape.clone()),
                 ),
             )?;
-            traced.to_mlir_module("main")?
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new())?
         };
         let plugin = load_cpu_plugin()?;
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions {

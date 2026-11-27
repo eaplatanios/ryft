@@ -392,7 +392,7 @@ impl RaggedCase {
             },
             types,
         )?;
-        Ok((traced.to_mlir_module("main")?, output_shapes))
+        Ok((traced.to_rendered_mlir("main", &ProgramLoweringOptions::new())?, output_shapes))
     }
 }
 

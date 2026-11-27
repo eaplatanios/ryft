@@ -33,7 +33,7 @@ mod tests {
 
     use crate::ArrayConstant;
     use crate::lowering::tests::{
-        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, to_mlir_module_for_plain_program,
+        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, to_rendered_mlir_for_plain_program,
         unproject_plain_program,
     };
     use crate::tests::execution_client;
@@ -49,7 +49,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
             indoc! {r#"
             module {
               func.func @main(%arg0: tensor<3xf64>) -> tensor<3xf64> {

@@ -33,7 +33,7 @@ use ryft_mlir::{
 
 use crate::lowering::EffectTokens;
 use crate::lowering::regions::NestedProgramLoweringExtension;
-use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, TypeLoweringExtension, lower_constant_output,
     lower_static_index_constants, stable_hlo_dynamic_dimension_bound, static_dimensions,
@@ -93,8 +93,7 @@ impl LowerableOperation for ScanOperation<Type> {
         self.validate_region_count(lowerer.regions().len())?;
         let (context, location) = (lowerer.context(), lowerer.location());
         let block = &mut lowerer.block();
-        let (effect_tokens, regions, captured_values, nested_functions, collective_state) =
-            lowerer.split_effect_tokens();
+        let (effect_tokens, regions, captured_values, nested_functions, lowering_state) = lowerer.split_effect_tokens();
         let body = &regions[0];
         let (carry_count, length) = (self.carry_count(), self.iteration_count());
         let body_input_types = body.input_types();
@@ -185,7 +184,7 @@ impl LowerableOperation for ScanOperation<Type> {
             location,
             captured_values,
             nested_functions,
-            collective_state,
+            lowering_state,
         };
 
         // Initial carries only need to refine the carry types, so each one is converted to the lowered type of its
@@ -282,13 +281,7 @@ impl LowerableOperation for ScanOperation<Type> {
         // length, which the output types of the scan may refine (e.g., to the trip count of an exact runtime length).
         let results =
             lower_refined_region_outputs(results, &region_output_types, output_types, block, context, location)?;
-        lower_explicit_sharding_constraints(
-            results,
-            output_types,
-            collective_state.bound_manual_axes(),
-            block,
-            location,
-        )
+        lower_explicit_sharding_constraints(results, output_types, lowering_state.bound_manual_axes(), block, location)
     }
 }
 
@@ -345,8 +338,8 @@ struct ScanLoopInputs<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> {
     /// Nested functions that `call` operations in the body lower against.
     nested_functions: Option<&'o Rc<CallFunctionMap<O>>>,
 
-    /// Collective lowering state shared with the enclosing function.
-    collective_state: &'o CollectiveLoweringState,
+    /// Program lowering state shared with the enclosing function.
+    lowering_state: &'o ProgramLoweringState,
 }
 
 impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b, 'c, 't, O> {
@@ -620,7 +613,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
             self.captured_values,
             &RematerializationOptimizationBarrier::None,
             self.nested_functions,
-            self.collective_state,
+            self.lowering_state,
             effect_tokens,
         )?;
         let stacked_outputs = body_outputs.split_off(self.carry_count);
@@ -976,7 +969,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert_eq!(program.output_types(), vec![Type::Array(stacked_type.clone())]);
-            program.to_mlir_module("main")
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new())
         };
         assert!(matches!(
             scan_program(2),
@@ -1031,7 +1024,7 @@ mod tests {
             .map(|r#type| (r#type.lower(&context, location).unwrap(), location))
             .collect::<Vec<_>>();
         let block = context.block(&block_arguments);
-        let collective_state = CollectiveLoweringState::new();
+        let lowering_state = ProgramLoweringState::new();
         let lower = |threaded_effects| {
             let inputs = ScanLoopInputs {
                 body: &body,
@@ -1047,7 +1040,7 @@ mod tests {
                 location,
                 captured_values: &[],
                 nested_functions: None,
-                collective_state: &collective_state,
+                lowering_state: &lowering_state,
             };
             let state_values = (0..3).map(|index| block.as_ref().argument(index).unwrap().as_ref()).collect();
             inputs.lower_loop(state_values, 1, &mut block.as_ref(), &mut EffectTokens::default())
@@ -1522,7 +1515,7 @@ mod tests {
             )
             .unwrap();
         let stablehlo = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&(scalar_type.clone(), ArrayType::scalar(DataType::I64)))
@@ -1812,7 +1805,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -1883,7 +1876,7 @@ mod tests {
             )
             .unwrap();
         let stablehlo = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&(scalar_type.clone(), ArrayType::scalar(DataType::I64)))
@@ -2229,7 +2222,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let stablehlo = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -2338,7 +2331,7 @@ mod tests {
             )
             .unwrap();
         let stablehlo = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&(stacked_state_type.clone(), ArrayType::scalar(DataType::I64)))
@@ -2516,7 +2509,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             stablehlo,
@@ -2822,7 +2815,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let module = program.to_mlir_module("main").unwrap();
+            let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
             assert_eq!(module, expected, "length {length}");
         }
     }
@@ -2913,7 +2906,7 @@ mod tests {
             let output_type = <&ArrayType>::try_from(&output_type).unwrap().clone();
             let stacked_types = [stacked_type.clone()];
             let module = program
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .without_pruning()
@@ -2976,7 +2969,7 @@ mod tests {
         let types = vec![stack_type.clone()];
         let shardings = vec![stack_sharding];
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -3115,7 +3108,7 @@ mod tests {
         let types = vec![carry_type.clone(), stack_type.clone()];
         let shardings = vec![carry_sharding, stack_sharding];
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -3298,7 +3291,7 @@ mod tests {
         );
         let types = vec![sum_type.clone(), items_type.clone()];
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()

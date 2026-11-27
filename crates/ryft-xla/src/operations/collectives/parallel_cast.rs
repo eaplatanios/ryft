@@ -2,6 +2,7 @@ use ryft_core::macros::check_count;
 use ryft_core::{ArrayType, Operation, ParallelCastOperation, ProgramError};
 use ryft_mlir::ValueRef;
 
+use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ParallelCastOperation {
@@ -18,7 +19,7 @@ impl LowerableOperation for ParallelCastOperation {
         // validates the source state and guarantees this mesh and axis exist before the owning binder is checked.
         let inferred = self.infer_output_types(input_types, &[]).map_err(ProgramError::from)?;
         let mesh = input_types[0].sharding().unwrap().mesh();
-        lowerer.collective_state().validate_manual_collective(
+        lowerer.lowering_state().validate_manual_collective(
             self.name(),
             self.axis_name(),
             mesh.axis_size(self.axis_name()).unwrap(),

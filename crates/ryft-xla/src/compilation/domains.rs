@@ -838,7 +838,7 @@ impl Session {
                 options.unread_inputs().unwrap_or(&[]).to_vec(),
             )
             .with_ragged_dot_lowering_strategy(options.ragged_dot_lowering_strategy());
-        let lowered_module = program.lower("main", &lowering_options)?;
+        let lowered_module = program.to_mlir("main", &lowering_options)?;
         // The module mesh assigns the devices of the target mesh to mesh coordinates, so a program over another
         // topology cannot be placed on it.
         if let Some(mesh) = lowered_module.mesh()
@@ -1656,7 +1656,7 @@ fn contains_shard_map(program: &FlatProgram<Session>, target_platform: Option<&s
 /// Regions that lowering never reaches (e.g., the rule regions of composites, the transpose region of a `linear_call`,
 /// a body that a backend implementation replaces, or the body of a scan whose length admits no iteration) are not
 /// checked, because they are not part of the compiled program. Entry points that lower a program without compiling it
-/// for a device mesh (e.g., [`ProgramLoweringExtension::to_mlir_module`]) know no devices
+/// for a device mesh (e.g., [`ProgramLoweringExtension::to_rendered_mlir`]) know no devices
 /// and do not run it.
 ///
 /// # Errors
@@ -3977,7 +3977,7 @@ mod tests {
         // though every boundary type is static.
         let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let annotated = program
-            .lower(
+            .to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()

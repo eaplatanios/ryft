@@ -20,7 +20,7 @@ use crate::compilation::analysis::{CompilationAnalysis, OptimizedProgram};
 use crate::compilation::keys::{COMPILER_IDENTITY, canonical_boundary_types};
 use crate::compilation::options::FeedbackDirectedProfile;
 use crate::execution::{ExecutionPlan, validate_input_reduction};
-use crate::lowering::modules::LoweredModule;
+use crate::lowering::programs::MlirProgram;
 use crate::lowering::signatures::ExecutableSignature;
 use crate::{Array, Error, RetainedArray, RuntimeRequirement, Session, Target, Type};
 
@@ -102,7 +102,7 @@ impl ProgramLowering {
     ///   - `kernel_execution_facts`: Configuration key of the live execution facts when the module embeds kernels.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        module: LoweredModule,
+        module: MlirProgram,
         compilation_options: CompilationOptions,
         input_types: Arc<[ArrayType]>,
         output_types: Arc<[ArrayType]>,

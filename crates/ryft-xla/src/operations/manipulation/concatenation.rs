@@ -232,14 +232,14 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
-        ProgramBuilder, dynamic_dimension, test_matrix_type, test_vector_type, to_mlir_module_for_plain_program,
+        ProgramBuilder, dynamic_dimension, test_matrix_type, test_vector_type, to_rendered_mlir_for_plain_program,
     };
     use crate::lowering::types::physical_bound_type;
     use crate::operations::Operation;
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, ProgramLoweringExtension, Session, ToPjrt, Type,
-        compile,
+        Array, ArrayConstant, CompiledFunction, Constant, FromPjrt, ProgramLoweringExtension, ProgramLoweringOptions,
+        Session, ToPjrt, Type, compile,
     };
 
     use super::*;
@@ -264,7 +264,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, ArrayConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -323,7 +323,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![joined], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(program.effects().classes(), EffectClasses::NONE);
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -369,7 +369,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![joined], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -456,7 +456,7 @@ mod tests {
                     .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
                     .unwrap();
                 let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
-                let module = program.to_mlir_module("concatenate_dynamic").unwrap();
+                let module = program.to_rendered_mlir("concatenate_dynamic", &ProgramLoweringOptions::new()).unwrap();
                 let bound = physical_bound_type(&output_type).unwrap().dimension(0).value().unwrap();
                 // Inputs carry static storage plus hidden i32 extents, and dynamic outputs also return hidden i64
                 // extents.
@@ -689,7 +689,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, ArrayConstant>(vec![joined], vec![Placeholder; 33], Placeholder)
             .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         // The 33 inputs are joined as two full chunks of 16 followed by one chunk of the two partial results and the
         // last input.
         let parameters = (0..33).map(|index| format!("%arg{index}: tensor<1xf32>")).collect::<Vec<_>>().join(", ");

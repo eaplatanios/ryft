@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use ryft_core::{
     ArrayType, AtomId, BroadcastOperation, CallOperation, DeviceMesh, ExternalReferenceBinding, LogicalMesh,
@@ -10,47 +11,84 @@ use ryft_core::{
 };
 
 use crate::lowering::emissions::{collect_session_constants, omits_regions};
-use crate::lowering::modules::{LoweredModule, render_devices};
+use crate::lowering::modules::{emit_mlir_program, render_devices};
+use crate::lowering::signatures::ExecutableSignature;
 use crate::lowering::{LowerableOperationFamily, LoweringError, RaggedDotLoweringStrategy};
-use crate::{Constant, Error, RetainedArray, Type};
+use crate::{Constant, Error, RetainedArray, RuntimeRequirement, Type};
+
+// TODO(eaplatanios): Review this.
+/// StableHLO/Shardy MLIR module that a staged [`Program`] lowers to, paired with what executing it requires.
+pub struct MlirProgram {
+    /// Textual StableHLO/Shardy module.
+    stable_hlo: String,
+
+    /// Signature of the entry function, which maps its logical inputs and outputs to its physical arguments and
+    /// results.
+    signature: ExecutableSignature,
+
+    /// Whether execution requires the host runtime assertion handler.
+    requires_assertion_handler: bool,
+
+    /// Canonical runtime contracts required by emitted calls and synthesized checks.
+    runtime_requirements: Arc<[RuntimeRequirement]>,
+
+    /// Module mesh that every sharding and `shard_map` boundary of the module refers to, or `None` when the module
+    /// declares no mesh. Compilation checks it against the topology of the device mesh that it targets.
+    mesh: Option<LogicalMesh>,
+}
+
+// TODO(eaplatanios): Review this.
+impl MlirProgram {
+    /// Pairs the rendered `stable_hlo` module with the `signature` of its entry function, whether executing it
+    /// requires the host runtime assertion handler, its canonical `runtime_requirements`, and its module `mesh`.
+    #[inline]
+    pub(crate) fn new(
+        stable_hlo: String,
+        signature: ExecutableSignature,
+        requires_assertion_handler: bool,
+        runtime_requirements: Arc<[RuntimeRequirement]>,
+        mesh: Option<LogicalMesh>,
+    ) -> Self {
+        Self { stable_hlo, signature, requires_assertion_handler, runtime_requirements, mesh }
+    }
+
+    /// Returns the rendered StableHLO module of this lowering.
+    #[inline]
+    pub fn stable_hlo(&self) -> &str {
+        &self.stable_hlo
+    }
+
+    /// Returns the rendered StableHLO module of this lowering, consuming it.
+    #[inline]
+    pub fn into_stable_hlo(self) -> String {
+        self.stable_hlo
+    }
+
+    /// Returns the signature of the entry function, which maps its logical inputs and outputs to its physical arguments
+    /// and results.
+    #[inline]
+    pub(crate) fn signature(&self) -> &ExecutableSignature {
+        &self.signature
+    }
+
+    /// Returns the module mesh that every sharding and `shard_map` boundary of the module refers to, or `None` when the
+    /// module declares no mesh. Compilation checks it against the topology of the device mesh that it targets.
+    #[inline]
+    pub fn mesh(&self) -> Option<&LogicalMesh> {
+        self.mesh.as_ref()
+    }
+
+    /// Consumes the textual module, executable signature, assertion classification, and runtime requirements.
+    #[inline]
+    pub(crate) fn into_parts(self) -> (String, ExecutableSignature, bool, Arc<[RuntimeRequirement]>) {
+        (self.stable_hlo, self.signature, self.requires_assertion_handler, self.runtime_requirements)
+    }
+}
 
 /// Lowering of staged [`Program`]s of the XLA backend, over any [`LowerableOperationFamily`], to StableHLO/Shardy MLIR
 /// modules. References and mutable state must have been discharged from a program before it is lowered.
 pub trait ProgramLoweringExtension {
-    /// Renders a full StableHLO/Shardy MLIR module for this program with the default [`ProgramLoweringOptions`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `function_name`: Symbol name to use for the outer `func.func` operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`Self::lower`].
-    #[inline]
-    fn to_mlir_module<S: AsRef<str>>(&self, function_name: S) -> Result<String, Error> {
-        self.to_mlir_module_with_options(function_name, &ProgramLoweringOptions::new())
-    }
-
-    /// Renders a full StableHLO/Shardy MLIR module for this program according to `options`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `function_name`: Symbol name to use for the outer `func.func` operation.
-    ///   - `options`: Options that determine the entry signature and how the program is prepared.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`Self::lower`].
-    #[inline]
-    fn to_mlir_module_with_options<S: AsRef<str>>(
-        &self,
-        function_name: S,
-        options: &ProgramLoweringOptions,
-    ) -> Result<String, Error> {
-        Ok(self.lower(function_name, options)?.into_stable_hlo())
-    }
-
-    /// Lowers this program according to `options` and returns its [`LoweredModule`], which pairs the textual module
+    /// Lowers this program according to `options` and returns its [`MlirProgram`], which pairs the textual module
     /// with what executing it requires.
     ///
     /// # Parameters
@@ -68,7 +106,26 @@ pub trait ProgramLoweringExtension {
     /// [`LoweringError::UnresolvedReference`] or [`LoweringError::UnresolvedState`] for undischarged references or
     /// state, [`LoweringError::InvalidFunctionName`] for an invalid function name, mismatched signature shardings,
     /// or operations that the backend cannot lower).
-    fn lower<S: AsRef<str>>(&self, function_name: S, options: &ProgramLoweringOptions) -> Result<LoweredModule, Error>;
+    fn to_mlir<S: AsRef<str>>(&self, function_name: S, options: &ProgramLoweringOptions) -> Result<MlirProgram, Error>;
+
+    /// Renders a full StableHLO/Shardy MLIR module for this program according to `options`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `function_name`: Symbol name to use for the outer `func.func` operation.
+    ///   - `options`: Options that determine the entry signature and how the program is prepared.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::to_mlir`].
+    #[inline]
+    fn to_rendered_mlir<S: AsRef<str>>(
+        &self,
+        function_name: S,
+        options: &ProgramLoweringOptions,
+    ) -> Result<String, Error> {
+        Ok(self.to_mlir(function_name, options)?.into_stable_hlo())
+    }
 }
 
 impl<O, Input, Output> ProgramLoweringExtension for Program<Constant, O, Input, Output>
@@ -77,7 +134,7 @@ where
     Input: Parameterized<Constant>,
     Output: Parameterized<Constant>,
 {
-    fn lower<S: AsRef<str>>(&self, function_name: S, options: &ProgramLoweringOptions) -> Result<LoweredModule, Error> {
+    fn to_mlir<S: AsRef<str>>(&self, function_name: S, options: &ProgramLoweringOptions) -> Result<MlirProgram, Error> {
         let target_platform = options.target_platform();
         let pruned;
         let program = if options.prune {
@@ -193,7 +250,7 @@ where
             }
         };
 
-        LoweredModule::new(
+        emit_mlir_program(
             program,
             function_name.as_ref(),
             &capture_types,
@@ -1121,13 +1178,13 @@ mod tests {
     }
 
     #[test]
-    fn test_program_to_mlir_module() {
+    fn test_program_to_rendered_mlir() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let traced: TracedProgram<ArrayType, ArrayType> =
             trace(move |x: ArrayTracer| x.sin().unwrap().reshard(&sharding).unwrap(), test_vector_type(8)).unwrap();
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {"
                 module {
                   sdy.mesh @mesh = <[\"x\"=4]>
@@ -1143,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_to_mlir_module_merges_tracked_placement_into_sharding_constraint() {
+    fn test_program_to_rendered_mlir_merges_tracked_placement_into_sharding_constraint() {
         // The input is tracked as sharded over the explicit axis and the constraint places it over the auto axis, so
         // the emitted constraint must carry both placements rather than the constraint alone, which would contradict
         // the tracked type by marking the explicit axis replicated. The result is not the result of a `place`, so its
@@ -1161,7 +1218,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {"
                 module {
                   sdy.mesh @mesh = <[\"x\"=2, \"a\"=2]>
@@ -1176,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_to_mlir_module_annotates_placed_results() {
+    fn test_program_to_rendered_mlir_annotates_placed_results() {
         // A result that a `place` produces, also through an operation that returns its input unchanged, is annotated
         // with the target of that `place`, including its split along the auto axis that the result type drops, as
         // compilation places it.
@@ -1191,7 +1248,7 @@ mod tests {
             trace(move |x: ArrayTracer| x.place(&target, None).unwrap().stop_gradient().unwrap(), test_vector_type(8))
                 .unwrap();
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {"
                 module {
                   sdy.mesh @mesh = <[\"x\"=2]>
@@ -1206,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_to_mlir_module_passes_imported_arrays_as_arguments() {
+    fn test_program_to_rendered_mlir_passes_imported_arrays_as_arguments() {
         // An array that the traced function imports becomes a session constant, which enters the module as a hidden
         // argument that precedes the inputs and is annotated as the array is placed, as compilation passes it.
         let client = cpu_client(1);
@@ -1224,7 +1281,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {"
                 module {
                   sdy.mesh @mesh = <[\"device\"=1]>
@@ -1238,9 +1295,10 @@ mod tests {
     }
 
     #[test]
-    fn test_program_to_mlir_module_with_options() {
+    fn test_program_to_rendered_mlir_with_options() {
         // Explicit shardings are attached to the arguments and the results of the function. The global types have no
-        // sharding here, so without explicit shardings the signature is not annotated, as `to_mlir_module` renders it.
+        // sharding here, so without explicit shardings the signature is not annotated, as `to_rendered_mlir` renders
+        // it.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]);
         let traced: TracedProgram<ArrayType, ArrayType> =
@@ -1248,7 +1306,7 @@ mod tests {
         let shardings = vec![sharding.clone()];
         assert_eq!(
             traced
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .with_input_shardings(shardings.clone())
@@ -1267,7 +1325,7 @@ mod tests {
             "},
         );
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
@@ -1277,38 +1335,41 @@ mod tests {
                 }
             "},
         );
-        assert_eq!(traced.to_mlir_module("main").unwrap(), traced.to_mlir_module("main").unwrap());
+        assert_eq!(
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap()
+        );
     }
 
     #[test]
-    fn test_program_to_mlir_module_with_options_rejects_wrong_open_output_flag_count() {
+    fn test_program_to_rendered_mlir_rejects_wrong_open_output_flag_count() {
         let traced = trace(|input: ArrayTracer| (input.clone(), input), test_vector_type(4)).unwrap();
         for (flags, reason) in [
             (vec![true], "expected 2 open output flags or an empty list, but got 1"),
             (vec![true, false, true], "expected 2 open output flags or an empty list, but got 3"),
         ] {
             assert_eq!(
-                traced.to_mlir_module_with_options("main", &ProgramLoweringOptions::new().with_open_outputs(flags)),
+                traced.to_rendered_mlir("main", &ProgramLoweringOptions::new().with_open_outputs(flags)),
                 Err(Error::Compilation(CompilationError::InvalidOptions { reason: reason.to_string() })),
             );
         }
     }
 
     #[test]
-    fn test_program_to_mlir_module_with_options_rejects_boundaries_that_are_not_arrays() {
+    fn test_program_to_rendered_mlir_rejects_boundaries_that_are_not_arrays() {
         // The export reads array types at the boundary of the program, so a program whose input is a dimension is
         // rejected before anything is lowered.
         let dimension_type = Type::Dimension(DimensionValue::constant(3).unwrap().r#type().into_owned());
         let (_, program) =
             DomainTracingContext::<Session>::trace(|inputs: Vec<Tracer>| Ok(inputs), vec![dimension_type]).unwrap();
         assert_eq!(
-            program.to_mlir_module("main"),
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new()),
             Err(Error::from(ProgramError::from(TypeError::invalid("expected array type but got dimension type")))),
         );
     }
 
     #[test]
-    fn test_program_to_mlir_module_with_options_rejects_imports_over_other_topologies() {
+    fn test_program_to_rendered_mlir_rejects_imports_over_other_topologies() {
         // A plain trace keeps the type of an array that it imports, so a signature over a mesh of another topology
         // cannot hold an array over two devices, and the error names the cause and the way forward.
         let client = cpu_client(2);
@@ -1336,7 +1397,7 @@ mod tests {
         let signature = Sharding::replicated(LogicalMesh::single_device(), 1);
         let signatures = vec![signature.clone()];
         assert_eq!(
-            traced.to_mlir_module_with_options(
+            traced.to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_shardings(signatures.clone())
@@ -1355,7 +1416,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_to_mlir_module_with_options_closes_unconstrained_result_placements() {
+    fn test_program_to_rendered_mlir_closes_unconstrained_result_placements() {
         // The runtime placement of a result reads an unconstrained dimension of the target of the `place` that produces
         // it, or of a result sharding override, as replicated, so the result is annotated with that dimension closed,
         // as compilation annotates it, while the constraint inside the function keeps it open.
@@ -1394,7 +1455,7 @@ mod tests {
         "};
         assert_eq!(
             traced
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .with_input_shardings((std::slice::from_ref(&input_sharding)).to_vec())
@@ -1404,7 +1465,7 @@ mod tests {
         );
         assert_eq!(
             traced
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .with_input_shardings((std::slice::from_ref(&input_sharding)).to_vec())
@@ -1416,7 +1477,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_to_mlir_module_with_options_closes_unconstrained_result_types() {
+    fn test_program_to_rendered_mlir_closes_unconstrained_result_types() {
         // A result that is computed from the result of a `place` inherits the unconstrained dimension of its target in
         // its type, which its runtime placement reads as replicated as well, so it is annotated with that dimension
         // closed, as compilation annotates it.
@@ -1450,7 +1511,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             traced
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .with_input_shardings((std::slice::from_ref(&input_sharding)).to_vec())
@@ -1471,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_to_mlir_module_with_options_leaves_results_open_over_auto_axes() {
+    fn test_program_to_rendered_mlir_leaves_results_open_over_auto_axes() {
         // A result that is computed from the result of a `place`, rather than produced by it, has a type that drops the
         // split of the target along the auto axis `x`, so the compiler chooses its placement along that axis, and the
         // result is annotated open over it, as compilation annotates it.
@@ -1503,25 +1564,22 @@ mod tests {
                   }
                 }
             "};
-        assert_eq!(traced.to_mlir_module_with_options("main", &options).unwrap(), open);
+        assert_eq!(traced.to_rendered_mlir("main", &options).unwrap(), open);
+        assert_eq!(traced.to_rendered_mlir("main", &options.clone().with_open_outputs(vec![true])).unwrap(), open,);
         assert_eq!(
-            traced.to_mlir_module_with_options("main", &options.clone().with_open_outputs(vec![true])).unwrap(),
-            open,
-        );
-        assert_eq!(
-            traced.to_mlir_module_with_options("main", &options.with_open_outputs(Vec::new())).unwrap(),
+            traced.to_rendered_mlir("main", &options.with_open_outputs(Vec::new())).unwrap(),
             open.replace("[{?}]", "[{}]"),
         );
     }
 
     #[test]
-    fn test_program_to_mlir_module_with_options_keeps_effectful_dead_shard_maps() {
+    fn test_program_to_rendered_mlir_keeps_effectful_dead_shard_maps() {
         // Pruning keeps a `shard_map` whose ordinary results are all dead when its body has observable effects, with no
         // ordinary results, so the lowered manual computation only threads the effect token of its body.
         let (traced, sharding) = traced_effectful_dead_shard_map();
         assert_eq!(
             traced
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .with_input_shardings((std::slice::from_ref(&sharding)).to_vec())
@@ -1552,10 +1610,10 @@ mod tests {
     }
 
     #[test]
-    fn test_program_to_mlir_module_with_options_executes_effectful_dead_shard_maps_on_cpu() {
+    fn test_program_to_rendered_mlir_executes_effectful_dead_shard_maps_on_cpu() {
         let (traced, sharding) = traced_effectful_dead_shard_map();
         let module = traced
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_shardings((std::slice::from_ref(&sharding)).to_vec())

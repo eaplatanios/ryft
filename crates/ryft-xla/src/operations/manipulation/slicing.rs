@@ -695,7 +695,7 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
-        ProgramBuilder, test_matrix_type, to_mlir_module_for_plain_program, unproject_plain_program,
+        ProgramBuilder, test_matrix_type, to_rendered_mlir_for_plain_program, unproject_plain_program,
     };
     use crate::operations::Operation;
     use crate::sessions::tests::{
@@ -705,7 +705,9 @@ mod tests {
         execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::types::DataTypeExtension;
-    use crate::{Array, ArrayConstant, Constant, Options, ProgramLoweringExtension, Session, Type, Value};
+    use crate::{
+        Array, ArrayConstant, Constant, Options, ProgramLoweringExtension, ProgramLoweringOptions, Session, Type, Value,
+    };
 
     use super::*;
 
@@ -766,7 +768,7 @@ mod tests {
                 vec![Placeholder, Placeholder, Placeholder, Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -821,7 +823,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -884,7 +886,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<?x4xf32, #stablehlo.bounds<4, ?>>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>> {
@@ -917,7 +919,7 @@ mod tests {
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let pullback = pullback.into_program();
-        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -944,7 +946,7 @@ mod tests {
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let pullback = pullback.into_program();
-        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -970,7 +972,7 @@ mod tests {
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let pullback = pullback.into_program();
-        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -1011,7 +1013,7 @@ mod tests {
             .unwrap();
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let pullback = pullback.into_program();
-        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -1080,7 +1082,7 @@ mod tests {
                     )
                     .unwrap(),
             );
-            let module = program.to_mlir_module("main").unwrap();
+            let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
@@ -1155,7 +1157,7 @@ mod tests {
             builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
         let discharged = pullback.discharge_references(0).unwrap();
-        let stablehlo = discharged.program().to_mlir_module("main").unwrap();
+        let stablehlo = discharged.program().to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -1464,7 +1466,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
             .unwrap();
@@ -1567,7 +1569,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap();
-            let module = program.to_mlir_module("main").unwrap();
+            let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();

@@ -49,7 +49,7 @@ use crate::lowering::emissions::{omits_regions, partition_session_constants, unr
 use crate::lowering::programs::RegionPlacementRequestsExtension;
 use crate::lowering::reductions::validate_declared_pending_reduction;
 use crate::lowering::regions::NestedProgramLoweringExtension;
-use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::types::{TypeLoweringExtension, lower_unplaced_constant_output};
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::TypeCastLoweringExtension;
@@ -291,7 +291,7 @@ where
 ///
 /// The body is lowered with `nested_functions` in scope so that any repeated `call`s inside this callee also
 /// lower to `func.call`s. Calls between shared functions are resolved by symbol, so emission order does not matter. The
-/// body is also lowered with the module's `collective_state`, so module-scoped lowering state (i.e., the shared channel
+/// body is also lowered with the module's `lowering_state`, so module-scoped lowering state (i.e., the shared channel
 /// id counter and the target platform that gates platform-specific fast paths such as fused attention) reaches the
 /// callee body exactly like it reaches inlined callees. The mesh and manual region state intentionally resets per
 /// function.
@@ -299,7 +299,7 @@ pub(crate) fn emit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily
     module_block: &mut BlockRef<'b, 'c, 't>,
     function: &CallFunction<O>,
     nested_functions: &Rc<CallFunctionMap<O>>,
-    collective_state: &CollectiveLoweringState,
+    lowering_state: &ProgramLoweringState,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
@@ -337,7 +337,7 @@ pub(crate) fn emit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily
             &[],
             &RematerializationOptimizationBarrier::None,
             Some(nested_functions),
-            collective_state,
+            lowering_state,
             &mut effect_tokens,
         )?;
         function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
@@ -912,7 +912,7 @@ impl LowerableOperation for CallOperation<Type> {
             capture_count => unread_call_captures(
                 lowerer.regions()[0].entry_region_ref(),
                 capture_count,
-                lowerer.collective_state().target_platform(),
+                lowerer.lowering_state().target_platform(),
             ),
         };
         let input_values = input_values
@@ -944,7 +944,7 @@ impl LowerableOperation for CallOperation<Type> {
             .collect::<Result<Vec<_>, Error>>()?;
         let output_values = {
             let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-            let (effect_tokens, regions, captured_values, nested_functions, collective_state) =
+            let (effect_tokens, regions, captured_values, nested_functions, lowering_state) =
                 lowerer.split_effect_tokens();
             let [callee] = regions else { unreachable!("validated call region count") };
 
@@ -972,7 +972,7 @@ impl LowerableOperation for CallOperation<Type> {
                 context,
                 location,
                 nested_functions,
-                collective_state,
+                lowering_state,
                 effect_tokens,
             )?;
             output_values
@@ -1309,7 +1309,7 @@ trait CallProgramLoweringExtension<O: LowerableOperationFamily> {
     /// exact leading lifted-capture prefix length. Deriving it from capture-constant indices instead would conflate the
     /// independent capture namespaces of nested calls inside the callee arena. `caller_captured_values` are the
     /// captured values of the calling scope, whose session-constant suffix the inlined callee inherits (refer to
-    /// [`CollectiveLoweringState::session_values`]).
+    /// [`ProgramLoweringState::session_values`]).
     fn lower_call<'b, 'c: 'b, 't: 'c>(
         &self,
         capture_count: usize,
@@ -1319,7 +1319,7 @@ trait CallProgramLoweringExtension<O: LowerableOperationFamily> {
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
         nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -1335,7 +1335,7 @@ impl<O: LowerableOperationFamily> CallProgramLoweringExtension<O> for FlatProgra
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
         nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // Only pure callees are ever deduplicated (`collect_call_functions` skips effectful programs), so the shared
@@ -1363,7 +1363,7 @@ impl<O: LowerableOperationFamily> CallProgramLoweringExtension<O> for FlatProgra
         }
         // The callee's capture references name its own leading inputs, while session constants remain module-scoped.
         let mut captured_values = input_values[..capture_count].to_vec();
-        captured_values.extend_from_slice(collective_state.session_values(caller_captured_values));
+        captured_values.extend_from_slice(lowering_state.session_values(caller_captured_values));
         self.lower_inline(
             input_values,
             block,
@@ -1372,7 +1372,7 @@ impl<O: LowerableOperationFamily> CallProgramLoweringExtension<O> for FlatProgra
             captured_values.as_slice(),
             &RematerializationOptimizationBarrier::None,
             nested_functions,
-            collective_state,
+            lowering_state,
             effect_tokens,
         )
     }
@@ -1403,7 +1403,7 @@ fn lower_boundary_constraint<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     let untracked_type = array_type.clone().with_sharding(None)?;
     let declared = sharding.with_unconstrained_dimensions_replicated();
     // The constraint is lowered for the untracked type, so what the value already carries is read from its own type.
-    let bound_manual_axes = lowerer.collective_state().bound_manual_axes();
+    let bound_manual_axes = lowerer.lowering_state().bound_manual_axes();
     validate_declared_pending_reduction(
         &declared,
         array_type.sharding(),
@@ -1485,7 +1485,7 @@ mod tests {
         let input_types = program.input_types().iter().map(array_type).collect::<Vec<_>>();
         let output_types = program.output_types().iter().map(array_type).collect::<Vec<_>>();
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -1567,7 +1567,7 @@ mod tests {
         let input_types = vec![array_type.clone()];
         let output_types = vec![array_type];
         program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -1698,7 +1698,7 @@ mod tests {
         let input_types = vec![array_type.clone()];
         let output_types = vec![array_type.clone(), array_type.clone()];
         let module = (program(&base, &derived(vec![None])))
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&input_types)
@@ -1806,7 +1806,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = program.lower("main", &ProgramLoweringOptions::new()).unwrap();
+        let lowered = program.to_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         let (stable_hlo, _, _, runtime_requirements) = lowered.into_parts();
         assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin("test.active")]);
@@ -1850,7 +1850,8 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = program.lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda"))).unwrap();
+        let lowered =
+            program.to_mlir("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda"))).unwrap();
 
         let (stable_hlo, _, _, runtime_requirements) = lowered.into_parts();
         assert!(runtime_requirements.is_empty());
@@ -1956,7 +1957,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             module,
@@ -2076,7 +2077,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -2182,7 +2183,7 @@ mod tests {
             .unwrap();
         let output_type = ArrayType::new_static(DataType::F64, [2, 2]);
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -3139,7 +3140,7 @@ mod tests {
         let output_types = vec![array_type];
         let shardings = [replicated];
         let stablehlo = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -3450,7 +3451,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"

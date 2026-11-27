@@ -69,7 +69,7 @@ pub use kernels::{
 };
 pub use lowering::{
     DataDependentPaddingDiscipline, EntryShardingOverride, LogicalMeshExtension, LowerableOperation,
-    LowerableOperationFamily, LoweredModule, Lowerer, LoweringError, MemberLowerableOperation, OpenDimensions,
+    LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation, MlirProgram, OpenDimensions,
     ProgramLoweringExtension, ProgramLoweringOptions, RaggedDotLoweringStrategy, SHARDY_MESH_SYMBOL_NAME,
     ShardingExtension, UnreducedKindExtension, lower_projected_operation,
 };

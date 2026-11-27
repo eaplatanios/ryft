@@ -39,7 +39,7 @@ impl LowerableOperation for GatherOperation {
         let value = output_types[0].sharding().unwrap().lower_sharding_constraint(
             values[0],
             OpenDimensions::All,
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.location(),
         )?;
@@ -282,13 +282,13 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::tests::{ProgramBuilder, to_mlir_module_for_plain_program, unproject_plain_program};
+    use crate::lowering::tests::{ProgramBuilder, to_rendered_mlir_for_plain_program, unproject_plain_program};
     use crate::sessions::tests::{domain_mesh, read_first_shard};
     use crate::tests::{
         execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
     };
     use crate::types::DataTypeExtension;
-    use crate::{Array, ArrayConstant, Options, ProgramLoweringExtension, Session, Type};
+    use crate::{Array, ArrayConstant, Options, ProgramLoweringExtension, ProgramLoweringOptions, Session, Type};
 
     #[test]
     fn test_gather_operation_lower() {
@@ -310,7 +310,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -345,7 +345,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -382,7 +382,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -475,7 +475,7 @@ mod tests {
             let program = builder
                 .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
-            let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
@@ -555,7 +555,7 @@ mod tests {
                     )
                     .unwrap(),
             );
-            let module = program.to_mlir_module("main").unwrap();
+            let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
@@ -633,7 +633,7 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap(),
         );
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -776,7 +776,7 @@ mod tests {
                 vec![Placeholder; 2],
             )
             .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"

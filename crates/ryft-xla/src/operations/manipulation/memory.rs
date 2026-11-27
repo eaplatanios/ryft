@@ -27,7 +27,7 @@ mod tests {
         ReverseModeDifferentiate, Sharding, Trace, TransferToMemory, Typed,
     };
 
-    use crate::lowering::tests::{ProgramBuilder, test_vector_type, to_mlir_module_for_plain_program};
+    use crate::lowering::tests::{ProgramBuilder, test_vector_type, to_rendered_mlir_for_plain_program};
     use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
@@ -57,7 +57,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
             indoc! {r#"
             module {
               func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
@@ -82,7 +82,7 @@ mod tests {
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let pullback = pullback.into_program();
         assert_eq!(
-            to_mlir_module_for_plain_program(&pullback, "main").unwrap(),
+            to_rendered_mlir_for_plain_program(&pullback, "main").unwrap(),
             indoc! {r#"
             module {
               func.func @main(%arg0: tensor<f64> {mhlo.memory_kind = "pinned_host"}) -> tensor<f64> {
@@ -228,12 +228,12 @@ mod tests {
                   }
                 }
             "#}.replace("KIND", kind);
-            assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
+            assert_eq!(to_rendered_mlir_for_plain_program(&program, "main").unwrap(), expected);
             let program = program.into_unprojected::<Constant, Operation>().unwrap();
-            assert_eq!(program.to_mlir_module("main").unwrap(), expected,);
+            assert_eq!(program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(), expected,);
 
             // A program compiled for CUDA can place its boundary in pinned host memory only.
-            let lowered = program.lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda")));
+            let lowered = program.to_mlir("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda")));
             if memory == (Memory::Host { pinned: true }) {
                 assert_eq!(lowered.unwrap().into_stable_hlo(), expected);
             } else {

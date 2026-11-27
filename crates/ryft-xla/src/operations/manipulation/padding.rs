@@ -372,12 +372,12 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
-        ProgramBuilder, dynamic_dimension, test_vector_type, to_mlir_module_for_plain_program,
+        ProgramBuilder, dynamic_dimension, test_vector_type, to_rendered_mlir_for_plain_program,
     };
     use crate::lowering::types::lower_static_index_constants;
     use crate::operations::Operation;
     use crate::tests::{execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
-    use crate::{ArrayConstant, Constant, ProgramLoweringExtension, ToPjrt};
+    use crate::{ArrayConstant, Constant, ProgramLoweringExtension, ProgramLoweringOptions, ToPjrt};
 
     use super::*;
 
@@ -413,7 +413,7 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -459,7 +459,7 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -519,7 +519,7 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
-            let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
@@ -623,7 +623,7 @@ mod tests {
                         .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
                         .unwrap();
                     let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
-                    let module = program.to_mlir_module("pad_dynamic").unwrap();
+                    let module = program.to_rendered_mlir("pad_dynamic", &ProgramLoweringOptions::new()).unwrap();
                     let capacity = physical_bound_type(&output_type).unwrap().dimension(0).value().unwrap();
                     let storage_type = format!("tensor<{capacity}x{element}>");
                     let body = if output_type.static_shape().is_some() {

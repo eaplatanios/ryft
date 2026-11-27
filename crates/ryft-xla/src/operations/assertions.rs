@@ -1698,7 +1698,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![printed], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&[ArrayType::scalar(DataType::I64), array_type.clone()])
@@ -1875,7 +1875,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![guarded, printed], vec![Placeholder; 4], vec![Placeholder; 2])
             .unwrap();
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         // The guard emits no assertion of its own, but it joins the token of the preceding requirement into the ordered
         // I/O chain, so the print consumes that token.
         assert_eq!(
@@ -1969,7 +1969,7 @@ mod tests {
             assert!(discharged.external_reference_bindings().iter().all(|binding| binding.output_index().is_none()));
             let program = discharged.program();
             let module = program
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .without_pruning()
@@ -2067,7 +2067,7 @@ mod tests {
             };
             assert_eq!(jvp.to_string(), expected_jvp);
             let tangent_module = jvp
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .without_pruning()
@@ -2281,7 +2281,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder, Placeholder], vec![])
             .unwrap();
         let lowered = program
-            .lower(
+            .to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -2392,7 +2392,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![left], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         // The two gateway bounds checks and two explicit requirements share the assertion chain. The print receives
         // a separately created token, so it has no artificial dependency on either neighboring assertion.

@@ -16,7 +16,7 @@ use ryft_mlir::{
 use crate::lowering::emissions::emitted_regions;
 use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
-use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, dimension_extent_i64, lower_unplaced_constant_output, physical_bound_type,
 };
@@ -359,7 +359,7 @@ pub(crate) trait ControlFlowRegionLoweringExtension<O: LowerableOperationFamily>
         location: LocationRef<'c, 't>,
         captured_values: &[ValueRef<'b, 'c, 't>],
         nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         entry_effect_tokens: EffectTokens<'b, 'c, 't>,
         threaded_effects: EffectClasses,
     ) -> Result<DetachedRegion<'c, 't>, Error>;
@@ -375,7 +375,7 @@ impl<O: LowerableOperationFamily> ControlFlowRegionLoweringExtension<O> for Flat
         location: LocationRef<'c, 't>,
         captured_values: &[ValueRef<'b, 'c, 't>],
         nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         entry_effect_tokens: EffectTokens<'b, 'c, 't>,
         threaded_effects: EffectClasses,
     ) -> Result<DetachedRegion<'c, 't>, Error> {
@@ -392,7 +392,7 @@ impl<O: LowerableOperationFamily> ControlFlowRegionLoweringExtension<O> for Flat
                 captured_values,
                 &RematerializationOptimizationBarrier::None,
                 nested_functions,
-                collective_state,
+                lowering_state,
                 &mut region_effect_tokens,
             )?;
             validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, threaded_effects)?;
@@ -575,7 +575,7 @@ mod tests {
         let input_types = program.input_types().iter().map(boundary_type).collect::<Vec<_>>();
         let output_types = program.output_types().iter().map(boundary_type).collect::<Vec<_>>();
         program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -695,7 +695,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![input, tangent], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(lowered_effect_classes(&jvp).unwrap(), EffectClasses::single(EffectClass::OrderedAssertion));
-        let active = jvp.lower("main", &ProgramLoweringOptions::new()).unwrap();
+        let active = jvp.to_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         let (_, _, requires_assertion_handler, runtime_requirements) = active.into_parts();
         assert!(requires_assertion_handler);
         assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin("ryft.assert")],);
@@ -715,7 +715,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let dormant = program.lower("main", &ProgramLoweringOptions::new()).unwrap();
+        let dormant = program.to_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert!(lowered_effect_classes(&program).unwrap().is_empty());
         let (stable_hlo, _, requires_assertion_handler, runtime_requirements) = dormant.into_parts();
@@ -911,7 +911,7 @@ mod tests {
                     location,
                     &[],
                     None,
-                    &CollectiveLoweringState::new(),
+                    &ProgramLoweringState::new(),
                     EffectTokens::default(),
                     EffectClasses::NONE,
                 )
@@ -962,7 +962,7 @@ mod tests {
                 location,
                 &[],
                 None,
-                &CollectiveLoweringState::new(),
+                &ProgramLoweringState::new(),
                 EffectTokens::default(),
                 threaded_effects,
             )
@@ -1118,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_to_mlir_module_lowers_differentiated_array_ir_control_flow() {
+    fn test_program_to_rendered_mlir_lowers_differentiated_array_ir_control_flow() {
         let scalar_boolean = ArrayType::scalar(DataType::Boolean);
         let scalar_f32 = ArrayType::scalar(DataType::F32);
         let vector_f32 = test_vector_type(2);
@@ -1222,9 +1222,9 @@ mod tests {
 
         let linearization = program.linearize().unwrap();
         let primal = linearization.primal();
-        let primal_module = primal.to_mlir_module("main").unwrap();
+        let primal_module = primal.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         let pullback = linearization.pullback().unwrap().into_program();
-        let pullback_module = pullback.to_mlir_module("main").unwrap();
+        let pullback_module = pullback.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         // The primal returns the predicate of the condition and the predicate of each loop iteration as residuals, and
         // the pullback replays the loop and the condition backwards over them.
         assert_eq!(

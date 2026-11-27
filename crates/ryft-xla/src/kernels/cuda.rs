@@ -951,7 +951,8 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = program.lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda"))).unwrap();
+        let lowered =
+            program.to_mlir("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda"))).unwrap();
         let (module, _, _, _) = lowered.into_parts();
         assert_eq!(
             module,
@@ -1047,7 +1048,8 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = program.lower("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda"))).unwrap();
+        let lowered =
+            program.to_mlir("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda"))).unwrap();
         let (module, signature, assertions, requirements) = lowered.into_parts();
         assert_eq!(
             module,

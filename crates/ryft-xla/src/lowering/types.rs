@@ -12,7 +12,7 @@ use ryft_mlir::{
 };
 
 use crate::devices::MemoryExtension;
-use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::{LoweringError, MlirLowerableValue};
 use crate::{ArrayConstant, ArrayError, Constant, Error, ToPjrt, Type};
 
@@ -404,12 +404,12 @@ impl DimensionValueLoweringExtension for DimensionValue {
 impl Constant {
     /// Lowers this traced constant atom to a StableHLO value and returns it. A captured constant forwards the hidden
     /// capture argument that carries its runtime value, and a session constant forwards the hidden entry argument that
-    /// `collective_state` assigns to it, while an immediate dimension extent is materialized in place. The latter is
+    /// `lowering_state` assigns to it, while an immediate dimension extent is materialized in place. The latter is
     /// exactly what makes extents usable inside a `shard_map` manual region, where no capture table is reachable.
     pub(crate) fn lower<'b, 'c: 'b, 't: 'c, B, L>(
         &self,
         captured_values: &[ValueRef<'b, 'c, 't>],
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         block: &mut B,
         context: &'c MlirContext<'t>,
         location: L,
@@ -420,7 +420,7 @@ impl Constant {
     {
         match self {
             Constant::Captured(value) => value.lower(captured_values),
-            Constant::Session(value) => collective_state.lower_session_constant(value, captured_values),
+            Constant::Session(value) => lowering_state.lower_session_constant(value, captured_values),
             Constant::Dimension(value) => value.lower(block, context, location),
             Constant::Boolean(value) => ArrayConstant::Boolean(*value).lower_literal(block, context, location),
         }
@@ -1171,7 +1171,7 @@ mod tests {
     };
 
     use crate::lowering::tests::{
-        ProgramBuilder, dynamic_dimension, test_vector_type, to_mlir_module_for_plain_program,
+        ProgramBuilder, dynamic_dimension, test_vector_type, to_rendered_mlir_for_plain_program,
     };
 
     use super::*;
@@ -1259,7 +1259,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(
-            to_mlir_module_for_plain_program(&zero_program(Memory::Device), "main").unwrap(),
+            to_rendered_mlir_for_plain_program(&zero_program(Memory::Device), "main").unwrap(),
             indoc! {r#"
             module {
               func.func @main() -> tensor<4xf32> {
@@ -1284,7 +1284,7 @@ mod tests {
                 }
             "#}
             .replace("KIND", kind);
-            assert_eq!(to_mlir_module_for_plain_program(&zero_program(memory), "main").unwrap(), expected);
+            assert_eq!(to_rendered_mlir_for_plain_program(&zero_program(memory), "main").unwrap(), expected);
         }
     }
 
@@ -1343,7 +1343,7 @@ mod tests {
             .unwrap();
         // Widening retains the physical bound as well as the runtime dimension before recovering the signed value.
         assert_eq!(
-            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
             indoc! {r#"
         module {
           func.func @main(%arg0: tensor<?xi1, #stablehlo.bounds<5>>) -> tensor<?xf32, #stablehlo.bounds<5>> {
@@ -1453,10 +1453,10 @@ mod tests {
         let tensor_type = test_vector_type(2).lower(&context, location).unwrap();
         let block = context.block(&[(tensor_type, location)]);
         let captured_values = [block.argument(0).unwrap().as_ref()];
-        let collective_state = CollectiveLoweringState::new();
+        let lowering_state = ProgramLoweringState::new();
         let mut block_ref = block.as_ref();
         let mut lower = |constant: Constant| {
-            constant.lower(&captured_values, &collective_state, &mut block_ref, &context, location).unwrap()
+            constant.lower(&captured_values, &lowering_state, &mut block_ref, &context, location).unwrap()
         };
         let captured = lower(Constant::Captured(CaptureReference::new(0, Type::Array(test_vector_type(2)))));
         let dimension = lower(Constant::Dimension(DimensionValue::constant(3).unwrap()));

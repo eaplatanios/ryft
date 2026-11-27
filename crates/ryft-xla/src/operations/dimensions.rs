@@ -452,7 +452,7 @@ mod tests {
             .unwrap();
         let boundary_type = ArrayType::scalar(DataType::I64);
         program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -490,7 +490,7 @@ mod tests {
             .unwrap();
         let boundary_type = ArrayType::scalar(DataType::I64);
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&[input_type])
@@ -657,7 +657,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap();
-            program.to_mlir_module("main").unwrap()
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap()
         };
 
         // An unproven subtraction keeps its diagnostic assertions, which are two gateway checks and one arithmetic
@@ -741,7 +741,7 @@ mod tests {
         let boundary_type = ArrayType::scalar(DataType::I64);
         assert_eq!(
             program
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .with_input_types(&[boundary_type.clone(), boundary_type.clone()])

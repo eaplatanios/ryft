@@ -4,7 +4,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
 
 use ryft_core::{
     ArrayType, BroadcastLikeOperation, BroadcastOperation, CallOperation, CastOperation, ConstrainShardingOperation,
@@ -24,7 +23,7 @@ use ryft_mlir::{
 use crate::arrays::host::ReductionChange;
 use crate::devices::MemoryExtension;
 use crate::lowering::emissions::{emitted_regions, partition_session_constants, unread_entry_arguments};
-use crate::lowering::programs::ProgramLoweringOptions;
+use crate::lowering::programs::{MlirProgram, ProgramLoweringOptions};
 use crate::lowering::reductions::{
     ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
     validate_pending_reduction_change,
@@ -32,7 +31,7 @@ use crate::lowering::reductions::{
 use crate::lowering::regions::lower_program_outputs_with_inputs;
 use crate::lowering::sharding::{LogicalMeshExtension, OpenDimensions, ShardingExtension};
 use crate::lowering::signatures::ExecutableSignature;
-use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, lower_runtime_dimension_size_i64, lower_unplaced_constant_output,
     validate_boundary_memory,
@@ -47,247 +46,190 @@ use crate::{
 
 // TODO(eaplatanios): Review this module.
 
-/// StableHLO/Shardy MLIR module that a staged [`Program`] lowers to (refer to
-/// [`ProgramLoweringExtension::lower`](crate::ProgramLoweringExtension::lower)), paired with what executing it
-/// requires.
-pub struct LoweredModule {
-    /// Textual StableHLO/Shardy module.
-    stable_hlo: String,
+/// Lowers `program` to a StableHLO/Shardy MLIR module whose entry function is named `function_name`, validating
+/// its reference state aliases and entry boundary. The boundary is the one that [`ProgramLoweringExtension::to_mlir`]
+/// resolves from its options, which this function takes as it is.
+///
+/// # Parameters
+///
+///   - `program`: Program to lower, as lowering emits it (i.e., already pruned when pruning is requested).
+///   - `function_name`: Symbol name of the entry function.
+///   - `capture_types`: Types of the hidden capture arguments that precede the inputs, which end with the types of
+///     the session constants of `program`.
+///   - `input_types`: Global types of the inputs.
+///   - `output_types`: Global types of the outputs.
+///   - `argument_shardings`: Optional sharding of each entry function argument (i.e., captures first).
+///   - `output_shardings`: Optional sharding of each entry function result.
+///   - `open_outputs`: Whether each result is lowered open over auto mesh axes, so that the compiler chooses its
+///     placement over those axes (i.e., one flag per result, or none at all).
+///   - `options`: Options that provide the target platform, the reference states, the donated and unread inputs,
+///     the ragged dot lowering strategy, and whether the entry function exports its ordered I/O token chain.
+///
+/// [`ProgramLoweringExtension::to_mlir`]: crate::ProgramLoweringExtension::to_mlir
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_mlir_program<O, ProgramInput, ProgramOutput>(
+    program: &Program<Constant, O, ProgramInput, ProgramOutput>,
+    function_name: &str,
+    capture_types: &[ArrayType],
+    input_types: &[ArrayType],
+    output_types: &[ArrayType],
+    argument_shardings: &[Option<Sharding>],
+    output_shardings: &[Option<Sharding>],
+    open_outputs: &[bool],
+    options: &ProgramLoweringOptions,
+) -> Result<MlirProgram, Error>
+where
+    O: LowerableOperationFamily,
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
+{
+    let target_platform = options.target_platform();
+    let supports_shardy = options.supports_shardy();
+    let reference_states = options.reference_bindings();
+    let donated_inputs = options.donated_inputs();
+    let unread_inputs = options.unread_inputs();
+    let ragged_dot_lowering_strategy = options.ragged_dot_lowering_strategy();
+    let export_effects = options.exports_effects();
+    let boundary = plan_entry_boundary(
+        program,
+        capture_types,
+        input_types,
+        output_types,
+        function_name,
+        argument_shardings,
+        output_shardings,
+        target_platform,
+        reference_states,
+        donated_inputs,
+        unread_inputs,
+        open_outputs,
+        export_effects,
+    )?;
 
-    /// Signature of the entry function, which maps its logical inputs and outputs to its physical arguments and
-    /// results.
-    signature: ExecutableSignature,
+    let context = MlirContext::new();
+    let location = context.unknown_location();
+    let module = context.module(location)?;
 
-    /// Whether execution requires the host runtime assertion handler.
-    requires_assertion_handler: bool,
+    // Emit `sdy.mesh` declarations for any sharding referenced either by inner operations or by the optional
+    // signature shardings, so the `func.func` attributes can refer to `@mesh`.
+    let mut signature_mesh = None;
+    for sharding in argument_shardings.iter().chain(output_shardings).flatten() {
+        signature_mesh = Some(match signature_mesh.take() {
+            Some(existing_mesh) => merge_logical_meshes(existing_mesh, sharding.mesh())?,
+            None => sharding.mesh().clone(),
+        });
+    }
+    let mesh = collect_nested_sharding_mesh(program, signature_mesh, target_platform)?;
+    if let Some(mesh) = mesh.as_ref() {
+        let mesh_operation = mesh.lower(location)?;
+        module.body()?.append_operation(mesh_operation)?;
+    }
 
-    /// Canonical runtime contracts required by emitted calls and synthesized checks.
-    runtime_requirements: Arc<[RuntimeRequirement]>,
+    // Trace each distinct named semantic decomposition once and retain it in the lowering state of the module, so
+    // that the entry and nested function bodies resolve the same private symbol.
+    let named_compositions = Rc::new(collect_named_composition_functions(program, target_platform)?);
 
-    /// Module mesh that every sharding and `shard_map` boundary of the module refers to, or `None` when the module
-    /// declares no mesh. Compilation checks it against the topology of the device mesh that it targets.
-    mesh: Option<LogicalMesh>,
-}
+    // Module-scoped lowering state, shared between the entry function body and private functions below so channel
+    // ids stay unique and target, representation policy, named compositions, and provenance state reach nested
+    // bodies. The arrays that the program only passes on to calls that never read them follow the session constants
+    // in the table, and the entry function binds them to values that require no buffer (refer to
+    // `partition_session_constants`).
+    let lowering_state = ProgramLoweringState::new()
+        .with_target_platform(target_platform)
+        .with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy)
+        .with_named_compositions(named_compositions.clone())
+        .with_session_constants(
+            &[boundary.session_constants.as_slice(), boundary.passed_on_constants.as_slice()].concat(),
+        );
 
-impl LoweredModule {
-    /// Lowers `program` to a StableHLO/Shardy MLIR module whose entry function is named `function_name`, validating
-    /// its reference state aliases and entry boundary. The boundary is the one that [`ProgramLoweringExtension::lower`]
-    /// resolves from its options, which this function takes as it is.
-    ///
-    /// # Parameters
-    ///
-    ///   - `program`: Program to lower, as lowering emits it (i.e., already pruned when pruning is requested).
-    ///   - `function_name`: Symbol name of the entry function.
-    ///   - `capture_types`: Types of the hidden capture arguments that precede the inputs, which end with the types of
-    ///     the session constants of `program`.
-    ///   - `input_types`: Global types of the inputs.
-    ///   - `output_types`: Global types of the outputs.
-    ///   - `argument_shardings`: Optional sharding of each entry function argument (i.e., captures first).
-    ///   - `output_shardings`: Optional sharding of each entry function result.
-    ///   - `open_outputs`: Whether each result is lowered open over auto mesh axes, so that the compiler chooses its
-    ///     placement over those axes (i.e., one flag per result, or none at all).
-    ///   - `options`: Options that provide the target platform, the reference states, the donated and unread inputs,
-    ///     the ragged dot lowering strategy, and whether the entry function exports its ordered I/O token chain.
-    ///
-    /// [`ProgramLoweringExtension::lower`]: crate::ProgramLoweringExtension::lower
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new<O, ProgramInput, ProgramOutput>(
-        program: &Program<Constant, O, ProgramInput, ProgramOutput>,
-        function_name: &str,
-        capture_types: &[ArrayType],
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-        argument_shardings: &[Option<Sharding>],
-        output_shardings: &[Option<Sharding>],
-        open_outputs: &[bool],
-        options: &ProgramLoweringOptions,
-    ) -> Result<Self, Error>
-    where
-        O: LowerableOperationFamily,
-        ProgramInput: Parameterized<Constant>,
-        ProgramOutput: Parameterized<Constant>,
+    // Deduplicate `call` callees that occur more than once into shared private `func.func`s, so repeated nested
+    // programs (e.g., identical transformer blocks or the per-block primal and pullback programs of `grad`) lower
+    // to one function plus N `func.call`s instead of N inlined copies. The map is empty for modules without
+    // repeated calls, in which case every `call` inlines exactly as before.
+    let nested_functions = Rc::new(collect_call_functions(program, target_platform)?);
     {
-        let target_platform = options.target_platform();
-        let supports_shardy = options.supports_shardy();
-        let reference_states = options.reference_bindings();
-        let donated_inputs = options.donated_inputs();
-        let unread_inputs = options.unread_inputs();
-        let ragged_dot_lowering_strategy = options.ragged_dot_lowering_strategy();
-        let export_effects = options.exports_effects();
-        let boundary = plan_entry_boundary(
-            program,
-            capture_types,
-            input_types,
-            output_types,
-            function_name,
-            argument_shardings,
-            output_shardings,
-            target_platform,
-            reference_states,
-            donated_inputs,
-            unread_inputs,
-            open_outputs,
-            export_effects,
-        )?;
-
-        let context = MlirContext::new();
-        let location = context.unknown_location();
-        let module = context.module(location)?;
-
-        // Emit `sdy.mesh` declarations for any sharding referenced either by inner operations or by the optional
-        // signature shardings, so the `func.func` attributes can refer to `@mesh`.
-        let mut signature_mesh = None;
-        for sharding in argument_shardings.iter().chain(output_shardings).flatten() {
-            signature_mesh = Some(match signature_mesh.take() {
-                Some(existing_mesh) => merge_logical_meshes(existing_mesh, sharding.mesh())?,
-                None => sharding.mesh().clone(),
-            });
+        let mut module_block = module.body()?;
+        for key in named_compositions.order() {
+            let function = named_compositions.functions().get(key).unwrap();
+            emit_named_composition_function(&mut module_block, function, &lowering_state, &context, location.as_ref())?;
         }
-        let mesh = collect_nested_sharding_mesh(program, signature_mesh, target_platform)?;
-        if let Some(mesh) = mesh.as_ref() {
-            let mesh_operation = mesh.lower(location)?;
-            module.body()?.append_operation(mesh_operation)?;
-        }
-
-        // Trace each distinct named semantic decomposition once and retain it in the lowering state of the module, so
-        // that the entry and nested function bodies resolve the same private symbol.
-        let named_compositions = Rc::new(collect_named_composition_functions(program, target_platform)?);
-
-        // Module-scoped lowering state, shared between the entry function body and private functions below so channel
-        // ids stay unique and target, representation policy, named compositions, and provenance state reach nested
-        // bodies. The arrays that the program only passes on to calls that never read them follow the session constants
-        // in the table, and the entry function binds them to values that require no buffer (refer to
-        // `partition_session_constants`).
-        let collective_state = CollectiveLoweringState::new()
-            .with_target_platform(target_platform)
-            .with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy)
-            .with_named_compositions(named_compositions.clone())
-            .with_session_constants(
-                &[boundary.session_constants.as_slice(), boundary.passed_on_constants.as_slice()].concat(),
-            );
-
-        // Deduplicate `call` callees that occur more than once into shared private `func.func`s, so repeated nested
-        // programs (e.g., identical transformer blocks or the per-block primal and pullback programs of `grad`) lower
-        // to one function plus N `func.call`s instead of N inlined copies. The map is empty for modules without
-        // repeated calls, in which case every `call` inlines exactly as before.
-        let nested_functions = Rc::new(collect_call_functions(program, target_platform)?);
-        {
-            let mut module_block = module.body()?;
-            for key in named_compositions.order() {
-                let function = named_compositions.functions().get(key).unwrap();
-                emit_named_composition_function(
-                    &mut module_block,
-                    function,
-                    &collective_state,
-                    &context,
-                    location.as_ref(),
-                )?;
-            }
-            for key in nested_functions.order() {
-                let function = nested_functions.functions().get(key).unwrap();
-                emit_call_function(
-                    &mut module_block,
-                    function,
-                    &nested_functions,
-                    &collective_state,
-                    &context,
-                    location.as_ref(),
-                )?;
-            }
-        }
-
-        let (function_arguments, function_results) = entry_function_attributes(
-            &boundary,
-            argument_shardings,
-            output_shardings,
-            open_outputs,
-            mesh.is_some(),
-            supports_shardy,
-            target_platform,
-            &context,
-            location.as_ref(),
-        )?;
-        module.body()?.append_operation({
-            let argument_types =
-                function_arguments.iter().map(|argument| (argument.r#type, location)).collect::<Vec<_>>();
-            let function_block = context.block(argument_types.as_slice());
-            lower_entry_function_body(
-                program,
-                &boundary,
-                capture_types.len(),
-                argument_shardings,
-                supports_shardy,
-                &function_block,
+        for key in nested_functions.order() {
+            let function = nested_functions.functions().get(key).unwrap();
+            emit_call_function(
+                &mut module_block,
+                function,
                 &nested_functions,
-                &collective_state,
+                &lowering_state,
                 &context,
                 location.as_ref(),
             )?;
-            let mut function_region = context.region();
-            function_region.append_block(function_block)?;
-            func::func(
-                boundary.function_name.as_str(),
-                func::FuncAttributes { arguments: function_arguments, results: function_results, ..Default::default() },
-                function_region,
-                location,
-            )?
-        })?;
-        let mut signature = boundary.signature;
-        let mesh = declare_constrained_mesh(&module, program, mesh, target_platform, location.as_ref())?;
-        if !supports_shardy {
-            remove_shardy_operations(&module)?;
         }
-
-        remove_unused_constants(&module)?;
-        if !module.verify()? {
-            return Err(Error::Lowering(LoweringError::VerificationFailure));
-        }
-        if collective_state.has_assertions() {
-            signature.require_assertion_handler();
-        }
-        let requires_assertion_handler = signature.requires_assertion_handler();
-        let mut runtime_requirements = collective_state.runtime_requirements();
-        if requires_assertion_handler {
-            runtime_requirements.push(RuntimeRequirement::builtin("ryft.assert"));
-        }
-        if signature.has_ordered_io() {
-            runtime_requirements.push(RuntimeRequirement::builtin("ryft.ordered-io"));
-        }
-        let runtime_requirements = normalize_runtime_requirements(runtime_requirements)?.into();
-        Ok(LoweredModule {
-            stable_hlo: serialize_lowered_module(&module, &collective_state)?,
-            signature,
-            requires_assertion_handler,
-            runtime_requirements,
-            mesh,
-        })
     }
 
-    /// Returns the rendered StableHLO module of this lowering, consuming it.
-    #[inline]
-    pub fn into_stable_hlo(self) -> String {
-        self.stable_hlo
+    let (function_arguments, function_results) = entry_function_attributes(
+        &boundary,
+        argument_shardings,
+        output_shardings,
+        open_outputs,
+        mesh.is_some(),
+        supports_shardy,
+        target_platform,
+        &context,
+        location.as_ref(),
+    )?;
+    module.body()?.append_operation({
+        let argument_types = function_arguments.iter().map(|argument| (argument.r#type, location)).collect::<Vec<_>>();
+        let function_block = context.block(argument_types.as_slice());
+        lower_entry_function_body(
+            program,
+            &boundary,
+            capture_types.len(),
+            argument_shardings,
+            supports_shardy,
+            &function_block,
+            &nested_functions,
+            &lowering_state,
+            &context,
+            location.as_ref(),
+        )?;
+        let mut function_region = context.region();
+        function_region.append_block(function_block)?;
+        func::func(
+            boundary.function_name.as_str(),
+            func::FuncAttributes { arguments: function_arguments, results: function_results, ..Default::default() },
+            function_region,
+            location,
+        )?
+    })?;
+    let mut signature = boundary.signature;
+    let mesh = declare_constrained_mesh(&module, program, mesh, target_platform, location.as_ref())?;
+    if !supports_shardy {
+        remove_shardy_operations(&module)?;
     }
 
-    /// Returns the signature of the entry function, which maps its logical inputs and outputs to its physical arguments
-    /// and results.
-    #[inline]
-    pub(crate) fn signature(&self) -> &ExecutableSignature {
-        &self.signature
+    remove_unused_constants(&module)?;
+    if !module.verify()? {
+        return Err(Error::Lowering(LoweringError::VerificationFailure));
     }
-
-    /// Returns the module mesh that every sharding and `shard_map` boundary of the module refers to, or `None` when the
-    /// module declares no mesh. Compilation checks it against the topology of the device mesh that it targets.
-    #[inline]
-    pub fn mesh(&self) -> Option<&LogicalMesh> {
-        self.mesh.as_ref()
+    if lowering_state.has_assertions() {
+        signature.require_assertion_handler();
     }
-
-    /// Consumes the textual module, executable signature, assertion classification, and runtime requirements.
-    #[inline]
-    pub(crate) fn into_parts(self) -> (String, ExecutableSignature, bool, Arc<[RuntimeRequirement]>) {
-        (self.stable_hlo, self.signature, self.requires_assertion_handler, self.runtime_requirements)
+    let requires_assertion_handler = signature.requires_assertion_handler();
+    let mut runtime_requirements = lowering_state.runtime_requirements();
+    if requires_assertion_handler {
+        runtime_requirements.push(RuntimeRequirement::builtin("ryft.assert"));
     }
+    if signature.has_ordered_io() {
+        runtime_requirements.push(RuntimeRequirement::builtin("ryft.ordered-io"));
+    }
+    let runtime_requirements = normalize_runtime_requirements(runtime_requirements)?.into();
+    Ok(MlirProgram::new(
+        serialize_lowered_module(&module, &lowering_state)?,
+        signature,
+        requires_assertion_handler,
+        runtime_requirements,
+        mesh,
+    ))
 }
 
 /// Returns `true` if any operation in a region of `program` that lowering emits (i.e., its entry region and the
@@ -357,9 +299,9 @@ where
 /// never acceptable.
 pub(crate) fn serialize_lowered_module(
     module: &Module<'_, '_>,
-    collective_state: &CollectiveLoweringState,
+    lowering_state: &ProgramLoweringState,
 ) -> Result<String, Error> {
-    if !collective_state.has_provenance() {
+    if !lowering_state.has_provenance() {
         return Ok(module.to_string());
     }
     module
@@ -690,7 +632,7 @@ struct EntryBoundary {
 }
 
 /// Validates the entry boundary of `program` and returns its [`EntryBoundary`], without emitting anything. The
-/// arguments are those of [`LoweredModule::new`] and of its options.
+/// arguments are those of [`emit_mlir_program`] and of its options.
 #[allow(clippy::too_many_arguments)]
 fn plan_entry_boundary<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
@@ -1128,7 +1070,7 @@ fn lower_entry_function_body<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O:
     supports_shardy: bool,
     function_block: &'b DetachedBlock<'c, 't>,
     nested_functions: &Rc<CallFunctionMap<O>>,
-    collective_state: &CollectiveLoweringState,
+    lowering_state: &ProgramLoweringState,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error>
@@ -1244,7 +1186,7 @@ where
     // third boundary form exists, so the entry input count must match one of those two shapes exactly.
     // Session constants are not program inputs, so the lifted form omits the trailing session arguments of the
     // capture prefix from the entry inputs, while `capture_values` keeps them as its suffix for
-    // `CollectiveLoweringState::lower_session_constant`.
+    // `ProgramLoweringState::lower_session_constant`.
     debug_assert!(
         program.input_count() + session_count == logical_argument_values.len()
             || program.input_count() == public_input_values.len(),
@@ -1261,7 +1203,7 @@ where
         public_input_values
     };
     // The arrays that the program only passes on to calls that never read them are bound like unread arguments,
-    // after the session constants (refer to `collective_state` above).
+    // after the session constants (refer to `lowering_state` above).
     let mut captured_values = Cow::Borrowed(capture_values);
     for constant in passed_on_constants {
         let r#type = constant.r#type();
@@ -1286,7 +1228,7 @@ where
         context,
         location.as_ref(),
         Some(nested_functions),
-        collective_state,
+        lowering_state,
         &mut effect_tokens,
     )?;
     let mut physical_outputs = signature.project_outputs(logical_outputs.as_slice());
@@ -1500,7 +1442,7 @@ mod tests {
         ProgramBuilder, TEST_ARRAY_DOMAIN, add_reference_state, dynamic_dimension, linear_call_program,
         lower_replicated_shard_map_body, neg_branch, scalar_bilinear_sin, scalar_linear_region,
         scalar_quartic_plus_sin, shard_map_module, stateful_scan_program, test_manual_mesh, test_matrix_type,
-        test_vector_type, to_mlir_module_for_plain_program, unproject_plain_program,
+        test_vector_type, to_rendered_mlir_for_plain_program, unproject_plain_program,
     };
 
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
@@ -1720,7 +1662,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![zero, input], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(
-            program.to_mlir_module("main").unwrap(),
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<2x3xf32> {mhlo.layout_mode = \"{0,1}\"}) \
@@ -1748,7 +1690,7 @@ mod tests {
         let input_types = vec![array_type.clone()];
         let output_types = vec![array_type];
         let stablehlo = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -1784,7 +1726,7 @@ mod tests {
         let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![extent], None).unwrap()[0];
         let program =
             builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             stablehlo,
@@ -1809,7 +1751,7 @@ mod tests {
         let input_types: [ArrayType; 0] = [];
         let output_types = vec![array_type.clone()];
         let stablehlo = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -1857,7 +1799,7 @@ mod tests {
             .unwrap();
         let output_types = vec![array_type.clone()];
         let stablehlo = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -1892,7 +1834,7 @@ mod tests {
         let input = builder.add_input(zero_type.clone().into());
         let program: FlatProgram<Session> = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
 
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             stablehlo,
@@ -1918,7 +1860,7 @@ mod tests {
             .unwrap()[0];
         let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             stablehlo,
@@ -1947,7 +1889,7 @@ mod tests {
         let input = builder.add_input(zero_type.clone().into());
         let program: FlatProgram<Session> = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
 
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             stablehlo,
@@ -1974,7 +1916,7 @@ mod tests {
         let program: FlatProgram<Session> =
             builder.build(vec![dynamic, r#static, dynamic], vec![Placeholder; 2], vec![Placeholder; 3]).unwrap();
 
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         // Both dynamic results pass through the barrier, while the static result and the hidden extents bypass it.
         assert_eq!(
@@ -2018,7 +1960,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             program
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .with_input_types(&vec![input_type])
@@ -2062,7 +2004,7 @@ mod tests {
             .collect::<Vec<_>>();
         let lower = |supports_shardy| {
             program
-                .lower(
+                .to_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .without_pruning()
@@ -2197,7 +2139,7 @@ mod tests {
         // future state that does not come from references, and `token_threaded_effects` above pins that `OrderedState`
         // has no token slot either way.
         assert!(matches!(
-            program.lower("main", &ProgramLoweringOptions::new()),
+            program.to_mlir("main", &ProgramLoweringOptions::new()),
             Err(Error::Lowering(LoweringError::UnresolvedReference { construct })) if construct == "program",
         ));
     }
@@ -2215,7 +2157,7 @@ mod tests {
         let contract = KernelBoundaryContract::new(vec![Some(KernelParameterAccess::ReadOnly)]);
         validate_kernel_body(program.entry_region_ref(), &contract).unwrap();
         assert!(matches!(
-            program.lower(
+            program.to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&vec![scalar_type.clone()])
@@ -2250,7 +2192,7 @@ mod tests {
         ];
 
         let lowered = program
-            .lower(
+            .to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -2262,8 +2204,8 @@ mod tests {
                     .with_reference_bindings(states.to_vec(), Vec::new(), Vec::new()),
             )
             .unwrap();
-        assert_eq!(lowered.signature.input_mapping(), &[None, Some(0), Some(1)]);
-        assert_eq!(lowered.signature.output_mapping(), &[Some(0)]);
+        assert_eq!(lowered.signature().input_mapping(), &[None, Some(0), Some(1)]);
+        assert_eq!(lowered.signature().output_mapping(), &[Some(0)]);
         let expected_signature = concat!(
             "  func.func @main(",
             "%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>, ",
@@ -2272,7 +2214,7 @@ mod tests {
             "(tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {",
         );
         assert_eq!(
-            lowered.stable_hlo,
+            lowered.stable_hlo(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
@@ -2288,7 +2230,7 @@ mod tests {
 
         let invalid_state = ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None);
         assert!(matches!(
-            program.lower(
+            program.to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -2309,7 +2251,7 @@ mod tests {
             [(Some(argument_shardings.as_slice()), None), (None, Some(output_shardings.as_slice()))]
         {
             assert!(matches!(
-                program.lower(
+                program.to_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .without_pruning()
@@ -2326,7 +2268,7 @@ mod tests {
 
         let mismatched_output_shardings = vec![Sharding::replicated(mesh, 1)];
         assert!(matches!(
-            program.lower(
+            program.to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -2354,7 +2296,7 @@ mod tests {
         let reference_state = ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(0));
 
         assert!(matches!(
-            program.lower(
+            program.to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -2387,7 +2329,7 @@ mod tests {
                           output_shardings: Option<&[Sharding]>,
                           donated_inputs: &[bool],
                           open_outputs: &[bool]| {
-            program.lower(
+            program.to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -2402,12 +2344,12 @@ mod tests {
         let lower = |shardings: Option<&[Sharding]>, donated_inputs: &[bool], open_outputs: &[bool]| {
             lower_with(shardings, shardings, donated_inputs, open_outputs)
         };
-        let signature = |lowered: LoweredModule| {
-            let line = lowered.stable_hlo.lines().find(|line| line.contains("func.func @main")).unwrap();
+        let signature = |lowered: MlirProgram| {
+            let line = lowered.stable_hlo().lines().find(|line| line.contains("func.func @main")).unwrap();
             line.trim().to_string()
         };
         // Pairs of the index of each aliased argument and the index of its output.
-        let aliases = |lowered: LoweredModule| {
+        let aliases = |lowered: MlirProgram| {
             signature(lowered)
                 .split("%arg")
                 .skip(1)
@@ -2596,7 +2538,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program() {
+    fn test_to_rendered_mlir_for_plain_program() {
         let (_, compiled): (Array, Program<Array, ArrayOperation<Array>, (Array, Array), Array>) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
                 |inputs| Ok(scalar_bilinear_sin(inputs)),
@@ -2604,7 +2546,7 @@ mod tests {
             )
             .unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&compiled, "main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -2621,7 +2563,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_gradients() {
+    fn test_to_rendered_mlir_for_plain_program_lowers_gradients() {
         let (_, compiled): (Array, Program<Array, ArrayOperation<Array>, Array, Array>) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
                 |x| {
@@ -2632,7 +2574,7 @@ mod tests {
             )
             .unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&compiled, "main").unwrap();
 
         // The gradient computes one cosine for the derivative of `sin(x)`, expands the `x^4` chain rule into
         // multiplications, accumulates the cotangent contributions with additions, and contains no sine.
@@ -2664,7 +2606,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_standalone_pullbacks() {
+    fn test_to_rendered_mlir_for_plain_program_lowers_standalone_pullbacks() {
         // Standalone pullback over the primal operation family, produced by the reverse path that is aware of
         // partitions. The reverse program of `f(x, y) = x * y + sin(x)` consumes `[output_cotangent ++ residuals]`,
         // where the residuals are the factors `cos(x)`, `x`, and `y` at the linearization point. It lowers the backward
@@ -2681,7 +2623,7 @@ mod tests {
         let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let pullback = pullback.into_program();
 
-        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&pullback, "main").unwrap();
         // The pullback takes the output cotangent plus three residual inputs and returns one cotangent output for each
         // of `x` and `y`. It multiplies the cotangent by the residual inputs rather than baking the primal point in as
         // constants, so the lowering consists of multiplications and additions with no `stablehlo.constant`.
@@ -2702,7 +2644,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_staged_gradients() {
+    fn test_to_rendered_mlir_for_plain_program_lowers_staged_gradients() {
         // The gradient of `f` staged for JIT compilation stays symbolic, like `jit(grad(f))` in JAX. It uses the traced
         // gradient path, which traces through the VJP and its pullback.
         let (_, compiled): ((Array, Array), Program<Array, ArrayOperation<Array>, (Array, Array), (Array, Array)>) =
@@ -2716,7 +2658,7 @@ mod tests {
                 )
                 .unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&compiled, "main").unwrap();
         // `cos(x)` is computed symbolically from `%arg0` rather than baked in as a constant, both inputs are
         // referenced, and the gradient contains no sine, because the derivative of sine is cosine.
         assert_eq!(
@@ -2760,7 +2702,7 @@ mod tests {
         assert_eq!(collect_nested_sharding_mesh(&program, None, None).unwrap(), Some(mesh.clone()));
         // The mesh exists only on an internal value. Lowering must still declare the symbol referenced by its
         // reshape constraint, even though neither the signature nor an explicit sharding operation supplies it.
-        program.to_mlir_module("main").unwrap();
+        program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         let mut builder = ProgramBuilder::new();
         builder.add_input(input_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap());
         let metadata_only = builder
@@ -2776,7 +2718,7 @@ mod tests {
                 if expected == incompatible && actual == mesh,
         ));
         assert!(matches!(
-            program.to_mlir_module_with_options(
+            program.to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -2807,7 +2749,7 @@ mod tests {
             let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder], vec![]).unwrap();
             assert_eq!(collect_nested_sharding_mesh(&program, None, None).unwrap(), Some(mesh.clone()));
             assert_eq!(
-                program.to_mlir_module("main").unwrap(),
+                program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
                 indoc! {r#"
                     module {
                       sdy.mesh @mesh = <["x"=2]>
@@ -2852,7 +2794,7 @@ mod tests {
                 if expected == reordered && actual == mesh,
         ));
         assert!(matches!(
-            program.to_mlir_module_with_options(
+            program.to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -2883,7 +2825,7 @@ mod tests {
         assert_eq!(collect_nested_sharding_mesh(&program, Some(manual.clone()), None).unwrap(), Some(manual.clone()));
         assert_eq!(
             program
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .without_pruning()
@@ -3089,7 +3031,7 @@ mod tests {
             assert_eq!(collect_nested_sharding_mesh(&program, None, None).unwrap(), Some(mesh.clone()));
             let types = vec![array_type];
             program
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .with_input_types(&types)

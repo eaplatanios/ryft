@@ -18,7 +18,7 @@ impl LowerableOperation for ReshardOperation {
         let value = self.sharding().lower_sharding_constraint(
             input_values[0],
             OpenDimensions::All,
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.location(),
         )?;
@@ -41,8 +41,8 @@ mod tests {
     use crate::sessions::tests::{read_first_shard, two_device_mesh};
     use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, CompileTracer, CompiledFunction, FromPjrt, Options, ProgramLoweringExtension, Session,
-        TracedProgram, compile, compile_with_options, trace,
+        Array, ArrayTracer, CompileTracer, CompiledFunction, FromPjrt, Options, ProgramLoweringExtension,
+        ProgramLoweringOptions, Session, TracedProgram, compile, compile_with_options, trace,
     };
 
     /// Returns `logical_mesh` over the addressable devices of `client`.
@@ -95,7 +95,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2, "y"=2]>
@@ -129,7 +129,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2, "y"=2]>

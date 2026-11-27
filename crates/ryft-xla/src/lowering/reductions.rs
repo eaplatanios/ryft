@@ -20,7 +20,7 @@ use crate::arrays::host::{
 };
 use crate::lowering::LoweringError;
 use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
-use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::states::ProgramLoweringState;
 use crate::{Error, Type};
 
 // TODO(eaplatanios): Review this module.
@@ -581,11 +581,11 @@ pub(super) fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
     input_types: &[Type],
     outputs: &[ValueRef<'b, 'c, 't>],
     output_types: &[Type],
-    collective_state: &CollectiveLoweringState,
+    lowering_state: &ProgramLoweringState,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<Option<Rc<[ShardingDimension]>>>, Error> {
-    let bound_manual_axes = collective_state.bound_manual_axes();
+    let bound_manual_axes = lowering_state.bound_manual_axes();
     let mut pending_reductions = input_values
         .iter()
         .zip(input_types)
@@ -778,11 +778,11 @@ pub(super) fn constrain_unreduced_outputs<'b, 'c: 'b, 't: 'c>(
     outputs: &mut [ValueRef<'b, 'c, 't>],
     output_types: &[Type],
     output_dimensions: &[Option<Rc<[ShardingDimension]>>],
-    collective_state: &CollectiveLoweringState,
+    lowering_state: &ProgramLoweringState,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
-    let bound_manual_axes = collective_state.bound_manual_axes();
+    let bound_manual_axes = lowering_state.bound_manual_axes();
     let is_declared = |output: &ValueRef<'b, 'c, 't>| {
         output
             .cast::<OperationResultRef>()
@@ -853,7 +853,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_program_to_mlir_module_constrains_unreduced_outputs() {
+    fn test_program_to_rendered_mlir_constrains_unreduced_outputs() {
         // Shardy rejects an operation whose result does not declare the unreduced axes of its inputs, so every output
         // that is unreduced over an axis that no manual region binds is constrained, also where its placement does not
         // change (e.g., a sum, and a broadcast that gives it a batch dimension).
@@ -876,7 +876,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             program
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .with_input_types(&vec![input_type.clone(), input_type])
@@ -1518,7 +1518,7 @@ mod tests {
                 (input_type.clone(), input_type),
             )
             .unwrap();
-            traced.to_mlir_module("main").unwrap()
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap()
         };
         assert_eq!(
             lower(UnreducedKind::Max),

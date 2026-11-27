@@ -7,8 +7,9 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::types::ArrayTypeLoweringExtension;
+use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::operations::collectives::refine_collective_result_dimensions;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation, Type};
 
@@ -22,8 +23,8 @@ impl LowerableOperation for ParallelAllGatherOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let collective_state = lowerer.collective_state().clone();
-        collective_state.validate_manual_collective(
+        let lowering_state = lowerer.lowering_state().clone();
+        lowering_state.validate_manual_collective(
             self.name(),
             self.axes(),
             self.axis_size(),
@@ -38,7 +39,7 @@ impl LowerableOperation for ParallelAllGatherOperation {
             },
         )?;
         self.lower_to_mlir(
-            &collective_state,
+            &lowering_state,
             input_values[0],
             &output_types[0],
             &mut lowerer.block(),
@@ -58,9 +59,9 @@ impl MemberLowerableOperation<Type> for ParallelAllGatherOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
-        let collective_state = lowerer.collective_state();
+        let lowering_state = lowerer.lowering_state();
         let block = &mut lowerer.block();
-        collective_state.validate_manual_collective(
+        lowering_state.validate_manual_collective(
             self.name(),
             self.axes(),
             self.axis_size(),
@@ -81,7 +82,7 @@ impl MemberLowerableOperation<Type> for ParallelAllGatherOperation {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
         let output_type = <&ArrayType>::try_from(output_type)?;
-        let result = self.lower_to_mlir(collective_state, *input, output_type, block, context, location)?.remove(0);
+        let result = self.lower_to_mlir(lowering_state, *input, output_type, block, context, location)?.remove(0);
         refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
     }
 }
@@ -92,7 +93,7 @@ trait ParallelAllGatherOperationLoweringExtension {
     /// groups.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         input_value: ValueRef<'b, 'c, 't>,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
@@ -104,7 +105,7 @@ trait ParallelAllGatherOperationLoweringExtension {
 impl ParallelAllGatherOperationLoweringExtension for ParallelAllGatherOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         input_value: ValueRef<'b, 'c, 't>,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
@@ -112,7 +113,7 @@ impl ParallelAllGatherOperationLoweringExtension for ParallelAllGatherOperation 
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let (replica_groups, _) =
-            collective_state.replica_groups(self.axes(), self.axis_size(), self.options().axis_index_groups())?;
+            lowering_state.replica_groups(self.axes(), self.axis_size(), self.options().axis_index_groups())?;
         let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
         let input_value =
             insert_untiled_all_gather_axis(self, input_value, output_array_type, block, context, location)?;
@@ -121,7 +122,7 @@ impl ParallelAllGatherOperationLoweringExtension for ParallelAllGatherOperation 
             &[input_value],
             self.concatenation_axis(),
             stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-            Some(collective_state.next_channel_id()),
+            Some(lowering_state.next_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             true,
             &[output_type],
@@ -229,7 +230,7 @@ mod tests {
         )
         .unwrap();
 
-        let mlir_program = traced.to_mlir_module("main").unwrap();
+        let mlir_program = traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             mlir_program,
             indoc! {r#"
@@ -350,7 +351,7 @@ mod tests {
         )
         .unwrap();
 
-        let module = traced.to_mlir_module("main").unwrap();
+        let module = traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -458,7 +459,7 @@ mod tests {
         )
         .unwrap();
 
-        let module = traced.to_mlir_module("main").unwrap();
+        let module = traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert!(
             module.contains("replica_groups = dense<[[0, 4], [6, 2], [1, 5], [7, 3]]> : tensor<4x2xi64>"),
             "{module}",
@@ -523,7 +524,7 @@ mod tests {
         )
         .unwrap();
         let program = traced
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_shardings((std::slice::from_ref(&sharded)).to_vec())

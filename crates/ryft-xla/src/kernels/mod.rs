@@ -929,7 +929,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(program.clone().into_simplified().unwrap().to_string(), program.to_string());
         let lowered = program
-            .lower(
+            .to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -1085,7 +1085,7 @@ pub(crate) mod tests {
             .unwrap();
         assert!(program.reference_analysis(0).unwrap().roots().next().is_none());
         let lowered = program
-            .lower(
+            .to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()

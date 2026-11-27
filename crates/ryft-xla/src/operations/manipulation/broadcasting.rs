@@ -26,7 +26,7 @@ impl LowerableOperation for BroadcastOperation {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let bound_manual_axes = lowerer.collective_state().bound_manual_axes();
+        let bound_manual_axes = lowerer.lowering_state().bound_manual_axes();
         let block = &mut lowerer.block();
         let (context, location) = (lowerer.context(), lowerer.location());
         check_count!("input", input_values, 1, ProgramError);
@@ -162,7 +162,7 @@ impl LowerableOperation for BroadcastLikeOperation {
             output_type.sharding().unwrap().lower_sharding_constraint(
                 result,
                 OpenDimensions::All,
-                lowerer.collective_state().bound_manual_axes(),
+                lowerer.lowering_state().bound_manual_axes(),
                 block,
                 location,
             )?
@@ -183,7 +183,7 @@ impl LowerableOperation for DynamicBroadcastOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
-        let collective_state = lowerer.collective_state();
+        let lowering_state = lowerer.lowering_state();
         let block = &mut lowerer.block();
         let Some((input, output_extents)) = input_values.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -270,7 +270,7 @@ impl LowerableOperation for DynamicBroadcastOperation {
             output_type.sharding().unwrap().lower_sharding_constraint(
                 result,
                 OpenDimensions::All,
-                collective_state.bound_manual_axes(),
+                lowering_state.bound_manual_axes(),
                 block,
                 location,
             )?
@@ -302,7 +302,7 @@ mod tests {
 
     use crate::lowering::tests::{
         MixedValue, PlainProgram, ProgramBuilder, dynamic_dimension, execute_mixed_program, shard_map_module,
-        test_manual_mesh, test_vector_type, to_mlir_module_for_plain_program,
+        test_manual_mesh, test_vector_type, to_rendered_mlir_for_plain_program,
     };
     use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, replicated_vector_type};
@@ -333,7 +333,7 @@ mod tests {
             .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -368,7 +368,7 @@ mod tests {
             .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -395,7 +395,7 @@ mod tests {
             .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<?xf32>) -> tensor<2x?xf32> {
@@ -428,7 +428,7 @@ mod tests {
                 .map(|dimension| *dimension as u64)
                 .collect::<Vec<_>>();
             let program = program.into_unprojected::<Constant, Operation>().unwrap();
-            let module = program.to_mlir_module("main").unwrap();
+            let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
             let client = execution_client();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
@@ -653,7 +653,7 @@ mod tests {
             let program = builder
                 .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
+            assert_eq!(to_rendered_mlir_for_plain_program(&program, "main").unwrap(), expected);
         }
     }
 
@@ -673,7 +673,7 @@ mod tests {
                 .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert!(matches!(
-                to_mlir_module_for_plain_program(&program, "main"),
+                to_rendered_mlir_for_plain_program(&program, "main"),
                 Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                     if reason == format!("{kind} output layout `{layout}`"),
             ));
@@ -695,7 +695,7 @@ mod tests {
             .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            to_mlir_module_for_plain_program(&program, "main"),
+            to_rendered_mlir_for_plain_program(&program, "main"),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "dynamic broadcast with explicit output layout needs finite allocation bounds",
         ));
@@ -717,7 +717,7 @@ mod tests {
             .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -755,7 +755,7 @@ mod tests {
             .unwrap();
 
         let stablehlo = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -809,7 +809,7 @@ mod tests {
             .into_unprojected::<Constant, Operation>()
             .unwrap();
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -1257,7 +1257,7 @@ mod tests {
                 vec![Placeholder; 2],
             )
             .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -1297,7 +1297,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let error = to_mlir_module_for_plain_program(&program, "main").unwrap_err();
+        let error = to_rendered_mlir_for_plain_program(&program, "main").unwrap_err();
         assert!(matches!(
             error,
             Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })
@@ -1370,7 +1370,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -1426,7 +1426,7 @@ mod tests {
                 vec![Placeholder; 2],
             )
             .unwrap();
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         // The executable ABI exposes physical buffers followed by each input's runtime size, and returns
         // each dynamic output size separately. One executable must handle both populated and empty shapes.
         let client = execution_client();
@@ -1564,7 +1564,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![rows.into(), columns.into()])).with_layout(layout);
         assert_eq!(program.output_types(), vec![Type::Array(output_type.clone())]);
         assert!(matches!(
-            program.to_mlir_module_with_options("main", &ProgramLoweringOptions::new().with_input_types(&vec![
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new().with_input_types(&vec![
                     ArrayType::scalar(DataType::F32),
                     ArrayType::scalar(DataType::I64),
                     ArrayType::scalar(DataType::I64)
@@ -1574,7 +1574,7 @@ mod tests {
         ));
         // An unspecified executable result layout still permits the internal constraint.
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&vec![
@@ -1631,7 +1631,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert!(matches!(
-                program.to_mlir_module("main"),
+                program.to_rendered_mlir("main", &ProgramLoweringOptions::new()),
                 Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                     if reason == format!("{kind} output layout `{layout}`"),
             ));
@@ -1658,7 +1658,7 @@ mod tests {
             .unwrap();
         // An unspecified executable result layout defers the layout check to the operation lowering.
         assert!(matches!(
-            program.to_mlir_module_with_options(
+            program.to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&vec![ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::I64)])

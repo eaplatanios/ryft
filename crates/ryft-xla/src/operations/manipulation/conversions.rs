@@ -514,7 +514,7 @@ fn lower_cast<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         result = sharding.lower_sharding_constraint(
             result,
             OpenDimensions::All,
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.location(),
         )?;
@@ -1152,7 +1152,7 @@ mod tests {
 
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, shard_map_module, test_manual_mesh,
-        to_mlir_module_for_plain_program,
+        to_rendered_mlir_for_plain_program,
     };
     use crate::operations::Operation;
     use crate::operations::debugging::with_captured_prints;
@@ -1575,7 +1575,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<3xf32>) -> tensor<3xf32> {
@@ -1916,7 +1916,7 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
-            assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
+            assert_eq!(to_rendered_mlir_for_plain_program(&program, "main").unwrap(), expected);
         }
     }
 
@@ -2446,7 +2446,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -2491,7 +2491,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         // The stored signature with a repeated identity proves itself, but actual [a, 3] still needs a == 3. The source
         // and output declarations repeat both observations, and that one real comparison must not emit duplicate
         // callbacks.
@@ -2549,7 +2549,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -2593,7 +2593,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         // Swapping axes states a == b twice, but requires just one runtime comparison.
         assert_eq!(
             module,
@@ -2652,7 +2652,7 @@ mod tests {
                 let %2:f32[a, 2] = cast [type=f32[a, 2], inputs=[f32[a, b], f32[a, b]], checked=true] %0 %1
                 in (%2)"},
         );
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         // Only b == 2 is conditional. Both input arrays already carry the same a and b identities.
         assert_eq!(
             module,
@@ -2716,7 +2716,7 @@ mod tests {
                 let %1:f64[2, 2] = cast [type=f64[2, 2], inputs=[f64[n, n]], checked=true] %0
                 in (%1)"},
         );
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -2897,7 +2897,7 @@ mod tests {
             in (%2)"};
             assert_eq!(program.to_string(), expected);
             let module = program
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .with_input_types(&vec![ArrayType::scalar(DataType::I64), input_type.clone()])
@@ -3084,7 +3084,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -3146,7 +3146,7 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert_eq!(
-                to_mlir_module_for_plain_program(&program, "main").unwrap(),
+                to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
                 indoc! {"
                     module {
                       func.func @main(%arg0: tensor<?x3xf64, #stablehlo.bounds<4, ?>>) \
@@ -3168,7 +3168,7 @@ mod tests {
             );
             let program = program.into_unprojected::<Constant, Operation>().unwrap();
             assert!(matches!(
-                program.to_mlir_module("main"),
+                program.to_rendered_mlir("main", &ProgramLoweringOptions::new()),
                 Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                     if reason == "non-row-major bounded-dynamic output layout `tiled{0,1}`",
             ));
@@ -3210,7 +3210,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -3351,7 +3351,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -3709,12 +3709,12 @@ mod tests {
                     .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                     .unwrap();
                 assert!(matches!(
-                    to_mlir_module_for_plain_program(&program, "main"),
+                    to_rendered_mlir_for_plain_program(&program, "main"),
                     Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })) if reason == expected,
                 ));
                 let program = program.into_unprojected::<Constant, Operation>().unwrap();
                 assert!(matches!(
-                    program.to_mlir_module("main"),
+                    program.to_rendered_mlir("main", &ProgramLoweringOptions::new()),
                     Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })) if reason == expected,
                 ));
             }
@@ -3816,11 +3816,11 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
+            assert_eq!(to_rendered_mlir_for_plain_program(&program, "main").unwrap(), expected);
             let program = program.into_unprojected::<Constant, Operation>().unwrap();
             assert_eq!(
                 program
-                    .to_mlir_module_with_options(
+                    .to_rendered_mlir(
                         "main",
                         &ProgramLoweringOptions::new()
                             .with_input_types(&vec![input_type.clone()])
@@ -3929,13 +3929,13 @@ mod tests {
                 let program = builder
                     .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                     .unwrap();
-                assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
+                assert_eq!(to_rendered_mlir_for_plain_program(&program, "main").unwrap(), expected);
                 // The executable entry point declares meshes only for casts that emit a constraint, and the input's
                 // own placement is declared through the executable signature instead.
                 let program = program.into_unprojected::<Constant, Operation>().unwrap();
                 assert_eq!(
                     program
-                        .to_mlir_module_with_options(
+                        .to_rendered_mlir(
                             "main",
                             &ProgramLoweringOptions::new()
                                 .with_input_types(&vec![input_type.clone()])
@@ -3988,7 +3988,7 @@ mod tests {
             .into_unprojected::<Constant, Operation>()
             .unwrap();
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -4050,7 +4050,7 @@ mod tests {
             .into_unprojected::<Constant, Operation>()
             .unwrap();
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -4167,7 +4167,7 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let (program, input_type, output_type, replicated, sharded) = program_and_types(mesh);
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -4335,7 +4335,7 @@ mod tests {
                 program.instructions()[0].operation().effects().classes().contains(EffectClass::OrderedAssertion);
             if !checked {
                 assert_eq!(
-                    program.to_mlir_module("main").unwrap(),
+                    program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
                     // The witness is a dependency of the unchecked cast, so both inputs pass through one barrier. The
                     // negative high padding slices the physical buffer from the source bound to the target bound.
                     indoc! {"
@@ -4606,7 +4606,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
             indoc! {r#"
             module {
               func.func @main(%arg0: tensor<?xf32>) -> tensor<?xi32> {
@@ -4630,7 +4630,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            to_mlir_module_for_plain_program(&program, "main"),
+            to_rendered_mlir_for_plain_program(&program, "main"),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "width-changing bitcast with an unbounded dynamic dimension",
         ));

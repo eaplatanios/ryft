@@ -3,12 +3,12 @@
 //! # Exporting Programs
 //!
 //! [`ProgramLoweringExtension`] lowers a staged program over any [`LowerableOperationFamily`].
-//! [`ProgramLoweringExtension::to_mlir_module`] renders the module with the default [`ProgramLoweringOptions`], which
-//! read the entry signature from the global input and output types of the program, pass the arrays that the program
-//! imports as hidden arguments that precede its inputs, and prune the program first.
-//! [`ProgramLoweringExtension::to_mlir_module_with_options`] takes options that replace those types, attach
-//! `sdy.sharding` attributes to the arguments and results of the entry function, or lower the program as it is.
-//! [`ProgramLoweringExtension::lower`] returns the [`LoweredModule`], which pairs the module with what executing it
+//! [`ProgramLoweringExtension::to_rendered_mlir`] renders the module according to its [`ProgramLoweringOptions`]. The
+//! default options read the entry signature from the global input and output types of the program, pass the arrays
+//! that the program imports as hidden arguments that precede its inputs, and prune the program first. Other options
+//! replace those types, attach `sdy.sharding` attributes to the arguments and results of the entry function, or lower
+//! the program as it is.
+//! [`ProgramLoweringExtension::to_mlir`] returns the [`MlirProgram`], which pairs the module with what executing it
 //! requires. Programs must have their references and mutable state discharged before lowering. Failures that only
 //! lowering can detect are reported as [`LoweringError`]s wrapped in [`Error::Lowering`].
 //!
@@ -51,7 +51,7 @@ use crate::lowering::reductions::{
     validate_pending_reductions_across_regions,
 };
 use crate::lowering::regions::NestedProgramLoweringExtension;
-use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::types::CaptureReferenceLoweringExtension;
 use crate::operations::call::CallFunctionMap;
 use crate::{ArrayConstant, Constant, Error, Operation, RuntimeRequirement, Type};
@@ -187,8 +187,7 @@ pub(crate) mod states;
 pub(crate) mod types;
 
 pub use admission::DataDependentPaddingDiscipline;
-pub use modules::LoweredModule;
-pub use programs::{EntryShardingOverride, ProgramLoweringExtension, ProgramLoweringOptions};
+pub use programs::{EntryShardingOverride, MlirProgram, ProgramLoweringExtension, ProgramLoweringOptions};
 pub use sharding::{
     LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension, UnreducedKindExtension,
 };
@@ -300,9 +299,9 @@ pub struct Lowerer<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type> = Operation
     /// Current per-class effect tokens of the lowering scope this lowerer emits into.
     effect_tokens: EffectTokens<'b, 'c, 't>,
 
-    /// Collective lowering state of the lowering scope this lowerer emits into. Refer to the documentation of
-    /// [`CollectiveLoweringState`] for more information.
-    collective_state: CollectiveLoweringState,
+    /// Program lowering state of the lowering scope this lowerer emits into. Refer to the documentation of
+    /// [`ProgramLoweringState`] for more information.
+    lowering_state: ProgramLoweringState,
 }
 
 impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
@@ -320,7 +319,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
             nested_functions: None,
             captured_values: Vec::new(),
             effect_tokens: EffectTokens::default(),
-            collective_state: CollectiveLoweringState::new(),
+            lowering_state: ProgramLoweringState::new(),
         }
     }
 
@@ -348,9 +347,9 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
         self
     }
 
-    /// Attaches the collective lowering state of the enclosing lowering scope.
-    pub(crate) fn with_collective_state(mut self, collective_state: CollectiveLoweringState) -> Self {
-        self.collective_state = collective_state;
+    /// Attaches the program lowering state of the enclosing lowering scope.
+    pub(crate) fn with_lowering_state(mut self, lowering_state: ProgramLoweringState) -> Self {
+        self.lowering_state = lowering_state;
         self
     }
 
@@ -373,15 +372,15 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
         &mut self.effect_tokens
     }
 
-    /// Returns the collective lowering state of the lowering scope this lowerer emits into. Refer to the documentation
-    /// of [`CollectiveLoweringState`] for more information.
+    /// Returns the program lowering state of the lowering scope this lowerer emits into. Refer to the documentation
+    /// of [`ProgramLoweringState`] for more information.
     #[inline]
-    pub(crate) fn collective_state(&self) -> &CollectiveLoweringState {
-        &self.collective_state
+    pub(crate) fn lowering_state(&self) -> &ProgramLoweringState {
+        &self.lowering_state
     }
 
     /// Returns the effect tokens of the lowering scope mutably, together with the attached regions, the captured
-    /// values, the shared `call` functions, and the collective lowering state of this lowerer, in that order.
+    /// values, the shared `call` functions, and the program lowering state of this lowerer, in that order.
     /// Lowering helpers thread the tokens while they read the rest of that state, which the separate accessors cannot
     /// provide, because the mutable borrow of [`Self::effect_tokens_mut`] covers the whole lowerer.
     #[allow(clippy::type_complexity)]
@@ -392,14 +391,14 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
         &[FlatProgram<EagerContext<Constant, O>>],
         &[ValueRef<'b, 'c, 't>],
         Option<&Rc<CallFunctionMap<O>>>,
-        &CollectiveLoweringState,
+        &ProgramLoweringState,
     ) {
         (
             &mut self.effect_tokens,
             &self.regions,
             &self.captured_values,
             self.nested_functions.as_ref(),
-            &self.collective_state,
+            &self.lowering_state,
         )
     }
 
@@ -433,7 +432,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     ///
     /// Returns an error when this declaration conflicts with an earlier requirement for the same identifier.
     pub fn require_runtime(&mut self, requirement: RuntimeRequirement) -> Result<(), Error> {
-        self.collective_state.require_runtime(requirement)
+        self.lowering_state.require_runtime(requirement)
     }
 
     /// Returns the StableHLO tensor type that represents values of `array_type`.
@@ -506,7 +505,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
             self.captured_values.as_slice(),
             &RematerializationOptimizationBarrier::None,
             self.nested_functions.as_ref(),
-            &self.collective_state,
+            &self.lowering_state,
             &mut self.effect_tokens,
         )
     }
@@ -971,7 +970,7 @@ pub(crate) fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput,
     location: LocationRef<'c, 't>,
     captured_values: &[ValueRef<'b, 'c, 't>],
     nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-    collective_state: &CollectiveLoweringState,
+    lowering_state: &ProgramLoweringState,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
@@ -990,13 +989,13 @@ where
         .collect::<Vec<_>>();
     // Every StableHLO operation generated from this one Ryft instruction inherits the instruction's provenance
     // through the lowerer's shared location, with the ambient location as its base.
-    let location = collective_state.instruction_location(context, instruction.provenance(), location);
+    let location = lowering_state.instruction_location(context, instruction.provenance(), location);
     let regions = if lowers_without_regions(
         instruction.operation(),
         &input_types,
         &output_types,
         nested_functions,
-        collective_state.target_platform(),
+        lowering_state.target_platform(),
     ) {
         Vec::new()
     } else {
@@ -1011,7 +1010,7 @@ where
         .with_nested_functions(nested_functions.cloned())
         .with_captured_values(captured_values)
         .with_effect_tokens(*effect_tokens)
-        .with_collective_state(collective_state.clone());
+        .with_lowering_state(lowering_state.clone());
     let outputs = lower_instruction_operation(
         instruction.operation(),
         &mut lowerer,
@@ -1020,7 +1019,7 @@ where
         output_types.as_slice(),
     )?;
     if lowerer.effect_tokens.ordered_assertion.is_some() {
-        collective_state.record_assertion();
+        lowering_state.record_assertion();
     }
     *effect_tokens = lowerer.effect_tokens;
     Ok(outputs)
@@ -1057,7 +1056,7 @@ pub(crate) fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperat
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let mut block = lowerer.block();
     let location = lowerer.location();
-    let bound_manual_axes = lowerer.collective_state().bound_manual_axes();
+    let bound_manual_axes = lowerer.lowering_state().bound_manual_axes();
     if let Some(constraint) = operation.projected_payload::<ConstrainShardingOperation>()
         && let Some(Type::Array(input_type)) = input_types.first()
     {
@@ -1081,7 +1080,7 @@ pub(crate) fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperat
         None
     };
     let mut outputs = operation.lower(lowerer, input_values, input_types, output_types)?;
-    let collective_state = lowerer.collective_state();
+    let lowering_state = lowerer.lowering_state();
     let mut output_dimensions = Vec::new();
     if let Some(anchor) = anchor {
         output_dimensions = constrain_unreduced_intermediates(
@@ -1090,7 +1089,7 @@ pub(crate) fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperat
             input_types,
             &outputs,
             output_types,
-            collective_state,
+            lowering_state,
             &mut block,
             location,
         )?;
@@ -1098,14 +1097,7 @@ pub(crate) fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperat
         // operation that `remove_operation` returns destroys it without leaving a dangling use.
         unsafe { block.remove_operation(anchor)? };
     }
-    constrain_unreduced_outputs(
-        &mut outputs,
-        output_types,
-        &output_dimensions,
-        collective_state,
-        &mut block,
-        location,
-    )?;
+    constrain_unreduced_outputs(&mut outputs, output_types, &output_dimensions, lowering_state, &mut block, location)?;
     Ok(outputs)
 }
 
@@ -1186,7 +1178,7 @@ pub(crate) mod tests {
 
     use crate::lowering::regions::tests::lower_plain_program_outputs;
 
-    use crate::lowering::states::CollectiveLoweringState;
+    use crate::lowering::states::ProgramLoweringState;
     use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::operations::assertions::ensure_assertion_handler_registered;
 
@@ -1195,7 +1187,7 @@ pub(crate) mod tests {
     use super::*;
 
     /// Builder of homogeneous array programs that operation tests across the crate use to stage fixtures for the test-only
-    /// plain program lowering (i.e., [`to_mlir_module_for_plain_program`]) and for [`unproject_plain_program`].
+    /// plain program lowering (i.e., [`to_rendered_mlir_for_plain_program`]) and for [`unproject_plain_program`].
     pub(crate) type ProgramBuilder = CoreProgramBuilder<ArrayConstant, ArrayOperation<ArrayConstant>>;
 
     /// Homogeneous array program that [`ProgramBuilder`] builds, which operation tests across the crate lower through the
@@ -1204,7 +1196,7 @@ pub(crate) mod tests {
         Program<ArrayConstant, ArrayOperation<ArrayConstant>, Vec<ArrayConstant>, Vec<ArrayConstant>>;
 
     /// Lowers a plain traced [`Program`] to a textual StableHLO MLIR module.
-    pub(crate) fn to_mlir_module_for_plain_program<
+    pub(crate) fn to_rendered_mlir_for_plain_program<
         V: MlirLowerableValue,
         Input: Parameterized<V>,
         Output: Parameterized<V>,
@@ -1214,16 +1206,16 @@ pub(crate) mod tests {
         program: &Program<V, O, Input, Output>,
         function_name: S,
     ) -> Result<String, Error> {
-        to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy(
+        to_rendered_mlir_for_plain_program_with_ragged_dot_lowering_strategy(
             program,
             function_name,
             RaggedDotLoweringStrategy::default(),
         )
     }
 
-    /// Lowers a plain traced program like [`to_mlir_module_for_plain_program`], but with an explicit
+    /// Lowers a plain traced program like [`to_rendered_mlir_for_plain_program`], but with an explicit
     /// [`RaggedDotLoweringStrategy`].
-    pub(crate) fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy<
+    pub(crate) fn to_rendered_mlir_for_plain_program_with_ragged_dot_lowering_strategy<
         V: MlirLowerableValue,
         Input: Parameterized<V>,
         Output: Parameterized<V>,
@@ -1238,9 +1230,9 @@ pub(crate) mod tests {
         let context = MlirContext::new();
         let location = context.unknown_location();
         let module = context.module(location)?;
-        // This entry point lowers one whole module, so the collective lowering state is scoped to that module.
-        let collective_state =
-            CollectiveLoweringState::new().with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy);
+        // This entry point lowers one whole module, so the program lowering state is scoped to that module.
+        let lowering_state =
+            ProgramLoweringState::new().with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy);
         let mut mesh = None;
         for region in program.regions().iter() {
             for atom in region.atoms() {
@@ -1286,7 +1278,7 @@ pub(crate) mod tests {
                     &mut function_block_ref,
                     &context,
                     location.as_ref(),
-                    &collective_state,
+                    &lowering_state,
                 )?;
                 function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
             }
@@ -1335,7 +1327,7 @@ pub(crate) mod tests {
             return Err(Error::Lowering(LoweringError::VerificationFailure));
         }
 
-        serialize_lowered_module(&module, &collective_state)
+        serialize_lowered_module(&module, &lowering_state)
     }
 
     /// Logical mesh with one manual axis named `axis_name` of size `axis_size`.
@@ -1430,7 +1422,7 @@ pub(crate) mod tests {
             },
             global_input_types,
         )?;
-        traced.to_mlir_module("main")
+        traced.to_rendered_mlir("main", &ProgramLoweringOptions::new())
     }
 
     /// Dynamic dimension of a fresh non-negative variable named `name`, bounded above by `exclusive_upper_bound` when it
@@ -1473,7 +1465,7 @@ pub(crate) mod tests {
         let input_types = program.input_types().iter().map(boundary_type).collect::<Vec<_>>();
         let output_types = program.output_types().iter().map(boundary_type).collect::<Vec<_>>();
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -1632,7 +1624,7 @@ pub(crate) mod tests {
             builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])?;
         let input_types = vec![vector_type.clone()];
         let output_types = vec![vector_type];
-        program.to_mlir_module_with_options(
+        program.to_rendered_mlir(
             "main",
             &ProgramLoweringOptions::new()
                 .without_pruning()
@@ -1656,7 +1648,7 @@ pub(crate) mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        to_mlir_module_for_plain_program(&program, "main")
+        to_rendered_mlir_for_plain_program(&program, "main")
     }
 
     /// Builds a one-instruction program reducing an input of the given data type and dimensions, and returns the
@@ -2043,7 +2035,7 @@ pub(crate) mod tests {
                 )
                 .unwrap()[0];
             let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
-            let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
             assert!(stablehlo.contains(rendered_values), "low-precision literal {data_type}: {stablehlo}");
         }
 
@@ -2236,7 +2228,7 @@ pub(crate) mod tests {
         let types = vec![r#type.clone(), r#type];
         let module = program
             .unwrap()
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()

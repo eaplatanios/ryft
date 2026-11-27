@@ -1147,7 +1147,7 @@ mod tests {
         target_platform: Option<&str>,
     ) -> Result<String, Error> {
         program
-            .lower(
+            .to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -1729,7 +1729,7 @@ mod tests {
             input_types.clone(),
             2,
         );
-        let module = program.0.to_mlir_module("main").unwrap();
+        let module = program.0.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(module.matches("func.func private @ryft.dot_product_attention.v1(").count(), 1);
         assert_eq!(module.matches("call @ryft.dot_product_attention.v1(").count(), 2);
         assert_eq!(module.matches("stablehlo.dot_general").count(), 2);

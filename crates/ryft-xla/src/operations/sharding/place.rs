@@ -59,7 +59,7 @@ impl LowerableOperation for PlaceOperation {
         // the transposed placement, which moves the cotangent there, so the program of reverse mode is rejected by the
         // target rule below when that target leaves the region, and by the program mesh check when it leaves the mesh
         // (refer to `LoweringError::PlacementOutsideProgramMesh`), when that program is compiled itself.
-        let is_inside_manual_region = !lowerer.collective_state().bound_manual_axes().is_empty();
+        let is_inside_manual_region = !lowerer.lowering_state().bound_manual_axes().is_empty();
 
         // A placement without a target leaves its input where it is, so it lowers to nothing, also inside a manual
         // region. Its source only matters to transposition, and its copy policy is ignored like that of any other
@@ -144,8 +144,8 @@ mod tests {
     use crate::tests::{cpu_client, native_buffer_addresses, shard_values, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, Options, PlacementOptions,
-        ProgramLoweringExtension, Session, StatefulCompileTracer, TracedProgram, Type, Value, compile,
-        compile_statefully, compile_with_options, trace,
+        ProgramLoweringExtension, ProgramLoweringOptions, Session, StatefulCompileTracer, TracedProgram, Type, Value,
+        compile, compile_statefully, compile_with_options, trace,
     };
 
     use super::*;
@@ -216,7 +216,7 @@ mod tests {
         let traced: TracedProgram<ArrayType, ArrayType> =
             trace(move |input: ArrayTracer| input.place(&target, None).unwrap(), input_type.clone()).unwrap();
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
@@ -237,7 +237,7 @@ mod tests {
         let traced: TracedProgram<ArrayType, ArrayType> =
             trace(move |input: ArrayTracer| input.place(&target, None).unwrap(), input_type).unwrap();
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
@@ -271,7 +271,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
@@ -322,9 +322,12 @@ mod tests {
             "#}
             .trim_end(),
         );
-        assert_eq!(copying.to_mlir_module("main").unwrap(), place(true).to_mlir_module("main").unwrap());
         assert_eq!(
-            copying.to_mlir_module("main").unwrap(),
+            copying.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
+            place(true).to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap()
+        );
+        assert_eq!(
+            copying.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
@@ -379,9 +382,12 @@ mod tests {
             "#}
             .trim_end(),
         );
-        assert_eq!(traced.to_mlir_module("main").unwrap(), place(None, true).to_mlir_module("main").unwrap());
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
+            place(None, true).to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap()
+        );
+        assert_eq!(
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
@@ -412,7 +418,7 @@ mod tests {
         let device = Device::new(0, 0);
         assert_eq!(
             place(PlacementRequest::Device { device, memory: Some(Memory::Device), layout: None })
-                .to_mlir_module("main")
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new())
                 .unwrap(),
             indoc! {r#"
                 module {
@@ -432,7 +438,7 @@ mod tests {
             layout: Some(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]))),
         };
         assert_eq!(
-            place(target).to_mlir_module("main").unwrap(),
+            place(target).to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=1]>
@@ -454,7 +460,7 @@ mod tests {
             trace(move |input: ArrayTracer| place_on(&input, &PlacementRequest::from(device)).unwrap(), unreduced_type)
                 .unwrap();
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=1]>
@@ -493,7 +499,7 @@ mod tests {
         let traced: TracedProgram<ArrayType, ArrayType> =
             trace(move |input: ArrayTracer| place_on(&input, &target).unwrap(), input_type).unwrap();
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>
@@ -531,7 +537,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2]>

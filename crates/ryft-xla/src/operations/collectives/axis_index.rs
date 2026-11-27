@@ -7,7 +7,7 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::types::{ArrayTypeLoweringExtension, lower_u64_scalar_constant};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
@@ -17,7 +17,7 @@ pub(super) trait AxisIndexOperationLoweringExtension {
     /// along the named device mesh axis, as a scalar `u64`.
     ///
     /// Devices are linearized row-major over the mesh axes, which is the same linearization that
-    /// [`CollectiveLoweringState::mesh_axis_replica_groups`] uses for the replica groups of collectives such as
+    /// [`ProgramLoweringState::mesh_axis_replica_groups`] uses for the replica groups of collectives such as
     /// [`lower_to_all_reduce`](crate::operations::collectives::parallel_reduce::ParallelReduceOperationLoweringExtension::lower_to_all_reduce).
     /// The coordinate along the named axis is therefore `(partition_id / stride) % size`, where `stride` is the product
     /// of the mesh axis sizes after the named axis and `size` is the named axis's size. `partition_id` yields the
@@ -29,7 +29,7 @@ pub(super) trait AxisIndexOperationLoweringExtension {
     /// `explicit_axes` may retype the region's free axes, and the coordinate arithmetic uses the region's mesh.
     fn lower_to_coordinate<'b, 'c: 'b, 't: 'c>(
         &self,
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         block: &mut BlockRef<'b, 'c, 't>,
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
@@ -39,13 +39,13 @@ pub(super) trait AxisIndexOperationLoweringExtension {
 impl AxisIndexOperationLoweringExtension for AxisIndexOperation {
     fn lower_to_coordinate<'b, 'c: 'b, 't: 'c>(
         &self,
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         block: &mut BlockRef<'b, 'c, 't>,
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         let axis_name = self.axis_name();
-        if collective_state.manual_shard_map().is_none() {
+        if lowering_state.manual_shard_map().is_none() {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "`{AXIS_INDEX_OPERATION_NAME}` for axis `{axis_name}` can only be lowered inside a \
@@ -54,7 +54,7 @@ impl AxisIndexOperationLoweringExtension for AxisIndexOperation {
             }
             .into());
         }
-        let Some(axis_region) = collective_state.manual_axis_region(axis_name) else {
+        let Some(axis_region) = lowering_state.manual_axis_region(axis_name) else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "`{AXIS_INDEX_OPERATION_NAME}` for axis `{axis_name}` cannot lower inside this \
@@ -110,8 +110,8 @@ impl LowerableOperation for AxisIndexOperation {
         let _ = input_types;
         check_count!("input", input_values, 0, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let collective_state = lowerer.collective_state().clone();
-        if let Some(boundary) = collective_state.manual_axis_region(self.axis_name()) {
+        let lowering_state = lowerer.lowering_state().clone();
+        if let Some(boundary) = lowering_state.manual_axis_region(self.axis_name()) {
             if boundary.checks_manual_variation() && self.mesh().is_none() {
                 return Err(ProgramError::MalformedProgram(
                     "`axis_index` requires mesh metadata inside a manual region".to_string(),
@@ -126,7 +126,7 @@ impl LowerableOperation for AxisIndexOperation {
             }
         }
         let result =
-            self.lower_to_coordinate(&collective_state, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+            self.lower_to_coordinate(&lowering_state, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
         Ok(vec![result])
     }
 }
@@ -145,7 +145,8 @@ mod tests {
     use crate::lowering::tests::{shard_map_module, static_sharded_array_type, test_manual_mesh, test_vector_type};
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, ExecutionArguments, FromPjrt, ProgramLoweringExtension, Session, TracedProgram, trace,
+        Array, ArrayTracer, ExecutionArguments, FromPjrt, ProgramLoweringExtension, ProgramLoweringOptions, Session,
+        TracedProgram, trace,
     };
 
     use super::*;
@@ -158,7 +159,7 @@ mod tests {
         ])
         .unwrap();
         let boundary = ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap();
-        let state = CollectiveLoweringState::new().enter_manual_region(boundary);
+        let state = ProgramLoweringState::new().enter_manual_region(boundary);
         let context = MlirContext::new();
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
@@ -234,7 +235,7 @@ mod tests {
         )
         .unwrap();
 
-        let mlir_program = traced.to_mlir_module("main").unwrap();
+        let mlir_program = traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             mlir_program,
             indoc! {r#"
@@ -355,7 +356,7 @@ mod tests {
 
         // The body reads only the shape of its input, so pruning drops the input from the manual computation.
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   sdy.mesh @mesh = <["x"=2, "y"=2]>

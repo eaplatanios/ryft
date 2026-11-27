@@ -9,8 +9,9 @@ use ryft_mlir::{
 };
 
 use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
-use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::types::ArrayTypeLoweringExtension;
+use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::operations::collectives::{collapse_singleton_axis, refine_collective_result_dimensions};
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::build_reduce_body_region;
@@ -26,8 +27,8 @@ impl LowerableOperation for ParallelSumScatterOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let collective_state = lowerer.collective_state().clone();
-        collective_state.validate_manual_collective(
+        let lowering_state = lowerer.lowering_state().clone();
+        lowering_state.validate_manual_collective(
             self.name(),
             self.axes(),
             self.axis_size(),
@@ -42,7 +43,7 @@ impl LowerableOperation for ParallelSumScatterOperation {
             },
         )?;
         self.lower_to_mlir(
-            &collective_state,
+            &lowering_state,
             input_values[0],
             &output_types[0],
             &mut lowerer.block(),
@@ -62,9 +63,9 @@ impl MemberLowerableOperation<Type> for ParallelSumScatterOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
-        let collective_state = lowerer.collective_state();
+        let lowering_state = lowerer.lowering_state();
         let block = &mut lowerer.block();
-        collective_state.validate_manual_collective(
+        lowering_state.validate_manual_collective(
             self.name(),
             self.axes(),
             self.axis_size(),
@@ -85,7 +86,7 @@ impl MemberLowerableOperation<Type> for ParallelSumScatterOperation {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
         let output_type = <&ArrayType>::try_from(output_type)?;
-        let result = self.lower_to_mlir(collective_state, *input, output_type, block, context, location)?.remove(0);
+        let result = self.lower_to_mlir(lowering_state, *input, output_type, block, context, location)?.remove(0);
         refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
     }
 }
@@ -100,7 +101,7 @@ trait ParallelSumScatterOperationLoweringExtension {
     /// of a `parallel_all_gather` is such a sum scatter, so it reaches the same check.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         input_value: ValueRef<'b, 'c, 't>,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
@@ -112,7 +113,7 @@ trait ParallelSumScatterOperationLoweringExtension {
 impl ParallelSumScatterOperationLoweringExtension for ParallelSumScatterOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         input_value: ValueRef<'b, 'c, 't>,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
@@ -131,7 +132,7 @@ impl ParallelSumScatterOperationLoweringExtension for ParallelSumScatterOperatio
             .into());
         }
         let (replica_groups, _) =
-            collective_state.replica_groups(self.axes(), self.axis_size(), self.options().axis_index_groups())?;
+            lowering_state.replica_groups(self.axes(), self.axis_size(), self.options().axis_index_groups())?;
         let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
         let computation = build_reduce_body_region(
             ReductionKind::Sum,
@@ -151,7 +152,7 @@ impl ParallelSumScatterOperationLoweringExtension for ParallelSumScatterOperatio
             input_value,
             self.scatter_axis(),
             stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-            Some(collective_state.next_channel_id()),
+            Some(lowering_state.next_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             true,
             computation,
@@ -179,7 +180,8 @@ mod tests {
     use crate::lowering::tests::static_sharded_array_type;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, ExecutionArguments, FromPjrt, ProgramLoweringExtension, Session, TracedProgram, trace,
+        Array, ArrayTracer, ExecutionArguments, FromPjrt, ProgramLoweringExtension, ProgramLoweringOptions, Session,
+        TracedProgram, trace,
     };
 
     use super::*;
@@ -226,7 +228,7 @@ mod tests {
         )
         .unwrap();
 
-        let mlir_program = traced.to_mlir_module("main").unwrap();
+        let mlir_program = traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             mlir_program,
             indoc! {r#"
@@ -353,7 +355,7 @@ mod tests {
         )
         .unwrap();
 
-        let module = traced.to_mlir_module("main").unwrap();
+        let module = traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         // Group order chooses the recipient of each column, so device 1 receives column 0, and device 0 column 1.
         // Untiled scatter removes dimension 1 after the native reduce scatter leaves it with extent 1.
         assert_eq!(
@@ -465,7 +467,10 @@ mod tests {
                 ArrayType::new_static(data_type, [4]),
             )
             .unwrap();
-            traced.to_mlir_module("main").map(|_| ()).map_err(|error| error.to_string())
+            traced
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new())
+                .map(|_| ())
+                .map_err(|error| error.to_string())
         };
         assert_eq!(
             lower(DataType::U1),

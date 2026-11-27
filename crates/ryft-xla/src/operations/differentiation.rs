@@ -85,17 +85,16 @@ impl LowerableOperation for RematerializeOperation<Type> {
             false => &RematerializationOptimizationBarrier::None,
         };
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-        let (effect_tokens, regions, captured_values, nested_functions, collective_state) =
-            lowerer.split_effect_tokens();
+        let (effect_tokens, regions, captured_values, nested_functions, lowering_state) = lowerer.split_effect_tokens();
         regions[0].lower_inline(
             input_values,
             &mut block,
             context,
             location,
-            collective_state.session_values(captured_values),
+            lowering_state.session_values(captured_values),
             optimization_barrier,
             nested_functions,
-            collective_state,
+            lowering_state,
             effect_tokens,
         )
     }
@@ -290,7 +289,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             stablehlo,
@@ -343,7 +342,7 @@ mod tests {
 
         // The enclosing function's capture prefix has a matching slot #0, so before rematerialized bodies were scoped
         // to an empty capture namespace this lowering silently forwarded that unrelated captured value.
-        let result = program.to_mlir_module_with_options(
+        let result = program.to_rendered_mlir(
             "main",
             &ProgramLoweringOptions::new()
                 .without_pruning()
@@ -377,7 +376,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            program.to_mlir_module("main").unwrap()
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap()
         };
         let operation = RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable));
         assert_eq!(
@@ -432,7 +431,7 @@ mod tests {
             )
             .unwrap();
             program
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .without_pruning()
@@ -526,7 +525,7 @@ mod tests {
             let input_types = array_types(program.input_types().into_owned());
             let output_types = array_types(program.output_types().into_owned());
             program
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .without_pruning()
@@ -623,7 +622,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             gradient
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .without_pruning()
@@ -672,7 +671,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             gradient
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .without_pruning()
@@ -740,7 +739,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"

@@ -673,7 +673,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             module,
@@ -726,7 +726,7 @@ mod tests {
             .unwrap();
         let program = unproject_plain_program(program);
         assert!(matches!(
-            program.to_mlir_module("main"),
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new()),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "strided input layout `strided{12,4}`",
         ));
@@ -781,7 +781,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -812,7 +812,7 @@ mod tests {
         let program = unproject_plain_program(program);
         assert_eq!(
             program
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .without_pruning()
@@ -850,7 +850,7 @@ mod tests {
             .unwrap();
         let program = unproject_plain_program(program);
         assert_eq!(
-            program.to_mlir_module("main").unwrap(),
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   func.func @main() -> (tensor<2xf64> {mhlo.memory_kind = "pinned_host"}) {
@@ -884,7 +884,9 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let error = (unproject_plain_program(program)).to_mlir_module("main").unwrap_err();
+            let error = (unproject_plain_program(program))
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new())
+                .unwrap_err();
             assert!(matches!(
                 error.downcast_custom::<KernelEmbeddingError>(),
                 Some(KernelEmbeddingError::Invalid { message })
@@ -919,7 +921,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let lowered = program.lower("main", &ProgramLoweringOptions::new()).unwrap();
+        let lowered = program.to_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         let (stable_hlo, _, _, runtime_requirements) = lowered.into_parts();
         assert_eq!(runtime_requirements.as_ref(), &[first, second]);
@@ -958,7 +960,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            program.lower("main", &ProgramLoweringOptions::new()),
+            program.to_mlir("main", &ProgramLoweringOptions::new()),
             Err(Error::Runtime(RuntimeError::ConflictingRequirements { identifier })) if identifier == "test.runtime",
         ));
     }
@@ -980,7 +982,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![first], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let text = program.to_mlir_module("main").unwrap();
+        let text = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         let context = MlirContext::new();
         context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         context.load_dialect(DialectHandle::stable_hlo().unwrap()).unwrap();
@@ -1017,7 +1019,7 @@ mod tests {
         builder.add_instruction(call, vec![], vec![], None).unwrap();
         let program = builder.build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![], vec![]).unwrap();
         let program = unproject_plain_program(program);
-        let text = program.to_mlir_module("main").unwrap();
+        let text = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         let context = MlirContext::new();
         context.load_dialect(DialectHandle::func().unwrap()).unwrap();
         context.load_dialect(DialectHandle::stable_hlo().unwrap()).unwrap();
@@ -1055,7 +1057,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             module,
@@ -1164,7 +1166,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            program.to_mlir_module("main"),
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new()),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason
                     == "`custom_call` input dimension `size` needs a finite upper bound for physical buffer \
@@ -1186,7 +1188,7 @@ mod tests {
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![], vec![Placeholder]).unwrap();
         let output_type = ArrayType::new_static(DataType::F32, [3]);
         assert_eq!(program.output_types(), vec![Type::Array(output_type.clone())]);
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -1228,7 +1230,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
         let lowered = program
-            .lower(
+            .to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&vec![alias_type.clone(), ArrayType::scalar(DataType::I64)])
@@ -1338,7 +1340,7 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let module = program
-                .to_mlir_module_with_options(
+                .to_rendered_mlir(
                     "main",
                     &ProgramLoweringOptions::new()
                         .with_input_types(&vec![ArrayType::scalar(DataType::I64)])
@@ -1365,7 +1367,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&vec![ArrayType::scalar(DataType::I64)])
@@ -1925,7 +1927,7 @@ mod tests {
         )
         .unwrap();
 
-        let mlir_program = traced.to_mlir_module("main").unwrap();
+        let mlir_program = traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             mlir_program,
             indoc! {r#"

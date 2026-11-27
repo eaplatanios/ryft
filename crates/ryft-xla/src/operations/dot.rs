@@ -37,7 +37,7 @@ impl LowerableOperation for DotOperation {
         // results it reproduces and rejects every other algorithm instead of computing something else. This is the
         // allowlist of JAX's `_handle_dot_precision`, without its `DEFAULT` preset, which is the default precision.
         let targets_cpu = lowerer
-            .collective_state()
+            .lowering_state()
             .target_platform()
             .is_some_and(|platform| platform.eq_ignore_ascii_case("cpu"));
         let supported_on_cpu = matches!(
@@ -130,7 +130,7 @@ impl LowerableOperation for RaggedDotOperation {
         check_count!("input", input_types, 3, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let dimensions = self.dimensions();
-        if lowerer.collective_state().ragged_dot_lowering_strategy() == RaggedDotLoweringStrategy::Instruction {
+        if lowerer.lowering_state().ragged_dot_lowering_strategy() == RaggedDotLoweringStrategy::Instruction {
             // JAX applies an explicit transpose of the right-hand side input only for its TPU instruction path as a
             // backend layout workaround. Ryft emits the canonical CHLO contract and leaves target specific layout
             // selection to legalization.
@@ -616,7 +616,7 @@ mod tests {
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
-        ProgramBuilder, dynamic_dimension, to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy,
+        ProgramBuilder, dynamic_dimension, to_rendered_mlir_for_plain_program_with_ragged_dot_lowering_strategy,
         unproject_plain_program,
     };
     use crate::operations::Operation;
@@ -649,7 +649,7 @@ mod tests {
         let program = unproject_plain_program(program);
         let input_types = vec![left_type, right_type];
         program
-            .lower(
+            .to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -684,7 +684,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy(&program, "main", strategy)
+        to_rendered_mlir_for_plain_program_with_ragged_dot_lowering_strategy(&program, "main", strategy)
     }
 
     // Lowers the basic non-contracting grouped matrix form using `strategy`.
@@ -796,7 +796,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             module,
@@ -827,7 +827,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -2322,7 +2322,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   func.func private @ryft.einsum.v1(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>, %arg2: tensor<2x2xf32>) -> tensor<2x2xf32> {

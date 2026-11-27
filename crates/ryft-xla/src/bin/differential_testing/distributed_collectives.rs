@@ -284,7 +284,7 @@ impl DistributedCollectiveCase {
             },
             types,
         )?;
-        Ok(traced.to_mlir_module("main")?)
+        Ok(traced.to_rendered_mlir("main", &ProgramLoweringOptions::new())?)
     }
 }
 

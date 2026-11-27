@@ -23,7 +23,7 @@ impl LowerableOperation for ConstrainShardingOperation {
         let value = sharding.lower_sharding_constraint(
             input_values[0],
             OpenDimensions::None,
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.location(),
         )?;
@@ -41,7 +41,7 @@ mod tests {
     use ryft_mlir::{Block, Context as MlirContext, Location, Operation as MlirOperation, Value as MlirValue};
 
     use crate::lowering::sharding::tests::{test_input_type, test_mesh};
-    use crate::lowering::states::CollectiveLoweringState;
+    use crate::lowering::states::ProgramLoweringState;
     use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::operations::Operation;
     use crate::sessions::tests::two_device_mesh;
@@ -100,10 +100,10 @@ mod tests {
         let tensor_type = input_type.lower(&context, location).unwrap();
         let block = context.block(&[(tensor_type, location)]);
         let input = block.argument(0).unwrap().as_ref();
-        let state = CollectiveLoweringState::new()
+        let state = ProgramLoweringState::new()
             .enter_manual_region(ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap());
         let mut lowerer: Lowerer<'_, '_, '_, Operation> =
-            Lowerer::new(block.as_ref(), &context, location.as_ref()).with_collective_state(state);
+            Lowerer::new(block.as_ref(), &context, location.as_ref()).with_lowering_state(state);
         operation.lower(&mut lowerer, &[input], &[input_type], &output_types).unwrap();
         let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(

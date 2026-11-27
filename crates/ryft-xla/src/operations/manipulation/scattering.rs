@@ -31,7 +31,7 @@ impl LowerableOperation for ScatterOperation {
             input_values,
             input_types,
             output_types,
-            lowerer.collective_state().target_platform(),
+            lowerer.lowering_state().target_platform(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -43,7 +43,7 @@ impl LowerableOperation for ScatterOperation {
         let value = output_types[0].sharding().unwrap().lower_sharding_constraint(
             values[0],
             OpenDimensions::All,
-            lowerer.collective_state().bound_manual_axes(),
+            lowerer.lowering_state().bound_manual_axes(),
             &mut lowerer.block(),
             lowerer.location(),
         )?;
@@ -425,7 +425,7 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::tests::{ProgramBuilder, to_mlir_module_for_plain_program, unproject_plain_program};
+    use crate::lowering::tests::{ProgramBuilder, to_rendered_mlir_for_plain_program, unproject_plain_program};
     use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, read_first_shard};
     use crate::tests::{
@@ -461,7 +461,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
 
         assert_eq!(
             stablehlo,
@@ -500,7 +500,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -554,7 +554,7 @@ mod tests {
             .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            to_mlir_module_for_plain_program(&program, "main"),
+            to_rendered_mlir_for_plain_program(&program, "main"),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "`scatter` dynamic update window axis 1 must match input axis 0; independently sized dynamic \
                    windows are unsupported by XLA",
@@ -609,7 +609,7 @@ mod tests {
                         )
                         .unwrap(),
                 );
-                let module = program.to_mlir_module("main").unwrap();
+                let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
                 let executable = client
                     .compile(
                         &PjrtProgram::Mlir { bytecode: module.into_bytes() },
@@ -743,7 +743,7 @@ mod tests {
             let output = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap()[0];
             let program =
                 builder.build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![], vec![Placeholder]).unwrap();
-            let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
@@ -896,7 +896,7 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap();
             let module = (unproject_plain_program(program))
-                .lower("main", &ProgramLoweringOptions::new().with_target_platform(platform))
+                .to_mlir("main", &ProgramLoweringOptions::new().with_target_platform(platform))
                 .unwrap()
                 .into_stable_hlo();
             assert_eq!(module, expected_module, "{data_type} on {platform:?}");

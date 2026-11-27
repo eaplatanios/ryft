@@ -32,7 +32,7 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::ArrayConstant;
-    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, to_mlir_module_for_plain_program};
+    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, to_rendered_mlir_for_plain_program};
     use crate::tests::{execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
 
     use super::*;
@@ -48,7 +48,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
             indoc! {r#"
             module {
               func.func @main(%arg0: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
@@ -79,7 +79,7 @@ mod tests {
                 vec![Placeholder; 2],
             )
             .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "transpose_dynamic").unwrap();
+        let module = to_rendered_mlir_for_plain_program(&program, "transpose_dynamic").unwrap();
         // Keep CPU PJRT's physical boundary static while transposing bounded dynamic intermediates. The output
         // extent must follow the permuted axis, and one executable must also handle an empty runtime shape.
         let module = format!(

@@ -32,7 +32,7 @@ impl LowerableOperation for CumulativeOperation {
             self.reverse(),
             input_values[0],
             &output_types[0],
-            lowerer.collective_state().target_platform(),
+            lowerer.lowering_state().target_platform(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -421,7 +421,7 @@ mod tests {
 
     use crate::lowering::programs::{ProgramLoweringExtension, ProgramLoweringOptions};
     use crate::lowering::tests::{
-        ProgramBuilder, lowered_unary_module, to_mlir_module_for_plain_program, unproject_plain_program,
+        ProgramBuilder, lowered_unary_module, to_rendered_mlir_for_plain_program, unproject_plain_program,
     };
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
@@ -777,7 +777,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            to_mlir_module_for_plain_program(&program, "main"),
+            to_rendered_mlir_for_plain_program(&program, "main"),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "`cumulative` with kind `log_sum_exp` over dynamically sized axis 0",
         ));
@@ -800,7 +800,7 @@ mod tests {
                 .unwrap();
             let program = unproject_plain_program(program);
             program
-                .lower("main", &ProgramLoweringOptions::new().with_target_platform(Some(target_platform)))
+                .to_mlir("main", &ProgramLoweringOptions::new().with_target_platform(Some(target_platform)))
                 .unwrap()
                 .into_stable_hlo()
         };
@@ -866,7 +866,7 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let jvp = program.jvp().unwrap();
-            assert!(to_mlir_module_for_plain_program(&jvp, "main").is_ok(), "{kind}");
+            assert!(to_rendered_mlir_for_plain_program(&jvp, "main").is_ok(), "{kind}");
         }
     }
 
@@ -975,7 +975,7 @@ mod tests {
             for target_platform in ["cuda", "rocm"] {
                 assert_eq!(
                     program
-                        .lower("main", &ProgramLoweringOptions::new().with_target_platform(Some(target_platform)))
+                        .to_mlir("main", &ProgramLoweringOptions::new().with_target_platform(Some(target_platform)))
                         .unwrap()
                         .into_stable_hlo(),
                     indoc! {"
@@ -1064,7 +1064,7 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert!(matches!(
-                to_mlir_module_for_plain_program(&program, "main"),
+                to_rendered_mlir_for_plain_program(&program, "main"),
                 Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                     if reason == format!(
                            "`cumulative` with kind `log_sum_exp` over `{element_type}`, whose lowest value is not a \

@@ -8,7 +8,8 @@ use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
 use crate::lowering::regions::NestedProgramLoweringExtension;
-use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::states::ProgramLoweringState;
+use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer, Type};
 
 impl LowerableOperation for ParallelBroadcastOperation {
@@ -22,8 +23,8 @@ impl LowerableOperation for ParallelBroadcastOperation {
         let input_count = if self.source() == ParallelBroadcastSource::Dynamic(()) { 2 } else { 1 };
         check_count!("input", input_values, input_count, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let collective_state = lowerer.collective_state().clone();
-        collective_state.validate_manual_collective(
+        let lowering_state = lowerer.lowering_state().clone();
+        lowering_state.validate_manual_collective(
             self.name(),
             self.axes(),
             self.axis_size(),
@@ -40,11 +41,11 @@ impl LowerableOperation for ParallelBroadcastOperation {
         if self.source() == ParallelBroadcastSource::Dynamic(()) {
             // Trace the operation's canonical checked interpretation in the actual manual-axis environment. The
             // decomposition retains exact copies and assertion tokens on targets without native root support.
-            let axes = collective_state
+            let axes = lowering_state
                 .bound_manual_axes()
                 .iter()
                 .map(|name| {
-                    let boundary = collective_state.manual_axis_region(name).unwrap();
+                    let boundary = lowering_state.manual_axis_region(name).unwrap();
                     let mesh = boundary.mesh().clone();
                     let axis = mesh.axis_index(name).unwrap();
                     (
@@ -79,11 +80,11 @@ impl LowerableOperation for ParallelBroadcastOperation {
                 &[],
                 &RematerializationOptimizationBarrier::None,
                 None,
-                &collective_state,
+                &lowering_state,
                 lowerer.effect_tokens_mut(),
             );
         }
-        self.lower_static_to_mlir(&collective_state, input_values[0], &mut lowerer.block(), lowerer.location())
+        self.lower_static_to_mlir(&lowering_state, input_values[0], &mut lowerer.block(), lowerer.location())
     }
 }
 
@@ -101,7 +102,7 @@ trait ParallelBroadcastOperationLoweringExtension {
     /// operation and leaves the rejection to XLA's compiler. JAX registers its lowering for GPUs only.
     fn lower_static_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         input_value: ValueRef<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
         location: LocationRef<'c, 't>,
@@ -111,7 +112,7 @@ trait ParallelBroadcastOperationLoweringExtension {
 impl ParallelBroadcastOperationLoweringExtension for ParallelBroadcastOperation {
     fn lower_static_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         input_value: ValueRef<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
         location: LocationRef<'c, 't>,
@@ -119,13 +120,13 @@ impl ParallelBroadcastOperationLoweringExtension for ParallelBroadcastOperation 
         if self.axis_size() == 1 {
             return Ok(vec![input_value]);
         }
-        if collective_state.target_platform().is_some_and(|platform| platform.eq_ignore_ascii_case("cpu")) {
+        if lowering_state.target_platform().is_some_and(|platform| platform.eq_ignore_ascii_case("cpu")) {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` is not supported by the XLA CPU backend"),
             }
             .into());
         }
-        let (replica_groups, _) = collective_state.replica_groups(self.axes(), self.axis_size(), None)?;
+        let (replica_groups, _) = lowering_state.replica_groups(self.axes(), self.axis_size(), None)?;
         let ParallelBroadcastSource::Static(source) = self.source() else {
             unreachable!();
         };
@@ -143,7 +144,7 @@ impl ParallelBroadcastOperationLoweringExtension for ParallelBroadcastOperation 
             &[input_value],
             None,
             stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-            Some(collective_state.next_channel_id()),
+            Some(lowering_state.next_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             location,
         )?)?;
@@ -203,7 +204,7 @@ mod tests {
         let types = [global_type];
         let shardings = [sharded];
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -243,7 +244,7 @@ mod tests {
                 if message.contains("HLO opcode `collective-broadcast` is not supported by XLA:CPU"),
         ));
         assert!(matches!(
-            program.lower(
+            program.to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -294,7 +295,7 @@ mod tests {
         )
         .unwrap();
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -419,7 +420,7 @@ mod tests {
         let types = [global_type];
         let shardings = [sharded];
         let module = program
-            .lower(
+            .to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -464,7 +465,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            traced.to_mlir_module("main").unwrap(),
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {"
                 module {
                   sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>

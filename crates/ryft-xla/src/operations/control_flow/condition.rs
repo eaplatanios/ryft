@@ -64,8 +64,7 @@ impl LowerableOperation for ConditionOperation<Type> {
         // internal error, reported as the operation's own region contract and input count would report it.
         self.validate_region_count(lowerer.regions().len())?;
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-        let (effect_tokens, regions, captured_values, nested_functions, collective_state) =
-            lowerer.split_effect_tokens();
+        let (effect_tokens, regions, captured_values, nested_functions, lowering_state) = lowerer.split_effect_tokens();
         let (true_branch, false_branch) = (&regions[0], &regions[1]);
         let branch_input_types = true_branch.input_types();
         let expected = branch_input_types.len() + 1;
@@ -116,7 +115,7 @@ impl LowerableOperation for ConditionOperation<Type> {
                 location,
                 captured_values,
                 nested_functions,
-                collective_state,
+                lowering_state,
                 entry_effect_tokens,
                 threaded_effects,
             )
@@ -135,7 +134,7 @@ impl LowerableOperation for ConditionOperation<Type> {
         lower_explicit_sharding_constraints(
             outputs,
             output_types,
-            collective_state.bound_manual_axes(),
+            lowering_state.bound_manual_axes(),
             &mut block,
             location,
         )
@@ -239,7 +238,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             stablehlo,
@@ -303,7 +302,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&[
@@ -404,7 +403,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![printed], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .with_input_types(&[
@@ -497,7 +496,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             stablehlo,
@@ -577,7 +576,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             stablehlo,
@@ -641,7 +640,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             module,
@@ -719,7 +718,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             stablehlo,
@@ -816,7 +815,7 @@ mod tests {
                 ]
                 in ()"#},
         );
-        let module = program.as_ref().to_mlir_module("main").unwrap();
+        let module = program.as_ref().to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -879,7 +878,7 @@ mod tests {
             .add_instruction(PrintOperation::<ArrayType>::new("after"), Vec::new(), vec![input], None)
             .unwrap();
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder; 2], vec![]).unwrap();
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -2125,7 +2124,7 @@ mod tests {
                 in (%4)"#},
         );
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()

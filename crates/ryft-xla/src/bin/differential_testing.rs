@@ -379,7 +379,7 @@ fn emit_grouped_collectives() -> Result<DifferentialObservation, Box<dyn Error>>
         },
         ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(16)])),
     )?;
-    let stablehlo = traced.to_mlir_module("main")?;
+    let stablehlo = traced.to_rendered_mlir("main", &ProgramLoweringOptions::new())?;
     let input_values = (0..4)
         .map(|device| (0..4).map(|offset| (device * 4 + offset) as f32).collect::<Vec<_>>())
         .collect::<Vec<_>>();
@@ -428,7 +428,7 @@ fn emit_parallel_shuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
         },
         ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
     )?;
-    let stablehlo = traced.to_mlir_module("main")?;
+    let stablehlo = traced.to_rendered_mlir("main", &ProgramLoweringOptions::new())?;
     let input_values = (0..4)
         .map(|device| (0..2).map(|offset| (device * 2 + offset) as f32).collect::<Vec<_>>())
         .collect::<Vec<_>>();
@@ -499,7 +499,7 @@ fn emit_parallel_swap_axes() -> Result<DifferentialObservation, Box<dyn Error>> 
         },
         ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(16), Dimension::Static(2)])),
     )?;
-    let stablehlo = traced.to_mlir_module("main")?;
+    let stablehlo = traced.to_rendered_mlir("main", &ProgramLoweringOptions::new())?;
     let input_values = (0..4)
         .map(|device| (0..8).map(|offset| (device * 8 + offset) as f32).collect::<Vec<_>>())
         .collect::<Vec<_>>();
@@ -694,7 +694,7 @@ fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error
         case_id: "scaled_dot_and_matmul".into(),
         observations,
         staging: None,
-        stablehlo: Some(traced.to_mlir_module("main")?),
+        stablehlo: Some(traced.to_rendered_mlir("main", &ProgramLoweringOptions::new())?),
     })
 }
 
@@ -790,7 +790,7 @@ fn emit_block_scaled_dot() -> Result<DifferentialObservation, Box<dyn Error>> {
         case_id: "block_scaled_dot".into(),
         observations,
         staging: None,
-        stablehlo: Some(traced.to_mlir_module("main")?),
+        stablehlo: Some(traced.to_rendered_mlir("main", &ProgramLoweringOptions::new())?),
     })
 }
 
@@ -871,7 +871,7 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
         case_id: "dot_product_attention".into(),
         observations,
         staging: None,
-        stablehlo: Some(traced.to_mlir_module("main")?),
+        stablehlo: Some(traced.to_rendered_mlir("main", &ProgramLoweringOptions::new())?),
     })
 }
 
@@ -903,7 +903,7 @@ fn emit_negative_dynamic_slice() -> Result<DifferentialObservation, Box<dyn Erro
         case_id: "negative_dynamic_slice".into(),
         observations,
         staging: None,
-        stablehlo: Some(traced.to_mlir_module("main")?),
+        stablehlo: Some(traced.to_rendered_mlir("main", &ProgramLoweringOptions::new())?),
     })
 }
 
@@ -968,7 +968,7 @@ fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation
         },
         vec![ArrayType::new_static(DataType::F32, [1]), ArrayType::new_static(DataType::F32, [4])],
     )?;
-    let stablehlo = traced.to_mlir_module("main")?;
+    let stablehlo = traced.to_rendered_mlir("main", &ProgramLoweringOptions::new())?;
     let outputs = execute_collective_inputs(
         client,
         device_mesh,

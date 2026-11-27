@@ -3,7 +3,8 @@ use ryft_core::{ArrayType, Operation, ParallelPermuteOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::states::ProgramLoweringState;
+use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
 impl LowerableOperation for ParallelPermuteOperation {
@@ -16,8 +17,8 @@ impl LowerableOperation for ParallelPermuteOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let collective_state = lowerer.collective_state().clone();
-        collective_state.validate_manual_collective(
+        let lowering_state = lowerer.lowering_state().clone();
+        lowering_state.validate_manual_collective(
             self.name(),
             self.axes(),
             self.axis_size(),
@@ -31,7 +32,7 @@ impl LowerableOperation for ParallelPermuteOperation {
                 operation.infer_output_types(input_types, &[])
             },
         )?;
-        self.lower_to_mlir(&collective_state, input_values[0], &mut lowerer.block(), lowerer.location())
+        self.lower_to_mlir(&lowering_state, input_values[0], &mut lowerer.block(), lowerer.location())
     }
 }
 
@@ -41,7 +42,7 @@ trait ParallelPermuteOperationLoweringExtension {
     /// `(source, target)` pairs to global device pairs across the named mesh axis's replica groups.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         input_value: ValueRef<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
         location: LocationRef<'c, 't>,
@@ -51,12 +52,12 @@ trait ParallelPermuteOperationLoweringExtension {
 impl ParallelPermuteOperationLoweringExtension for ParallelPermuteOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        collective_state: &CollectiveLoweringState,
+        lowering_state: &ProgramLoweringState,
         input_value: ValueRef<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let (replica_groups, _) = collective_state.replica_groups(self.axes(), self.axis_size(), None)?;
+        let (replica_groups, _) = lowering_state.replica_groups(self.axes(), self.axis_size(), None)?;
         let mut source_target_pairs = Vec::with_capacity(replica_groups.len() * self.source_target_pairs().len());
         for group in &replica_groups {
             for (source, target) in self.source_target_pairs() {
@@ -66,7 +67,7 @@ impl ParallelPermuteOperationLoweringExtension for ParallelPermuteOperation {
         let result = block.append_operation(stable_hlo::collective_permute(
             input_value,
             source_target_pairs.as_slice(),
-            Some(collective_state.next_channel_id()),
+            Some(lowering_state.next_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             location,
         )?)?;
@@ -87,7 +88,8 @@ mod tests {
     use crate::lowering::tests::static_sharded_array_type;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, ExecutionArguments, FromPjrt, ProgramLoweringExtension, Session, TracedProgram, trace,
+        Array, ArrayTracer, ExecutionArguments, FromPjrt, ProgramLoweringExtension, ProgramLoweringOptions, Session,
+        TracedProgram, trace,
     };
 
     use super::*;
@@ -132,7 +134,7 @@ mod tests {
         )
         .unwrap();
 
-        let mlir_program = traced.to_mlir_module("main").unwrap();
+        let mlir_program = traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             mlir_program,
             indoc! {r#"
@@ -228,7 +230,9 @@ mod tests {
                 ArrayType::new_static(DataType::F32, [4]),
             )
             .unwrap();
-            let program = Program::Mlir { bytecode: traced.to_mlir_module("main").unwrap().into_bytes() };
+            let program = Program::Mlir {
+                bytecode: traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap().into_bytes(),
+            };
             let executable = client.compile(&program, &test_compilation_options(client, Some(2))).unwrap();
             assert_eq!(
                 executable
@@ -297,7 +301,7 @@ mod tests {
             )
             .unwrap();
             assert!(matches!(
-                traced.to_mlir_module("main"),
+                traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
                     CoreError::Program(ProgramError::MalformedProgram(message))

@@ -82,8 +82,7 @@ impl LowerableOperation for WhileOperation<Type> {
         self.validate_region_count(lowerer.regions().len())?;
         let (context, location) = (lowerer.context(), lowerer.location());
         let block = &mut lowerer.block();
-        let (effect_tokens, regions, captured_values, nested_functions, collective_state) =
-            lowerer.split_effect_tokens();
+        let (effect_tokens, regions, captured_values, nested_functions, lowering_state) = lowerer.split_effect_tokens();
         let (condition, body) = (&regions[0], &regions[1]);
         let state_types = body.input_types();
         let state_count = state_types.len();
@@ -183,7 +182,7 @@ impl LowerableOperation for WhileOperation<Type> {
                 captured_values,
                 &RematerializationOptimizationBarrier::None,
                 nested_functions,
-                collective_state,
+                lowering_state,
                 effect_tokens,
             )?;
             state_values.push(initial_predicate[0]);
@@ -239,7 +238,7 @@ impl LowerableOperation for WhileOperation<Type> {
                     captured_values,
                     &RematerializationOptimizationBarrier::None,
                     nested_functions,
-                    collective_state,
+                    lowering_state,
                     &mut condition_effect_tokens,
                 )?;
                 // The condition region of a `stablehlo.while` returns only the predicate, so it threads no token.
@@ -290,7 +289,7 @@ impl LowerableOperation for WhileOperation<Type> {
                 captured_values,
                 &RematerializationOptimizationBarrier::None,
                 nested_functions,
-                collective_state,
+                lowering_state,
                 &mut body_effect_tokens,
             )?;
             // For a batched predicate, mask each carry update under the carried predicate of the incoming state, so
@@ -425,7 +424,7 @@ impl LowerableOperation for WhileOperation<Type> {
                         location,
                         captured_values,
                         nested_functions,
-                        collective_state,
+                        lowering_state,
                         body_effect_tokens,
                         threaded_effects,
                     )?;
@@ -458,7 +457,7 @@ impl LowerableOperation for WhileOperation<Type> {
                         captured_values,
                         &RematerializationOptimizationBarrier::None,
                         nested_functions,
-                        collective_state,
+                        lowering_state,
                         &mut body_effect_tokens,
                     )?;
                     Some(next_predicate[0])
@@ -488,13 +487,7 @@ impl LowerableOperation for WhileOperation<Type> {
         let results =
             (0..state_count).map(|index| operation.result(counter_offset + index).unwrap().as_ref()).collect();
         let results = lower_refined_region_outputs(results, &state_types, output_types, block, context, location)?;
-        lower_explicit_sharding_constraints(
-            results,
-            output_types,
-            collective_state.bound_manual_axes(),
-            block,
-            location,
-        )
+        lower_explicit_sharding_constraints(results, output_types, lowering_state.bound_manual_axes(), block, location)
     }
 }
 
@@ -544,7 +537,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -629,7 +622,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -719,7 +712,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             stablehlo,
@@ -799,7 +792,7 @@ mod tests {
             .unwrap();
         assert_eq!(program.output_types(), vec![Type::Array(static_type.clone()), Type::Array(static_type.clone())],);
 
-        let module = program.to_mlir_module("main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -979,7 +972,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -1335,7 +1328,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap();
-            let module = program.to_mlir_module("main").unwrap();
+            let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
             assert_eq!(module, expected, "upper bound {upper_bound:?}");
         }
@@ -1402,7 +1395,7 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = program.to_mlir_module("main").unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         // The condition region `or`-reduces the carried `tensor<3xi1>` predicate, the array carry takes one
         // `stablehlo.select` against the carried predicate, and the dimension carry (i.e., `%iterArg`) is returned
@@ -1514,7 +1507,7 @@ mod tests {
             ),
         );
         let module = program
-            .to_mlir_module_with_options(
+            .to_rendered_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()

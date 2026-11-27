@@ -126,7 +126,7 @@ impl LowerableOperation for LogAddExpOperation<ArrayType> {
             lowerer.context(),
             lowerer.location(),
         )?;
-        let form = FloatExtremumForm::for_elementwise(lowerer.collective_state().target_platform());
+        let form = FloatExtremumForm::for_elementwise(lowerer.lowering_state().target_platform());
         let value = lower_log_add_exp_to_mlir(
             left,
             right,
@@ -738,7 +738,7 @@ mod tests {
     };
 
     use crate::lowering::tests::{
-        ProgramBuilder, dynamic_dimension, lowered_unary_module, to_mlir_module_for_plain_program,
+        ProgramBuilder, dynamic_dimension, lowered_unary_module, to_rendered_mlir_for_plain_program,
     };
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
@@ -754,7 +754,7 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        to_mlir_module_for_plain_program(&program, "main").unwrap()
+        to_rendered_mlir_for_plain_program(&program, "main").unwrap()
     }
 
     #[test]
@@ -915,7 +915,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {

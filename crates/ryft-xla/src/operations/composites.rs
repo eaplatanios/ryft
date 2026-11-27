@@ -19,7 +19,7 @@ use ryft_mlir::{
 use crate::lowering::EffectTokens;
 use crate::lowering::emissions::omits_regions;
 use crate::lowering::regions::NestedProgramLoweringExtension;
-use crate::lowering::states::CollectiveLoweringState;
+use crate::lowering::states::ProgramLoweringState;
 use crate::lowering::types::TypeLoweringExtension;
 use crate::operations::attention::{AttentionConfigurationLoweringExtension, select_attention_implementation};
 use crate::operations::call::lower_shared_function_call;
@@ -196,7 +196,7 @@ where
         if let Some(key) = self.key() {
             let input_types = input_types.iter().cloned().map(Into::into).collect::<Vec<Type>>();
             let output_types = output_types.iter().cloned().map(Into::into).collect::<Vec<Type>>();
-            let target_platform = lowerer.collective_state().target_platform();
+            let target_platform = lowerer.lowering_state().target_platform();
             if let Some(backend) =
                 NamedCompositeImplementation::select(key, &input_types, &output_types, target_platform)
             {
@@ -258,17 +258,16 @@ where
         // programs (i.e., those of `while`, `scan`, `condition`, and `linear_call`) share the enclosing capture scope
         // and keep inheriting it.
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-        let (effect_tokens, regions, captured_values, nested_functions, collective_state) =
-            lowerer.split_effect_tokens();
+        let (effect_tokens, regions, captured_values, nested_functions, lowering_state) = lowerer.split_effect_tokens();
         regions[0].lower_inline(
             input_values,
             &mut block,
             context,
             location,
-            collective_state.session_values(captured_values),
+            lowering_state.session_values(captured_values),
             &RematerializationOptimizationBarrier::None,
             nested_functions,
-            collective_state,
+            lowering_state,
             effect_tokens,
         )
     }
@@ -494,7 +493,7 @@ where
 pub(crate) fn emit_named_composition_function<'b, 'c: 'b, 't: 'c>(
     module_block: &mut BlockRef<'b, 'c, 't>,
     function: &NamedCompositionFunction,
-    collective_state: &CollectiveLoweringState,
+    lowering_state: &ProgramLoweringState,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
@@ -525,7 +524,7 @@ pub(crate) fn emit_named_composition_function<'b, 'c: 'b, 't: 'c>(
             &[],
             &RematerializationOptimizationBarrier::None, // Decompositions are traced independently of the lowered program and contain no `call` sharing.
             None,
-            collective_state,
+            lowering_state,
             &mut effect_tokens,
         )?;
         function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
@@ -623,7 +622,7 @@ mod tests {
         let input_types = vec![test_vector_type(4)];
         let output_types = vec![test_vector_type(4); program.output_ids().len()];
         program
-            .lower(
+            .to_mlir(
                 "main",
                 &ProgramLoweringOptions::new()
                     .without_pruning()
@@ -759,7 +758,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let module = program.to_mlir_module("main").unwrap();
+            let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
             assert_eq!(
                 module,
@@ -911,7 +910,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            program.to_mlir_module("main").unwrap(),
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
@@ -1348,7 +1347,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            program.to_mlir_module("main"),
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new()),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 CoreError::Program(ProgramError::UnsupportedOperation { message })
