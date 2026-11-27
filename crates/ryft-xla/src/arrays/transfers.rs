@@ -1716,8 +1716,8 @@ impl Array {
     /// returned only when the execution could not take its buffers.
     ///
     /// Unsupported requests return typed [`ArrayError`] variants through [`Error::Array`] (refer to
-    /// [`PlacementPlanningView::validate_compiled_reshard`]), and cross-host extension, tracing, compilation,
-    /// and execution failures propagate through [`Error`] without losing their typed payloads.
+    /// [`PlacementPlanningView::strategy`]). Cross-host extension, tracing, compilation, and execution failures
+    /// propagate through [`Error`] without losing their typed payloads.
     ///
     /// `layout` is the layout of each target shard that the placement records (refer to [`Self::placement_layout`]),
     /// which [`Self::place_process_local_value`] uploads into directly. `host_fallback` is whether the caller falls
@@ -1742,9 +1742,8 @@ impl Array {
 
         // A planning error reads only shared metadata, so every process meets it alike, and no process recovers from
         // it with a host fallback of its own (a decline that one process can make with a host round trip is planned
-        // as one, refer to `PlacementPlanningView::host_round_trip`). Only the failures of a planned strategy, which
-        // only this process can see (e.g., a failed compilation or execution on its own devices), return this array
-        // for that fallback.
+        // as one). Only failures that this process observes while carrying out a planned strategy (e.g., a failed
+        // compilation or execution on its devices) can return this array for that fallback.
         let layout_resolver = cross_host_layout_resolver(self.client());
         let strategy = match self.device_placement_strategy(&layout_resolver, mesh, sharding, process_index) {
             Ok(strategy) => strategy,
@@ -2540,7 +2539,7 @@ enum DevicePlacementStrategy {
     /// Places an array on the devices at coordinate zero along the introduced mesh axes (at `axis_indices` within the
     /// target mesh) according to the target sharding without the pending sums that the target introduces, and then
     /// gives the other devices of the target the additive identity of the data type. Refer to
-    /// [`PlacementPlanningView::introduced_sums_strategy`] and [`Array::place_with_strategy`] for more information.
+    /// [`PlacementPlanningView::strategy`] and [`Array::place_with_strategy`] for more information.
     IntroducedSums {
         /// Mesh of the first step, which is the mesh of the devices at coordinate zero along the introduced axes (refer
         /// to [`DeviceMeshExtension::at_coordinate_zero`]), or the target mesh when the array cannot be placed
@@ -2554,8 +2553,8 @@ enum DevicePlacementStrategy {
         /// information.
         restrict_source: bool,
 
-        /// Strategy of the first step, which is never a host round trip, or [`None`] when the restriction of the array
-        /// to `mesh` already has `sharding`.
+        /// Strategy of the first step, or [`None`] when the restriction of the array to `mesh` already has `sharding`.
+        /// A host round trip in this step targets only the devices at coordinate zero.
         first: Option<Box<DevicePlacementStrategy>>,
 
         /// Indices within the target mesh of the axes along which the target introduces a pending sum.
@@ -2571,8 +2570,7 @@ enum DevicePlacementStrategy {
         /// Why no device strategy places the array.
         cause: HostRoundTripCause,
 
-        /// Index of the process that can do the round trip, if any. Refer to [`PlacementPlanningView::host_round_trip`]
-        /// for more information.
+        /// Index of the process that owns every target device and can read the full source value, if any.
         process_index: Option<usize>,
     },
 }
@@ -3073,12 +3071,124 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
                 unreduced_sum_identity(data_type)?
                     .ok_or_else(|| Error::from(ArrayError::MissingUnreducedSumIdentity { data_type }))?;
             }
+
             let remaining = sharding.unreduced_axes().iter().filter(|axis| !introduced.contains(&axis.as_str()));
             let first_sharding = sharding.clone().with_unreduced_axes(remaining.cloned().collect::<Vec<_>>())?;
-            return self.introduced_sums_strategy(layout_resolver, mesh, &first_sharding, axis_indices);
+            let coordinate_zero = || -> Result<(DeviceMesh, Sharding), Error> {
+                let first_mesh = mesh.at_coordinate_zero(&axis_indices)?;
+                let first_sharding = sharding_on_mesh(&first_sharding, first_mesh.logical_mesh())?;
+                Ok((first_mesh, first_sharding))
+            };
+
+            let replicated_along_introduced_axes =
+                self.mesh() == mesh && introduced.iter().all(|axis| !self.sharding().distinguishes_shards_along(axis));
+            let (first_mesh, first_sharding, restrict_source, first) = if replicated_along_introduced_axes {
+                // The existing shards at coordinate zero already hold the whole value, including any contributions
+                // the target keeps. Plan from that restriction only if its sharding still needs to change.
+                let (first_mesh, first_sharding) = coordinate_zero()?;
+
+                // Runtime arrays store unconstrained dimensions replicated, so treat those dimensions alike.
+                let closed = |sharding: &Sharding| -> Result<Sharding, Error> {
+                    let dimensions = sharding
+                        .dimensions()
+                        .iter()
+                        .map(|dimension| match dimension {
+                            ShardingDimension::Unconstrained => ShardingDimension::Replicated,
+                            dimension => dimension.clone(),
+                        })
+                        .collect();
+                    Ok(sharding.with_dimensions(dimensions)?)
+                };
+
+                let restricted_sharding = sharding_on_mesh(self.sharding(), first_mesh.logical_mesh())?;
+
+                if closed(&restricted_sharding)? == closed(&first_sharding)? {
+                    (first_mesh, first_sharding, false, None)
+                } else {
+                    let (metadata, shards) = self.on_mesh(first_mesh.clone(), restricted_sharding)?;
+                    let view = PlacementPlanningView { metadata: &metadata, shards: shards.iter() };
+                    let first = view.strategy(layout_resolver, &first_mesh, &first_sharding)?;
+                    (first_mesh, first_sharding, true, Some(first))
+                }
+            } else {
+                // When reduction state must change, plan on the full target mesh so the first step can use the usual
+                // collective path. Devices away from coordinate zero then discard what they received.
+                let on_target_mesh = !self.sharding().holds_one_value_per_slice()
+                    && !keeps_contributions(self.sharding(), &first_sharding);
+                let direct =
+                    on_target_mesh.then(|| self.strategy(layout_resolver, mesh, &first_sharding)).transpose()?;
+                match direct {
+                    Some(first) if !matches!(first, DevicePlacementStrategy::HostRoundTrip { .. }) => {
+                        (mesh.clone(), first_sharding, false, Some(first))
+                    }
+                    _ => {
+                        // A pure move can target coordinate zero directly. A host round trip also goes there,
+                        // so its owner only needs the source contributions and the devices that receive the value.
+                        let (first_mesh, first_sharding) = coordinate_zero()?;
+                        let first = self.strategy(layout_resolver, &first_mesh, &first_sharding)?;
+                        (first_mesh, first_sharding, false, Some(first))
+                    }
+                }
+            };
+
+            return Ok(DevicePlacementStrategy::IntroducedSums {
+                mesh: first_mesh,
+                sharding: first_sharding,
+                restrict_source,
+                first: first.map(Box::new),
+                axis_indices,
+            });
         }
 
-        let compiled = self.validate_compiled_reshard(mesh, sharding);
+        // Validate the device programs from shared metadata before any process posts transfers or compiles. Keep
+        // the result here so a limit of the partitioner can still lead to shard regions or a host round trip.
+        let compiled = (|| -> Result<Option<HostRoundTripCause>, Error> {
+            let data_type = self.data_type();
+            let cause = if self.mesh() == mesh {
+                validate_reduction_transition(data_type, mesh, self.sharding(), sharding)
+            } else {
+                // Check both stages across meshes. The gather carries contributions for any reduction the target
+                // keeps, and the second program reshards those replicas on the target mesh.
+                let input = self.sharding();
+                let gathered = gathered_sharding(input, sharding, self.mesh().logical_mesh(), shape.rank())?;
+                let gather = validate_reduction_transition(data_type, self.mesh(), input, &gathered);
+                let gathered = gathered_sharding(input, sharding, mesh.logical_mesh(), shape.rank())?;
+                let reshard = validate_reduction_transition(data_type, mesh, &gathered, sharding);
+                gather.or(reshard)
+            };
+
+            // The SPMD partitioner handles auto and explicit axes. A manual axis belongs to user-managed
+            // computations such as `shard_map`, so check for it in both the reshard and any source gather.
+            let gathers = self.mesh() != mesh && !self.sharding().is_replicated();
+            let program_meshes = [mesh].into_iter().chain(gathers.then(|| self.mesh()));
+            for program_mesh in program_meshes {
+                if let Some(axis) =
+                    program_mesh.logical_mesh().axes().iter().find(|axis| axis.r#type() == MeshAxisType::Manual)
+                {
+                    return Err(ArrayError::ManualReshardingAxis { axis_name: axis.name().to_string() }.into());
+                }
+            }
+
+            // XLA pads uneven splits to equal buffer shapes. Shard regions can materialize exact shapes, so this
+            // error lets planning fall back to regions when a compiled reshard would pad them.
+            let target_layout = ShardLayout::new(&shape, mesh, sharding)?;
+            let has_uneven_shards = |shapes: Vec<StaticShape>| shapes.iter().any(|shape| shape != &shapes[0]);
+            if has_uneven_shards(self.shards.clone().map(ShardDescriptor::shape).collect()) {
+                return Err(ArrayError::UnevenReshardingShards {
+                    shape: shape.clone(),
+                    sharding: self.sharding().clone(),
+                }
+                .into());
+            }
+
+            if has_uneven_shards(target_layout.descriptors().iter().map(ShardDescriptor::shape).collect()) {
+                return Err(
+                    ArrayError::UnevenReshardingShards { shape: shape.clone(), sharding: sharding.clone() }.into()
+                );
+            }
+
+            Ok(cause)
+        })();
 
         // A compiled reshard across meshes moves whole shards in a declared layout other than the dense row-major one,
         // which regions convert on every source device, so regions replace it only where it declines.
@@ -3145,7 +3255,17 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
                 }
                 .into());
             }
-            return Ok(self.host_round_trip(mesh, cause));
+
+            // A host round trip runs on one process. It must own every target device and a replica of every non-empty
+            // source contribution, and the source must have a well-defined host value. Shared metadata makes every
+            // process select the same owner, or agree that no owner can do it.
+            let owner = mesh.devices()[0].process_index();
+            let process_index = (mesh.devices().iter().all(|device| device.process_index() == owner)
+                && self.contribution_missing_from(owner).is_none()
+                && validate_one_value_per_contribution(self.mesh(), self.sharding(), self.shards.clone()).is_ok())
+            .then_some(owner);
+
+            return Ok(DevicePlacementStrategy::HostRoundTrip { cause, process_index });
         }
 
         if self.mesh() == mesh {
@@ -3199,23 +3319,6 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
 
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Returns [`DevicePlacementStrategy::HostRoundTrip`] for placing this array on `mesh` for `cause`. Only one
-    /// process can read the value back and upload it again, so the host round trip is available only when one process
-    /// owns every device of `mesh` and a device of every contribution of this array with elements (refer to
-    /// [`ShardContribution`]), which is what its readback reads, and when the metadata of this array lets a readback
-    /// produce one host value at all (refer to [`validate_one_value_per_contribution`]), and this function names
-    /// that process when there is one. Devices of other processes that hold only replicas of those contributions take
-    /// no part in it. The rule reads only the metadata that every process shares, so every process names the same
-    /// owner.
-    fn host_round_trip(&self, mesh: &DeviceMesh, cause: HostRoundTripCause) -> DevicePlacementStrategy {
-        let owner = mesh.devices()[0].process_index();
-        let process_index = (mesh.devices().iter().all(|device| device.process_index() == owner)
-            && self.contribution_missing_from(owner).is_none()
-            && validate_one_value_per_contribution(self.mesh(), self.sharding(), self.shards.clone()).is_ok())
-        .then_some(owner);
-        DevicePlacementStrategy::HostRoundTrip { cause, process_index }
-    }
-
     /// Returns the first shard with elements of this array whose contribution (refer to [`ShardContribution`]) has no
     /// replica on a device of process `process_index`, or [`None`] when that process holds a replica of every such
     /// contribution, which is what a readback of this array on that process reads.
@@ -3232,123 +3335,15 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         self.shards.clone().filter(with_elements).find(|shard| !owned.contains(&contribution(shard)))
     }
 
-    /// Chooses [`DevicePlacementStrategy::IntroducedSums`] for placing this array on `mesh` with a sharding that is
-    /// `first_sharding` plus pending sums along the mesh axes at `axis_indices` (refer to [`Self::strategy`]).
-    /// Its first step places the value with `first_sharding` on the devices at coordinate zero along those axes only
-    /// (i.e., on [`DeviceMeshExtension::at_coordinate_zero`]), because every other device receives the additive
-    /// identity and needs nothing else. It starts from the first of the following that applies:
-    ///
-    ///   1. **Restriction:** When this array is on `mesh` and replicated along every introduced axis (i.e., its shards
-    ///      along that axis hold one contribution, refer to [`Sharding::distinguishes_shards_along`]), the shards at
-    ///      coordinate zero already hold its whole value with the same placement along every other axis. The first
-    ///      step starts from that restriction (refer to [`Array::restricted_to`]) on the same mesh, which keeps
-    ///      every pending reduction of this array that the target keeps as a pure move. When the restriction
-    ///      already has `first_sharding`, there is no first step at all, so nothing moves and nothing is compiled.
-    ///   2. **One value per slice or kept contributions:** Otherwise, an array that holds one value per slice, or whose
-    ///      contributions the first step keeps (refer to [`keeps_contributions`], e.g., onto another mesh that keeps
-    ///      its pending sums and introduces another one), is placed from where it is onto the devices at coordinate
-    ///      zero (e.g., with exact shards or shard regions, which move only what those devices need, or a gather and
-    ///      copies of the gathered value to those devices).
-    ///   3. **Target mesh:** Otherwise (i.e., an array with a pending reduction that it does not hold replicated
-    ///      along the introduced axes, such as a pending maximum along one of them), the first step places the value
-    ///      on all of `mesh` with the introduced axes replicated, whose strategy keeps or completes the pending
-    ///      reductions of this array as a placement without introduced sums does, and the devices away from coordinate
-    ///      zero then discard what they received. When that step is a host round trip, the round trip goes to the
-    ///      devices at coordinate zero instead.
-    ///
-    /// A host round trip of the first step goes to the devices at coordinate zero only, so it needs one process that
-    /// owns the source and those devices, and not the devices that receive only an identity. A process that owns no
-    /// device at coordinate zero takes part only in what the first step plans for it (e.g., the sends of its shards to
-    /// those devices).
-    fn introduced_sums_strategy(
+    /// Plans the shard regions that place the source on `mesh` with `sharding` and resolves their default receive
+    /// layouts. Returns `None` if the target cannot be covered by corresponding source contributions or the plugin
+    /// cannot provide a receive layout. Each process plans every move from the same global metadata.
+    fn shard_region_plan(
         &self,
         layout_resolver: &CrossHostLayoutResolver<'_>,
         mesh: &DeviceMesh,
-        first_sharding: &Sharding,
-        axis_indices: Vec<usize>,
-    ) -> Result<DevicePlacementStrategy, Error> {
-        let introduced = axis_indices.iter().map(|&index| mesh.logical_mesh().axes()[index].name()).collect::<Vec<_>>();
-        let replicated_along_introduced_axes =
-            self.mesh() == mesh && introduced.iter().all(|axis| !self.sharding().distinguishes_shards_along(axis));
-        let coordinate_zero = || -> Result<(DeviceMesh, Sharding), Error> {
-            let first_mesh = mesh.at_coordinate_zero(&axis_indices)?;
-            let first_sharding = sharding_on_mesh(first_sharding, first_mesh.logical_mesh())?;
-            Ok((first_mesh, first_sharding))
-        };
-        let (first_mesh, first_sharding, restrict_source, first) = if replicated_along_introduced_axes {
-            let (first_mesh, first_sharding) = coordinate_zero()?;
-            // A runtime array stores an unconstrained dimension replicated, so such a dimension already places the
-            // value as a replicated one does.
-            let closed = |sharding: &Sharding| -> Result<Sharding, Error> {
-                let dimensions = sharding
-                    .dimensions()
-                    .iter()
-                    .map(|dimension| match dimension {
-                        ShardingDimension::Unconstrained => ShardingDimension::Replicated,
-                        dimension => dimension.clone(),
-                    })
-                    .collect();
-                Ok(sharding.with_dimensions(dimensions)?)
-            };
-            let restricted_sharding = sharding_on_mesh(self.sharding(), first_mesh.logical_mesh())?;
-            if closed(&restricted_sharding)? == closed(&first_sharding)? {
-                (first_mesh, first_sharding, false, None)
-            } else {
-                let (metadata, shards) = self.on_mesh(first_mesh.clone(), restricted_sharding)?;
-                let view = PlacementPlanningView { metadata: &metadata, shards: shards.iter() };
-                let first = view.strategy(layout_resolver, &first_mesh, &first_sharding)?;
-                (first_mesh, first_sharding, true, Some(first))
-            }
-        } else {
-            // A host round trip can upload the value wherever it goes, so it goes to the devices at coordinate zero,
-            // which needs one process that owns the source and those devices only.
-            let on_target_mesh =
-                !self.sharding().holds_one_value_per_slice() && !keeps_contributions(self.sharding(), first_sharding);
-            let direct = on_target_mesh.then(|| self.strategy(layout_resolver, mesh, first_sharding)).transpose()?;
-            match direct {
-                Some(first) if !matches!(first, DevicePlacementStrategy::HostRoundTrip { .. }) => {
-                    (mesh.clone(), first_sharding.clone(), false, Some(first))
-                }
-                _ => {
-                    let (first_mesh, first_sharding) = coordinate_zero()?;
-                    let first = self.strategy(layout_resolver, &first_mesh, &first_sharding)?;
-                    (first_mesh, first_sharding, false, Some(first))
-                }
-            }
-        };
-        Ok(DevicePlacementStrategy::IntroducedSums {
-            mesh: first_mesh,
-            sharding: first_sharding,
-            restrict_source,
-            first: first.map(Box::new),
-            axis_indices,
-        })
-    }
-
-    /// Plans the moves of the regions that place this array on `mesh` according to `sharding`, which are the nonempty
-    /// intersections of its shards with the target shards, for every process. When both shardings hold one value
-    /// per slice (refer to [`Sharding::holds_one_value_per_slice`]), identical source slices are replicas of one
-    /// contribution. Otherwise, the array is a sequence of ordinary arrays, one for each contribution, and when the
-    /// placement only moves contributions (refer to [`moves_contributions`]), each member is planned on its own: a
-    /// target shard takes regions only from the source shards of the corresponding member (refer to
-    /// [`contribution_member`]), and identical source slices of one member are replicas. Each region moves from the
-    /// replica that [`SourceReplicas::preferred`] chooses. The moves are in target shard order, and the regions of
-    /// each target shard are in the order of their starting coordinates, which [`Array::place_shard_regions`]
-    /// needs.
-    ///
-    /// Each target shard looks up the source slices that it intersects among the combinations of the distinct
-    /// source ranges that it intersects along each dimension, which it finds with two binary searches, so planning a
-    /// one-dimensional placement of `n` shards costs `O(n log n)` rather than `O(n^2)`.
-    ///
-    /// Returns `None` when the placement changes contributions, or when the regions of the corresponding member do not
-    /// cover a target shard (e.g., along a varying manual axis that splits a dimension at the source only).
-    ///
-    /// # Errors
-    ///
-    /// Returns the error of [`validate_kept_contributions`] when the target would leave a distinct source
-    /// contribution with elements out, and the error of [`ShardMovePlan::new`] for a device identifier that cross-host
-    /// transfers cannot represent.
-    fn plan_shard_regions(&self, mesh: &DeviceMesh, sharding: &Sharding) -> Result<Option<ShardMovePlan>, Error> {
+        sharding: &Sharding,
+    ) -> Result<Option<(ShardMovePlan, HashMap<StaticShape, ryft_pjrt::Layout>)>, Error> {
         let Some(axes) = corresponding_shards(self.sharding(), sharding) else {
             return Ok(None);
         };
@@ -3366,7 +3361,10 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             }
             Ok(total)
         };
+        // Group replicas by slice and contribution. For a pending reduction or manual variation within a tile,
+        // each target takes regions only from the corresponding contribution.
         let replicas = SourceReplicas::by_contribution(self.mesh(), self.sharding(), self.shards.clone(), source_axes);
+        // Index the distinct ranges per dimension so each target can look up its intersections by binary search.
         let mut source_ranges = vec![Vec::new(); self.shape().rank()];
         for (slice, _) in replicas.keys() {
             for (ranges, range) in source_ranges.iter_mut().zip(slice.iter()) {
@@ -3383,6 +3381,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         let mut received = HashSet::new();
         for target in targets {
             let member = contribution_member(mesh, sharding, target, target_axes);
+            // Combine intersecting ranges across dimensions to find candidate source slices.
             let mut candidates = vec![Vec::new()];
             for (ranges, target_range) in source_ranges.iter().zip(target.slice()) {
                 // The ranges that intersect `target_range` end after it starts and start before it ends.
@@ -3421,6 +3420,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             if target_elements > 0 {
                 received.insert((target.slice(), member));
             }
+            // Emit each target's moves in order of their starts, which the executor uses to assemble the shard.
             regions.sort_unstable_by(|(_, left), (_, right)| {
                 left.iter().map(|range| range.start).cmp(right.iter().map(|range| range.start))
             });
@@ -3441,89 +3441,11 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         let source_elements = total(&mut replicas.keys().map(|(slice, _)| elements(slice)))?;
         let received_elements = total(&mut received.iter().map(|(slice, _)| elements(slice)))?;
         validate_kept_contributions(self.sharding(), source_elements == received_elements)?;
-        Ok(Some(ShardMovePlan::new(self.data_type().executable_buffer_type(), moves)?))
-    }
-
-    /// Returns the moves of the regions of every target shard (refer to [`Self::plan_shard_regions`]) and the
-    /// default layout of the shape of every region that crosses processes when [`Array::place_shard_regions`] can
-    /// place this array on `mesh` according to `sharding`, or `None` when it cannot. That is the case when
-    /// [`Self::plan_shard_regions`] declines the placement (e.g., when it changes the contributions of a pending
-    /// reduction), or `layout_resolver` cannot obtain a default layout for a remote region because the plugin lacks the
-    /// cross-host transfers extension or cannot report the layout. Every process derives the same moves and checks all
-    /// of them, not only its own, so all processes decline alike, and the placement then executes these moves rather
-    /// than deriving them again. Neither the memory nor the declared layout of this array matters, because each process
-    /// converts its own shards (refer to [`Array::place_shard_regions`]).
-    fn shard_region_plan(
-        &self,
-        layout_resolver: &CrossHostLayoutResolver<'_>,
-        mesh: &DeviceMesh,
-        sharding: &Sharding,
-    ) -> Result<Option<(ShardMovePlan, HashMap<StaticShape, ryft_pjrt::Layout>)>, Error> {
-        // `Self::plan_shard_regions` validates every remote device ID, so a missing layout cannot mask an invalid ID.
-        let Some(plan) = self.plan_shard_regions(mesh, sharding)? else {
-            return Ok(None);
-        };
+        // Check all remote device IDs before resolving layouts so a missing layout cannot hide an invalid ID.
+        let plan = ShardMovePlan::new(self.data_type().executable_buffer_type(), moves)?;
         let remote_regions = plan.cross_host_moves().map(|movement| (movement.target_shard_index, movement.shape()));
         let layouts = cross_host_layouts(layout_resolver, plan.element_type, remote_regions)?;
         Ok(layouts.map(|layouts| (plan, layouts)))
-    }
-
-    /// Checks that a compiled program can place this array on `target_mesh` with `target_sharding`, which
-    /// introduces no pending sum after [`Self::strategy`] handles introduced sums, and returns the reason why it
-    /// would not preserve the value of this array, if any (refer to [`validate_reduction_transition`]). The placement takes
-    /// a host round trip instead. The errors are [`ArrayError::ManualReshardingAxis`] when the mesh of one of its
-    /// programs (i.e., the target mesh, or the mesh of this array for the gather of a reshard across meshes) has a
-    /// `Manual` axis, while `Auto` and `Explicit` axes are supported, and [`ArrayError::UnevenReshardingShards`] when
-    /// the shards of this array or of the target differ in size.
-    ///
-    /// The SPMD partitioner splits a dimension into parts of one size and pads the last parts, so a dimension whose
-    /// extent the number of its parts does not divide (e.g., five elements over two devices) yields buffers whose
-    /// shapes differ from the exact shards that [`ShardLayout`] describes (i.e., `[3]` and `[2]`). Such a placement
-    /// can use whole shards or shard regions, both of which materialize those exact shapes.
-    fn validate_compiled_reshard(
-        &self,
-        target_mesh: &DeviceMesh,
-        target_sharding: &Sharding,
-    ) -> Result<Option<HostRoundTripCause>, Error> {
-        // The programs are those of `PlacementPlanningView::strategy`, which on another mesh gathers this array
-        // into a replicated value that keeps the pending reductions that the target keeps (refer to
-        // `gathered_sharding`) and reshards such a value on the target mesh.
-        let (data_type, shape) = (self.data_type(), self.shape());
-        let cause = if self.mesh() == target_mesh {
-            validate_reduction_transition(data_type, target_mesh, self.sharding(), target_sharding)
-        } else {
-            let (input, output, rank) = (self.sharding(), target_sharding, shape.rank());
-            let gathered = gathered_sharding(input, output, self.mesh().logical_mesh(), rank)?;
-            let gather = validate_reduction_transition(data_type, self.mesh(), input, &gathered);
-            let gathered = gathered_sharding(input, output, target_mesh.logical_mesh(), rank)?;
-            let reshard = validate_reduction_transition(data_type, target_mesh, &gathered, output);
-            gather.or(reshard)
-        };
-
-        // `Manual` axes are managed explicitly by the user (e.g., inside `shard_map`) and cannot be planned by the SPMD
-        // partitioner from the top level. `Auto` and `Explicit` axes both go through SPMD partitioning, so both are
-        // allowed. The rule holds for the mesh of every program alike, so a gather on the mesh of this array is checked
-        // as a reshard on the target mesh is, before any process posts or compiles anything (e.g., a value that
-        // varies along a manual axis cannot be gathered into one replicated value, and a process that owns only
-        // target devices would otherwise post the receives of a gather that its peers cannot stage).
-        let gathers = self.mesh() != target_mesh && !self.sharding().is_replicated();
-        let program_meshes = [target_mesh].into_iter().chain(gathers.then(|| self.mesh()));
-        for mesh in program_meshes {
-            if let Some(axis) = mesh.logical_mesh().axes().iter().find(|axis| axis.r#type() == MeshAxisType::Manual) {
-                return Err(ArrayError::ManualReshardingAxis { axis_name: axis.name().to_string() }.into());
-            }
-        }
-
-        // The shards of one sharding have equal shapes exactly when every split divides its dimension evenly.
-        let target_layout = ShardLayout::new(&shape, target_mesh, target_sharding)?;
-        let has_uneven_shards = |shapes: Vec<StaticShape>| shapes.iter().any(|shape| shape != &shapes[0]);
-        if has_uneven_shards(self.shards.clone().map(ShardDescriptor::shape).collect()) {
-            return Err(ArrayError::UnevenReshardingShards { shape, sharding: self.sharding().clone() }.into());
-        }
-        if has_uneven_shards(target_layout.descriptors().iter().map(ShardDescriptor::shape).collect()) {
-            return Err(ArrayError::UnevenReshardingShards { shape, sharding: target_sharding.clone() }.into());
-        }
-        Ok(cause)
     }
 }
 
@@ -3887,7 +3809,7 @@ fn plan_exact_shard_put<'o>(
 }
 
 /// Returns how the shards of a placement of a value placed as `input` with the sharding `output` correspond, which
-/// [`plan_exact_shard_put`] and [`PlacementPlanningView::plan_shard_regions`] read: `Some(None)` when both hold one
+/// [`plan_exact_shard_put`] and [`PlacementPlanningView::shard_region_plan`] read: `Some(None)` when both hold one
 /// value per slice (refer to [`Sharding::holds_one_value_per_slice`]), so that any shard with the same elements
 /// corresponds, `Some(Some(axes))` when the placement only moves contributions (refer to [`moves_contributions`]), so a
 /// shard corresponds to the shards with the same elements and contribution member (refer to [`contribution_member`]),
@@ -3953,7 +3875,7 @@ fn contribution_member(
 ///
 /// The contributions of both ends then correspond by their slices and their members, so the placement changes no value
 /// (e.g., onto another order of the same devices or onto other devices, in any memory and layout), and
-/// [`plan_exact_shard_put`] or [`PlacementPlanningView::plan_shard_regions`] moves each contribution as it is.
+/// [`plan_exact_shard_put`] or [`PlacementPlanningView::shard_region_plan`] moves each contribution as it is.
 ///
 /// Returns the corresponding varying manual axes of both ends, or `None` when the placement does not only move
 /// contributions.
@@ -6099,6 +6021,8 @@ mod tests {
             .unwrap()
             .with_unreduced_axes(["x"])
             .unwrap();
+        let uneven_shards =
+            ArrayError::UnevenReshardingShards { shape: StaticShape::new(vec![5]), sharding: uneven.clone() };
         let values = [f32::MAX, 0., f32::MAX, -f32::MAX];
         let r#type = ArrayType::new_static(DataType::F32, [5]);
         let render = |bytes: &[u8]| {
@@ -6122,7 +6046,6 @@ mod tests {
                 let sharding = Some(source_sharding.clone());
                 let source = Array::from_host_shards(&session, r#type.clone(), mesh.clone(), sharding, shards);
                 let source = source.unwrap();
-                let reason = source.placement_planning_view().validate_compiled_reshard(&mesh, target_sharding).err();
                 let target = Placement::new(mesh.clone(), target_sharding.clone()).unwrap();
                 let placed = if consume {
                     source.into_placement(&session, target)
@@ -6141,10 +6064,9 @@ mod tests {
                             error.to_string(),
                             format!(
                                 "cannot place an array whose pending reduction the placement keeps along the mesh \
-                                 axes `x` and changes along others when no device strategy applies ({}), because the \
-                                 host round trip that remains would combine the contributions that the placement \
-                                 keeps; complete the reduction first, or place the array onto an even split",
-                                reason.as_ref().unwrap(),
+                                 axes `x` and changes along others when no device strategy applies ({uneven_shards}), \
+                                 because the host round trip that remains would combine the contributions that the \
+                                 placement keeps; complete the reduction first, or place the array onto an even split",
                             ),
                         );
                         "error".to_string()
@@ -6276,21 +6198,6 @@ mod tests {
             vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
         )
         .unwrap();
-        let regions = source
-            .placement_planning_view()
-            .plan_shard_regions(&target_mesh, &target_sharding)
-            .unwrap()
-            .unwrap();
-        // Each column needs two regions. Two of the eight regions are already on their target devices.
-        let copied_bytes = regions
-            .moves
-            .iter()
-            .filter(|movement| movement.source_device != movement.target_device)
-            .map(|movement| movement.shape().as_slice().iter().product::<usize>() * size_of::<f32>())
-            .sum::<usize>();
-        assert_eq!(regions.moves.len(), 8);
-        assert_eq!(copied_bytes, 48);
-
         // The strategy keeps the regions that it derived to choose itself, which the placement then executes.
         let process_index = client.process_index().unwrap();
         let Ok(DevicePlacementStrategy::ShardRegions { plan, cross_host_layouts }) = source.device_placement_strategy(
@@ -6302,7 +6209,16 @@ mod tests {
             panic!("a placement on another mesh of this process must use shard regions");
         };
         assert!(cross_host_layouts.is_empty());
-        assert_eq!(plan, regions);
+
+        // Each column needs two regions. Two of the eight regions are already on their target devices.
+        let copied_bytes = plan
+            .moves
+            .iter()
+            .filter(|movement| movement.source_device != movement.target_device)
+            .map(|movement| movement.shape().as_slice().iter().product::<usize>() * size_of::<f32>())
+            .sum::<usize>();
+        assert_eq!(plan.moves.len(), 8);
+        assert_eq!(copied_bytes, 48);
 
         let output = source.to_placement(&session, Placement::new(target_mesh, target_sharding).unwrap()).unwrap();
         output.block_until_ready().unwrap();
@@ -8341,7 +8257,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_plan_shard_regions() {
+    fn test_placement_planning_view_shard_region_plan() {
         let client = cpu_client(4);
         let session = Session::builder().client(client).build().unwrap();
         let devices = session.addressable_devices().unwrap();
@@ -8366,7 +8282,11 @@ mod tests {
             vec![ShardingDimension::sharded(["z"]), ShardingDimension::replicated()],
         )
         .unwrap();
-        let plan = source.placement_planning_view().plan_shard_regions(&rows_mesh, &rows).unwrap().unwrap();
+        let (plan, _) = source
+            .placement_planning_view()
+            .shard_region_plan(&simulated_cross_host_layout, &rows_mesh, &rows)
+            .unwrap()
+            .unwrap();
         let moves = plan
             .moves
             .iter()
@@ -8395,7 +8315,11 @@ mod tests {
         let source =
             Array::from_addressable_buffers(&session, r#type, replicated_mesh, Some(replicated), Vec::new()).unwrap();
         let split = Sharding::new(rows_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["z"])]).unwrap();
-        let plan = source.placement_planning_view().plan_shard_regions(&rows_mesh, &split).unwrap().unwrap();
+        let (plan, _) = source
+            .placement_planning_view()
+            .shard_region_plan(&simulated_cross_host_layout, &rows_mesh, &split)
+            .unwrap()
+            .unwrap();
         let moves = plan
             .moves
             .iter()
@@ -8415,7 +8339,11 @@ mod tests {
         .unwrap();
         let halves =
             Sharding::new(halves_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["w"])]).unwrap();
-        let plan = source.placement_planning_view().plan_shard_regions(&halves_mesh, &halves).unwrap().unwrap();
+        let (plan, _) = source
+            .placement_planning_view()
+            .shard_region_plan(&simulated_cross_host_layout, &halves_mesh, &halves)
+            .unwrap()
+            .unwrap();
         let moves = plan
             .moves
             .iter()
