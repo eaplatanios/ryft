@@ -48,15 +48,16 @@ use crate::{
     normalize_runtime_requirements,
 };
 
-// TODO(eaplatanios): Review this.
 /// StableHLO/Shardy MLIR module that a staged [`Program`] lowers to, paired with what executing it requires.
 pub struct MlirProgram {
-    /// Textual StableHLO/Shardy module.
+    /// Textual StableHLO/Shardy module of this [`MlirProgram`].
     stable_hlo: String,
 
-    /// Signature of the entry function, which maps its logical inputs and outputs to its physical inputs and outputs.
+    /// Signature of the entry function of this [`MlirProgram`], which maps its logical inputs and outputs to its
+    /// physical inputs and outputs.
     signature: MlirProgramSignature,
 
+    // TODO(eaplatanios): Why do we need this? Is `runtime_requirements` being non-empty not sufficient?
     /// Whether execution requires the host runtime assertion handler.
     requires_assertion_handler: bool,
 
@@ -68,12 +69,11 @@ pub struct MlirProgram {
     mesh: Option<LogicalMesh>,
 }
 
-// TODO(eaplatanios): Review this.
 impl MlirProgram {
     /// Pairs the rendered `stable_hlo` module with the `signature` of its entry function, whether executing it
     /// requires the host runtime assertion handler, its canonical `runtime_requirements`, and its module `mesh`.
     #[inline]
-    pub(crate) fn new(
+    fn new(
         stable_hlo: String,
         signature: MlirProgramSignature,
         requires_assertion_handler: bool,
@@ -83,20 +83,14 @@ impl MlirProgram {
         Self { stable_hlo, signature, requires_assertion_handler, runtime_requirements, mesh }
     }
 
-    /// Returns the rendered StableHLO module of this lowering.
+    /// Returns the rendered StableHLO module of this [`MlirProgram`].
     #[inline]
     pub fn stable_hlo(&self) -> &str {
         &self.stable_hlo
     }
 
-    /// Returns the rendered StableHLO module of this lowering, consuming it.
-    #[inline]
-    pub fn into_stable_hlo(self) -> String {
-        self.stable_hlo
-    }
-
-    /// Returns the signature of the entry function, which maps its logical inputs and outputs to its physical inputs
-    /// and outputs.
+    /// Returns the signature of the entry function of this [`MlirProgram`], which maps its logical inputs and outputs
+    /// to its physical inputs and outputs.
     #[inline]
     pub fn signature(&self) -> &MlirProgramSignature {
         &self.signature
@@ -109,9 +103,15 @@ impl MlirProgram {
         self.mesh.as_ref()
     }
 
+    /// Returns the rendered StableHLO module of this lowering, consuming it.
+    #[inline]
+    pub fn into_stable_hlo(self) -> String {
+        self.stable_hlo
+    }
+
     /// Consumes the textual module, executable signature, assertion classification, and runtime requirements.
     #[inline]
-    pub(crate) fn into_parts(self) -> (String, MlirProgramSignature, bool, Arc<[RuntimeRequirement]>) {
+    pub fn into_parts(self) -> (String, MlirProgramSignature, bool, Arc<[RuntimeRequirement]>) {
         (self.stable_hlo, self.signature, self.requires_assertion_handler, self.runtime_requirements)
     }
 }
