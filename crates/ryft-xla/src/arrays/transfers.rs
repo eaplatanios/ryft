@@ -2472,8 +2472,6 @@ impl Array {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Device work that places an [`Array`] on a mesh with a sharding, which [`Array::device_placement_strategy`] chooses
 /// from information that every process shares, so that the processes of a placement agree on it.
 #[allow(
@@ -2485,20 +2483,20 @@ enum DevicePlacementStrategy {
     Bufferless,
 
     /// Places the full value that an array with locally assigned devices holds on the devices of this process alone
-    /// (refer to [`Array::is_locally_assigned`] and [`Array::place_process_local_value`]).
+    /// Refer to [`Array::is_locally_assigned`] and [`Array::place_process_local_value`] for more information.
     ProcessLocalValue,
 
     /// Takes no part in the placement of an array with locally assigned devices onto devices that one other process
-    /// owns, which places its own value there with `strategy` (refer to [`Array::device_placement_strategy`]), and
-    /// returns the metadata of the result after the checks that `strategy` makes from metadata before it submits
-    /// anything (refer to [`Array::place_elsewhere`]).
+    /// owns, which places its own value there with `strategy`, and returns the metadata of the result after the checks
+    /// that `strategy` makes from metadata before it submits anything.
     OnOwner {
         /// Strategy that the owner runs, as every process plans it on the view of the value on the devices of the
-        /// owner (refer to [`Array::device_placement_strategy`]).
+        /// owner. Refer to [`Array::device_placement_strategy`] for more information.
         strategy: Box<DevicePlacementStrategy>,
     },
 
-    /// Shares, copies, and transfers the whole shards that `plan` describes (refer to [`Array::place_exact_shards`]).
+    /// Shares, copies, and transfers the whole shards that `plan` describes. Refer to [`Array::place_exact_shards`]
+    /// for more information.
     ExactShards {
         /// Plan of the moves of whole shards of every process.
         plan: ShardMovePlan,
@@ -2507,8 +2505,8 @@ enum DevicePlacementStrategy {
         cross_host_layouts: HashMap<StaticShape, ryft_pjrt::Layout>,
     },
 
-    /// Slices the source shards and joins the regions on the target devices (refer to
-    /// [`Array::place_shard_regions`]).
+    /// Slices the source shards and joins the regions on the target devices. Refer to [`Array::place_shard_regions`]
+    /// for more information.
     ShardRegions {
         /// Plan of the moves of the regions of every target shard of every process.
         plan: ShardMovePlan,
@@ -2524,7 +2522,7 @@ enum DevicePlacementStrategy {
     },
 
     /// Moves a replicated copy of an array to another mesh, gathering a sharded array on its own mesh first, and then
-    /// reshards it there with a compiled program (refer to [`Array::place_with_strategy`]).
+    /// reshards it there with a compiled program. Refer to [`Array::place_with_strategy`] for more information.
     CompiledReshardAcrossMeshes {
         /// All-gather of a sharded array on its own mesh, or `None` for a replicated array.
         gather: Option<ReshardProgram>,
@@ -2540,9 +2538,9 @@ enum DevicePlacementStrategy {
     },
 
     /// Places an array on the devices at coordinate zero along the introduced mesh axes (at `axis_indices` within the
-    /// target mesh) according to the target sharding without the pending sums that the target
-    /// introduces, and then gives the other devices of the target the additive identity of the data type (refer
-    /// to [`PlacementPlanningView::introduced_sums_strategy`] and [`Array::place_with_strategy`]).
+    /// target mesh) according to the target sharding without the pending sums that the target introduces, and then
+    /// gives the other devices of the target the additive identity of the data type. Refer to
+    /// [`PlacementPlanningView::introduced_sums_strategy`] and [`Array::place_with_strategy`] for more information.
     IntroducedSums {
         /// Mesh of the first step, which is the mesh of the devices at coordinate zero along the introduced axes (refer
         /// to [`DeviceMeshExtension::at_coordinate_zero`]), or the target mesh when the array cannot be placed
@@ -2552,7 +2550,8 @@ enum DevicePlacementStrategy {
         /// Target sharding without the pending sums that the target introduces, over `mesh`.
         sharding: Sharding,
 
-        /// Whether `first` starts from a restriction of the array to `mesh` (refer to [`Array::restricted_to`]).
+        /// Whether `first` starts from a restriction of the array to `mesh`. Refer to [`Array::restricted_to`] for more
+        /// information.
         restrict_source: bool,
 
         /// Strategy of the first step, which is never a host round trip, or [`None`] when the restriction of the array
@@ -2563,23 +2562,23 @@ enum DevicePlacementStrategy {
         axis_indices: Vec<usize>,
     },
 
-    /// Reads an array back and uploads it again with the host functions that define what its reduction state means,
-    /// for a reason that every process predicts (refer to [`HostRoundTripCause`]). Process `process_index` does the
-    /// round trip (refer to the host fallback of [`Array::to_placement`]), and every other process returns the
-    /// placement without buffers. Without such a process, every process returns the error of `cause` before starting
-    /// the placement (refer to [`HostRoundTripCause::across_processes`]).
+    /// Reads an array back and uploads it again with the host functions that define what its reduction state means, for
+    /// a reason that every process predicts (i.e., [`HostRoundTripCause`]). Process `process_index` does the round trip
+    /// (refer to the host fallback of [`Array::to_placement`]), and every other process returns the placement without
+    /// buffers. Without such a process, every process returns the error of `cause` before starting the placement
+    /// (i.e., [`HostRoundTripCause::across_processes`]).
     HostRoundTrip {
         /// Why no device strategy places the array.
         cause: HostRoundTripCause,
 
-        /// Index of the process that can do the round trip, if any (refer to
-        /// [`PlacementPlanningView::host_round_trip`]).
+        /// Index of the process that can do the round trip, if any. Refer to [`PlacementPlanningView::host_round_trip`]
+        /// for more information.
         process_index: Option<usize>,
     },
 }
 
 impl DevicePlacementStrategy {
-    /// Reports whether the selected moves or compiled programs involve communication between processes.
+    /// Returns whether the selected moves or compiled programs involve communication between processes.
     fn communicates(&self) -> bool {
         let moves_between_processes = |plan: &ShardMovePlan| plan.cross_host_moves().next().is_some();
         let runs_on_several_processes = |program: &ReshardProgram| devices_span_processes(program.mesh.devices());
@@ -2606,6 +2605,231 @@ impl DevicePlacementStrategy {
             }
             _ => None,
         }
+    }
+}
+
+/// Deterministic plan of the moves of whole shards or of shard regions that place an [`Array`] (e.g., by
+/// [`Array::to_placement`]), which holds the moves of every process, so that every process derives the same plan
+/// from global metadata. Each process performs the part of every move that [`ShardMove::role`] assigns to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShardMovePlan {
+    /// Element type of the buffers that the plan moves, which is the executable buffer type of the array (e.g., a
+    /// predicate for one-bit integers), because that is the buffer that a send transfers and a receive allocates.
+    element_type: BufferType,
+
+    /// Moves of the plan, in target shard order, and for each target shard in the order of the starting coordinates
+    /// of the moved slices.
+    moves: Vec<ShardMove>,
+}
+
+impl ShardMovePlan {
+    /// Creates a plan of the moves of whole shards or of shard regions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SizeLimitExceeded`] when a move that crosses processes names a device whose identifier PJRT
+    /// cross-host transfers cannot represent. The plan covers the moves of every process, so every process returns this
+    /// error before any of them submits a transfer.
+    fn new(element_type: BufferType, moves: Vec<ShardMove>) -> Result<Self, Error> {
+        let plan = Self { element_type, moves };
+        for movement in plan.cross_host_moves() {
+            cross_host_global_device_id(movement.source_device.id())?;
+            cross_host_global_device_id(movement.target_device.id())?;
+        }
+        Ok(plan)
+    }
+
+    /// Returns the moves in which the process with index `process_index` takes the part `role`.
+    fn moves_with_role(&self, process_index: usize, role: MoveRole) -> impl Iterator<Item = &ShardMove> {
+        self.moves.iter().filter(move |movement| movement.role(process_index) == Some(role))
+    }
+
+    /// Returns the moves that cross processes, whatever processes they cross between.
+    fn cross_host_moves(&self) -> impl Iterator<Item = &ShardMove> {
+        self.moves.iter().filter(|movement| movement.is_cross_host())
+    }
+}
+
+/// One move in a [`ShardMovePlan`] of the elements of a slice, which is a whole source shard or the intersection
+/// of a source shard with a target shard, from the device of that source shard to the device of the target shard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShardMove {
+    /// Index of the source shard in the source array.
+    source_shard_index: ShardIndex,
+
+    /// Device of the source shard.
+    source_device: Device,
+
+    /// Index of the target shard in the target array.
+    target_shard_index: ShardIndex,
+
+    /// Device of the target shard.
+    target_device: Device,
+
+    /// Moved slice in global array coordinates, which is the slice of the target shard for a move of a whole shard.
+    slice: Vec<Range<usize>>,
+
+    /// Deterministic transfer rendezvous key that the send and the receive of a cross-host move share.
+    transfer_key: CrossHostTransferKey,
+}
+
+impl ShardMove {
+    /// Returns the static shape of the moved slice.
+    fn shape(&self) -> StaticShape {
+        StaticShape::new(self.slice.iter().map(Range::len).collect::<Vec<_>>())
+    }
+
+    /// Returns whether this move crosses processes, which needs a PJRT cross-host transfer.
+    fn is_cross_host(&self) -> bool {
+        self.source_device.process_index() != self.target_device.process_index()
+    }
+
+    /// Returns the part that the process with index `process_index` takes in this move, or `None` when it owns neither
+    /// of its devices.
+    fn role(&self, process_index: usize) -> Option<MoveRole> {
+        match (self.source_device.process_index() == process_index, self.target_device.process_index() == process_index)
+        {
+            (true, true) => Some(MoveRole::Copy),
+            (true, false) => Some(MoveRole::Send),
+            (false, true) => Some(MoveRole::Receive),
+            (false, false) => None,
+        }
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
+
+/// Program that a placement compiles and runs on the devices of one mesh to reshard an array there, which is the
+/// identity with sharding annotations on its input and its output (refer to [`Self::compile`]). The strategy of a
+/// placement fixes its programs from information that every process shares, so every process that runs one of them
+/// runs the same program.
+#[derive(Clone, Debug, PartialEq)]
+struct ReshardProgram {
+    /// Mesh whose devices run the program, which is the mesh of its input and of its output.
+    mesh: DeviceMesh,
+
+    /// Sharding of the input of the program.
+    input: Sharding,
+
+    /// Sharding of the output of the program.
+    output: Sharding,
+}
+
+impl ReshardProgram {
+    /// Returns whether the process with index `process_index` runs this program, which is the case exactly when it
+    /// owns a device of its mesh. Any other process holds no buffer that the program reads or writes and takes part in
+    /// none of its collectives, and its PJRT client cannot compile a program for devices that it does not address, so
+    /// it compiles and runs nothing and only derives the metadata of the output (refer to [`Self::execute`]).
+    fn runs_on(&self, process_index: usize) -> bool {
+        self.mesh.devices().iter().any(|device| device.process_index() == process_index)
+    }
+
+    /// Returns the mesh over which this program is compiled, which is [`Self::mesh`] with the explicit axes along which
+    /// the program changes the reduction state (refer to [`ReductionState`]) typed as auto, and the auto axes along
+    /// which it keeps a pending reduction typed as explicit. The program only moves data, so the types of the axes of
+    /// its shardings change nothing that it computes, but over an explicit axis a type records reduction state, which
+    /// no staged operation may change (i.e., a `reshard` keeps it, refer to
+    /// [`ReshardOperation`](ryft_core::ReshardOperation)). Over an auto axis the type omits it, so the lowering makes
+    /// the change instead (i.e., it completes a pending reduction where the input enters the program, and the output
+    /// sharding introduces a pending sum or a completed reduction), with the arithmetic of XLA, which
+    /// [`validate_reduction_transition`] compares with the meaning of the reduction before a program is planned. A
+    /// pending reduction that the program keeps therefore moves over an explicit axis, as its contributions, without
+    /// being completed and introduced again, which preserves the value of every data type and needs no collective.
+    /// Every other axis keeps its type.
+    fn compiled_mesh(&self) -> Result<DeviceMesh, Error> {
+        let logical_mesh = self.mesh.logical_mesh();
+        let (mut changed_axes, mut kept_axes) = (Vec::new(), Vec::new());
+        for axis in logical_mesh.axes() {
+            let (from, to) =
+                (ReductionState::of(&self.input, axis.name()), ReductionState::of(&self.output, axis.name()));
+            match axis.r#type() {
+                MeshAxisType::Explicit if from != to => changed_axes.push(axis.name()),
+                MeshAxisType::Auto if from == to && matches!(from, ReductionState::Unreduced(_)) => {
+                    kept_axes.push(axis.name())
+                }
+                _ => {}
+            }
+        }
+        if changed_axes.is_empty() && kept_axes.is_empty() {
+            return Ok(self.mesh.clone());
+        }
+        let logical_mesh = logical_mesh
+            .with_axis_types(changed_axes, MeshAxisType::Auto)?
+            .with_axis_types(kept_axes, MeshAxisType::Explicit)?;
+        Ok(DeviceMesh::new(logical_mesh, self.mesh.devices().to_vec())?)
+    }
+
+    /// Compiles this program, the identity that reshards `array`, which must be on the mesh of this program with its
+    /// input sharding, to its output sharding, or returns `None` when this process does not run this program (refer to
+    /// [`Self::runs_on`]). The program is compiled over [`Self::compiled_mesh`], which types the explicit mesh axes
+    /// along which it changes the reduction state as auto, and [`Self::execute`] then moves `array` onto that mesh and
+    /// its result back. The input and the output of the program are declared in the memory of `array`, so the program
+    /// accepts `array` and returns its result in the same memory. If `donate` is `true`, the input of the program is
+    /// marked as donated so that PJRT can reuse the memory of its buffers for the output buffers. The compilation
+    /// cache is keyed by the complete lowered computation, including its input and output sharding annotations and
+    /// PJRT options.
+    fn compile(&self, array: &Array, donate: bool) -> Result<Option<CompiledFunction<ArrayType, ArrayType>>, Error> {
+        let session = array.session();
+        if !self.runs_on(session.client().process_index()?) {
+            return Ok(None);
+        }
+
+        // Build the bare input type, which has no sharding, for tracing. The input and output shardings are attached
+        // as `sdy.sharding` attributes through `Options::with_input_shardings` and `Options::with_output_shardings`.
+        // The type keeps the memory of the array, which the identity carries over to the output.
+        let bare_input_type =
+            ArrayType::new(array.data_type(), array.shape().into()).with_memory(array.r#type().memory());
+        let mesh = self.compiled_mesh()?;
+        let (input, output) = if mesh == self.mesh {
+            (self.input.clone(), self.output.clone())
+        } else {
+            let logical_mesh = mesh.logical_mesh();
+            (self.input.with_mesh(logical_mesh.clone())?, self.output.with_mesh(logical_mesh.clone())?)
+        };
+
+        let options = Options::new(mesh)
+            .with_input_shardings(vec![input])
+            .with_output_shardings(vec![output])
+            .with_donate(donate);
+        let staged = stage(|input| input, bare_input_type, options)?;
+
+        Ok(Some(session.compile_staged_function(staged)?))
+    }
+
+    /// Executes `compiled`, which [`Self::compile`] compiled from this program for `array`, on `array`. Without
+    /// `compiled` (i.e., in a process that does not run this program), this function runs nothing and returns the
+    /// metadata of the output of this program (refer to [`Array::place_without_local_buffers`]). The execution fence
+    /// of the result joins the execution fence of `array` with the fence of the launch (refer to the documentation of
+    /// this module). This function takes `array` by value so that a donation takes effect.
+    ///
+    /// The executable runs on [`Self::compiled_mesh`], so when that mesh types an axis differently, `array` enters it
+    /// as the same shards on that mesh, and its result leaves it as the same shards on the mesh of this program. Both
+    /// conversions preserve pending reductions, storage, and completion fences.
+    fn execute(&self, array: Array, compiled: Option<&CompiledFunction<ArrayType, ArrayType>>) -> Result<Array, Error> {
+        let Some(compiled) = compiled else {
+            let r#type = ArrayType::new(array.data_type(), array.shape().into()).with_memory(array.r#type().memory());
+            return array.place_without_local_buffers(array.session(), r#type, &self.mesh, &self.output);
+        };
+        let mut completion = PlacementCompletion::default();
+        completion.track_fence(array.execution_fence());
+        let session = array.session().clone();
+        let mesh = self.compiled_mesh()?;
+        let mut output = if mesh == self.mesh {
+            compiled.executable().execute(&session, array)?
+        } else {
+            // Consume each handle as it is retyped so the input's buffers can still be donated to the executable.
+            let retype_mesh = |array: Array, mesh: &DeviceMesh| -> Result<Array, Error> {
+                debug_assert_eq!(array.mesh().devices(), mesh.devices());
+                let sharding = array.sharding().with_mesh(mesh.logical_mesh().clone())?;
+                let r#type = array.r#type().into_owned().with_sharding(None)?;
+                let buffers = array.shards().iter().filter_map(|shard| shard.buffer().cloned()).collect();
+                array.rebuilt(r#type, mesh, sharding, buffers, PlacementCompletion::default())
+            };
+            let input = retype_mesh(array, &mesh)?;
+            retype_mesh(compiled.executable().execute(&session, input)?, &self.mesh)?
+        };
+        output.execution_fence = completion.join(output.execution_fence.take());
+        Ok(output)
     }
 }
 
@@ -3345,140 +3569,6 @@ impl PlacementCompletion {
     }
 }
 
-/// Program that a placement compiles and runs on the devices of one mesh to reshard an array there, which is the
-/// identity with sharding annotations on its input and its output (refer to [`Self::compile`]). The strategy of a
-/// placement fixes its programs from information that every process shares, so every process that runs one of them
-/// runs the same program.
-#[derive(Clone, Debug, PartialEq)]
-struct ReshardProgram {
-    /// Mesh whose devices run the program, which is the mesh of its input and of its output.
-    mesh: DeviceMesh,
-
-    /// Sharding of the input of the program.
-    input: Sharding,
-
-    /// Sharding of the output of the program.
-    output: Sharding,
-}
-
-impl ReshardProgram {
-    /// Returns whether the process with index `process_index` runs this program, which is the case exactly when it
-    /// owns a device of its mesh. Any other process holds no buffer that the program reads or writes and takes part in
-    /// none of its collectives, and its PJRT client cannot compile a program for devices that it does not address, so
-    /// it compiles and runs nothing and only derives the metadata of the output (refer to [`Self::execute`]).
-    fn runs_on(&self, process_index: usize) -> bool {
-        self.mesh.devices().iter().any(|device| device.process_index() == process_index)
-    }
-
-    /// Returns the mesh over which this program is compiled, which is [`Self::mesh`] with the explicit axes along which
-    /// the program changes the reduction state (refer to [`ReductionState`]) typed as auto, and the auto axes along
-    /// which it keeps a pending reduction typed as explicit. The program only moves data, so the types of the axes of
-    /// its shardings change nothing that it computes, but over an explicit axis a type records reduction state, which
-    /// no staged operation may change (i.e., a `reshard` keeps it, refer to
-    /// [`ReshardOperation`](ryft_core::ReshardOperation)). Over an auto axis the type omits it, so the lowering makes
-    /// the change instead (i.e., it completes a pending reduction where the input enters the program, and the output
-    /// sharding introduces a pending sum or a completed reduction), with the arithmetic of XLA, which
-    /// [`validate_reduction_transition`] compares with the meaning of the reduction before a program is planned. A
-    /// pending reduction that the program keeps therefore moves over an explicit axis, as its contributions, without
-    /// being completed and introduced again, which preserves the value of every data type and needs no collective.
-    /// Every other axis keeps its type.
-    fn compiled_mesh(&self) -> Result<DeviceMesh, Error> {
-        let logical_mesh = self.mesh.logical_mesh();
-        let (mut changed_axes, mut kept_axes) = (Vec::new(), Vec::new());
-        for axis in logical_mesh.axes() {
-            let (from, to) =
-                (ReductionState::of(&self.input, axis.name()), ReductionState::of(&self.output, axis.name()));
-            match axis.r#type() {
-                MeshAxisType::Explicit if from != to => changed_axes.push(axis.name()),
-                MeshAxisType::Auto if from == to && matches!(from, ReductionState::Unreduced(_)) => {
-                    kept_axes.push(axis.name())
-                }
-                _ => {}
-            }
-        }
-        if changed_axes.is_empty() && kept_axes.is_empty() {
-            return Ok(self.mesh.clone());
-        }
-        let logical_mesh = logical_mesh
-            .with_axis_types(changed_axes, MeshAxisType::Auto)?
-            .with_axis_types(kept_axes, MeshAxisType::Explicit)?;
-        Ok(DeviceMesh::new(logical_mesh, self.mesh.devices().to_vec())?)
-    }
-
-    /// Compiles this program, the identity that reshards `array`, which must be on the mesh of this program with its
-    /// input sharding, to its output sharding, or returns `None` when this process does not run this program (refer to
-    /// [`Self::runs_on`]). The program is compiled over [`Self::compiled_mesh`], which types the explicit mesh axes
-    /// along which it changes the reduction state as auto, and [`Self::execute`] then moves `array` onto that mesh and
-    /// its result back. The input and the output of the program are declared in the memory of `array`, so the program
-    /// accepts `array` and returns its result in the same memory. If `donate` is `true`, the input of the program is
-    /// marked as donated so that PJRT can reuse the memory of its buffers for the output buffers. The compilation
-    /// cache is keyed by the complete lowered computation, including its input and output sharding annotations and
-    /// PJRT options.
-    fn compile(&self, array: &Array, donate: bool) -> Result<Option<CompiledFunction<ArrayType, ArrayType>>, Error> {
-        let session = array.session();
-        if !self.runs_on(session.client().process_index()?) {
-            return Ok(None);
-        }
-
-        // Build the bare input type, which has no sharding, for tracing. The input and output shardings are attached
-        // as `sdy.sharding` attributes through `Options::with_input_shardings` and `Options::with_output_shardings`.
-        // The type keeps the memory of the array, which the identity carries over to the output.
-        let bare_input_type =
-            ArrayType::new(array.data_type(), array.shape().into()).with_memory(array.r#type().memory());
-        let mesh = self.compiled_mesh()?;
-        let (input, output) = if mesh == self.mesh {
-            (self.input.clone(), self.output.clone())
-        } else {
-            let logical_mesh = mesh.logical_mesh();
-            (self.input.with_mesh(logical_mesh.clone())?, self.output.with_mesh(logical_mesh.clone())?)
-        };
-
-        let options = Options::new(mesh)
-            .with_input_shardings(vec![input])
-            .with_output_shardings(vec![output])
-            .with_donate(donate);
-        let staged = stage(|input| input, bare_input_type, options)?;
-
-        Ok(Some(session.compile_staged_function(staged)?))
-    }
-
-    /// Executes `compiled`, which [`Self::compile`] compiled from this program for `array`, on `array`. Without
-    /// `compiled` (i.e., in a process that does not run this program), this function runs nothing and returns the
-    /// metadata of the output of this program (refer to [`Array::place_without_local_buffers`]). The execution fence
-    /// of the result joins the execution fence of `array` with the fence of the launch (refer to the documentation of
-    /// this module). This function takes `array` by value so that a donation takes effect.
-    ///
-    /// The executable runs on [`Self::compiled_mesh`], so when that mesh types an axis differently, `array` enters it
-    /// as the same shards on that mesh, and its result leaves it as the same shards on the mesh of this program. Both
-    /// conversions preserve pending reductions, storage, and completion fences.
-    fn execute(&self, array: Array, compiled: Option<&CompiledFunction<ArrayType, ArrayType>>) -> Result<Array, Error> {
-        let Some(compiled) = compiled else {
-            let r#type = ArrayType::new(array.data_type(), array.shape().into()).with_memory(array.r#type().memory());
-            return array.place_without_local_buffers(array.session(), r#type, &self.mesh, &self.output);
-        };
-        let mut completion = PlacementCompletion::default();
-        completion.track_fence(array.execution_fence());
-        let session = array.session().clone();
-        let mesh = self.compiled_mesh()?;
-        let mut output = if mesh == self.mesh {
-            compiled.executable().execute(&session, array)?
-        } else {
-            // Consume each handle as it is retyped so the input's buffers can still be donated to the executable.
-            let retype_mesh = |array: Array, mesh: &DeviceMesh| -> Result<Array, Error> {
-                debug_assert_eq!(array.mesh().devices(), mesh.devices());
-                let sharding = array.sharding().with_mesh(mesh.logical_mesh().clone())?;
-                let r#type = array.r#type().into_owned().with_sharding(None)?;
-                let buffers = array.shards().iter().filter_map(|shard| shard.buffer().cloned()).collect();
-                array.rebuilt(r#type, mesh, sharding, buffers, PlacementCompletion::default())
-            };
-            let input = retype_mesh(array, &mesh)?;
-            retype_mesh(compiled.executable().execute(&session, input)?, &self.mesh)?
-        };
-        output.execution_fence = completion.join(output.execution_fence.take());
-        Ok(output)
-    }
-}
-
 /// Reduction state of a value along one mesh axis, which a [`Sharding`] records per axis (with one
 /// [`UnreducedKind`] for all of its unreduced axes), and which a [`ReshardProgram`] keeps or changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3528,97 +3618,6 @@ enum MoveRole {
 
     /// The process owns only the target device and receives the moved data with a PJRT cross-host transfer.
     Receive,
-}
-
-/// Deterministic plan of the moves of whole shards or of shard regions that place an [`Array`] (e.g., by
-/// [`Array::to_placement`]), which holds the moves of every process, so that every process derives the same plan from
-/// global metadata (refer to [`plan_exact_shard_put`] and [`PlacementPlanningView::plan_shard_regions`]). Each
-/// process performs the part of every move that [`ShardMove::role`] assigns to it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ShardMovePlan {
-    /// Element type of the buffers that the plan moves, which is the executable buffer type of the array (e.g., a
-    /// predicate for one-bit integers), because that is the buffer that a send transfers and a receive allocates.
-    element_type: BufferType,
-
-    /// Moves of the plan, in target shard order, and for each target shard in the order of the starting
-    /// coordinates of the moved slices.
-    moves: Vec<ShardMove>,
-}
-
-impl ShardMovePlan {
-    /// Creates a plan of the moves of whole shards or of shard regions.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::SizeLimitExceeded`] when a move that crosses processes names a device whose identifier PJRT
-    /// cross-host transfers cannot represent (refer to [`cross_host_global_device_id`]). The plan covers the moves of
-    /// every process, so every process returns this error before any of them submits a transfer.
-    fn new(element_type: BufferType, moves: Vec<ShardMove>) -> Result<Self, Error> {
-        let plan = Self { element_type, moves };
-        for movement in plan.cross_host_moves() {
-            cross_host_global_device_id(movement.source_device.id())?;
-            cross_host_global_device_id(movement.target_device.id())?;
-        }
-        Ok(plan)
-    }
-
-    /// Returns the moves in which the process with index `process_index` takes the part `role`.
-    fn moves_with_role(&self, process_index: usize, role: MoveRole) -> impl Iterator<Item = &ShardMove> {
-        self.moves.iter().filter(move |movement| movement.role(process_index) == Some(role))
-    }
-
-    /// Returns the moves that cross processes, whatever processes they cross between.
-    fn cross_host_moves(&self) -> impl Iterator<Item = &ShardMove> {
-        self.moves.iter().filter(|movement| movement.is_cross_host())
-    }
-}
-
-/// One move in a [`ShardMovePlan`] of the elements of a slice, which is a whole source shard or the intersection of a
-/// source shard with a target shard, from the device of that source shard to the device of the target shard.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ShardMove {
-    /// Index of the source shard in the source array.
-    source_shard_index: ShardIndex,
-
-    /// Device of the source shard.
-    source_device: Device,
-
-    /// Index of the target shard in the target array.
-    target_shard_index: ShardIndex,
-
-    /// Device of the target shard.
-    target_device: Device,
-
-    /// Moved slice in global array coordinates, which is the slice of the target shard for a move of a whole
-    /// shard.
-    slice: Vec<Range<usize>>,
-
-    /// Deterministic transfer rendezvous key that the send and the receive of a cross-host move share.
-    transfer_key: CrossHostTransferKey,
-}
-
-impl ShardMove {
-    /// Returns the static shape of the moved slice.
-    fn shape(&self) -> StaticShape {
-        StaticShape::new(self.slice.iter().map(Range::len).collect::<Vec<_>>())
-    }
-
-    /// Returns whether this move crosses processes, which needs a PJRT cross-host transfer.
-    fn is_cross_host(&self) -> bool {
-        self.source_device.process_index() != self.target_device.process_index()
-    }
-
-    /// Returns the part that the process with index `process_index` takes in this move, or `None` when it owns neither
-    /// of its devices.
-    fn role(&self, process_index: usize) -> Option<MoveRole> {
-        match (self.source_device.process_index() == process_index, self.target_device.process_index() == process_index)
-        {
-            (true, true) => Some(MoveRole::Copy),
-            (true, false) => Some(MoveRole::Send),
-            (false, true) => Some(MoveRole::Receive),
-            (false, false) => None,
-        }
-    }
 }
 
 /// Replicas of one source slice (i.e., the source shards that cover it), indexed so that a plan finds the preferred
