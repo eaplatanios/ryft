@@ -1794,12 +1794,31 @@ where
 
         let all_known = inputs.iter().all(PartialEvaluationValue::is_known);
         let callee = driver.region(0)?;
+
+        // A cached split can be shared across call sites when the inputs and callee carry no references or nominal
+        // type identities and the callee has no lifted capture constants. All-known forwarding also checks effects.
+        let can_share_split = || {
+            !inputs.iter().any(|input| {
+                let r#type = input.r#type();
+                r#type.is_reference() || r#type.identities().next().is_some()
+            }) && !callee.contains_atom_in_closure(|atom| {
+                let r#type = atom.r#type();
+                r#type.is_reference()
+                    || r#type.identities().next().is_some()
+                    || atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
+            })
+        };
+
         if all_known || inputs.iter().all(PartialEvaluationValue::is_unknown) {
             // An all-known call folds as a whole, unless its callee holds work that must not fold under this context
             // (e.g., a copy that every execution of a specialized program must make), in which case the default rule
             // keeps the whole call residual.
             let outputs = self.fold_or_residualize(context, driver, inputs)?;
-            if all_known && context.residual_policy().is_some() && !keeps_call_boundary(callee, inputs) {
+            if all_known
+                && context.residual_policy().is_some()
+                && callee.effects().classes().is_empty()
+                && can_share_split()
+            {
                 return Ok(self.resolve_forwarded_outputs(callee, inputs, outputs));
             }
             return Ok(outputs);
@@ -1824,7 +1843,7 @@ where
 
         // Retain mixed splits without references, captures, or nominal identities. Unlike all-known replay,
         // partitioning a mixed effectful call preserves its effects and shares only the structural split.
-        if can_cache_call_split(callee, inputs) {
+        if can_share_split() {
             let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
             let partition =
                 |callee: RegionRef<'_, V, C::Operation>| driver.partition_program(context, callee, &input_known);
@@ -1928,9 +1947,22 @@ where
         C::Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
     {
         let callee = driver.region(0)?;
+
+        // All-known replay must preserve the boundary that orders effects and validates references, identities,
+        // and captures.
         if !inputs.iter().all(PartialEvaluationValue::is_known)
             || context.residual_policy().is_none()
-            || keeps_call_boundary(callee, inputs)
+            || !callee.effects().classes().is_empty()
+            || inputs.iter().any(|input| {
+                let r#type = input.r#type();
+                r#type.is_reference() || r#type.identities().next().is_some()
+            })
+            || callee.contains_atom_in_closure(|atom| {
+                let r#type = atom.r#type();
+                r#type.is_reference()
+                    || r#type.identities().next().is_some()
+                    || atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
+            })
         {
             return Ok(None);
         }
@@ -3301,34 +3333,6 @@ fn shared_call_callee<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrT
         Ok(TransformArtifact::new(vec![Arc::new(callee.to_program())], ()))
     })?;
     Ok(artifact.programs()[0].clone())
-}
-
-/// Returns whether an all-known call of `callee` with `inputs` keeps its boundary under a residual policy, which is the
-/// case when `callee` has effects, references, nominal type identities, or capture constants. Splitting such a call on
-/// residual demand, or forwarding its outputs, would move effects, reference accesses, nominally scoped types, or
-/// captures that name its capture prefix across the boundary that validates them.
-fn keeps_call_boundary<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>, W: Value>(
-    callee: RegionRef<'_, V, O>,
-    inputs: &[PartialEvaluationValue<W>],
-) -> bool {
-    !callee.effects().classes().is_empty() || !can_cache_call_split(callee, inputs)
-}
-
-/// Returns whether a mixed call can retain its structural partition. Effects are permitted because its cache key
-/// includes their partition configuration, whereas references, captures, and nominal identities require the original
-/// boundary or call-local identities. All-known replay additionally excludes effects (refer to
-/// [`keeps_call_boundary`]).
-fn can_cache_call_split<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>, W: Value>(
-    callee: RegionRef<'_, V, O>,
-    inputs: &[PartialEvaluationValue<W>],
-) -> bool {
-    !inputs
-        .iter()
-        .any(|input| input.r#type().is_reference() || input.r#type().identities().next().is_some())
-        && !callee.contains_atom_type_in_closure(|r#type| r#type.is_reference() || r#type.identities().next().is_some())
-        && !callee.contains_atom_in_closure(|atom| {
-            atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
-        })
 }
 
 /// Returns `callee`, the callee of a call whose effective boundary is `boundary` (refer to

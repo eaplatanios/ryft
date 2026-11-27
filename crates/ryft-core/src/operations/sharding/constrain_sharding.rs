@@ -380,7 +380,8 @@ impl<
 /// while recording a [`ConstrainShardingOperation`] that backend lowering must enforce. Lowering merges the requested
 /// auto-axis placement with the input's tracked placement (refer to [`ConstrainShardingOperation::lowered_sharding`]),
 /// so the compiler must honor both and remains free where placement is unconstrained. To perform a tracked transition
-/// over [`Explicit`](MeshAxisType::Explicit) axes, use [`Reshard::reshard`].
+/// over [`Explicit`](MeshAxisType::Explicit) axes, use [`Reshard::reshard`]. Use [`place`](crate::Place) to choose a
+/// destination device or mesh, or [`transfer_to_memory`](crate::TransferToMemory) to change only the memory space.
 ///
 /// Concrete single-device arrays are returned unchanged after type validation. Context-carrying values stage the
 /// operation, preserving the constraint through interpretation and transformations. Differentiation applies the

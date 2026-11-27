@@ -2590,6 +2590,11 @@ impl<P: PlacementRequestParameter, S: Parameterized<P>> PlacementSources<P, S> f
 /// replicated dimensions, as JAX pads a short partition specification (refer to [`PlacementRequest::padded`]),
 /// and one with more dimensions than the value is rejected.
 ///
+/// On XLA, a memory-only target commits an eager result to its current devices. A compiled program that retains the
+/// placement commits all its public outputs. Use [`transfer_to_memory`](crate::TransferToMemory) for a memory move that
+/// leaves commitment to the inputs and the surrounding program. Use [`constrain_sharding`](crate::ConstrainSharding) to
+/// constrain placement over auto axes while preserving tracked sharding.
+///
 /// The source is informative. It states where the value is expected to live when the placement is created. Placement
 /// over auto mesh axes and devices are runtime state that types do not record, so transposition uses the source to move
 /// the cotangent back to those devices. [`PlaceOperation`] type inference checks the source against what the type of

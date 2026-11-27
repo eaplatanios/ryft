@@ -1447,8 +1447,11 @@ impl Session {
     /// the leaf's layout only if it still describes each result shard.
     ///
     /// A [`PlacementRequest::InPlace`] target changes only memory or layout, even when the devices and sharding are
-    /// unknown during tracing (e.g., how a compiled input is split along auto mesh axes). Its results are committed,
-    /// as JAX commits the result of `device_put` onto a memory space eagerly and inside `jit`.
+    /// unknown during tracing (e.g., how a compiled input is split along auto mesh axes). It commits eager results
+    /// to their current devices and commits all public outputs of a compiled program that retains the placement.
+    /// Use [`transfer_to_memory`](ryft_core::TransferToMemory) for memory-only moves. With that operation, commitment
+    /// depends on the inputs and the surrounding program. Use [`constrain_sharding`](ryft_core::ConstrainSharding)
+    /// to constrain auto axes while preserving tracked sharding.
     ///
     /// Inside a batched function, the placement of a batch item (refer to [`Placed`](ryft_core::Placed)) records
     /// how its batch is distributed. A target or source that is such a [`Placement`] keeps that record (refer to

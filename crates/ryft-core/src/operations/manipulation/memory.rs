@@ -216,6 +216,11 @@ impl<O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType, Projected
 /// performs the transfer if the destination is supported. Transfer and staging failures are returned to the caller.
 /// Native scalar values have no memory placement metadata and are returned unchanged.
 ///
+/// Use this for memory-only moves such as offloading an intermediate. On XLA, commitment still depends on the inputs
+/// and the surrounding program. A memory target with [`place`](crate::Place) commits an eager result to its current
+/// devices and commits all public outputs of a compiled program that retains the placement. For a constraint over auto
+/// mesh axes, use [`constrain_sharding`](crate::ConstrainSharding).
+///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
 ///
