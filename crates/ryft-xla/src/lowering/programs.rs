@@ -375,48 +375,24 @@ impl MlirProgramSignature {
         self.output_mapping.iter().flatten().count() + self.output_dimensions.len()
     }
 
-    /// Returns the total number of inputs of the executable, including the hidden ordered I/O token.
+    /// Returns the total number of executable inputs, including hidden extent scalars and the ordered I/O token
+    /// when present.
     #[inline]
-    pub fn input_count(&self) -> usize {
+    pub fn executable_input_count(&self) -> usize {
         self.input_mapping.iter().flatten().count() + self.input_dimensions.len() + usize::from(self.ordered_io)
     }
 
-    /// Returns the total number of outputs of the executable, including the hidden ordered I/O token.
+    /// Returns the total number of executable outputs, including hidden extent scalars and the ordered I/O token
+    /// when present.
     #[inline]
-    pub fn output_count(&self) -> usize {
+    pub fn executable_output_count(&self) -> usize {
         self.output_array_count() + usize::from(self.ordered_io)
     }
 
-    /// Clones the entries in `inputs` for logical inputs that have an executable array slot. Supply one entry per
-    /// flattened logical input, including captures. For example, the input mapping `[Some(0), None, Some(1)]` maps
-    /// `[a, b, c]` to `[a, c]`. Hidden extent scalars and effect tokens have separate slots.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `inputs` has a different length from [`Self::input_mapping`].
-    #[inline]
-    pub fn project_inputs<T: Clone>(&self, inputs: &[T]) -> Vec<T> {
-        Self::project(&self.input_mapping, inputs)
-    }
-
-    /// Clones the entries in `outputs` for logical outputs that have an executable array slot. Supply one entry per
-    /// flattened logical output. For example, the output mapping `[None, Some(0)]` maps `[a, b]` to `[b]`. Hidden
-    /// extent scalars and effect tokens have separate slots.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `outputs` has a different length from [`Self::output_mapping`].
-    #[inline]
-    pub fn project_outputs<T: Clone>(&self, outputs: &[T]) -> Vec<T> {
-        Self::project(&self.output_mapping, outputs)
-    }
-
-    // TODO(eaplatanios): Review this.
-
-    /// Projects logical data inputs to bounded physical tensor types and appends hidden extent scalars.
-    /// Native effect tokens are separate from array types and are excluded.
-    pub fn physical_input_types(&self, inputs: &[ArrayType]) -> Vec<ArrayType> {
-        let mut physical = Self::project(&self.input_mapping, inputs);
+    /// Returns the executable's array input types. Bounded dynamic dimensions use their maximum extents, and hidden
+    /// extent scalars follow the data inputs. When present, the ordered I/O token occupies a separate slot.
+    pub fn executable_input_types(&self, inputs: &[ArrayType]) -> Vec<ArrayType> {
+        let mut physical = Self::select_mapped_entries(&self.input_mapping, inputs);
         let mut converted = vec![false; physical.len()];
         for input_dimension in self.input_dimensions.iter() {
             // The conversion rewrites every axis of the owning tensor at once, so an input with several dynamic axes
@@ -445,17 +421,18 @@ impl MlirProgramSignature {
         physical
     }
 
-    /// Projects logical outputs and appends the scalar types of hidden output extents, excluding native effect tokens.
-    pub fn physical_output_types(&self, outputs: &[ArrayType]) -> Vec<ArrayType> {
-        let mut physical = Self::project(&self.output_mapping, outputs);
+    /// Returns the executable's array output types, with hidden extent scalars after the data outputs. When present,
+    /// the ordered I/O token occupies a separate slot.
+    pub fn executable_output_types(&self, outputs: &[ArrayType]) -> Vec<ArrayType> {
+        let mut physical = Self::select_mapped_entries(&self.output_mapping, outputs);
         physical.extend(self.output_dimensions.iter().map(|_| ArrayType::scalar(DataType::I64)));
         physical
     }
 
-    /// Projects logical input shardings and appends a replicated scalar sharding per hidden extent input, on the mesh
-    /// of the input that owns the extent.
-    pub fn physical_input_shardings(&self, shardings: &[Sharding]) -> Vec<Sharding> {
-        let mut physical = Self::project(&self.input_mapping, shardings);
+    /// Returns input shardings in executable order, with a replicated scalar sharding for each hidden extent on
+    /// the mesh of the input that owns it.
+    pub fn executable_input_shardings(&self, shardings: &[Sharding]) -> Vec<Sharding> {
+        let mut physical = Self::select_mapped_entries(&self.input_mapping, shardings);
         physical.extend(
             self.input_dimensions
                 .iter()
@@ -464,10 +441,10 @@ impl MlirProgramSignature {
         physical
     }
 
-    /// Projects optional logical input shardings like [`Self::physical_input_shardings`], leaving a hidden extent
-    /// input unannotated when the input that owns it is unannotated.
-    pub fn physical_optional_input_shardings(&self, shardings: &[Option<Sharding>]) -> Vec<Option<Sharding>> {
-        let mut physical = Self::project(&self.input_mapping, shardings);
+    /// Returns input shardings like [`Self::executable_input_shardings`], leaving a hidden extent input unannotated
+    /// when the input that owns it is unannotated.
+    fn executable_optional_input_shardings(&self, shardings: &[Option<Sharding>]) -> Vec<Option<Sharding>> {
+        let mut physical = Self::select_mapped_entries(&self.input_mapping, shardings);
         physical.extend(self.input_dimensions.iter().map(|dimension| {
             shardings[dimension.logical_input_index]
                 .as_ref()
@@ -476,10 +453,10 @@ impl MlirProgramSignature {
         physical
     }
 
-    /// Projects optional logical output shardings and appends the sharding of each hidden extent output, which is
+    /// Returns output shardings in executable order, including the sharding of each hidden extent output, which is
     /// replicated on the mesh of the output that owns the extent, or absent when that output is unannotated.
-    pub fn physical_optional_output_shardings(&self, shardings: &[Option<Sharding>]) -> Vec<Option<Sharding>> {
-        let mut physical = Self::project(&self.output_mapping, shardings);
+    pub fn executable_optional_output_shardings(&self, shardings: &[Option<Sharding>]) -> Vec<Option<Sharding>> {
+        let mut physical = Self::select_mapped_entries(&self.output_mapping, shardings);
         physical.extend(self.output_dimensions.iter().map(|dimension| {
             shardings[dimension.logical_output_index]
                 .as_ref()
@@ -488,13 +465,39 @@ impl MlirProgramSignature {
         physical
     }
 
+    /// Clones the entries in `inputs` for logical inputs that have an executable array slot. Supply one entry per
+    /// flattened logical input, including captures. For example, the input mapping `[Some(0), None, Some(1)]` maps
+    /// `[a, b, c]` to `[a, c]`. Hidden extent scalars and effect tokens have separate slots.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `inputs` has a different length from [`Self::input_mapping`].
+    #[inline]
+    pub fn select_input_entries<T: Clone>(&self, inputs: &[T]) -> Vec<T> {
+        Self::select_mapped_entries(&self.input_mapping, inputs)
+    }
+
+    /// Clones the entries in `outputs` for logical outputs that have an executable array slot. Supply one entry per
+    /// flattened logical output. For example, the output mapping `[None, Some(0)]` maps `[a, b]` to `[b]`. Hidden
+    /// extent scalars and effect tokens have separate slots.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `outputs` has a different length from [`Self::output_mapping`].
+    #[inline]
+    pub fn select_output_entries<T: Clone>(&self, outputs: &[T]) -> Vec<T> {
+        Self::select_mapped_entries(&self.output_mapping, outputs)
+    }
+
+    // TODO(eaplatanios): Review this.
+
     /// Clones entries from `values` whose corresponding entries in `mapping` are `Some(_)`. The signature assigns
     /// physical indices consecutively in logical order, so keeping these entries in sequence gives executable order.
     ///
     /// # Panics
     ///
     /// Panics if `mapping` and `values` have different lengths.
-    fn project<T: Clone>(mapping: &[Option<usize>], values: &[T]) -> Vec<T> {
+    fn select_mapped_entries<T: Clone>(mapping: &[Option<usize>], values: &[T]) -> Vec<T> {
         assert_eq!(mapping.len(), values.len());
         mapping
             .iter()
@@ -1528,7 +1531,7 @@ impl ProgramBoundary {
             physical_output_tensor_types.push(context.stable_hlo_token_type()?.as_ref());
         }
         let mut argument_sharding_attributes = signature
-            .physical_optional_input_shardings(logical_input_shardings)
+            .executable_optional_input_shardings(logical_input_shardings)
             .iter()
             .map(|sharding| {
                 sharding.as_ref().map(|sharding| sharding.lower(OpenDimensions::None, location)).transpose()
@@ -1537,9 +1540,9 @@ impl ProgramBoundary {
         // Results whose placement over auto mesh axes the compiler chooses are open over those axes, like JAX lowers
         // the shardings of output types without `out_shardings` (refer to `ShardingExtension::lower`).
         let physical_open_outputs =
-            if open_outputs.is_empty() { Vec::new() } else { signature.project_outputs(open_outputs) };
+            if open_outputs.is_empty() { Vec::new() } else { signature.select_output_entries(open_outputs) };
         let mut result_sharding_attributes = signature
-            .physical_optional_output_shardings(output_shardings)
+            .executable_optional_output_shardings(output_shardings)
             .iter()
             .enumerate()
             .map(|(index, sharding)| {
@@ -1806,7 +1809,7 @@ impl ProgramBoundary {
             lowering_state,
             &mut effect_tokens,
         )?;
-        let mut physical_outputs = signature.project_outputs(logical_outputs.as_slice());
+        let mut physical_outputs = signature.select_output_entries(logical_outputs.as_slice());
         // XLA writes the runtime-size trailer of a bounded dynamic result only in the `SliceToDynamic` that
         // `DynamicPadder` inserts before each output leaf. When several such leaves carry values that XLA proves
         // equal (e.g., the same SSA value or equal computations merged by CSE), one `SliceToDynamic` survives and
@@ -2278,8 +2281,8 @@ where
             output_shardings,
         )?;
 
-        let physical_input_types = signature.physical_input_types(logical_input_types.as_slice());
-        let physical_output_types = signature.physical_output_types(output_types);
+        let physical_input_types = signature.executable_input_types(logical_input_types.as_slice());
+        let physical_output_types = signature.executable_output_types(output_types);
 
         Ok(ProgramBoundary {
             function_name,
@@ -2583,9 +2586,9 @@ mod tests {
 
         assert_eq!(signature.input_mapping(), &[None, Some(0), Some(1)]);
         assert_eq!(signature.output_mapping(), &[Some(0), None]);
-        assert_eq!(signature.project_inputs(&[0, 1, 2]), vec![1, 2]);
-        assert_eq!(signature.project_outputs(&[0, 1]), vec![0]);
-        assert_eq!(signature.input_count(), 3);
+        assert_eq!(signature.select_input_entries(&[0, 1, 2]), vec![1, 2]);
+        assert_eq!(signature.select_output_entries(&[0, 1]), vec![0]);
+        assert_eq!(signature.executable_input_count(), 3);
         assert_eq!(signature.input_dimensions().len(), 1);
         assert_eq!(signature.input_dimensions()[0].logical_input_index(), 2);
         assert_eq!(signature.input_dimensions()[0].axis(), 0);
@@ -2611,7 +2614,7 @@ mod tests {
         assert_eq!(signature.unread_inputs(), &[true, true, false, false, false]);
         assert_eq!([0, 1, 2].map(|index| signature.is_unread_input(index)), [true, true, false]);
         assert_eq!(signature.input_dimensions()[0].physical_input_index(), 2);
-        assert_eq!(signature.input_count(), 3);
+        assert_eq!(signature.executable_input_count(), 3);
     }
 
     #[test]
@@ -2630,8 +2633,8 @@ mod tests {
         assert_eq!(signature.ordered_io_output_index(), None);
         assert_eq!(signature.input_array_count(), 3);
         assert_eq!(signature.output_array_count(), 3);
-        assert_eq!(signature.input_count(), 3);
-        assert_eq!(signature.output_count(), 3);
+        assert_eq!(signature.executable_input_count(), 3);
+        assert_eq!(signature.executable_output_count(), 3);
 
         // Ordered I/O appends one token after every array and hidden extent input and output.
         let ordered = signature.clone().with_effects(true, false, false, true);
@@ -2643,8 +2646,8 @@ mod tests {
         assert_eq!(ordered.ordered_io_output_index(), Some(3));
         assert_eq!(ordered.input_array_count(), 3);
         assert_eq!(ordered.output_array_count(), 3);
-        assert_eq!(ordered.input_count(), 4);
-        assert_eq!(ordered.output_count(), 4);
+        assert_eq!(ordered.executable_input_count(), 4);
+        assert_eq!(ordered.executable_output_count(), 4);
 
         // Device ordering only applies together with ordered I/O, while unordered I/O and runtime assertions still
         // participate in the effect barrier.
@@ -2652,14 +2655,14 @@ mod tests {
         assert!(!unordered.has_device_ordered_io());
         assert!(unordered.has_unordered_io());
         assert!(unordered.has_effects());
-        assert_eq!(unordered.input_count(), 3);
+        assert_eq!(unordered.executable_input_count(), 3);
         let asserting = signature.with_effects(false, false, true, false);
         assert!(asserting.requires_assertion_handler());
         assert!(asserting.has_effects());
     }
 
     #[test]
-    fn test_mlir_program_signature_physical_input_types() {
+    fn test_mlir_program_signature_executable_input_types() {
         // Every bounded dynamic axis of a materialized input becomes its physical bound, and each one appends a hidden
         // `i32` extent input, while static zero-sized inputs are erased.
         let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
@@ -2669,7 +2672,7 @@ mod tests {
         );
         let signature = MlirProgramSignature::new(&[static_zero.clone(), dynamic.clone()], &[]);
         assert_eq!(
-            signature.physical_input_types(&[static_zero, dynamic]),
+            signature.executable_input_types(&[static_zero, dynamic]),
             vec![
                 ArrayType::new_static(DataType::F32, [2, 4]),
                 ArrayType::scalar(DataType::I32),
@@ -2679,19 +2682,19 @@ mod tests {
     }
 
     #[test]
-    fn test_mlir_program_signature_physical_output_types() {
+    fn test_mlir_program_signature_executable_output_types() {
         // Dynamic outputs keep their logical types and each bounded dynamic axis appends a hidden `i64` extent output.
         let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
         let signature = MlirProgramSignature::new(&[], &[dynamic.clone(), static_zero.clone()]);
         assert_eq!(
-            signature.physical_output_types(&[dynamic.clone(), static_zero]),
+            signature.executable_output_types(&[dynamic.clone(), static_zero]),
             vec![dynamic, ArrayType::scalar(DataType::I64)],
         );
     }
 
     #[test]
-    fn test_mlir_program_signature_physical_input_shardings() {
+    fn test_mlir_program_signature_executable_input_shardings() {
         // Each hidden extent input is a replicated scalar on the mesh of the input that owns the extent, and it
         // stays unannotated when that input is unannotated.
         let mesh = test_manual_mesh("x", 2);
@@ -2701,7 +2704,7 @@ mod tests {
         let vector_sharding = Sharding::replicated(mesh.clone(), 1);
         let scalar_sharding = Sharding::replicated(mesh, 0);
         assert_eq!(
-            signature.physical_input_shardings(&[
+            signature.executable_input_shardings(&[
                 vector_sharding.clone(),
                 vector_sharding.clone(),
                 vector_sharding.clone(),
@@ -2709,19 +2712,19 @@ mod tests {
             vec![vector_sharding.clone(), vector_sharding.clone(), scalar_sharding.clone(), scalar_sharding.clone()],
         );
         assert_eq!(
-            signature.physical_optional_input_shardings(&[None, Some(vector_sharding.clone()), None]),
+            signature.executable_optional_input_shardings(&[None, Some(vector_sharding.clone()), None]),
             vec![Some(vector_sharding), None, Some(scalar_sharding), None],
         );
     }
 
     #[test]
-    fn test_mlir_program_signature_physical_optional_output_shardings() {
+    fn test_mlir_program_signature_executable_optional_output_shardings() {
         let mesh = test_manual_mesh("x", 2);
         let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
         let signature = MlirProgramSignature::new(&[], &[dynamic.clone(), dynamic]);
         let vector_sharding = Sharding::replicated(mesh.clone(), 1);
         assert_eq!(
-            signature.physical_optional_output_shardings(&[Some(vector_sharding.clone()), None]),
+            signature.executable_optional_output_shardings(&[Some(vector_sharding.clone()), None]),
             vec![Some(vector_sharding), None, Some(Sharding::replicated(mesh, 0)), None],
         );
     }
