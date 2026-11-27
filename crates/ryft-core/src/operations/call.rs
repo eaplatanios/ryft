@@ -1060,7 +1060,7 @@ where
         // resharded to where the call places it (i.e., the sharding that its callee input type declares, or its
         // boundary sharding when that type declares none), which changes no value of an `Array`, so that the callee
         // receives the input at the placement that a backend gives it.
-        interpret_call(self, context, driver, inputs, |input, sharding| input.reshard(sharding), |input, _| Ok(input))
+        self.interpret_with(context, driver, inputs, |input, sharding| input.reshard(sharding), |input, _| Ok(input))
             .map(|(_, outputs)| outputs)
     }
 }
@@ -1085,8 +1085,7 @@ impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<LockstepDomain<O>>
         // without their extra variation, still varies along the manual mesh axes along which inputs vary beyond their
         // callee input types, as the type rule of the call states, so that every later operation receives the output
         // at its staged type.
-        let (output_types, outputs) = interpret_call(
-            self,
+        let (output_types, outputs) = self.interpret_with(
             context,
             driver,
             inputs,
@@ -1118,10 +1117,63 @@ impl<O: Operation<Type = ArrayIrType>> InterpretableOperation<LockstepDomain<O>>
             },
         )?;
         check_count!("output", outputs, output_types.len(), ProgramError);
+
+        // The callee computed its outputs at the types that it was traced at, while the type rule of the call makes
+        // every output vary along the manual mesh axes along which inputs vary beyond their callee input types. Each
+        // output is therefore lifted to its staged type by adding the manual mesh axes that it lacks.
         outputs
             .into_iter()
             .zip(&output_types)
-            .map(|(output, r#type)| vary_lockstep_call_output(context, driver, output, r#type))
+            .map(|(output, r#type)| -> Result<LockstepValue<O>, ProgramError> {
+                let actual_type = output.r#type().into_owned();
+                let (ArrayIrType::Array(r#type), ArrayIrType::Array(actual_type)) = (r#type, &actual_type) else {
+                    return Ok(output);
+                };
+
+                let Some(sharding) = r#type.sharding() else { return Ok(output) };
+                let actual_sharding = actual_type.sharding();
+                let missing_axes = sharding
+                    .varying_manual_axes()
+                    .iter()
+                    .filter(|axis| !actual_sharding.is_some_and(|actual| actual.varying_manual_axes().contains(*axis)))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if missing_axes.is_empty() {
+                    return Ok(output);
+                }
+
+                // An output without a sharding first takes the replicated sharding over the mesh of its staged type,
+                // as an output type without one does in the type rule. Only the type of the value of each device
+                // changes, and its bytes are kept.
+                let mut output = match actual_sharding {
+                    Some(_) => output,
+                    None => {
+                        let replicated = Sharding::replicated(sharding.mesh().clone(), actual_type.rank());
+                        let placed = actual_type.clone().with_sharding(replicated).map_err(TypeError::from)?;
+                        let values = output
+                            .into_values()
+                            .into_iter()
+                            .map(|value| match value {
+                                ArrayIrValue::Array(array) => {
+                                    Array::from_logical_bytes(placed.clone(), &array.logical_bytes())
+                                        .map(ArrayIrValue::Array)
+                                }
+                                value => Ok(value),
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        LockstepValue::new(values, context)?
+                    }
+                };
+
+                // Each missing axis is added by `parallel_vary`, which changes no value of any device.
+                for axis in missing_axes {
+                    let mut varied =
+                        ParallelVaryOperation::new(axis).interpret_in_parent(context, driver, &[output])?;
+                    check_count!("output", varied, 1, ProgramError);
+                    output = varied.remove(0);
+                }
+                Ok(output)
+            })
             .collect()
     }
 }
@@ -1189,9 +1241,9 @@ where
             // An all-known call folds as a whole, unless its callee holds work that must not fold under this context
             // (e.g., a copy that every execution of a specialized program must make), in which case the default rule
             // keeps the whole call residual.
-            let outputs = fold_or_residualize_call(self, context, driver, inputs)?;
+            let outputs = self.fold_or_residualize(context, driver, inputs)?;
             if all_known && context.residual_policy().is_some() && !keeps_call_boundary(callee, inputs) {
-                return Ok(forward_call_inputs(self, callee, inputs, outputs));
+                return Ok(self.forward_inputs(callee, inputs, outputs));
             }
             return Ok(outputs);
         }
@@ -1220,7 +1272,7 @@ where
             let partition =
                 |callee: RegionRef<'_, V, C::Operation>| driver.partition_program(context, callee, &input_known);
             let kind = CallSplitKind::Knownness(input_known.clone());
-            return split_call(self, context, driver, inputs, kind, &partition).and_then(declare_outputs);
+            return self.split(context, driver, inputs, kind, &partition).and_then(declare_outputs);
         }
 
         // Split the callee of any other mixed call per call through the shared online boundary machinery, bind the
@@ -1241,7 +1293,7 @@ where
                 .instructions_in_closure()
                 .any(|(_, instruction)| instruction.operation().effects().has_reference_accesses());
         if accesses_references {
-            return fold_or_residualize_call(self, context, driver, inputs);
+            return self.fold_or_residualize(context, driver, inputs);
         }
 
         // Partitioning does not remap the absolute indices of capture constants retained in attached regions, so a
@@ -1251,7 +1303,7 @@ where
         if callee.contains_atom_in_closure(|atom| {
             atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
         }) {
-            return fold_or_residualize_call(self, context, driver, inputs);
+            return self.fold_or_residualize(context, driver, inputs);
         }
 
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
@@ -1261,7 +1313,7 @@ where
         // can only forward known inputs as residual edges. Keep the original boundary and let the default materialize
         // those knowns directly as residual feeders.
         if partition.known_program().instructions().is_empty() {
-            return fold_or_residualize_call(self, context, driver, inputs);
+            return self.fold_or_residualize(context, driver, inputs);
         }
 
         // Feed the residual call directly from the known call inputs and known call outputs that residual edges would
@@ -1327,10 +1379,9 @@ where
         }
 
         let kind = CallSplitKind::ResidualDemand(demanded_outputs.to_vec());
-        let mut outputs =
-            split_call(self, context, driver, inputs, kind, &|callee: RegionRef<'_, V, C::Operation>| {
-                context.partition_residual_demand(callee, demanded_outputs)
-            })?;
+        let mut outputs = self.split(context, driver, inputs, kind, &|callee: RegionRef<'_, V, C::Operation>| {
+            context.partition_residual_demand(callee, demanded_outputs)
+        })?;
         let replayed_outputs = outputs.split_off(callee.output_types().len());
         Ok(Some(ResidualDemandSplit::new(outputs, replayed_outputs)?))
     }
@@ -1878,15 +1929,16 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
-        // This is the transpose rule for a primal tangent `CallOperation`, forwarding to `transpose_primal_call` with
-        // the cotangent references of its linear reference inputs resolved, and allocated on first use, through the
-        // enclosing `TranspositionContext`. The callee is transposed through the driver, so instantiating this
-        // implementation introduces no recursive `TransposableOperation` obligation on the operation family `O`.
+        // This is the transpose rule for a primal tangent `CallOperation`, forwarding to
+        // `CallOperation::transposed_input_cotangents` with the cotangent references of its linear reference inputs
+        // resolved, and allocated on first use, through the enclosing `TranspositionContext`. The callee is transposed
+        // through the driver, so instantiating this implementation introduces no recursive `TransposableOperation`
+        // obligation on the operation family `O`.
         check_count!("output", outputs, driver.region(0)?.output_types().len(), ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let contributions = (|| -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
             let cotangents = context.cotangent_destinations(driver, inputs, accumulators)?;
-            transpose_primal_call(self, context, driver, inputs, outputs, &cotangents)
+            self.transposed_input_cotangents(context, driver, inputs, outputs, &cotangents)
                 .map_err(DifferentiationError::from)
         })()?;
         check_count!("input", contributions, accumulators.len(), ProgramError);
@@ -2077,7 +2129,7 @@ impl RegionPlacementRequests {
                             requests.push((request, instruction.operation().name()));
                         }
 
-                        if !omits_placement_regions(region, instruction, omits_regions) {
+                        if !naming.skips_regions(region, instruction) {
                             pending.extend(instruction.regions().iter().copied().enumerate().filter_map(
                                 |(index, id)| {
                                     (instruction.operation().region_role(index) == Some(RegionRole::Computation))
@@ -2339,6 +2391,17 @@ where
         Self { names_devices: vec![None; region_count], omits_regions }
     }
 
+    /// Returns whether the backend never runs the regions of `instruction` of `region`. This holds on every target for
+    /// the body of a scan with zero iterations (i.e., [`ScanOperation::has_zero_iterations`]) and for the regions for
+    /// which the `omits_regions` of this analysis returns `true`.
+    fn skips_regions(&self, region: RegionRef<'_, V, O>, instruction: &Instruction<O>) -> bool {
+        instruction
+            .operation()
+            .projected_payload::<ScanOperation<ArrayIrType>>()
+            .is_some_and(ScanOperation::has_zero_iterations)
+            || (self.omits_regions)(region, instruction)
+    }
+
     /// Returns whether `region` requests a placement that names devices in the regions that the backend runs for it.
     fn names_devices(&mut self, region: RegionRef<'_, V, O>) -> bool {
         if let Some(names_devices) = self.names_devices[region.id().index()] {
@@ -2350,7 +2413,7 @@ where
             let request = self.request(region, instruction);
             names_devices |= matches!(request, Some(RequestedPlacement::Devices(_) | RequestedPlacement::Sharding));
 
-            if omits_placement_regions(region, instruction, self.omits_regions) {
+            if self.skips_regions(region, instruction) {
                 continue;
             }
 
@@ -2406,7 +2469,7 @@ where
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Kind of a split of the callee of a `call` that [`split_call`] retains.
+/// Kind of a split of the callee of a `call` that [`CallOperation::split`] retains.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CallSplitKind {
     /// Split of a call whose inputs are partially known, marked in input order (refer to
@@ -2444,6 +2507,7 @@ fn call_input_variation(declared: &ArrayType, actual: &ArrayType) -> Option<BTre
             None => (no_axes, None, no_axes, no_axes),
         }
     }
+
     let (declared_unreduced, declared_kind, declared_reduced, declared_variation) = components(declared.sharding());
     let (actual_unreduced, actual_kind, actual_reduced, actual_variation) = components(actual.sharding());
     if (declared_unreduced, declared_kind, declared_reduced) != (actual_unreduced, actual_kind, actual_reduced)
@@ -2516,163 +2580,716 @@ fn validate_call_input_types<T: ArrayMemberType>(
     Ok(variation)
 }
 
-/// Returns whether the backend never runs the regions of `instruction` of `region`. This holds on every target for
-/// the body of a scan with zero iterations (refer to [`ScanOperation::has_zero_iterations`]) and for the regions for
-/// which `omits_regions` returns `true` (refer to [`RegionPlacementRequests::for_target`]).
-fn omits_placement_regions<V, O>(
-    region: RegionRef<'_, V, O>,
-    instruction: &Instruction<O>,
-    omits_regions: &dyn Fn(RegionRef<'_, V, O>, &Instruction<O>) -> bool,
-) -> bool
-where
-    V: Value<Type = ArrayIrType>,
-    O: 'static + Operation<Type = ArrayIrType> + OperationPayloadProjection,
-{
-    instruction
-        .operation()
-        .projected_payload::<ScanOperation<ArrayIrType>>()
-        .is_some_and(ScanOperation::has_zero_iterations)
-        || omits_regions(region, instruction)
-}
-
-/// Interprets `call` in `context` on `inputs` by the reference semantics of a call. The type rule of the call validates
-/// the complete application first (refer to [`CallOperation::validate_input_types`]), because direct eager binding does
-/// not pass through program construction, so that interpretation accepts exactly the inputs that staging accepts. Each
-/// array input is then placed where the eager application of a backend places it (refer to
-/// [`CallOperation::eager_boundary_input_sharding`]), as far as the callee region accepts that placement and the type
-/// of a value records it, and the callee region runs on the placed inputs:
-///
-///   - An input of a callee input type that declares a sharding enters the callee at that sharding, because the callee
-///     region validates its inputs against its declared input types and accepts no other placement. This is the
-///     boundary sharding of the input unless the call has a sharding override or a derived sharding for it that
-///     differs from the declared one, whose placement is therefore not observable inside the callee. An input of the
-///     lifted capture prefix, an input that the call keeps placed as it is, and an input that varies along manual mesh
-///     axes beyond its callee input type have no boundary sharding and enter at the declared sharding too. The target
-///     of the placement is the declared sharding without its manual reduction state, which `reshard` carries over from
-///     the input together with its manual variation, so that an input that varies beyond its callee input type keeps
-///     that variation.
-///   - An input of a callee input type without a sharding is placed at its boundary sharding, which is its sharding
-///     override, its derived sharding, or the sharding that replicates it over the mesh of the call, including the
-///     logical mesh of a placement over a single device, as far as its type records that sharding (refer to
-///     [`CallOperation::boundary_input_type`]). Placement along auto mesh axes is runtime state that neither types
-///     nor the values of the reference backend record (refer to
-///     [`Placed`](crate::operations::sharding::place::Placed)), so a backend
-///     applies it while this rule, as the reference rules of `place` and `constrain_sharding` do, keeps only the part
-///     that types record. A boundary sharding that states more than a placement (e.g., a pending reduction) or that
-///     `reshard` rejects (e.g., one that places a dimension along a manual mesh axis) is not applied at all. An input
-///     without a boundary sharding (i.e., of the lifted capture prefix, kept placed as it is, varying beyond its callee
-///     input type, or without a sharding when the call names no mesh) keeps its placement.
-///
-/// Each placed input that varies along manual mesh axes beyond its callee input type (refer to `call_input_variation`)
-/// is then passed to `narrow` with those axes. Returns the output types that the type rule infers together with the
-/// outputs of the callee.
-///
-/// # Parameters
-///
-///   - `reshard`: Reshards a value of `context` to a [`Sharding`] (refer to [`Reshard`]).
-///   - `narrow`: Returns a value of `context` that does not vary along the provided manual mesh axes, which a context
-///     whose values hold the values of every device of a manual region can do without changing any value (e.g., the
-///     [`LockstepDomain`] of the `shard_map` emulation). Other contexts return the value unchanged.
-fn interpret_call<C: Domain<Type = ArrayIrType>, D: InterpretationDriver<C>>(
-    call: &CallOperation<ArrayIrType>,
-    context: &C,
-    driver: &D,
-    inputs: &[C::Value],
-    reshard: impl Fn(C::Value, &Sharding) -> Result<C::Value, ProgramError>,
-    narrow: impl Fn(C::Value, &BTreeSet<String>) -> Result<C::Value, ProgramError>,
-) -> Result<(Vec<ArrayIrType>, Vec<C::Value>), ProgramError> {
-    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    let region_interfaces = driver.region_interfaces();
-    let output_types = call.infer_output_types(&input_types, &region_interfaces)?;
-    let inputs = inputs
-        .iter()
-        .zip(&input_types)
-        .zip(region_interfaces[0].input_types())
-        .enumerate()
-        .map(|(index, ((input, actual), declared))| {
-            let placement = match (actual, declared) {
-                (ArrayIrType::Array(actual), ArrayIrType::Array(declared_type)) => match declared_type.sharding() {
-                    Some(sharding) => Some(Cow::Borrowed(sharding)),
-                    None => call
-                        .eager_boundary_input_sharding(index, actual, declared)
-                        .and_then(|boundary| {
-                            CallOperation::boundary_input_type(declared_type, &boundary)?.sharding().cloned()
-                        })
-                        .filter(|sharding| {
-                            let reshard = ReshardOperation::new(sharding.clone());
-                            reshard.infer_output_types(&[actual.clone()], &[]).is_ok()
-                        })
-                        .map(Cow::Owned),
-                }
-                .filter(|sharding| actual.sharding() != Some(sharding.as_ref())),
-                _ => None,
-            };
-            let input = match placement {
-                Some(sharding) => reshard(input.clone(), &sharding.without_manual_reduction_axes())?,
-                None => input.clone(),
-            };
-            let variation = match (actual, declared) {
-                (ArrayIrType::Array(actual), ArrayIrType::Array(declared)) => call_input_variation(declared, actual),
-                _ => None,
-            };
-            match variation.filter(|axes| !axes.is_empty()) {
-                Some(axes) => narrow(input, &axes),
-                None => Ok(input),
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((output_types, driver.interpret_region(context, 0, inputs)?))
-}
-
-/// Returns `output`, an output of a call that the `shard_map` emulation interprets in lockstep, varying along every
-/// manual mesh axis along which `r#type`, its type by the type rule of the call, varies and its own type does not. Each
-/// such axis is added by `parallel_vary`, which changes no value of any device. An output without a sharding first
-/// takes the replicated sharding over the mesh of `r#type`, as an output type without one does in the type rule.
-fn vary_lockstep_call_output<O: Operation<Type = ArrayIrType>, D: InterpretationDriver<LockstepDomain<O>>>(
-    context: &LockstepDomain<O>,
-    driver: &D,
-    output: LockstepValue<O>,
-    r#type: &ArrayIrType,
-) -> Result<LockstepValue<O>, ProgramError> {
-    let output_type = output.r#type().into_owned();
-    let (ArrayIrType::Array(r#type), ArrayIrType::Array(actual)) = (r#type, &output_type) else {
-        return Ok(output);
-    };
-    let Some(sharding) = r#type.sharding() else { return Ok(output) };
-    let actual_sharding = actual.sharding();
-    let axes = sharding
-        .varying_manual_axes()
-        .iter()
-        .filter(|axis| !actual_sharding.is_some_and(|actual| actual.varying_manual_axes().contains(*axis)))
-        .cloned()
-        .collect::<Vec<_>>();
-    if axes.is_empty() {
-        return Ok(output);
-    }
-    let mut output = match actual_sharding {
-        Some(_) => output,
-        None => {
-            let replicated = Sharding::replicated(sharding.mesh().clone(), actual.rank());
-            let placed = actual.clone().with_sharding(replicated).map_err(TypeError::from)?;
-            let values = output
-                .into_values()
-                .into_iter()
-                .map(|value| match value {
-                    ArrayIrValue::Array(array) => {
-                        Array::from_logical_bytes(placed.clone(), &array.logical_bytes()).map(ArrayIrValue::Array)
+impl CallOperation<ArrayIrType> {
+    /// Interprets this call in `context` on `inputs` by the reference semantics of a call. The type rule of the call
+    /// validates the complete application first (refer to [`CallOperation::validate_input_types`]), because direct
+    /// eager binding does not pass through program construction, so that interpretation accepts exactly the inputs that
+    /// staging accepts. Each array input is then placed where the eager application of a backend places it (refer to
+    /// [`CallOperation::eager_boundary_input_sharding`]), as far as the callee region accepts that placement and the
+    /// type of a value records it, and the callee region runs on the placed inputs:
+    ///
+    ///   - An input of a callee input type that declares a sharding enters the callee at that sharding, because the
+    ///     callee region validates its inputs against its declared input types and accepts no other placement. This is
+    ///     the boundary sharding of the input unless the call has a sharding override or a derived sharding for it that
+    ///     differs from the declared one, whose placement is therefore not observable inside the callee. An input of
+    ///     the lifted capture prefix, an input that the call keeps placed as it is, and an input that varies along
+    ///     manual mesh axes beyond its callee input type have no boundary sharding and enter at the declared sharding
+    ///     too. The target of the placement is the declared sharding without its manual reduction state, which
+    ///     `reshard` carries over from the input together with its manual variation, so that an input that varies
+    ///     beyond its callee input type keeps that variation.
+    ///   - An input of a callee input type without a sharding is placed at its boundary sharding, which is its sharding
+    ///     override, its derived sharding, or the sharding that replicates it over the mesh of the call, including the
+    ///     logical mesh of a placement over a single device, as far as its type records that sharding (refer to
+    ///     [`CallOperation::boundary_input_type`]). Placement along auto mesh axes is runtime state that neither types
+    ///     nor the values of the reference backend record (refer to
+    ///     [`Placed`](crate::operations::sharding::place::Placed)), so a backend applies it while this rule, as the
+    ///     reference rules of `place` and `constrain_sharding` do, keeps only the part that types record. A boundary
+    ///     sharding that states more than a placement (e.g., a pending reduction) or that `reshard` rejects (e.g., one
+    ///     that places a dimension along a manual mesh axis) is not applied at all. An input without a boundary
+    ///     sharding (i.e., of the lifted capture prefix, kept placed as it is, varying beyond its callee input type, or
+    ///     without a sharding when the call names no mesh) keeps its placement.
+    ///
+    /// Each placed input that varies along manual mesh axes beyond its callee input type (refer to
+    /// `call_input_variation`) is then passed to `narrow` with those axes. Returns the output types that the type rule
+    /// infers together with the outputs of the callee.
+    ///
+    /// # Parameters
+    ///
+    ///   - `reshard`: Reshards a value of `context` to a [`Sharding`] (refer to [`Reshard`]).
+    ///   - `narrow`: Returns a value of `context` that does not vary along the provided manual mesh axes, which a
+    ///     context whose values hold the values of every device of a manual region can do without changing any value
+    ///     (e.g., the [`LockstepDomain`] of the `shard_map` emulation). Other contexts return the value unchanged.
+    fn interpret_with<C: Domain<Type = ArrayIrType>, D: InterpretationDriver<C>>(
+        &self,
+        context: &C,
+        driver: &D,
+        inputs: &[C::Value],
+        reshard: impl Fn(C::Value, &Sharding) -> Result<C::Value, ProgramError>,
+        narrow: impl Fn(C::Value, &BTreeSet<String>) -> Result<C::Value, ProgramError>,
+    ) -> Result<(Vec<ArrayIrType>, Vec<C::Value>), ProgramError> {
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let region_interfaces = driver.region_interfaces();
+        let output_types = self.infer_output_types(&input_types, &region_interfaces)?;
+        let inputs = inputs
+            .iter()
+            .zip(&input_types)
+            .zip(region_interfaces[0].input_types())
+            .enumerate()
+            .map(|(index, ((input, actual), declared))| {
+                let placement = match (actual, declared) {
+                    (ArrayIrType::Array(actual), ArrayIrType::Array(declared_type)) => match declared_type.sharding() {
+                        Some(sharding) => Some(Cow::Borrowed(sharding)),
+                        None => self
+                            .eager_boundary_input_sharding(index, actual, declared)
+                            .and_then(|boundary| {
+                                CallOperation::boundary_input_type(declared_type, &boundary)?.sharding().cloned()
+                            })
+                            .filter(|sharding| {
+                                let reshard = ReshardOperation::new(sharding.clone());
+                                reshard.infer_output_types(&[actual.clone()], &[]).is_ok()
+                            })
+                            .map(Cow::Owned),
                     }
-                    value => Ok(value),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            LockstepValue::new(values, context)?
-        }
-    };
-    for axis in axes {
-        let mut outputs = ParallelVaryOperation::new(axis).interpret_in_parent(context, driver, &[output])?;
-        check_count!("output", outputs, 1, ProgramError);
-        output = outputs.remove(0);
+                    .filter(|sharding| actual.sharding() != Some(sharding.as_ref())),
+                    _ => None,
+                };
+                let input = match placement {
+                    Some(sharding) => reshard(input.clone(), &sharding.without_manual_reduction_axes())?,
+                    None => input.clone(),
+                };
+                let variation = match (actual, declared) {
+                    (ArrayIrType::Array(actual), ArrayIrType::Array(declared)) => {
+                        call_input_variation(declared, actual)
+                    }
+                    _ => None,
+                };
+                match variation.filter(|axes| !axes.is_empty()) {
+                    Some(axes) => narrow(input, &axes),
+                    None => Ok(input),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((output_types, driver.interpret_region(context, 0, inputs)?))
     }
-    Ok(output)
+
+    /// Folds or residualizes this call as a whole (refer to [`PartialEvaluationContext::fold_or_residualize`]). The
+    /// callee is bound as a shared program (refer to [`shared_call_callee`]), so that repeated calls of one callee keep
+    /// sharing one region in the known-side context and in the residual program.
+    fn fold_or_residualize<V, C, D>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
+    where
+        V: 'static + Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C: Context<
+                Type = ArrayIrType,
+                Constant = V,
+                Operation: 'static
+                               + From<CallOperation<ArrayIrType>>
+                               + From<GuardOperation<ArrayIrType>>
+                               + OperationPayloadProjection,
+            >,
+        D: PartialEvaluationDriver<C>,
+    {
+        // A call that folds into an eager known side (e.g., the primal call of an eager linearization) is applied by
+        // the eager context and keeps the mesh of its function, and so does a call that an eager known side
+        // residualizes (e.g., the tangent call of an eager linearization), whose residual program an eager context
+        // applies too (e.g., the pullback of an eager VJP, which transposes it). A call placed into a known or a
+        // residual program of a staged known side follows its caller.
+        let callee = shared_call_callee(driver.region(0)?)?;
+        let operation = if context.parent().is_eager() { self.clone() } else { self.without_function_mesh() };
+        context.fold_or_residualize(
+            C::Operation::from(operation),
+            AttachedRegions::Callees(std::slice::from_ref(&callee)),
+            inputs,
+            None,
+        )
+    }
+
+    /// Returns `outputs`, the outputs of this call of `callee` with `inputs`, with every output that `callee` returns
+    /// by forwarding one of its inputs replaced by that call input, like the input forwarding of JAX's `pjit` staging
+    /// rule, wherever the call provably returns that input unchanged. For an all-known call that partial evaluation
+    /// keeps whole under a residual policy, this lets the residual planner reuse the forwarded input (e.g., a primal
+    /// input that the primal call of a linearized callee returns as a residual).
+    ///
+    /// The input types must prove that forwarding preserves devices, placement, commitment, and admission checks. The
+    /// proof requires all of the following conditions.
+    ///
+    /// - The call leaves the function mesh and explicit devices unspecified, so a top-level application can follow its
+    ///   argument.
+    /// - The callee makes no placement requests. Any request, including a memory-only transfer, commits every output
+    ///   (refer to [`CallOperation::has_placement_requests`]).
+    /// - The forwarded input is the only public array argument. A committed sibling can select the devices, move an
+    ///   uncommitted input there, and commit every result. Two committed arguments on different devices are rejected.
+    ///   These decisions depend on runtime facts that the argument types omit.
+    /// - The input is outside the lifted capture prefix. The call moves its captures to where it runs and returns them
+    ///   uncommitted.
+    /// - The input type records sharding on a mesh without auto axes. An eager call rejects pending reductions its
+    ///   callee cannot receive. The type rule checks pending reductions on explicit and manual axes during staging, and
+    ///   pending reductions on auto axes require a runtime check. An input with no recorded sharding can live on any
+    ///   mesh.
+    /// - The boundary leaves the input in place (refer to [`CallOperation::boundary_input_sharding_constraint`]) and
+    ///   the eager application preserves its logical mesh on a single device (refer to
+    ///   [`CallOperation::eager_boundary_input_sharding`]).
+    ///
+    /// The call rejects an argument from another client. A forwarded argument from another client can be returned, as
+    /// by any program that returns an argument directly, and every consumer that executes rejects it.
+    ///
+    /// An eager known side folds the call on concrete arguments before forwarding any outputs, so admission checks have
+    /// already run. A staged known side can later be compiled, in which case the outer executable admits the arguments,
+    /// or interpreted eagerly (e.g., by [`Program::interpret_in_context`](crate::Program)), in which case each
+    /// surviving call checks its arguments and decides placement at runtime. The same forwarding conditions apply in
+    /// both cases.
+    fn forward_inputs<V, O, W>(
+        &self,
+        callee: RegionRef<'_, V, O>,
+        inputs: &[PartialEvaluationValue<W>],
+        outputs: Vec<PartialEvaluationValue<W>>,
+    ) -> Vec<PartialEvaluationValue<W>>
+    where
+        V: 'static + Value<Type = ArrayIrType>,
+        O: 'static + Operation<Type = ArrayIrType> + OperationPayloadProjection,
+        W: Value<Type = ArrayIrType>,
+    {
+        let input_types = inputs.iter().map(PartialEvaluationValue::r#type).collect::<Vec<_>>();
+        let public_array_count = input_types
+            .iter()
+            .skip(self.capture_count)
+            .filter(|r#type| matches!(r#type.as_ref(), ArrayIrType::Array(_)))
+            .count();
+        if public_array_count != 1
+            || self.function_mesh.is_some()
+            || self.has_placement_requests(|| RegionPlacementRequests::new(callee))
+        {
+            return outputs;
+        }
+        let declared = callee.input_types();
+        let unchanged = input_types
+            .iter()
+            .enumerate()
+            .map(|(position, r#type)| match r#type.as_ref() {
+                ArrayIrType::Array(actual) if position >= self.capture_count => {
+                    let records_reduction_state = actual.sharding().is_some_and(|sharding| {
+                        sharding.mesh().axes().iter().all(|axis| axis.r#type() != MeshAxisType::Auto)
+                    });
+                    records_reduction_state
+                        && self.boundary_input_sharding_constraint(position, actual, &declared[position]).is_none()
+                        && self
+                            .eager_boundary_input_sharding(position, actual, &declared[position])
+                            .is_none_or(|sharding| actual.sharding() == Some(sharding.as_ref()))
+                }
+                _ => false,
+            })
+            .collect::<Vec<_>>();
+        if !unchanged.contains(&true) {
+            return outputs;
+        }
+        outputs
+            .into_iter()
+            .zip(callee.output_ids())
+            .map(|(output, atom)| match callee.input_ids().iter().position(|input| input == atom) {
+                Some(position) if unchanged[position] && *input_types[position] == *output.r#type() => {
+                    inputs[position].clone()
+                }
+                _ => output,
+            })
+            .collect()
+    }
+
+    /// Splits this call into a known call, which binds a known callee in the known-side context, and a residual call,
+    /// which is emitted into the residual program, and returns the outputs of the call in output order.
+    ///
+    ///   - A split by [`Knownness`](CallSplitKind::Knownness) splits a call whose inputs are partially known. The known
+    ///     callee computes the known outputs together with the residual edges that the residual callee needs, which the
+    ///     residual policy of `context`, if any, places. When the known callee contains no instructions, the split
+    ///     hoists no work, and the call is kept whole.
+    ///   - A split on [`ResidualDemand`](CallSplitKind::ResidualDemand) splits an all-known call (refer to
+    ///     [`PartiallyEvaluatableOperation::split_on_residual_demand`]). The known callee computes every output of the
+    ///     callee together with the interior values that the residual policy of `context` saves, and the residual
+    ///     callee replays the demanded outputs from those values.
+    ///
+    /// The residual callee reads the call inputs and the known outputs that its residual edges would merely repeat
+    /// directly (i.e., JAX's `in_fwd` and `out_fwd`), so that the known callee returns each value once and a residual
+    /// planner plans those inputs like any other demanded value. The two callees are retained by the region transform
+    /// cache of the callee and bound as shared regions. Every call of one callee, including the calls nested in the
+    /// callees of an enclosing split, therefore shares one known callee and one residual callee for each kind of split
+    /// and each policy, so the programs grow with the number of calls rather than with the size of their callees, and
+    /// each callee is partitioned once rather than once per call. Calls whose partial evaluations round the saved
+    /// values (refer to [`PartialEvaluationContext::residual_rounding_type`]) share a split of their own, whose known
+    /// callee rounds the values that it saves right after their producers, before its own known work consumes them.
+    /// Mixed splits may contain effects, with the driver's repeated-residual mode included in the key. All-known splits
+    /// exclude effects, and both kinds exclude references, captures, and nominal identities (refer to
+    /// [`keeps_call_boundary`] and [`can_cache_call_split`]).
+    ///
+    /// `partition` partitions the callee for `kind`, which keys the retained split. Callers supply it because a split
+    /// on residual demand partitions through [`PartialEvaluationContext::partition_residual_demand`], whose bound only
+    /// the caller's [`PartiallyEvaluatableOperation::split_on_residual_demand`] states.
+    fn split<V, C, D>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+        kind: CallSplitKind,
+        partition: &dyn Fn(RegionRef<'_, V, C::Operation>) -> Result<PartitionedProgram<V, C::Operation>, ProgramError>,
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
+    where
+        V: 'static + Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        C: Context<
+                Type = ArrayIrType,
+                Constant = V,
+                Operation: 'static
+                               + From<CallOperation<ArrayIrType>>
+                               + From<GuardOperation<ArrayIrType>>
+                               + OperationPayloadProjection,
+            >,
+        D: PartialEvaluationDriver<C>,
+    {
+        /// [`Region`] [`Transform`] marker for the splits of the callee of a `call` that this function binds. Such a
+        /// split partitions the callee in fresh traces, where every input is a fresh known or unknown input, so it
+        /// depends on no value of a live context and is a structural function of the callee and of its
+        /// [`CallSplitArguments`]. Every call of one callee with the same arguments therefore shares one split, as
+        /// JAX's call partial evaluation rules share one split per callee, knownness, and policy through their caches.
+        struct CallSplitTransform;
+
+        impl<V, O> Transform<Region<V, O>> for CallSplitTransform
+        where
+            V: Value<Type = ArrayIrType>,
+            O: Operation<Type = ArrayIrType>,
+        {
+            type Arguments = CallSplitArguments;
+            type Artifact = TransformArtifact<V, O, Arc<CallSplit>>;
+
+            const DEFAULT_CACHE_CAPACITY: usize = 8;
+        }
+
+        /// Argument key for one retained [`CallSplitTransform`].
+        #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+        struct CallSplitArguments {
+            /// Kind of the split.
+            kind: CallSplitKind,
+
+            /// Residual policy that places the residuals of the split and of the splits nested within it, compared by
+            /// definition identity, or [`None`] when partial evaluation has no residual policy.
+            policy: Option<ResidualPolicyReference<ArrayIrType>>,
+
+            /// Type of the rounding with which the placement of the residuals of the split also rounds the values that
+            /// the known callee saves (refer to [`PartialEvaluationContext::residual_rounding_type`]), which stages
+            /// rounding operations in the known callee, or [`None`] when the placement keeps those values unrounded.
+            residual_rounding_type: Option<TypeId>,
+
+            /// Whether effectful operations with known inputs may fold into the known callee (refer to
+            /// [`PartialEvaluationContext::allow_effect_folding`]).
+            allow_effect_folding: bool,
+
+            /// Whether operations whose results must have storage of their own for every execution may fold into the
+            /// known callee (refer to [`PartialEvaluationContext::allow_copy_folding`]), which program specialization
+            /// disallows.
+            allow_copy_folding: bool,
+
+            /// Whether recursive partitioning analyzes repeated residual invocations, which changes effect placement
+            /// (refer to [`PartialEvaluationDriver::partitions_for_repeated_residual_calls`]). Pure and residual-demand
+            /// splits use `false` because their partitions do not depend on this mode.
+            repeated_residual: bool,
+        }
+
+        /// Boundary wiring of a retained [`CallSplitTransform`] artifact, whose programs are the known callee and the
+        /// residual callee, in that order. The known callee returns the known outputs of the original callee followed
+        /// by the residual edges that the residual callee reads from it, and the residual callee returns the remaining
+        /// outputs (i.e., the demanded outputs for a split on residual demand). Refer to [`PartitionedProgram`] for
+        /// more information on this layout.
+        #[derive(Clone, Debug, PartialEq)]
+        struct CallSplit {
+            /// Index of the call input feeding each input of the known callee, in order.
+            known_input_indices: Vec<usize>,
+
+            /// Source of each input of the residual callee, which is a call input, an output of the known callee, or a
+            /// residual edge.
+            residual_inputs: Vec<ResidualInputSource>,
+
+            /// Source of each output of the call, in output order, which is a known output of the known callee or an
+            /// output of the residual callee.
+            outputs: Vec<PartialEvaluationOutput<usize>>,
+        }
+
+        let callee = driver.region(0)?;
+        let keeps_trivial_splits_whole = matches!(kind, CallSplitKind::Knownness(_));
+        // A split on residual demand reports every output of the callee as known, followed by each demanded output once
+        // more as an output of the residual callee, in output order (refer to
+        // `PartialEvaluationContext::partition_residual_demand`). Each of those trailing outputs is therefore the call
+        // output that was demanded, whose boundary sharding the residual call keeps.
+        let demanded_output_indices = match &kind {
+            CallSplitKind::Knownness(_) => Vec::new(),
+            CallSplitKind::ResidualDemand(demanded_outputs) => demanded_outputs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, demanded)| demanded.then_some(index))
+                .collect(),
+        };
+        let arguments = CallSplitArguments {
+            kind,
+            policy: context.residual_policy().cloned(),
+            residual_rounding_type: context.residual_rounding_type(),
+            allow_effect_folding: context.allow_effect_folding(),
+            allow_copy_folding: context.allow_copy_folding(),
+            repeated_residual: keeps_trivial_splits_whole
+                && !callee.effects().classes().is_empty()
+                && driver.partitions_for_repeated_residual_calls(),
+        };
+        let artifact = callee.transform::<CallSplitTransform, _, ProgramError>(arguments, |callee, _| {
+            // Partitioning stages both callees in fresh traces, so the partition depends only on the callee and the
+            // arguments, including whether mixed splits use repeated-residual allocation and effect-ordering analysis.
+            let (known_program, residual_program, known_input_indices, residual_inputs, outputs) =
+                partition(callee)?.forward_residuals()?.into_parts();
+            Ok(TransformArtifact::new(
+                vec![Arc::new(known_program), Arc::new(residual_program)],
+                Arc::new(CallSplit { known_input_indices, residual_inputs, outputs }),
+            ))
+        })?;
+        let [known_callee, residual_callee] = artifact.programs() else {
+            unreachable!("`{CALL_OPERATION_NAME}` splits retain a known callee and a residual callee");
+        };
+        if keeps_trivial_splits_whole && known_callee.instructions().is_empty() {
+            return self.fold_or_residualize(context, driver, inputs);
+        }
+        let split = artifact.metadata();
+
+        // The effective boundary of the call follows the types of its inputs before they are guarded.
+        let boundary = self.effective_boundary_input_shardings(
+            &callee.input_types(),
+            inputs.iter().map(PartialEvaluationValue::r#type),
+        );
+
+        // Partitioning seeds both callees at the declared input types of the callee, so neither checks a relationship
+        // that the entry of the callee checks between a known and an unknown input. Both calls therefore consume
+        // guarded inputs.
+        let inputs = context.guard_inputs(&callee.input_types(), inputs.to_vec(), false)?;
+
+        // The known callee keeps the members of the lifted capture prefix that it uses as its leading inputs, in order.
+        // The residual callee reads no capture prefix, and neither callee holds a capture constant.
+        let known_capture_count =
+            split.known_input_indices.iter().filter(|index| **index < self.capture_count()).count();
+        let known_call = CallOperation::new(known_capture_count).with_callee_region(known_callee.entry_region_ref())?;
+        let residual_call = CallOperation::new(0).with_callee_region(residual_callee.entry_region_ref())?;
+        let (known_call, residual_call) = self.with_split_boundary_shardings(
+            known_call,
+            residual_call,
+            &boundary,
+            &split.known_input_indices,
+            &split.residual_inputs,
+            (0..callee.output_types().len()).chain(demanded_output_indices).zip(split.outputs.iter().copied()),
+            known_callee.output_count(),
+            residual_callee.output_count(),
+            context.parent().is_eager(),
+        );
+        let known_inputs = split.known_input_indices.iter().map(|index| inputs[*index].clone()).collect::<Vec<_>>();
+        let known_outputs = context.fold_or_residualize(
+            C::Operation::from(known_call.clone()),
+            AttachedRegions::Callees(std::slice::from_ref(known_callee)),
+            &known_inputs,
+            None,
+        )?;
+        let known_outputs = match context.residual_policy() {
+            Some(_) if known_callee.effects().classes().is_empty() => {
+                known_call.forward_inputs(known_callee.entry_region_ref(), &known_inputs, known_outputs)
+            }
+            _ => known_outputs,
+        };
+
+        // The residual edges trail the known outputs among the outputs of the known call.
+        let known_output_count = split.outputs.iter().filter(|output| output.is_known()).count();
+        let residual_inputs = split
+            .residual_inputs
+            .iter()
+            .map(|source| match *source {
+                ResidualInputSource::UnknownInput(index) | ResidualInputSource::KnownInput(index) => {
+                    inputs[index].clone()
+                }
+                ResidualInputSource::KnownOutput(index) => known_outputs[index].clone(),
+                ResidualInputSource::ResidualEdge(edge) => known_outputs[known_output_count + edge].clone(),
+            })
+            .collect::<Vec<_>>();
+        let residual_outputs = context.residualize(
+            C::Operation::from(residual_call),
+            AttachedRegions::Callees(std::slice::from_ref(residual_callee)),
+            &residual_inputs,
+        )?;
+        Ok(split
+            .outputs
+            .iter()
+            .map(|output| match *output {
+                PartialEvaluationOutput::Known(index) => known_outputs[index].clone(),
+                PartialEvaluationOutput::Unknown(index) => residual_outputs[index].clone(),
+            })
+            .collect())
+    }
+
+    /// Transposes this tangent call while retaining its compilation boundary, and returns the cotangent of each of its
+    /// inputs.
+    ///
+    /// The [`TranspositionDriver`] transposes the attached callee under the linearity and cotangent destination masks
+    /// of the inputs and the structural zeros of its output cotangents. Known inputs supply residual or captured values
+    /// and may appear anywhere in the input boundary. The transposed call consumes the ordinary output cotangents that
+    /// are not structural zeros, live cotangent references, and known inputs, in that order. A structural zero output
+    /// cotangent seeds nothing, so it has no input in the transposed call and is not materialized at the call boundary,
+    /// although a dense backward rule inside the callee may still materialize the zero that it consumes. Reference
+    /// outputs forward input roots and therefore have no separate output cotangent slot.
+    ///
+    /// Returned cotangents follow the original input order. Linear value inputs receive call results, reference inputs
+    /// accumulate into their supplied cotangent destinations, and known or ignored inputs receive structural zeros.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active transpose tracing context the pullback is staged into.
+    ///   - `driver`: Instruction-scoped access to the attached callee region and its recursive transposition machinery.
+    ///   - `inputs`: [`PartialValue`] knowledge of each input, mirroring the callee's inputs one to one. The
+    ///     [`Unknown`](PartialValue::Unknown) entries are the input tangents, and the [`Known`](PartialValue::Known)
+    ///     entries carry the residual tracers and the tangent tracers of captured constants that the pullback reads.
+    ///   - `outputs`: Symbolic cotangents for the tangent call's outputs, one per callee output. A
+    ///     [`Zero`](MaybeZero::Zero) entry has no input in the transposed call.
+    ///   - `cotangents`: Cotangent destinations of the inputs (refer to the documentation of
+    ///     [`TranspositionContext::cotangent_destinations`]). The callee is transposed with their destination kinds, so
+    ///     the cotangent reference of a live reference input (i.e., one with a `Reference` destination) is an input of
+    ///     the transposed call, which accumulates into it in place and returns it by identity, while a dead reference
+    ///     input (i.e., one with an `Ignore` destination) has no slot in the transposed callee at all.
+    fn transposed_input_cotangents<V, O, D>(
+        &self,
+        context: &mut TracingContext<V, O>,
+        driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        cotangents: &CotangentDestinations<Tracer<TracingContext<V, O>>>,
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
+    where
+        V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+        O: Operation<Type = ArrayIrType>
+            + From<CallOperation<ArrayIrType>>
+            + From<CastOperation<ArrayIrType>>
+            + OperationProjection<ArrayType, Projected: From<ReshardOperation> + From<ParallelReduceOperation>>,
+        D: TranspositionDriver<V, O>,
+        TracingContext<V, O>: StagingContext<Type = ArrayIrType, Constant = V, Operation = O>,
+    {
+        // A `call` operation with no live output cotangents and no live reference input is a zero linear map, so every
+        // input cotangent is zero. A live reference input keeps the call live, because its accumulated state cotangent
+        // flows through the transposed callee even when no ordinary output cotangent does. A callee with deferred work
+        // or observable rule effects also keeps it live.
+        check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
+        if outputs.iter().all(MaybeZero::is_zero)
+            && !cotangents.has_reference_state_destinations()
+            && !driver.region(0)?.must_transpose()
+        {
+            return inputs
+                .iter()
+                .map(|input| input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from))
+                .collect();
+        }
+
+        // Each input maps to one callee input, independently linear (i.e., an input tangent) or known (i.e., a residual
+        // value or the tangent of a captured constant). The linear inputs need not lead, because a captured compiled
+        // function threads its captured prefix as known leading inputs. The dispatch guarantees that a `Known` input
+        // carries its pullback value, so each known tracer is read directly in callee input order.
+        let input_linearity = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
+        let callee = driver.region(0)?;
+        check_count!("input", input_linearity, callee.input_types().len(), ProgramError);
+
+        // Transpose the callee with respect to its linear inputs and with its structural zero output cotangents
+        // flagged, through the region's retained transform cache so that a callee shared by several outer programs is
+        // transposed once per linearity and seed mask. A live linear reference input is transposed with a `Reference`
+        // destination and a dead one with an `Ignore` destination, so the transposed callee maps
+        // `[live_non_reference_output_cotangents..., cotangent_references..., known_input_values...]` to
+        // `[linear_input_cotangents...]`, in callee input order, where a live reference input's cotangent is its
+        // cotangent reference itself and a dead reference input has no cotangent slot. The flags follow the callee's
+        // complete output order, and flags of reference outputs are normalized away because those outputs never own a
+        // cotangent slot.
+        let (input_indices, destination_kinds): (Vec<_>, Vec<_>) = input_linearity
+            .iter()
+            .zip(cotangents.kinds())
+            .enumerate()
+            .filter_map(|(index, (linear, kind))| linear.then_some((index, *kind)))
+            .unzip();
+        let output_types = callee.output_types();
+        check_count!("output", outputs, output_types.len(), ProgramError);
+        let zero_output_cotangents = outputs.iter().map(MaybeZero::is_zero).collect::<Vec<_>>();
+        let transposed_callee = driver.transpose_program_with_zero_seeds(
+            callee,
+            &input_indices,
+            &[],
+            &zero_output_cotangents,
+            &destination_kinds,
+        )?;
+
+        // Stage a fresh `call` over the transposed callee on `[live_outputs..., cotangent_references...,
+        // known_input_values...]`. Its outputs are the cotangents of the linear inputs. A reference output forwards a
+        // callee input root whose state cotangent lives in the cotangent reference of that input, so it owns no
+        // cotangent slot.
+        let mut transposed_inputs = Vec::with_capacity(output_types.len() + inputs.len());
+        transposed_inputs.extend(
+            outputs
+                .iter()
+                .zip(output_types.iter())
+                .filter(|(_, output_type)| !output_type.is_reference())
+                .filter_map(|(cotangent, _)| cotangent.as_value())
+                .cloned(),
+        );
+        transposed_inputs.extend(cotangents.references().iter().cloned());
+        transposed_inputs.extend(inputs.iter().filter_map(PartialValue::as_known).cloned());
+        // The transposed callee's inputs are live output cotangents, cotangent references, and known input values, and
+        // never a lifted-capture prefix. Attached region capture constants cannot appear in it because region bodies
+        // are traced through fresh-root contexts. Each output cotangent has the cotangent sharding of the boundary
+        // sharding of its output and each known input value the boundary sharding of its input, and the cotangent
+        // references have none, as JAX's `_pjit_transpose` gives the cotangents the cotangent shardings of their
+        // primals through `to_ct_spec`. Each returned linear input cotangent has the cotangent sharding of its input,
+        // whichever other inputs have a structurally zero or absent cotangent, which returns nothing (refer to
+        // `TransposedProgramCotangent`).
+        let mut transposed_call =
+            CallOperation::new(0).with_callee_region(transposed_callee.program().entry_region_ref())?;
+        transposed_call.keeps_input_placements = self.keeps_input_placements();
+        transposed_call.function_mesh = self.function_mesh.clone();
+        // The known input values keep the effective boundary of the call (refer to `with_derived_boundary_shardings`),
+        // which, in the tangent call of a linearization, places the inputs of the original call that it receives and
+        // leaves its residuals where they are.
+        let boundary =
+            self.effective_boundary_input_shardings(&callee.input_types(), inputs.iter().map(PartialValue::r#type));
+        // Seed inputs enter on the tangent result's cotangent sharding when the call already knows its devices. Eager
+        // admission checks device commitments before applying these boundary shardings. The callee can then transpose
+        // any placement-only result cast using the seed's admitted type.
+        let function_mesh = self
+            .function_mesh
+            .as_ref()
+            .filter(|function| function.logical_mesh().is_named())
+            .map(|function| function.logical_mesh());
+        let seed_shardings = outputs
+            .iter()
+            .zip(&output_types)
+            .filter(|(cotangent, output_type)| !output_type.is_reference() && cotangent.as_value().is_some())
+            .map(|(_, output_type)| {
+                let ArrayIrType::Array(output_type) = output_type else { return Ok(None) };
+                output_type
+                    .sharding()
+                    .filter(|sharding| Some(sharding.mesh()) == function_mesh)
+                    .map(Sharding::cotangent)
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(TypeError::from)?;
+        transposed_call.derived_input_shardings = Some(
+            seed_shardings
+                .into_iter()
+                .chain(std::iter::repeat_n(None, cotangents.references().len()))
+                .chain(
+                    inputs
+                        .iter()
+                        .zip(boundary)
+                        .filter(|(input, _)| input.as_known().is_some())
+                        .map(|(_, sharding)| sharding),
+                )
+                .collect(),
+        );
+        if let Some(mesh) = self.mesh() {
+            // An override places a primal value, and the cotangent of that value has the dual reduction state (refer to
+            // `Sharding::cotangent`), so each cotangent that crosses the boundary (i.e., an output cotangent that the
+            // transposed call receives and an input cotangent that it returns) is placed at the cotangent sharding of
+            // the override of its primal, as the cotangent types of those primals record it, and each known primal
+            // value is placed at the override itself. An input cotangent that the transposed call returns is the
+            // cotangent of the argument as the callee holds it once it has entered, so it carries no reduction state
+            // over auto mesh axes, which no type records (refer to `Sharding::without_auto_reduction_axes`).
+            let cotangent_sharding = |sharding: Option<&Sharding>| sharding.map(Sharding::cotangent).transpose();
+            let output_cotangent_shardings = outputs
+                .iter()
+                .zip(output_types.iter())
+                .enumerate()
+                .filter(|(_, (cotangent, output_type))| !output_type.is_reference() && cotangent.as_value().is_some())
+                .map(|(index, _)| cotangent_sharding(self.output_sharding(index)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(TypeError::from)?;
+            let reference_shardings = cotangents.references().iter().map(|_| None);
+            let known_input_shardings = inputs
+                .iter()
+                .enumerate()
+                .filter(|(_, input)| input.as_known().is_some())
+                .map(|(index, _)| self.input_sharding(index).cloned());
+            let input_shardings = output_cotangent_shardings
+                .into_iter()
+                .chain(reference_shardings)
+                .chain(known_input_shardings)
+                .collect();
+            let output_shardings = input_indices
+                .iter()
+                .zip(transposed_callee.cotangents())
+                .filter(|(_, cotangent)| **cotangent == TransposedProgramCotangent::Output)
+                .map(|(&index, _)| cotangent_sharding(self.input_sharding(index)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(TypeError::from)?
+                .into_iter()
+                .map(|sharding| sharding.map(|sharding| sharding.without_auto_reduction_axes()))
+                .collect::<Vec<_>>();
+            transposed_call = transposed_call.with_boundary(Some(mesh), input_shardings, output_shardings);
+        }
+        let transposed_call = O::from(transposed_call);
+        let input_cotangents = context.bind(
+            transposed_call,
+            AttachedRegions::Callees(&[transposed_callee.program().clone()]),
+            transposed_inputs.as_slice(),
+        )?;
+        let cotangent_types = input_indices
+            .iter()
+            .map(|&index| inputs[index].r#type().cotangent().map_err(ProgramError::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut input_cotangents =
+            transposed_callee.assemble_cotangents(&cotangent_types, input_cotangents)?.into_iter();
+
+        // Reassemble selected cotangents from the call's compact output boundary. Known and ignored inputs carry
+        // structural zeros. Reference-state outputs only thread the caller-owned destination, so they do not contribute
+        // a value cotangent to the enclosing context.
+        inputs
+            .iter()
+            .map(|input| {
+                let cotangent = if input.is_unknown() { input_cotangents.next().unwrap() } else { None };
+                match cotangent {
+                    Some(MaybeZero::Value(mut cotangent)) if !input.r#type().is_reference() => {
+                        let refined = input.r#type().cotangent().map_err(ProgramError::from)?;
+
+                        // A call whose inputs vary along manual mesh axes beyond the callee input types runs its callee
+                        // as if every input varied along all of them, as a JAX `jit` function is retraced with `pvary`
+                        // inserted on the inputs that vary along fewer axes. Each shard along such an axis then holds
+                        // one contribution to the cotangent of an input that does not vary along it, so the cotangent
+                        // is summed over the manual mesh axes along which it varies beyond its refined type, with the
+                        // `parallel_reduce` over a mesh that the transposition of `parallel_vary` stages.
+                        let extra_variation = match (&refined, cotangent.r#type().as_ref()) {
+                            (ArrayIrType::Array(refined), ArrayIrType::Array(actual)) => {
+                                actual.sharding().map(|sharding| {
+                                    let declared = refined.sharding().map(Sharding::varying_manual_axes);
+                                    let axes = sharding
+                                        .varying_manual_axes()
+                                        .iter()
+                                        .filter(|axis| !declared.is_some_and(|declared| declared.contains(*axis)))
+                                        .cloned()
+                                        .collect::<Vec<_>>();
+                                    (sharding.mesh().clone(), axes)
+                                })
+                            }
+                            _ => None,
+                        };
+                        if let Some((mesh, axes)) = extra_variation {
+                            for axis in axes {
+                                let reduction =
+                                    ParallelReduceOperation::new(ReductionKind::Sum, axis).with_mesh(mesh.clone());
+                                let reduction = <<O as OperationProjection<ArrayType>>::Projected>::from(reduction);
+                                cotangent = context.bind(reduction, Vec::new(), &[cotangent])?.remove(0);
+                            }
+                        }
+
+                        let cotangent = refined_derived_value(context, self.mesh(), refined, cotangent);
+                        return Ok(MaybeZero::Value(cotangent?));
+                    }
+                    Some(cotangent) if !input.r#type().is_reference() => return Ok(cotangent),
+                    _ => {}
+                }
+                input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
+            })
+            .collect()
+    }
 }
 
 /// Returns the callee of a `call` bound over `callee` as a shared program, which is the program that `callee` was
@@ -2707,42 +3324,6 @@ fn shared_call_callee<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrT
     Ok(artifact.programs()[0].clone())
 }
 
-/// Folds or residualizes `operation` as one whole call (refer to [`PartialEvaluationContext::fold_or_residualize`]).
-/// The callee is bound as a shared program (refer to [`shared_call_callee`]), so that repeated calls of one callee
-/// keep sharing one region in the known-side context and in the residual program.
-fn fold_or_residualize_call<V, C, D>(
-    operation: &CallOperation<ArrayIrType>,
-    context: &PartialEvaluationContext<C>,
-    driver: &D,
-    inputs: &[PartialEvaluationValue<C::Value>],
-) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
-where
-    V: 'static + Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C: Context<
-            Type = ArrayIrType,
-            Constant = V,
-            Operation: 'static
-                           + From<CallOperation<ArrayIrType>>
-                           + From<GuardOperation<ArrayIrType>>
-                           + OperationPayloadProjection,
-        >,
-    D: PartialEvaluationDriver<C>,
-{
-    // A call that folds into an eager known side (e.g., the primal call of an eager linearization) is applied by the
-    // eager context and keeps the mesh of its function, and so does a call that an eager known side residualizes (e.g.,
-    // the tangent call of an eager linearization), whose residual program an eager context applies too (e.g., the
-    // pullback of an eager VJP, which transposes it). A call placed into a known or a residual program of a staged
-    // known side follows its caller.
-    let callee = shared_call_callee(driver.region(0)?)?;
-    let operation = if context.parent().is_eager() { operation.clone() } else { operation.without_function_mesh() };
-    context.fold_or_residualize(
-        C::Operation::from(operation),
-        AttachedRegions::Callees(std::slice::from_ref(&callee)),
-        inputs,
-        None,
-    )
-}
-
 /// Returns whether an all-known call of `callee` with `inputs` keeps its boundary under a residual policy, which is the
 /// case when `callee` has effects, references, nominal type identities, or capture constants. Splitting such a call on
 /// residual demand, or forwarding its outputs, would move effects, reference accesses, nominally scoped types, or
@@ -2769,315 +3350,6 @@ fn can_cache_call_split<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayI
         && !callee.contains_atom_in_closure(|atom| {
             atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
         })
-}
-
-/// Returns `outputs`, the outputs of `operation`, a call of `callee` with `inputs`, with every output that `callee`
-/// returns by forwarding one of its inputs replaced by that call input, like the input forwarding of JAX's `pjit`
-/// staging rule, wherever the call provably returns that input unchanged. For an all-known call that partial
-/// evaluation keeps whole under a residual policy, this lets the residual planner reuse the forwarded input (e.g.,
-/// a primal input that the primal call of a linearized callee returns as a residual).
-///
-/// The input types must prove that forwarding preserves devices, placement, commitment, and admission checks. The
-/// proof requires all of the following conditions.
-///
-/// - The call leaves the function mesh and explicit devices unspecified, so a top-level application can follow its
-///   argument.
-/// - The callee makes no placement requests. Any request, including a memory-only transfer, commits every output
-///   (refer to [`CallOperation::has_placement_requests`]).
-/// - The forwarded input is the only public array argument. A committed sibling can select the devices, move an
-///   uncommitted input there, and commit every result. Two committed arguments on different devices are rejected.
-///   These decisions depend on runtime facts that the argument types omit.
-/// - The input is outside the lifted capture prefix. The call moves its captures to where it runs and returns them
-///   uncommitted.
-/// - The input type records sharding on a mesh without auto axes. An eager call rejects pending reductions its callee
-///   cannot receive. The type rule checks pending reductions on explicit and manual axes during staging, and pending
-///   reductions on auto axes require a runtime check. An input with no recorded sharding can live on any mesh.
-/// - The boundary leaves the input in place (refer to [`CallOperation::boundary_input_sharding_constraint`]) and the
-///   eager application preserves its logical mesh on a single device (refer to
-///   [`CallOperation::eager_boundary_input_sharding`]).
-///
-/// The call rejects an argument from another client. A forwarded argument from another client can be returned, as
-/// by any program that returns an argument directly, and every consumer that executes rejects it.
-///
-/// An eager known side folds the call on concrete arguments before forwarding any outputs, so admission checks have
-/// already run. A staged known side can later be compiled, in which case the outer executable admits the arguments,
-/// or interpreted eagerly (e.g., by [`Program::interpret_in_context`](crate::Program)), in which case each surviving
-/// call checks its arguments and decides placement at runtime. The same forwarding conditions apply in both cases.
-fn forward_call_inputs<V, O, W>(
-    operation: &CallOperation<ArrayIrType>,
-    callee: RegionRef<'_, V, O>,
-    inputs: &[PartialEvaluationValue<W>],
-    outputs: Vec<PartialEvaluationValue<W>>,
-) -> Vec<PartialEvaluationValue<W>>
-where
-    V: 'static + Value<Type = ArrayIrType>,
-    O: 'static + Operation<Type = ArrayIrType> + OperationPayloadProjection,
-    W: Value<Type = ArrayIrType>,
-{
-    let input_types = inputs.iter().map(PartialEvaluationValue::r#type).collect::<Vec<_>>();
-    let public_array_count = input_types
-        .iter()
-        .skip(operation.capture_count)
-        .filter(|r#type| matches!(r#type.as_ref(), ArrayIrType::Array(_)))
-        .count();
-    if public_array_count != 1
-        || operation.function_mesh.is_some()
-        || operation.has_placement_requests(|| RegionPlacementRequests::new(callee))
-    {
-        return outputs;
-    }
-    let declared = callee.input_types();
-    let unchanged = input_types
-        .iter()
-        .enumerate()
-        .map(|(position, r#type)| match r#type.as_ref() {
-            ArrayIrType::Array(actual) if position >= operation.capture_count => {
-                let records_reduction_state = actual.sharding().is_some_and(|sharding| {
-                    sharding.mesh().axes().iter().all(|axis| axis.r#type() != MeshAxisType::Auto)
-                });
-                records_reduction_state
-                    && operation.boundary_input_sharding_constraint(position, actual, &declared[position]).is_none()
-                    && operation
-                        .eager_boundary_input_sharding(position, actual, &declared[position])
-                        .is_none_or(|sharding| actual.sharding() == Some(sharding.as_ref()))
-            }
-            _ => false,
-        })
-        .collect::<Vec<_>>();
-    if !unchanged.contains(&true) {
-        return outputs;
-    }
-    outputs
-        .into_iter()
-        .zip(callee.output_ids())
-        .map(|(output, atom)| match callee.input_ids().iter().position(|input| input == atom) {
-            Some(position) if unchanged[position] && *input_types[position] == *output.r#type() => {
-                inputs[position].clone()
-            }
-            _ => output,
-        })
-        .collect()
-}
-
-/// Splits `operation` into a known call, which binds a known callee in the known-side context, and a residual call,
-/// which is emitted into the residual program, and returns the outputs of the call in output order.
-///
-///   - A split by [`Knownness`](CallSplitKind::Knownness) splits a call whose inputs are partially known. The known
-///     callee computes the known outputs together with the residual edges that the residual callee needs, which the
-///     residual policy of `context`, if any, places. When the known callee contains no instructions, the split hoists
-///     no work, and the call is kept whole.
-///   - A split on [`ResidualDemand`](CallSplitKind::ResidualDemand) splits an all-known call (refer to
-///     [`PartiallyEvaluatableOperation::split_on_residual_demand`]). The known callee computes every output of the
-///     callee together with the interior values that the residual policy of `context` saves, and the residual callee
-///     replays the demanded outputs from those values.
-///
-/// The residual callee reads the call inputs and the known outputs that its residual edges would merely repeat
-/// directly (i.e., JAX's `in_fwd` and `out_fwd`), so that the known callee returns each value once and a residual
-/// planner plans those inputs like any other demanded value. The two callees are retained by the region transform cache
-/// of the callee and bound as shared regions. Every call of one callee, including the
-/// calls nested in the callees of an enclosing split, therefore shares one known callee and one residual callee for
-/// each kind of split and each policy, so the programs grow with the number of calls rather than with the size of
-/// their callees, and each callee is partitioned once rather than once per call. Calls whose partial evaluations round
-/// the saved values (refer to [`PartialEvaluationContext::residual_rounding_type`]) share a split of their own, whose
-/// known callee rounds the values that it saves right after their producers, before its own known work consumes them.
-/// Mixed splits may contain effects, with the driver's repeated-residual mode included in the key. All-known splits
-/// exclude effects, and both kinds exclude references, captures, and nominal identities (refer to
-/// [`keeps_call_boundary`] and [`can_cache_call_split`]).
-///
-/// `partition` partitions the callee for `kind`, which keys the retained split. Callers supply it because a split on
-/// residual demand partitions through [`PartialEvaluationContext::partition_residual_demand`], whose bound only the
-/// caller's [`PartiallyEvaluatableOperation::split_on_residual_demand`] states.
-fn split_call<V, C, D>(
-    operation: &CallOperation<ArrayIrType>,
-    context: &PartialEvaluationContext<C>,
-    driver: &D,
-    inputs: &[PartialEvaluationValue<C::Value>],
-    kind: CallSplitKind,
-    partition: &dyn Fn(RegionRef<'_, V, C::Operation>) -> Result<PartitionedProgram<V, C::Operation>, ProgramError>,
-) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
-where
-    V: 'static + Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C: Context<
-            Type = ArrayIrType,
-            Constant = V,
-            Operation: 'static
-                           + From<CallOperation<ArrayIrType>>
-                           + From<GuardOperation<ArrayIrType>>
-                           + OperationPayloadProjection,
-        >,
-    D: PartialEvaluationDriver<C>,
-{
-    /// [`Region`] [`Transform`] marker for the splits of the callee of a `call` that this function binds. Such a split
-    /// partitions the callee in fresh traces, where every input is a fresh known or unknown input, so it depends on no
-    /// value of a live context and is a structural function of the callee and of its [`CallSplitArguments`]. Every call
-    /// of one callee with the same arguments therefore shares one split, as JAX's call partial evaluation rules share
-    /// one split per callee, knownness, and policy through their caches.
-    struct CallSplitTransform;
-
-    impl<V, O> Transform<Region<V, O>> for CallSplitTransform
-    where
-        V: Value<Type = ArrayIrType>,
-        O: Operation<Type = ArrayIrType>,
-    {
-        type Arguments = CallSplitArguments;
-        type Artifact = TransformArtifact<V, O, Arc<CallSplit>>;
-
-        const DEFAULT_CACHE_CAPACITY: usize = 8;
-    }
-
-    /// Argument key for one retained [`CallSplitTransform`].
-    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-    struct CallSplitArguments {
-        /// Kind of the split.
-        kind: CallSplitKind,
-
-        /// Residual policy that places the residuals of the split and of the splits nested within it, compared by
-        /// definition identity, or [`None`] when partial evaluation has no residual policy.
-        policy: Option<ResidualPolicyReference<ArrayIrType>>,
-
-        /// Type of the rounding with which the placement of the residuals of the split also rounds the values that the
-        /// known callee saves (refer to [`PartialEvaluationContext::residual_rounding_type`]), which stages rounding
-        /// operations in the known callee, or [`None`] when the placement keeps those values unrounded.
-        residual_rounding_type: Option<TypeId>,
-
-        /// Whether effectful operations with known inputs may fold into the known callee (refer to
-        /// [`PartialEvaluationContext::allow_effect_folding`]).
-        allow_effect_folding: bool,
-
-        /// Whether operations whose results must have storage of their own for every execution may fold into the known
-        /// callee (refer to [`PartialEvaluationContext::allow_copy_folding`]), which program specialization disallows.
-        allow_copy_folding: bool,
-
-        /// Whether recursive partitioning analyzes repeated residual invocations, which changes effect placement (refer
-        /// to [`PartialEvaluationDriver::partitions_for_repeated_residual_calls`]). Pure and residual-demand splits use
-        /// `false` because their partitions do not depend on this mode.
-        repeated_residual: bool,
-    }
-
-    /// Boundary wiring of a retained [`CallSplitTransform`] artifact, whose programs are the known callee and the
-    /// residual callee, in that order. The known callee returns the known outputs of the original callee followed by
-    /// the residual edges that the residual callee reads from it, and the residual callee returns the remaining outputs
-    /// (i.e., the demanded outputs for a split on residual demand). Refer to [`PartitionedProgram`] for more
-    /// information on this layout.
-    #[derive(Clone, Debug, PartialEq)]
-    struct CallSplit {
-        /// Index of the call input feeding each input of the known callee, in order.
-        known_input_indices: Vec<usize>,
-
-        /// Source of each input of the residual callee, which is a call input, an output of the known callee, or a
-        /// residual edge.
-        residual_inputs: Vec<ResidualInputSource>,
-
-        /// Source of each output of the call, in output order, which is a known output of the known callee or an output
-        /// of the residual callee.
-        outputs: Vec<PartialEvaluationOutput<usize>>,
-    }
-
-    let callee = driver.region(0)?;
-    let keeps_trivial_splits_whole = matches!(kind, CallSplitKind::Knownness(_));
-    // A split on residual demand reports every output of the callee as known, followed by each demanded output once
-    // more as an output of the residual callee, in output order (refer to
-    // `PartialEvaluationContext::partition_residual_demand`). Each of those trailing outputs is therefore the call
-    // output that was demanded, whose boundary sharding the residual call keeps.
-    let demanded_output_indices = match &kind {
-        CallSplitKind::Knownness(_) => Vec::new(),
-        CallSplitKind::ResidualDemand(demanded_outputs) => demanded_outputs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, demanded)| demanded.then_some(index))
-            .collect(),
-    };
-    let arguments = CallSplitArguments {
-        kind,
-        policy: context.residual_policy().cloned(),
-        residual_rounding_type: context.residual_rounding_type(),
-        allow_effect_folding: context.allow_effect_folding(),
-        allow_copy_folding: context.allow_copy_folding(),
-        repeated_residual: keeps_trivial_splits_whole
-            && !callee.effects().classes().is_empty()
-            && driver.partitions_for_repeated_residual_calls(),
-    };
-    let artifact = callee.transform::<CallSplitTransform, _, ProgramError>(arguments, |callee, _| {
-        // Partitioning stages both callees in fresh traces, so the partition depends only on the callee and the
-        // arguments, including whether mixed splits use repeated-residual allocation and effect-ordering analysis.
-        let (known_program, residual_program, known_input_indices, residual_inputs, outputs) =
-            partition(callee)?.forward_residuals()?.into_parts();
-        Ok(TransformArtifact::new(
-            vec![Arc::new(known_program), Arc::new(residual_program)],
-            Arc::new(CallSplit { known_input_indices, residual_inputs, outputs }),
-        ))
-    })?;
-    let [known_callee, residual_callee] = artifact.programs() else {
-        unreachable!("`{CALL_OPERATION_NAME}` splits retain a known callee and a residual callee");
-    };
-    if keeps_trivial_splits_whole && known_callee.instructions().is_empty() {
-        return fold_or_residualize_call(operation, context, driver, inputs);
-    }
-    let split = artifact.metadata();
-
-    // The effective boundary of the call follows the types of its inputs before they are guarded.
-    let boundary = operation
-        .effective_boundary_input_shardings(&callee.input_types(), inputs.iter().map(PartialEvaluationValue::r#type));
-
-    // Partitioning seeds both callees at the declared input types of the callee, so neither checks a relationship that
-    // the entry of the callee checks between a known and an unknown input. Both calls therefore consume guarded inputs.
-    let inputs = context.guard_inputs(&callee.input_types(), inputs.to_vec(), false)?;
-
-    // The known callee keeps the members of the lifted capture prefix that it uses as its leading inputs, in order.
-    // The residual callee reads no capture prefix, and neither callee holds a capture constant.
-    let known_capture_count =
-        split.known_input_indices.iter().filter(|index| **index < operation.capture_count()).count();
-    let known_call = CallOperation::new(known_capture_count).with_callee_region(known_callee.entry_region_ref())?;
-    let residual_call = CallOperation::new(0).with_callee_region(residual_callee.entry_region_ref())?;
-    let (known_call, residual_call) = operation.with_split_boundary_shardings(
-        known_call,
-        residual_call,
-        &boundary,
-        &split.known_input_indices,
-        &split.residual_inputs,
-        (0..callee.output_types().len()).chain(demanded_output_indices).zip(split.outputs.iter().copied()),
-        known_callee.output_count(),
-        residual_callee.output_count(),
-        context.parent().is_eager(),
-    );
-    let known_inputs = split.known_input_indices.iter().map(|index| inputs[*index].clone()).collect::<Vec<_>>();
-    let known_outputs = context.fold_or_residualize(
-        C::Operation::from(known_call.clone()),
-        AttachedRegions::Callees(std::slice::from_ref(known_callee)),
-        &known_inputs,
-        None,
-    )?;
-    let known_outputs = match context.residual_policy() {
-        Some(_) if known_callee.effects().classes().is_empty() => {
-            forward_call_inputs(&known_call, known_callee.entry_region_ref(), &known_inputs, known_outputs)
-        }
-        _ => known_outputs,
-    };
-
-    // The residual edges trail the known outputs among the outputs of the known call.
-    let known_output_count = split.outputs.iter().filter(|output| output.is_known()).count();
-    let residual_inputs = split
-        .residual_inputs
-        .iter()
-        .map(|source| match *source {
-            ResidualInputSource::UnknownInput(index) | ResidualInputSource::KnownInput(index) => inputs[index].clone(),
-            ResidualInputSource::KnownOutput(index) => known_outputs[index].clone(),
-            ResidualInputSource::ResidualEdge(edge) => known_outputs[known_output_count + edge].clone(),
-        })
-        .collect::<Vec<_>>();
-    let residual_outputs = context.residualize(
-        C::Operation::from(residual_call),
-        AttachedRegions::Callees(std::slice::from_ref(residual_callee)),
-        &residual_inputs,
-    )?;
-    Ok(split
-        .outputs
-        .iter()
-        .map(|output| match *output {
-            PartialEvaluationOutput::Known(index) => known_outputs[index].clone(),
-            PartialEvaluationOutput::Unknown(index) => residual_outputs[index].clone(),
-        })
-        .collect())
 }
 
 /// Returns `callee`, the callee of a call whose effective boundary is `boundary` (refer to
@@ -3159,7 +3431,7 @@ fn batched_boundary_sharding(
 /// topology. A value whose refined type names a different mesh is returned unchanged.
 ///
 /// A value whose type differs from `refined` in its sharding only in dimensions that one of them leaves unconstrained
-/// (i.e., `{?}`) and the other replicates (refer to [`replicates_unconstrained_dimensions`]) is cast to `refined` as
+/// (i.e., `{?}`) and the other replicates is cast to `refined` as
 /// well (e.g., the cotangent of an input that a call takes through an unconstrained input override). This is an
 /// unchecked cast rather than a `reshard`, because the value is already placed as `refined` states. A runtime array
 /// stores an unconstrained dimension replicated, so its buffers are those of `refined`. Inside a compiled program, the
@@ -3168,7 +3440,7 @@ fn batched_boundary_sharding(
 /// unconstrained dimension of any value that it exchanges.
 ///
 /// A value whose type tracks a sharding, where `refined` tracks none, is cast to `refined` as well when a call accepts
-/// an input of type `refined` for a callee input of the type of the value (refer to [`is_untracked_refinement`]), as
+/// an input of type `refined` for a callee input of the type of the value, as
 /// the cotangent of an input that a staged caller of untracked type passes to a callee with an input sharding override
 /// is. This mirrors the forward direction, where the call takes that input as it is (refer to `call_input_variation`)
 /// and its lowering constrains the input to the override, so the derivative returns to the type of the caller input.
@@ -3200,11 +3472,33 @@ where
         }
         _ => false,
     });
+
+    // Two distinct shardings place an array alike when they have the same logical mesh, rank, reduction state, and
+    // manual variation, and each of their dimensions is either equal in both or unconstrained (i.e., `{?}`) in one and
+    // replicated in the other, because a runtime array stores an unconstrained dimension replicated. The final
+    // comparison establishes everything but the dimensions, by giving one sharding the dimensions of the other.
+    let shardings = match (&declared, &refined) {
+        (ArrayIrType::Array(declared), ArrayIrType::Array(refined)) => declared.sharding().zip(refined.sharding()),
+        _ => None,
+    };
+    let replicates_unconstrained_dimensions = shardings.is_some_and(|(declared, refined)| {
+        declared != refined
+            && declared.rank() == refined.rank()
+            && declared.dimensions().iter().zip(refined.dimensions()).all(|dimensions| match dimensions {
+                (ShardingDimension::Unconstrained, ShardingDimension::Replicated)
+                | (ShardingDimension::Replicated, ShardingDimension::Unconstrained) => true,
+                (declared, refined) => declared == refined,
+            })
+            && declared.with_dimensions(refined.dimensions().to_vec()).is_ok_and(|declared| &declared == refined)
+    });
+
+    // A value whose sharding differs from the refined one only in the placement that it tracks, over a mesh of the
+    // same topology, is resharded. Shardings that place the value alike need no reshard and are cast below.
     if let (ArrayIrType::Array(declared), ArrayIrType::Array(refined)) = (&declared, &refined)
         && let (Some(declared_sharding), Some(refined_sharding)) = (declared.sharding(), refined.sharding())
         && !moves_devices
         && declared_sharding != refined_sharding
-        && !replicates_unconstrained_dimensions(declared_sharding, refined_sharding)
+        && !replicates_unconstrained_dimensions
         && declared_sharding.mesh().has_same_topology(refined_sharding.mesh())
         && declared_sharding.unreduced_axes() == refined_sharding.unreduced_axes()
         && declared_sharding.reduced_axes() == refined_sharding.reduced_axes()
@@ -3215,332 +3509,45 @@ where
         let reshard = <<C::Operation as OperationProjection<ArrayType>>::Projected>::from(reshard);
         return Ok(context.bind(reshard, Vec::new(), &[value])?.remove(0));
     }
-    if !moves_devices
-        && !refined.is_interchangeable_with(&declared)
-        && (declared.is_refined_by(&refined)
-            || is_refined_up_to_unconstrained_dimensions(&declared, &refined)?
-            || is_untracked_refinement(&declared, &refined))
-    {
+
+    if moves_devices || refined.is_interchangeable_with(&declared) {
+        return Ok(value);
+    }
+
+    // The value is cast when the refined type refines its type as it is, and in the two cases below, which the
+    // refinement of types alone does not cover.
+    let casts = declared.is_refined_by(&refined)
+        || match (&declared, &refined) {
+            (ArrayIrType::Array(declared), ArrayIrType::Array(refined)) => {
+                // The refined type refines the type of the value once its sharding is replaced by that of the value,
+                // where the two shardings place the value alike.
+                let is_refined_up_to_unconstrained_dimensions = replicates_unconstrained_dimensions && {
+                    let resharded = refined.clone().with_sharding(declared.sharding().cloned());
+                    declared.is_refined_by(&resharded.map_err(TypeError::from)?)
+                };
+
+                // The refined type tracks no sharding and is a type that a call accepts for a callee input of the type
+                // of the value without varying along more manual mesh axes, which is when the type of the value has the
+                // shape that the refined type refines and a sharding without reduction state and without manual
+                // variation. A sharding that partitions a dimension along manual mesh axes is excluded, because a cast
+                // cannot change placement over manual mesh axes, which inside a manual region also determines the shape
+                // of the local value.
+                let is_untracked_refinement = refined.sharding().is_none()
+                    && declared.sharding().is_some_and(|sharding| {
+                        sharding.dimensions().iter().all(|dimension| dimension.manual_axes(sharding.mesh()).is_empty())
+                    })
+                    && call_input_variation(declared, refined).is_some();
+
+                is_refined_up_to_unconstrained_dimensions || is_untracked_refinement
+            }
+            _ => false,
+        };
+    if casts {
         let cast = CastOperation::unchecked(refined, vec![declared])?;
         return Ok(context.bind(cast, Vec::new(), &[value])?.remove(0));
     }
+
     Ok(value)
-}
-
-/// Returns whether `declared` is refined by `refined` once the sharding of `refined` is replaced by that of
-/// `declared`, where both are array types whose shardings differ only in dimensions that one of them leaves
-/// unconstrained and the other replicates (refer to [`replicates_unconstrained_dimensions`]).
-fn is_refined_up_to_unconstrained_dimensions(declared: &ArrayIrType, refined: &ArrayIrType) -> Result<bool, TypeError> {
-    let (ArrayIrType::Array(declared), ArrayIrType::Array(refined)) = (declared, refined) else {
-        return Ok(false);
-    };
-    let (Some(declared_sharding), Some(refined_sharding)) = (declared.sharding(), refined.sharding()) else {
-        return Ok(false);
-    };
-    if !replicates_unconstrained_dimensions(declared_sharding, refined_sharding) {
-        return Ok(false);
-    }
-    Ok(declared.is_refined_by(&refined.clone().with_sharding(declared_sharding.clone())?))
-}
-
-/// Returns whether `refined`, an array type that tracks no sharding, is a type that a call accepts for a callee input
-/// of type `declared` without varying along more manual mesh axes (refer to `call_input_variation`), where `declared`
-/// tracks a sharding. A call accepts it exactly when `declared` has the shape that `refined` refines and a sharding
-/// without unreduced or reduced axes and without manual variation, so that a value of type `declared` is a value of
-/// type `refined` whose placement is no longer tracked. A sharding that partitions a dimension along manual mesh axes
-/// is not accepted, because a cast cannot change placement over manual mesh axes, which inside a manual region also
-/// determines the shape of the local value.
-fn is_untracked_refinement(declared: &ArrayIrType, refined: &ArrayIrType) -> bool {
-    let (ArrayIrType::Array(declared), ArrayIrType::Array(refined)) = (declared, refined) else {
-        return false;
-    };
-    refined.sharding().is_none()
-        && declared.sharding().is_some_and(|sharding| {
-            sharding.dimensions().iter().all(|dimension| dimension.manual_axes(sharding.mesh()).is_empty())
-        })
-        && call_input_variation(declared, refined).is_some()
-}
-
-/// Returns whether the distinct shardings `left` and `right` place an array alike, because they have the same logical
-/// mesh, rank, reduction state, and manual variation, and each of their dimensions is either equal in both or
-/// unconstrained (i.e., `{?}`) in one and replicated in the other. A runtime array stores an unconstrained dimension
-/// replicated, so arrays placed as either sharding have the same buffers.
-fn replicates_unconstrained_dimensions(left: &Sharding, right: &Sharding) -> bool {
-    left != right
-        && left.rank() == right.rank()
-        && left.dimensions().iter().zip(right.dimensions()).all(|dimensions| match dimensions {
-            (ShardingDimension::Unconstrained, ShardingDimension::Replicated)
-            | (ShardingDimension::Replicated, ShardingDimension::Unconstrained) => true,
-            (left, right) => left == right,
-        })
-        && left.with_dimensions(right.dimensions().to_vec()).is_ok_and(|left| &left == right)
-}
-
-/// Transposes a tangent [`CallOperation`] while retaining its compilation boundary.
-///
-/// The [`TranspositionDriver`] transposes the attached callee under the linearity and cotangent destination masks of
-/// the inputs and the structural zeros of its output cotangents. Known inputs supply residual or captured values and
-/// may appear anywhere in the input boundary. The transposed call consumes the ordinary output cotangents that are not
-/// structural zeros, live cotangent references, and known inputs, in that order. A structural zero output cotangent
-/// seeds nothing, so it has no input in the transposed call and is not materialized at the call boundary, although a
-/// dense backward rule inside the callee may still materialize the zero that it consumes. Reference outputs forward
-/// input roots and therefore have no separate output cotangent slot.
-///
-/// Returned cotangents follow the original input order. Linear value inputs receive call results, reference inputs
-/// accumulate into their supplied cotangent destinations, and known or ignored inputs receive structural zeros.
-///
-/// # Parameters
-///
-///   - `operation`: Primal tangent `call` staged into the tangent program.
-///   - `context`: Active transpose tracing context the pullback is staged into.
-///   - `driver`: Instruction-scoped access to the attached callee region and its recursive transposition machinery.
-///   - `inputs`: [`PartialValue`] knowledge of each input, mirroring the callee's inputs one to one. The
-///     [`Unknown`](PartialValue::Unknown) entries are the input tangents, and the [`Known`](PartialValue::Known)
-///     entries carry the residual tracers and the tangent tracers of captured constants that the pullback reads.
-///   - `outputs`: Symbolic cotangents for the tangent call's outputs, one per callee output. A
-///     [`Zero`](MaybeZero::Zero) entry has no input in the transposed call.
-///   - `cotangents`: Cotangent destinations of the inputs (refer to the documentation of
-///     [`TranspositionContext::cotangent_destinations`]). The callee is transposed with their destination kinds, so the
-///     cotangent reference of a live reference input (i.e., one with a `Reference` destination) is an input of the
-///     transposed call, which accumulates into it in place and returns it by identity, while a dead reference input
-///     (i.e., one with an `Ignore` destination) has no slot in the transposed callee at all.
-fn transpose_primal_call<V, O, D>(
-    operation: &CallOperation<ArrayIrType>,
-    context: &mut TracingContext<V, O>,
-    driver: &D,
-    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    cotangents: &CotangentDestinations<Tracer<TracingContext<V, O>>>,
-) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
-where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayIrType>
-        + From<CallOperation<ArrayIrType>>
-        + From<CastOperation<ArrayIrType>>
-        + OperationProjection<ArrayType, Projected: From<ReshardOperation> + From<ParallelReduceOperation>>,
-    D: TranspositionDriver<V, O>,
-    TracingContext<V, O>: StagingContext<Type = ArrayIrType, Constant = V, Operation = O>,
-{
-    // A `call` operation with no live output cotangents and no live reference input is a zero linear map, so every
-    // input cotangent is zero. A live reference input keeps the call live, because its accumulated state cotangent
-    // flows through the transposed callee even when no ordinary output cotangent does. A callee with deferred work or
-    // observable rule effects also keeps it live.
-    check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
-    if outputs.iter().all(MaybeZero::is_zero)
-        && !cotangents.has_reference_state_destinations()
-        && !driver.region(0)?.must_transpose()
-    {
-        return inputs
-            .iter()
-            .map(|input| input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from))
-            .collect();
-    }
-
-    // Each input maps to one callee input, independently linear (i.e., an input tangent) or known (i.e., a residual
-    // value or the tangent of a captured constant). The linear inputs need not lead, because a captured compiled
-    // function threads its captured prefix as known leading inputs. The dispatch guarantees that a `Known` input
-    // carries its pullback value, so each known tracer is read directly in callee input order.
-    let input_linearity = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
-    let callee = driver.region(0)?;
-    check_count!("input", input_linearity, callee.input_types().len(), ProgramError);
-
-    // Transpose the callee with respect to its linear inputs and with its structural zero output cotangents flagged,
-    // through the region's retained transform cache so that a callee shared by several outer programs is transposed
-    // once per linearity and seed mask. A live linear reference input is transposed with a `Reference` destination and
-    // a dead one with an `Ignore` destination, so the transposed callee maps
-    // `[live_non_reference_output_cotangents..., cotangent_references..., known_input_values...]` to
-    // `[linear_input_cotangents...]`, in callee input order, where a live reference input's cotangent is its cotangent
-    // reference itself and a dead reference input has no cotangent slot. The flags follow the callee's complete output
-    // order, and flags of reference outputs are normalized away because those outputs never own a cotangent slot.
-    let (input_indices, destination_kinds): (Vec<_>, Vec<_>) = input_linearity
-        .iter()
-        .zip(cotangents.kinds())
-        .enumerate()
-        .filter_map(|(index, (linear, kind))| linear.then_some((index, *kind)))
-        .unzip();
-    let output_types = callee.output_types();
-    check_count!("output", outputs, output_types.len(), ProgramError);
-    let zero_output_cotangents = outputs.iter().map(MaybeZero::is_zero).collect::<Vec<_>>();
-    let transposed_callee = driver.transpose_program_with_zero_seeds(
-        callee,
-        &input_indices,
-        &[],
-        &zero_output_cotangents,
-        &destination_kinds,
-    )?;
-
-    // Stage a fresh `call` over the transposed callee on `[live_outputs..., cotangent_references...,
-    // known_input_values...]`. Its outputs are the cotangents of the linear inputs. A reference output forwards a
-    // callee input root whose state cotangent lives in the cotangent reference of that input, so it owns no cotangent
-    // slot.
-    let mut transposed_inputs = Vec::with_capacity(output_types.len() + inputs.len());
-    transposed_inputs.extend(
-        outputs
-            .iter()
-            .zip(output_types.iter())
-            .filter(|(_, output_type)| !output_type.is_reference())
-            .filter_map(|(cotangent, _)| cotangent.as_value())
-            .cloned(),
-    );
-    transposed_inputs.extend(cotangents.references().iter().cloned());
-    transposed_inputs.extend(inputs.iter().filter_map(PartialValue::as_known).cloned());
-    // The transposed callee's inputs are live output cotangents, cotangent references, and known input values, and
-    // never a lifted-capture prefix. Attached region capture constants cannot appear in it because region bodies are
-    // traced through fresh-root contexts. Each output cotangent has the cotangent sharding of the boundary sharding of
-    // its output and each known input value the boundary sharding of its input, and the cotangent references have none,
-    // as JAX's `_pjit_transpose` gives the cotangents the cotangent shardings of their primals through `to_ct_spec`.
-    // Each returned linear input cotangent has the cotangent sharding of its input, whichever other inputs have a
-    // structurally zero or absent cotangent, which returns nothing (refer to `TransposedProgramCotangent`).
-    let mut transposed_call =
-        CallOperation::new(0).with_callee_region(transposed_callee.program().entry_region_ref())?;
-    transposed_call.keeps_input_placements = operation.keeps_input_placements();
-    transposed_call.function_mesh = operation.function_mesh.clone();
-    // The known input values keep the effective boundary of the call (refer to `with_derived_boundary_shardings`),
-    // which, in the tangent call of a linearization, places the inputs of the original call that it receives and
-    // leaves its residuals where they are.
-    let boundary =
-        operation.effective_boundary_input_shardings(&callee.input_types(), inputs.iter().map(PartialValue::r#type));
-    // Seed inputs enter on the tangent result's cotangent sharding when the call already knows its devices.
-    // Eager admission checks device commitments before applying these boundary shardings. The callee can then
-    // transpose any placement-only result cast using the seed's admitted type.
-    let function_mesh = operation
-        .function_mesh
-        .as_ref()
-        .filter(|function| function.logical_mesh().is_named())
-        .map(|function| function.logical_mesh());
-    let seed_shardings = outputs
-        .iter()
-        .zip(&output_types)
-        .filter(|(cotangent, output_type)| !output_type.is_reference() && cotangent.as_value().is_some())
-        .map(|(_, output_type)| {
-            let ArrayIrType::Array(output_type) = output_type else { return Ok(None) };
-            output_type
-                .sharding()
-                .filter(|sharding| Some(sharding.mesh()) == function_mesh)
-                .map(Sharding::cotangent)
-                .transpose()
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(TypeError::from)?;
-    transposed_call.derived_input_shardings = Some(
-        seed_shardings
-            .into_iter()
-            .chain(std::iter::repeat_n(None, cotangents.references().len()))
-            .chain(
-                inputs
-                    .iter()
-                    .zip(boundary)
-                    .filter(|(input, _)| input.as_known().is_some())
-                    .map(|(_, sharding)| sharding),
-            )
-            .collect(),
-    );
-    if let Some(mesh) = operation.mesh() {
-        // An override places a primal value, and the cotangent of that value has the dual reduction state (refer to
-        // `Sharding::cotangent`), so each cotangent that crosses the boundary (i.e., an output cotangent that the
-        // transposed call receives and an input cotangent that it returns) is placed at the cotangent sharding of the
-        // override of its primal, as the cotangent types of those primals record it, and each known primal value is
-        // placed at the override itself. An input cotangent that the transposed call returns is the cotangent of the
-        // argument as the callee holds it once it has entered, so it carries no reduction state over auto mesh axes,
-        // which no type records (refer to `Sharding::without_auto_reduction_axes`).
-        let cotangent_sharding = |sharding: Option<&Sharding>| sharding.map(Sharding::cotangent).transpose();
-        let output_cotangent_shardings = outputs
-            .iter()
-            .zip(output_types.iter())
-            .enumerate()
-            .filter(|(_, (cotangent, output_type))| !output_type.is_reference() && cotangent.as_value().is_some())
-            .map(|(index, _)| cotangent_sharding(operation.output_sharding(index)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(TypeError::from)?;
-        let reference_shardings = cotangents.references().iter().map(|_| None);
-        let known_input_shardings = inputs
-            .iter()
-            .enumerate()
-            .filter(|(_, input)| input.as_known().is_some())
-            .map(|(index, _)| operation.input_sharding(index).cloned());
-        let input_shardings = output_cotangent_shardings
-            .into_iter()
-            .chain(reference_shardings)
-            .chain(known_input_shardings)
-            .collect();
-        let output_shardings = input_indices
-            .iter()
-            .zip(transposed_callee.cotangents())
-            .filter(|(_, cotangent)| **cotangent == TransposedProgramCotangent::Output)
-            .map(|(&index, _)| cotangent_sharding(operation.input_sharding(index)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(TypeError::from)?
-            .into_iter()
-            .map(|sharding| sharding.map(|sharding| sharding.without_auto_reduction_axes()))
-            .collect::<Vec<_>>();
-        transposed_call = transposed_call.with_boundary(Some(mesh), input_shardings, output_shardings);
-    }
-    let transposed_call = O::from(transposed_call);
-    let input_cotangents = context.bind(
-        transposed_call,
-        AttachedRegions::Callees(&[transposed_callee.program().clone()]),
-        transposed_inputs.as_slice(),
-    )?;
-    let cotangent_types = input_indices
-        .iter()
-        .map(|&index| inputs[index].r#type().cotangent().map_err(ProgramError::from))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut input_cotangents = transposed_callee.assemble_cotangents(&cotangent_types, input_cotangents)?.into_iter();
-
-    // Reassemble selected cotangents from the call's compact output boundary. Known and ignored inputs carry
-    // structural zeros. Reference-state outputs only thread the caller-owned destination, so they do not contribute
-    // a value cotangent to the enclosing context.
-    inputs
-        .iter()
-        .map(|input| {
-            let cotangent = if input.is_unknown() { input_cotangents.next().unwrap() } else { None };
-            match cotangent {
-                Some(MaybeZero::Value(cotangent)) if !input.r#type().is_reference() => {
-                    let refined = input.r#type().cotangent().map_err(ProgramError::from)?;
-                    let cotangent = summed_input_cotangent(context, &refined, cotangent)?;
-                    let cotangent = refined_derived_value(context, operation.mesh(), refined, cotangent);
-                    return Ok(MaybeZero::Value(cotangent?));
-                }
-                Some(cotangent) if !input.r#type().is_reference() => return Ok(cotangent),
-                _ => {}
-            }
-            input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
-        })
-        .collect()
-}
-
-/// Returns `cotangent`, the cotangent that the transposition of a call returns for an input whose cotangent type is
-/// `refined`, summed over the manual mesh axes along which it varies beyond `refined`. A call whose inputs vary along
-/// manual mesh axes beyond the callee input types runs its callee as if every input varied along all of them, as a JAX
-/// `jit` function is retraced with `pvary` inserted on the inputs that vary along fewer axes. Each shard along such an
-/// axis then holds one contribution to the cotangent of such an input, and their sum is its cotangent, which a
-/// mesh-form `parallel_reduce` computes as the transposition of `parallel_vary` does. Every other cotangent, including
-/// every cotangent of a call without that variation, is returned unchanged.
-fn summed_input_cotangent<C>(context: &C, refined: &ArrayIrType, cotangent: C::Value) -> Result<C::Value, ProgramError>
-where
-    C: Context<Type = ArrayIrType, Operation: OperationProjection<ArrayType, Projected: From<ParallelReduceOperation>>>,
-{
-    let (mesh, axes) = match (refined, cotangent.r#type().as_ref()) {
-        (ArrayIrType::Array(refined), ArrayIrType::Array(actual)) if let Some(sharding) = actual.sharding() => {
-            let declared = refined.sharding().map(Sharding::varying_manual_axes);
-            let axes = sharding
-                .varying_manual_axes()
-                .iter()
-                .filter(|axis| !declared.is_some_and(|declared| declared.contains(*axis)))
-                .cloned()
-                .collect::<Vec<_>>();
-            if axes.is_empty() {
-                return Ok(cotangent);
-            }
-            (sharding.mesh().clone(), axes)
-        }
-        _ => return Ok(cotangent),
-    };
-    axes.into_iter().try_fold(cotangent, |cotangent, axis| {
-        let reduction = ParallelReduceOperation::new(ReductionKind::Sum, axis).with_mesh(mesh.clone());
-        let reduction = <<C::Operation as OperationProjection<ArrayType>>::Projected>::from(reduction);
-        Ok(context.bind(reduction, Vec::new(), &[cotangent])?.remove(0))
-    })
 }
 
 #[cfg(test)]
@@ -8018,7 +8025,7 @@ mod tests {
         // linearized callee). Partitioning a caller with both inputs known stages the known side, and partial
         // evaluation keeps `w` as an output of the call instead of forwarding the argument, because a staged known
         // program may later be interpreted eagerly, where a committed `b` selects the devices of the call, moves `w`
-        // there, and commits it (refer to `forward_call_inputs`). The known program therefore returns the output of the
+        // there, and commits it (refer to `CallOperation::forward_inputs`). The known program therefore returns the output of the
         // call, which a residual planner then plans as a value of its own. Both arguments are replicated over an
         // explicit mesh, so that their number alone keeps `w` from being forwarded.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -10769,7 +10776,7 @@ mod tests {
     }
 
     #[test]
-    fn test_split_call() {
+    fn test_call_operation_split() {
         /// Supplies only the source callee and partition mode, while the test provides the partition closure directly.
         struct SplitCacheDriver {
             /// Callee shared across both partition modes.
@@ -10889,15 +10896,9 @@ mod tests {
                     )
                 }
             };
-            let outputs = split_call(
-                &CallOperation::new(0),
-                &context,
-                &driver,
-                &inputs,
-                CallSplitKind::Knownness(vec![true, false]),
-                &partition,
-            )
-            .unwrap();
+            let outputs = CallOperation::<ArrayIrType>::new(0)
+                .split(&context, &driver, &inputs, CallSplitKind::Knownness(vec![true, false]), &partition)
+                .unwrap();
             let known_program = context
                 .parent()
                 .builder()
@@ -10960,93 +10961,183 @@ mod tests {
     }
 
     #[test]
-    fn test_is_untracked_refinement() {
-        // A type without a sharding is an untracked refinement of a type of the same shape whose sharding has no
-        // reduction state and no manual variation, whether that sharding replicates, splits over explicit axes, or
-        // leaves a dimension unconstrained.
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let untracked = ArrayIrType::Array(f32_vector_type(4));
-        let typed = |dimension: ShardingDimension| {
-            let sharding = Sharding::new(mesh.clone(), vec![dimension]).unwrap();
-            f32_vector_type(4).with_sharding(sharding).unwrap()
-        };
-        for dimension in
-            [ShardingDimension::Replicated, ShardingDimension::Unconstrained, ShardingDimension::sharded(["x"])]
-        {
-            assert!(is_untracked_refinement(&ArrayIrType::Array(typed(dimension)), &untracked));
-        }
-
-        // A tracked or missing sharding of either side, another shape, reduction state, manual variation, and a split
-        // over manual axes are not.
-        let replicated = typed(ShardingDimension::Replicated);
-        let sharding = replicated.sharding().unwrap().clone();
-        assert!(!is_untracked_refinement(
-            &ArrayIrType::Array(replicated.clone()),
-            &ArrayIrType::Array(replicated.clone()),
-        ));
-        assert!(!is_untracked_refinement(&untracked, &untracked));
-        assert!(!is_untracked_refinement(
-            &ArrayIrType::Array(replicated.clone()),
-            &ArrayIrType::Array(f32_vector_type(3)),
-        ));
-        for sharding in [
-            sharding.clone().with_unreduced_axes(["y"]).unwrap(),
-            sharding.clone().with_reduced_axes(["y"]).unwrap(),
-            sharding.with_varying_manual_axes(["y"]).unwrap(),
-        ] {
-            let declared = f32_vector_type(4).with_sharding(sharding).unwrap();
-            assert!(!is_untracked_refinement(&ArrayIrType::Array(declared), &untracked));
-        }
-        assert!(!is_untracked_refinement(&ArrayIrType::Array(typed(ShardingDimension::sharded(["y"]))), &untracked));
-    }
-
-    #[test]
-    fn test_replicates_unconstrained_dimensions() {
-        // Shardings place an array alike when each dimension is equal or unconstrained in one and replicated in the
-        // other, over the same mesh and with the same reduction state and manual variation.
+    fn test_refined_derived_value() {
+        // Each case stages the value of a derived call at its `declared` type and states the `refined` type that it has
+        // in the caller, over a mesh with an explicit axis `x` and a manual axis `y`.
         let axes = |axis_type: MeshAxisType| {
             vec![MeshAxis::new("x", 2, axis_type).unwrap(), MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap()]
         };
         let mesh = LogicalMesh::new(axes(MeshAxisType::Explicit)).unwrap();
-        let sharding =
-            |mesh: &LogicalMesh, dimensions: Vec<ShardingDimension>| Sharding::new(mesh.clone(), dimensions).unwrap();
+        let typed = |mesh: &LogicalMesh, dimensions: Vec<ShardingDimension>| {
+            let r#type = ArrayType::new_static(DataType::F32, vec![4; dimensions.len()]);
+            r#type.with_sharding(Sharding::new(mesh.clone(), dimensions).unwrap()).unwrap()
+        };
+        let with_sharding = |r#type: &ArrayType, sharding: Sharding| r#type.clone().with_sharding(sharding).unwrap();
+        let stage = |declared: &ArrayType, refined: &ArrayType, call_mesh: Option<&DeviceMesh>| {
+            let context = TracingContext::<TestValue, TestOperation>::new();
+            let value = context.input(ArrayIrType::Array(declared.clone()));
+            let value = refined_derived_value(&context, call_mesh, ArrayIrType::Array(refined.clone()), value).unwrap();
+            context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<TestValue>, Vec<TestValue>>(
+                    vec![value.atom_id().unwrap()],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+                .to_string()
+        };
         let (replicated, unconstrained, split) =
             (ShardingDimension::Replicated, ShardingDimension::Unconstrained, ShardingDimension::sharded(["x"]));
-        let open = sharding(&mesh, vec![unconstrained.clone(), split.clone()]);
-        let closed = sharding(&mesh, vec![replicated.clone(), split.clone()]);
-        assert!(replicates_unconstrained_dimensions(&open, &closed));
-        assert!(replicates_unconstrained_dimensions(&closed, &open));
-        assert!(replicates_unconstrained_dimensions(
-            &sharding(&mesh, vec![unconstrained.clone(), replicated.clone()]),
-            &sharding(&mesh, vec![replicated.clone(), unconstrained.clone()]),
-        ));
+        let untracked = f32_vector_type(4);
+        let replicated_vector = typed(&mesh, vec![replicated.clone()]);
+        let sharding = replicated_vector.sharding().unwrap().clone();
 
-        // Equal shardings, an unconstrained dimension that the other sharding splits, another rank, another mesh,
-        // another reduction state, and another manual variation are not.
-        assert!(!replicates_unconstrained_dimensions(&open, &open));
-        assert!(!replicates_unconstrained_dimensions(
-            &sharding(&mesh, vec![unconstrained.clone(), replicated.clone()]),
-            &sharding(&mesh, vec![split.clone(), replicated.clone()]),
-        ));
-        assert!(!replicates_unconstrained_dimensions(&sharding(&mesh, vec![unconstrained.clone()]), &closed));
+        // A value whose type tracks a sharding without reduction state, manual variation, or a split over manual axes
+        // is cast to a type of the same shape that tracks none.
+        let untracked_cases = [
+            replicated_vector.clone(),
+            typed(&mesh, vec![unconstrained.clone()]),
+            typed(&mesh, vec![split.clone()]),
+            with_sharding(&untracked, sharding.clone().with_unreduced_axes(["y"]).unwrap()),
+            with_sharding(&untracked, sharding.clone().with_reduced_axes(["y"]).unwrap()),
+            with_sharding(&untracked, sharding.clone().with_varying_manual_axes(["y"]).unwrap()),
+            typed(&mesh, vec![ShardingDimension::sharded(["y"])]),
+        ];
+        assert_eq!(
+            untracked_cases
+                .iter()
+                .map(|declared| stage(declared, &untracked, None))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}] .
+                let %1:f32[4] = cast [
+                    type=f32[4],
+                    inputs=[f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}]],
+                ] %0
+                in (%1)
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}]}] .
+                let %1:f32[4] = cast [
+                    type=f32[4],
+                    inputs=[f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}]}]],
+                ] %0
+                in (%1)
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{'x'}]}] .
+                let %1:f32[4] = cast [
+                    type=f32[4],
+                    inputs=[f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{'x'}]}]],
+                ] %0
+                in (%1)
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}], unreduced={'y'}}] .
+                in (%0)
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}], reduced={'y'}}] .
+                in (%0)
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}], varying_manual={'y'}}] .
+                in (%0)
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{'y'}]}] .
+                in (%0)"},
+        );
+
+        // Equal types, types that track no sharding, and types of other shapes leave the value as it is.
+        assert_eq!(
+            [
+                stage(&replicated_vector, &replicated_vector, None),
+                stage(&untracked, &untracked, None),
+                stage(&replicated_vector, &f32_vector_type(3), None),
+            ]
+            .join("\n"),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}] .
+                in (%0)
+                lambda %0:f32[4] .
+                in (%0)
+                lambda %0:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}] .
+                in (%0)"},
+        );
+
+        // Shardings that differ only in dimensions that one leaves unconstrained and the other replicates place a
+        // value alike, so it is cast, in either direction. Any other difference in placement over a mesh of the same
+        // topology is a reshard, and a difference in reduction state or manual variation leaves the value as it is.
+        let open = typed(&mesh, vec![unconstrained.clone(), split.clone()]);
+        let closed = typed(&mesh, vec![replicated.clone(), split.clone()]);
         let auto_mesh = LogicalMesh::new(axes(MeshAxisType::Auto)).unwrap();
-        assert!(!replicates_unconstrained_dimensions(
-            &open,
-            &sharding(&auto_mesh, vec![replicated.clone(), split.clone()]),
-        ));
-        let open = sharding(&mesh, vec![unconstrained, replicated.clone()]);
-        let closed = sharding(&mesh, vec![replicated.clone(), replicated]);
-        assert!(!replicates_unconstrained_dimensions(&open, &closed.clone().with_unreduced_axes(["y"]).unwrap()));
-        assert!(!replicates_unconstrained_dimensions(&open, &closed.clone().with_reduced_axes(["y"]).unwrap()));
-        assert!(!replicates_unconstrained_dimensions(&open, &closed.with_varying_manual_axes(["y"]).unwrap()));
+        let replicated_matrix = typed(&mesh, vec![replicated.clone(), replicated.clone()]);
+        let matrix_sharding = replicated_matrix.sharding().unwrap().clone();
+        assert_eq!(
+            [
+                stage(&open, &closed, None),
+                stage(&closed, &open, None),
+                stage(&typed(&mesh, vec![unconstrained.clone(), replicated.clone()]), &closed, None),
+                stage(&replicated_matrix, &closed, None),
+                stage(&open, &typed(&auto_mesh, vec![replicated.clone(), replicated.clone()]), None),
+                stage(
+                    &typed(&mesh, vec![unconstrained.clone(), replicated.clone()]),
+                    &with_sharding(&replicated_matrix, matrix_sharding.clone().with_unreduced_axes(["y"]).unwrap()),
+                    None,
+                ),
+                stage(
+                    &typed(&mesh, vec![unconstrained.clone(), replicated.clone()]),
+                    &with_sharding(&replicated_matrix, matrix_sharding.with_varying_manual_axes(["y"]).unwrap()),
+                    None,
+                ),
+            ]
+            .join("\n"),
+            indoc! {"
+                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}] .
+                let %1:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] = cast [
+                    type=f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}],
+                    inputs=[f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}]],
+                ] %0
+                in (%1)
+                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] .
+                let %1:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}] = cast [
+                    type=f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}],
+                    inputs=[f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}]],
+                ] %0
+                in (%1)
+                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {}]}] .
+                let %1:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] = reshard [sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] %0
+                in (%1)
+                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {}]}] .
+                let %1:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] = reshard [sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}, {'x'}]}] %0
+                in (%1)
+                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {'x'}]}] .
+                let %1:f32[4, 4][sharding={mesh<['x'=2:auto, 'y'=2:manual]>, [{}, {}]}] = reshard [sharding={mesh<['x'=2:auto, 'y'=2:manual]>, [{}, {}]}] %0
+                in (%1)
+                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {}]}] .
+                in (%0)
+                lambda %0:f32[4, 4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{?}, {}]}] .
+                in (%0)"},
+        );
+
+        // A value whose type tracks no sharding is cast to a refined type that tracks one, unless the call names
+        // devices over a mesh of another topology, on which the value lives.
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("z", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let devices = (0..4).map(|id| Device::new(id, 0)).collect::<Vec<_>>();
+        let call_mesh = DeviceMesh::new(other_mesh, devices).unwrap();
+        assert_eq!(
+            stage(&untracked, &replicated_vector, None),
+            indoc! {"
+                lambda %0:f32[4] .
+                let %1:f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}] = cast [
+                    type=f32[4][sharding={mesh<['x'=2:explicit, 'y'=2:manual]>, [{}]}],
+                    inputs=[f32[4]],
+                ] %0
+                in (%1)"},
+        );
+        assert_eq!(
+            stage(&untracked, &replicated_vector, Some(&call_mesh)),
+            indoc! {"
+                lambda %0:f32[4] .
+                in (%0)"},
+        );
     }
 
     #[test]
-    fn test_transpose_primal_call() {
+    fn test_call_operation_transposed_input_cotangents() {
         // The predicate output's cotangent is a zero space that arrives as a structural zero, so the transposed callee
         // has no input for it and the transposed call consumes the value output's seed alone.
         let value_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
@@ -11076,18 +11167,18 @@ mod tests {
         let mut context = TracingContext::<TestValue, TestOperation>::new();
         let value_cotangent = context.input(value_program_type.clone());
 
-        let contributions = transpose_primal_call(
-            &CallOperation::new(0),
-            &mut context,
-            &driver,
-            &[PartialValue::Unknown(value_program_type.clone())],
-            &[
-                MaybeZero::Value(value_cotangent.clone()),
-                MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
-            ],
-            &CotangentDestinations::without_references([true]),
-        )
-        .unwrap();
+        let contributions = CallOperation::<ArrayIrType>::new(0)
+            .transposed_input_cotangents(
+                &mut context,
+                &driver,
+                &[PartialValue::Unknown(value_program_type.clone())],
+                &[
+                    MaybeZero::Value(value_cotangent.clone()),
+                    MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
+                ],
+                &CotangentDestinations::without_references([true]),
+            )
+            .unwrap();
 
         let [MaybeZero::Value(contribution)] = &contributions[..] else {
             panic!("expected one cotangent contribution");
@@ -11118,7 +11209,7 @@ mod tests {
     }
 
     #[test]
-    fn test_transpose_primal_call_uses_cotangent_descriptors_for_zero_cotangents() {
+    fn test_call_operation_transposed_input_cotangents_uses_cotangent_descriptors_for_zero_cotangents() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(
@@ -11140,27 +11231,27 @@ mod tests {
         let transposed = transpose_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
         let driver = TestTranspositionDriver { source, transposed };
         let mut context = TracingContext::<TestValue, TestOperation>::new();
-        let cotangents = transpose_primal_call(
-            &CallOperation::new(0),
-            &mut context,
-            &driver,
-            &[PartialValue::Unknown(tangent_type.clone())],
-            &[MaybeZero::Zero(tangent_type.clone())],
-            &CotangentDestinations::without_references([true]),
-        )
-        .unwrap();
+        let cotangents = CallOperation::<ArrayIrType>::new(0)
+            .transposed_input_cotangents(
+                &mut context,
+                &driver,
+                &[PartialValue::Unknown(tangent_type.clone())],
+                &[MaybeZero::Zero(tangent_type.clone())],
+                &CotangentDestinations::without_references([true]),
+            )
+            .unwrap();
         assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
 
         let known = context.input(tangent_type.clone());
-        let cotangents = transpose_primal_call(
-            &CallOperation::new(0),
-            &mut context,
-            &driver,
-            &[PartialValue::Known(known)],
-            &[MaybeZero::Zero(tangent_type)],
-            &CotangentDestinations::without_references([true]),
-        )
-        .unwrap();
+        let cotangents = CallOperation::<ArrayIrType>::new(0)
+            .transposed_input_cotangents(
+                &mut context,
+                &driver,
+                &[PartialValue::Known(known)],
+                &[MaybeZero::Zero(tangent_type)],
+                &CotangentDestinations::without_references([true]),
+            )
+            .unwrap();
         assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
     }
 }
