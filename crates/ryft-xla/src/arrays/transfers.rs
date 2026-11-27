@@ -2918,8 +2918,6 @@ impl HostRoundTripCause {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Buffer- and session-independent source of a placement plan.
 pub(super) struct PlacementPlanningView<'a, Shards> {
     /// Runtime type, mesh, and sharding of the source.
@@ -2956,14 +2954,9 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             .map_or(true, |strategy| strategy.communicates())
     }
 
-    /// Returns the device mesh of the source.
-    fn mesh(&self) -> &DeviceMesh {
-        self.metadata.mesh()
-    }
-
-    /// Returns the sharding of the source.
-    fn sharding(&self) -> &Sharding {
-        self.metadata.sharding()
+    /// Returns the element data type of the source.
+    fn data_type(&self) -> DataType {
+        self.metadata.r#type().data_type()
     }
 
     /// Returns the static shape of the source.
@@ -2971,9 +2964,14 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         self.metadata.r#type().static_shape().unwrap()
     }
 
-    /// Returns the element data type of the source.
-    fn data_type(&self) -> DataType {
-        self.metadata.r#type().data_type()
+    /// Returns the sharding of the source.
+    fn sharding(&self) -> &Sharding {
+        self.metadata.sharding()
+    }
+
+    /// Returns the device mesh of the source.
+    fn mesh(&self) -> &DeviceMesh {
+        self.metadata.mesh()
     }
 
     /// Derives a metadata-only view of the source on a synthetic mesh or a restriction of its existing mesh.
@@ -2983,27 +2981,23 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
     }
 
     /// Chooses the device work that places this array, whose devices every process knows, on `mesh` according to
-    /// `sharding`, which is the first of the following strategies of [`Array::try_reshard_on_devices`] that
-    /// applies, or returns the error that rules out all of them. Each strategy carries the transfers and programs of
-    /// every process.
+    /// `sharding`, which is the first of the following strategies of [`Array::try_reshard_on_devices`] that applies, or
+    /// returns the error that rules out all of them. Each strategy carries the transfers and programs of every process:
     ///
-    ///   1. [`DevicePlacementStrategy::ExactShards`], when every target shard with elements holds what one source
-    ///      shard holds (refer to [`plan_exact_shard_put`]) and every shard that crosses processes has a default layout
-    ///      for its receive.
-    ///   2. [`DevicePlacementStrategy::ShardRegions`], when the placement keeps the contributions of this array (refer
-    ///      to [`keeps_contributions`] and [`Self::shard_region_plan`]).
-    ///   3. [`DevicePlacementStrategy::IntroducedSums`], when the target introduces a pending sum along a
-    ///      non-manual axis.
+    ///   1. [`DevicePlacementStrategy::ExactShards`], when every target shard with elements holds what one source shard
+    ///      holds and every shard that crosses processes has a default layout for its receive.
+    ///   2. [`DevicePlacementStrategy::ShardRegions`], when the placement keeps the contributions of this array.
+    ///   3. [`DevicePlacementStrategy::IntroducedSums`], when the target introduces a pending sum along a non-manual
+    ///      axis.
     ///   4. [`DevicePlacementStrategy::ShardRegions`], when the meshes differ and this array declares no layout other
-    ///      than the dense row-major one, or uneven shards or manual target axes rule out a compiled reshard (in
-    ///      any layout), and [`Self::shard_region_plan`] accepts the placement.
+    ///      than the dense row-major one, or uneven shards or manual target axes rule out a compiled reshard (in any
+    ///      layout), and [`Self::shard_region_plan`] accepts the placement.
     ///   5. [`DevicePlacementStrategy::HostRoundTrip`], when a program of the compiled reshard below would change the
-    ///      value of this array (refer to [`Self::validate_compiled_reshard`]) or item 4 declines a placement that
-    ///      uneven shards or manual axes rule out, and only when the placement keeps no contribution of this array
-    ///      (refer to [`keeps_some_contributions`]), which is an error otherwise.
+    ///      value of this array or item 4 declines a placement that uneven shards or manual axes rule out, and only
+    ///      when the placement keeps no contribution of this array, which is an error otherwise.
     ///   6. [`DevicePlacementStrategy::CompiledReshard`] on the mesh of this array, or
     ///      [`DevicePlacementStrategy::CompiledReshardAcrossMeshes`] to another mesh, whose replicas move as whole
-    ///      shards of the replicated value (refer to [`plan_exact_shard_put`]).
+    ///      shards of the replicated value.
     fn strategy(
         &self,
         layout_resolver: &CrossHostLayoutResolver<'_>,
@@ -3038,8 +3032,8 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         // Regions come first on the same mesh too, so that sparse and dense sources behave alike, and in any declared
         // layout. When regions decline on the same mesh with the same reduction state and variation by name, the
         // compiled reshard below re-splits each contribution without completing anything, so such a placement falls
-        // back to it, but never to the host round trip, which would combine its contributions. Any other such
-        // placement fails here (e.g., without a default layout for a cross-host receive).
+        // back to it, but never to the host round trip, which would combine its contributions. Any other such placement
+        // fails here (e.g., without a default layout for a cross-host receive).
         let keeps = keeps_contributions(self.sharding(), sharding);
         if keeps {
             if let Some((plan, cross_host_layouts)) = self.shard_region_plan(layout_resolver, mesh, sharding)? {
@@ -3057,8 +3051,8 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             }
         }
 
-        // A pending sum that the target introduces is written as additive identities after a first step that
-        // places the value without it on the devices at coordinate zero along the introduced axes only.
+        // A pending sum that the target introduces is written as additive identities after a first step that places
+        // the value without it on the devices at coordinate zero along the introduced axes only.
         let sum = ReductionState::Unreduced(UnreducedKind::Sum);
         let kept = kept_unreduced_axes(self.sharding(), sharding);
         let (mut axis_indices, mut introduced) = (Vec::new(), Vec::new());
@@ -3072,8 +3066,8 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             }
         }
         if !axis_indices.is_empty() {
-            // Empty shards and axes of size one need no identity elements. Check for an identity only when the
-            // target layout requires one, then leave the sums along the kept axes pending in the first step.
+            // Empty shards and axes of size one need no identity elements. Check for an identity only when the target
+            // layout requires one, then leave the sums along the kept axes pending in the first step.
             if requires_unreduced_sum_identity(mesh, &ShardLayout::new(&shape, mesh, sharding)?, &axis_indices) {
                 let data_type = self.data_type();
                 unreduced_sum_identity(data_type)?
@@ -3085,6 +3079,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         }
 
         let compiled = self.validate_compiled_reshard(mesh, sharding);
+
         // A compiled reshard across meshes moves whole shards in a declared layout other than the dense row-major one,
         // which regions convert on every source device, so regions replace it only where it declines.
         let dense =
@@ -3100,6 +3095,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             }
             Err(_) => false,
         };
+
         // A placement that keeps contributions has asked `Self::shard_region_plan` above with the same arguments.
         if try_regions
             && !keeps
@@ -3107,6 +3103,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         {
             return Ok(DevicePlacementStrategy::ShardRegions { plan, cross_host_layouts });
         }
+
         // A decline of the compiled reshard that every process predicts from shared metadata (i.e., a manual axis or
         // uneven shards where shard regions do not apply) takes the host round trip of the owner that every process
         // names alike, rather than leaving the recovery to a fallback that only the owner would take.
@@ -3115,6 +3112,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             Err(error) if try_regions => Some(HostRoundTripCause::Device(error)),
             Err(error) => return Err(error),
         };
+
         // That round trip reads back the combined value, so a placement that keeps some contributions of this array
         // (refer to `keeps_some_contributions`) fails here, alike on every process, rather than replacing them.
         if let Some(cause) = cause {
@@ -3137,16 +3135,19 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
                 };
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
-                        "cannot place an array whose pending reduction the placement keeps along the mesh axes {} and changes \
-                         along others when no device strategy applies ({reason}), because the host round trip that remains would \
-                         combine the contributions that the placement keeps; {remedy}",
+                        "cannot place an array whose pending reduction the placement keeps along the mesh axes {} and \
+                         changes along others when no device strategy applies ({}), because the host round trip that \
+                         remains would combine the contributions that the placement keeps; {}",
                         kept.join(", "),
+                        reason,
+                        remedy,
                     ),
                 }
                 .into());
             }
             return Ok(self.host_round_trip(mesh, cause));
         }
+
         if self.mesh() == mesh {
             let (input, output) = (self.sharding().clone(), sharding.clone());
             let program = ReshardProgram { mesh: mesh.clone(), input, output };
@@ -3155,10 +3156,10 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
 
         // A replicated copy of this array (i.e., this array itself or its all-gather on its own mesh) moves to every
         // target device as whole shards. Every process that owns a device of the mesh of this array holds such a
-        // replica, so a replica crosses processes exactly when a target device belongs to a process that owns
-        // none, and all replicas have the shape of this array. The gather completes only the pending reductions that
-        // the target does not keep (refer to `gathered_sharding`), so a kept one moves as its contributions, which
-        // correspond by their ordinals at both ends (refer to `moves_contributions`), and the final reshard keeps it.
+        // replica, so a replica crosses processes exactly when a target device belongs to a process that owns none, and
+        // all replicas have the shape of this array. The gather completes only the pending reductions that the target
+        // does not keep (refer to `gathered_sharding`), so a kept one moves as its contributions, which correspond by
+        // their ordinals at both ends (refer to `moves_contributions`), and the final reshard keeps it.
         let rank = shape.rank();
         let replicated = gathered_sharding(self.sharding(), sharding, self.mesh().logical_mesh(), rank)?;
         let gather = (!self.sharding().is_replicated() && self.sharding() != &replicated).then(|| ReshardProgram {
@@ -3168,6 +3169,7 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
         });
         let replicated_on_target = gathered_sharding(self.sharding(), sharding, mesh.logical_mesh(), rank)?;
         let replica_layout = ShardLayout::new(&shape, self.mesh(), &replicated)?;
+
         // Both shardings replicate the whole value and keep the same contributions, so every target shard has the
         // slices of every source shard of the same contribution.
         let replicas = plan_exact_shard_put(
@@ -3190,9 +3192,12 @@ impl<'a, Shards: Iterator<Item = &'a ShardDescriptor> + Clone> PlacementPlanning
             })?;
             cross_host_layouts.insert(shape, layout);
         }
+
         let reshard = ReshardProgram { mesh: mesh.clone(), input: replicated_on_target, output: sharding.clone() };
         Ok(DevicePlacementStrategy::CompiledReshardAcrossMeshes { gather, replicas, cross_host_layouts, reshard })
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns [`DevicePlacementStrategy::HostRoundTrip`] for placing this array on `mesh` for `cause`. Only one
     /// process can read the value back and upload it again, so the host round trip is available only when one process
