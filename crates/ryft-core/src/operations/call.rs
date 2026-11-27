@@ -25,8 +25,7 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue,
-    ArrayMemberType, ArrayType, Device, DeviceMesh, LogicalMesh, MeshAxisType, Sharding, ShardingDimension,
-    UnreducedKind,
+    ArrayMemberType, ArrayType, DeviceMesh, LogicalMesh, MeshAxisType, Sharding, ShardingDimension, UnreducedKind,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
@@ -2405,34 +2404,7 @@ where
     }
 }
 
-/// [`Region`](Region) [`Transform`] marker for the shared copy of the callee of a `call` that
-/// [`shared_call_callee`] retains for a callee region that is not interned as a shared region (e.g., the entry
-/// region of a shared callee program that a rule binds directly, such as the primal or tangent callee of a linearized
-/// call). Binding that copy instead of a fresh copy of the region lets every call of one callee share one region.
-struct CallCalleeTransform;
-
-impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> Transform<Region<V, O>> for CallCalleeTransform {
-    type Arguments = ();
-    type Artifact = TransformArtifact<V, O, ()>;
-
-    const DEFAULT_CACHE_CAPACITY: usize = 1;
-}
-
-/// [`Region`](Region) [`Transform`] marker for the splits of the callee of a `call` that [`split_call`] binds.
-/// Such a split partitions the callee in fresh traces, where every input is a fresh known or unknown input, so it
-/// depends on no value of a live context and is a structural function of the callee and of its
-/// [`CallSplitArguments`]. Every call of one callee with the same arguments therefore shares one split, as JAX's
-/// call partial evaluation rules share one split per callee, knownness, and policy through their caches.
-struct CallSplitTransform;
-
-impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> Transform<Region<V, O>> for CallSplitTransform {
-    type Arguments = CallSplitArguments;
-    type Artifact = TransformArtifact<V, O, Arc<CallSplit>>;
-
-    const DEFAULT_CACHE_CAPACITY: usize = 8;
-}
-
-/// Kind of a retained [`CallSplitTransform`] split.
+/// Kind of a split of the callee of a `call` that [`split_call`] retains.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CallSplitKind {
     /// Split of a call whose inputs are partially known, marked in input order (refer to
@@ -2442,54 +2414,6 @@ enum CallSplitKind {
     /// Split of an all-known call on residual demand for the outputs of the callee that the residual planner demands,
     /// marked in output order (refer to [`PartialEvaluationContext::partition_residual_demand`]).
     ResidualDemand(Vec<bool>),
-}
-
-/// Argument key for one retained [`CallSplitTransform`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CallSplitArguments {
-    /// Kind of the split.
-    kind: CallSplitKind,
-
-    /// Residual policy that places the residuals of the split and of the splits nested within it, compared by
-    /// definition identity, or [`None`] when partial evaluation has no residual policy.
-    policy: Option<ResidualPolicyReference<ArrayIrType>>,
-
-    /// Type of the rounding with which the placement of the residuals of the split also rounds the values that the
-    /// known callee saves (refer to [`PartialEvaluationContext::residual_rounding_type`]), which stages rounding
-    /// operations in the known callee, or [`None`] when the placement keeps those values unrounded.
-    residual_rounding_type: Option<TypeId>,
-
-    /// Whether effectful operations with known inputs may fold into the known callee (refer to
-    /// [`PartialEvaluationContext::allow_effect_folding`]).
-    allow_effect_folding: bool,
-
-    /// Whether operations whose results must have storage of their own for every execution may fold into the known
-    /// callee (refer to [`PartialEvaluationContext::allow_copy_folding`]), which program specialization disallows.
-    allow_copy_folding: bool,
-
-    /// Whether recursive partitioning analyzes repeated residual invocations, which changes effect placement (refer
-    /// to [`PartialEvaluationDriver::partitions_for_repeated_residual_calls`]). Pure and residual-demand splits use
-    /// `false` because their partitions do not depend on this mode.
-    repeated_residual: bool,
-}
-
-/// Boundary wiring of a retained [`CallSplitTransform`] artifact, whose programs are the known callee and the
-/// residual callee, in that order. The known callee returns the known outputs of the original callee followed by the
-/// residual edges that the residual callee reads from it, and the residual callee returns the remaining outputs (i.e.,
-/// the demanded outputs for a split on residual demand). Refer to [`PartitionedProgram`]
-/// for more information on this layout.
-#[derive(Clone, Debug, PartialEq)]
-struct CallSplit {
-    /// Index of the call input feeding each input of the known callee, in order.
-    known_input_indices: Vec<usize>,
-
-    /// Source of each input of the residual callee, which is a call input, an output of the known callee, or a
-    /// residual edge.
-    residual_inputs: Vec<ResidualInputSource>,
-
-    /// Source of each output of the call, in output order, which is a known output of the known callee or an output of
-    /// the residual callee.
-    outputs: Vec<PartialEvaluationOutput<usize>>,
 }
 
 /// Returns the manual mesh axes along which an input of type `actual` varies beyond `declared`, the type of the callee
@@ -2750,14 +2674,31 @@ fn vary_lockstep_call_output<O: Operation<Type = ArrayIrType>, D: Interpretation
 }
 
 /// Returns the callee of a `call` bound over `callee` as a shared program, which is the program that `callee` was
-/// interned from, if any, and otherwise a copy of `callee` that the region transform cache of `callee` retains (refer
-/// to [`CallCalleeTransform`]).
+/// interned from, if any, and otherwise a copy of `callee` that the region transform cache of `callee` retains.
 fn shared_call_callee<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>>(
     callee: RegionRef<'_, V, O>,
 ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, ProgramError> {
+    /// [`Region`] [`Transform`] marker for the shared copy of the callee of a `call` that this function retains for a
+    /// callee region that is not interned as a shared region (e.g., the entry region of a shared callee program that a
+    /// rule binds directly, such as the primal or tangent callee of a linearized call). Binding that copy instead of a
+    /// fresh copy of the region lets every call of one callee share one region.
+    struct CallCalleeTransform;
+
+    impl<V, O> Transform<Region<V, O>> for CallCalleeTransform
+    where
+        V: Value<Type = ArrayIrType>,
+        O: Operation<Type = ArrayIrType>,
+    {
+        type Arguments = ();
+        type Artifact = TransformArtifact<V, O, ()>;
+
+        const DEFAULT_CACHE_CAPACITY: usize = 1;
+    }
+
     if let Some(callee) = callee.interned_callee() {
         return Ok(callee.clone());
     }
+
     let artifact = callee.transform::<CallCalleeTransform, _, ProgramError>((), |callee, _| {
         Ok(TransformArtifact::new(vec![Arc::new(callee.to_program())], ()))
     })?;
@@ -2931,7 +2872,7 @@ where
 /// The residual callee reads the call inputs and the known outputs that its residual edges would merely repeat
 /// directly (i.e., JAX's `in_fwd` and `out_fwd`), so that the known callee returns each value once and a residual
 /// planner plans those inputs like any other demanded value. The two callees are retained by the region transform cache
-/// of the callee (refer to [`CallSplitTransform`]) and bound as shared regions. Every call of one callee, including the
+/// of the callee and bound as shared regions. Every call of one callee, including the
 /// calls nested in the callees of an enclosing split, therefore shares one known callee and one residual callee for
 /// each kind of split and each policy, so the programs grow with the number of calls rather than with the size of
 /// their callees, and each callee is partitioned once rather than once per call. Calls whose partial evaluations round
@@ -2964,6 +2905,72 @@ where
         >,
     D: PartialEvaluationDriver<C>,
 {
+    /// [`Region`] [`Transform`] marker for the splits of the callee of a `call` that this function binds. Such a split
+    /// partitions the callee in fresh traces, where every input is a fresh known or unknown input, so it depends on no
+    /// value of a live context and is a structural function of the callee and of its [`CallSplitArguments`]. Every call
+    /// of one callee with the same arguments therefore shares one split, as JAX's call partial evaluation rules share
+    /// one split per callee, knownness, and policy through their caches.
+    struct CallSplitTransform;
+
+    impl<V, O> Transform<Region<V, O>> for CallSplitTransform
+    where
+        V: Value<Type = ArrayIrType>,
+        O: Operation<Type = ArrayIrType>,
+    {
+        type Arguments = CallSplitArguments;
+        type Artifact = TransformArtifact<V, O, Arc<CallSplit>>;
+
+        const DEFAULT_CACHE_CAPACITY: usize = 8;
+    }
+
+    /// Argument key for one retained [`CallSplitTransform`].
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct CallSplitArguments {
+        /// Kind of the split.
+        kind: CallSplitKind,
+
+        /// Residual policy that places the residuals of the split and of the splits nested within it, compared by
+        /// definition identity, or [`None`] when partial evaluation has no residual policy.
+        policy: Option<ResidualPolicyReference<ArrayIrType>>,
+
+        /// Type of the rounding with which the placement of the residuals of the split also rounds the values that the
+        /// known callee saves (refer to [`PartialEvaluationContext::residual_rounding_type`]), which stages rounding
+        /// operations in the known callee, or [`None`] when the placement keeps those values unrounded.
+        residual_rounding_type: Option<TypeId>,
+
+        /// Whether effectful operations with known inputs may fold into the known callee (refer to
+        /// [`PartialEvaluationContext::allow_effect_folding`]).
+        allow_effect_folding: bool,
+
+        /// Whether operations whose results must have storage of their own for every execution may fold into the known
+        /// callee (refer to [`PartialEvaluationContext::allow_copy_folding`]), which program specialization disallows.
+        allow_copy_folding: bool,
+
+        /// Whether recursive partitioning analyzes repeated residual invocations, which changes effect placement (refer
+        /// to [`PartialEvaluationDriver::partitions_for_repeated_residual_calls`]). Pure and residual-demand splits use
+        /// `false` because their partitions do not depend on this mode.
+        repeated_residual: bool,
+    }
+
+    /// Boundary wiring of a retained [`CallSplitTransform`] artifact, whose programs are the known callee and the
+    /// residual callee, in that order. The known callee returns the known outputs of the original callee followed by
+    /// the residual edges that the residual callee reads from it, and the residual callee returns the remaining outputs
+    /// (i.e., the demanded outputs for a split on residual demand). Refer to [`PartitionedProgram`] for more
+    /// information on this layout.
+    #[derive(Clone, Debug, PartialEq)]
+    struct CallSplit {
+        /// Index of the call input feeding each input of the known callee, in order.
+        known_input_indices: Vec<usize>,
+
+        /// Source of each input of the residual callee, which is a call input, an output of the known callee, or a
+        /// residual edge.
+        residual_inputs: Vec<ResidualInputSource>,
+
+        /// Source of each output of the call, in output order, which is a known output of the known callee or an output
+        /// of the residual callee.
+        outputs: Vec<PartialEvaluationOutput<usize>>,
+    }
+
     let callee = driver.region(0)?;
     let keeps_trivial_splits_whole = matches!(kind, CallSplitKind::Knownness(_));
     // A split on residual demand reports every output of the callee as known, followed by each demanded output once
@@ -3545,8 +3552,8 @@ mod tests {
     use ryft_macros::Operation;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, Dimension, DimensionBounds,
-        DimensionType, DimensionValue, DimensionVariable, Memory, MeshAxis, Shape,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, Device, Dimension,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Memory, MeshAxis, Shape,
     };
     use crate::batching::RecursiveBatchingDriver;
     use crate::captures::CaptureReference;
@@ -10757,55 +10764,6 @@ mod tests {
         let rebound = first.renamed(&renamed).unwrap();
         assert_eq!(rebound.definitions(), vec![local]);
         assert_ne!(rebound.outputs, first.outputs);
-    }
-
-    #[test]
-    fn test_call_split_transform() {
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let source = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let arguments = CallSplitArguments {
-            kind: CallSplitKind::Knownness(vec![true]),
-            policy: None,
-            residual_rounding_type: None,
-            allow_effect_folding: true,
-            allow_copy_folding: true,
-            repeated_residual: false,
-        };
-        let derive =
-            |region: RegionRef<'_, TestValue, TestOperation>, _: &CallSplitArguments| {
-                let residual = ProgramBuilder::<TestValue, TestOperation>::new()
-                    .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), Vec::new(), Vec::new())?;
-                Ok::<_, ProgramError>(TransformArtifact::new(
-                    vec![Arc::new(region.to_program()), Arc::new(residual)],
-                    Arc::new(CallSplit {
-                        known_input_indices: vec![0],
-                        residual_inputs: Vec::new(),
-                        outputs: vec![PartialEvaluationOutput::Known(0)],
-                    }),
-                ))
-            };
-        let first = source.entry_region_ref().transform::<CallSplitTransform, _, _>(arguments.clone(), derive).unwrap();
-        let repeated = source.entry_region_ref().transform::<CallSplitTransform, _, _>(arguments, derive).unwrap();
-        assert!(Arc::ptr_eq(first.metadata(), repeated.metadata()));
-        assert!(Arc::ptr_eq(&first.programs()[0], &repeated.programs()[0]));
-        assert!(Arc::ptr_eq(&first.programs()[1], &repeated.programs()[1]));
-        assert_eq!(first.metadata().known_input_indices, vec![0]);
-        assert_eq!(first.metadata().outputs, vec![PartialEvaluationOutput::Known(0)]);
-        assert_eq!(
-            first.programs()[0].to_string(),
-            indoc! {"
-                lambda %0:f32[] .
-                in (%0)"},
-        );
-        assert_eq!(
-            first.programs()[1].to_string(),
-            indoc! {"
-                lambda  .
-                in ()"},
-        );
     }
 
     #[test]
