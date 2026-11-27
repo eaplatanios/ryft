@@ -4593,6 +4593,16 @@ mod tests {
         }
     }
 
+    /// Returns a session of process 0 over the two devices of `client` that also knows two devices of a simulated
+    /// process 1, together with the devices of process 0 and the devices of process 1.
+    fn two_process_session(client: &'static Client<'static>) -> (Session, Vec<Device>, [Device; 2]) {
+        let local = Session::builder().client(client).build().unwrap().addressable_devices().unwrap();
+        assert_eq!(local.iter().map(Device::process_index).collect::<Vec<_>>(), [0, 0]);
+        let next_id = local.iter().map(Device::id).max().unwrap() + 1;
+        let remote = [Device::new(next_id, 1), Device::new(next_id + 1, 1)];
+        (session_with_remote_devices(client, remote), local, remote)
+    }
+
     /// Returns the addressable devices of `client`, in the order of the client.
     fn addressable_devices(client: &Client<'_>) -> Vec<Device> {
         client
@@ -6807,6 +6817,44 @@ mod tests {
     }
 
     #[test]
+    fn test_array_place_exact_shards_fails_before_any_transfer_without_the_buffer_of_a_send() {
+        // A process that imported only the metadata of a tile that the plan has it send (i.e., without a buffer for it
+        // or for any local replica) agrees on the plan, and then fails before it issues any transfer, while its peer
+        // issues its receive and waits. This is the accepted limit of the PJRT cross-host transfers that
+        // `.tasks/plan_placement_decisions.md` records, because a process cannot fail the pending receive of another.
+        let (session, local, remote) = two_process_session(cpu_client(2));
+        let r#type = ArrayType::new_static(DataType::F32, [2, 2]);
+        let replicated = |mesh: &DeviceMesh| Sharding::replicated(mesh.logical_mesh().clone(), 2);
+        let views = shared_views(&session, &r#type, &[local[0]], &replicated);
+        let mesh = &explicit_mesh(&[local[0], remote[0]]);
+        let sharding = &replicated(mesh);
+        let Ok(DevicePlacementStrategy::ExactShards { plan, cross_host_layouts }) =
+            views[0].device_placement_strategy(&simulated_cross_host_layout, mesh, sharding, 0)
+        else {
+            panic!("a replica that crosses processes must move as a whole shard");
+        };
+        let sends = plan.moves_with_role(0, MoveRole::Send).map(|movement| movement.target_device).collect::<Vec<_>>();
+        assert_eq!(sends, [remote[0]]);
+        assert_eq!(
+            plan.moves_with_role(1, MoveRole::Receive)
+                .map(|movement| movement.source_device)
+                .collect::<Vec<_>>(),
+            [local[0]],
+        );
+        let error = views[0]
+            .place_exact_shards(mesh, sharding, Memory::Device, &plan, &cross_host_layouts)
+            .err()
+            .unwrap();
+        assert!(matches!(
+            &error,
+            Error::Array(error) if matches!(
+                error.as_ref(),
+                ArrayError::MissingShardBuffer { shard_index: 0, device_id } if *device_id == local[0].id(),
+            ),
+        ));
+    }
+
+    #[test]
     fn test_array_copy_shard_through_host() {
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
@@ -7393,13 +7441,12 @@ mod tests {
             let input_type = ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(replicated).unwrap();
             let compiled =
                 crate::compile::<_, ArrayType, ArrayType>(|x| x.clone() + x, input_type, &session, mesh).unwrap();
-            let rejected = compiled.executable().execute(&session, source).err().map(|error| error.to_string());
             let expected = Error::Execution(ExecutionError::CommittedInputDeviceMismatch {
                 index: 0,
                 actual: vec![devices[0].id()],
                 expected: devices.iter().map(Device::id).collect(),
             });
-            assert_eq!(rejected, Some(expected.to_string()));
+            assert_eq!(compiled.executable().execute(&session, source).err(), Some(expected));
             let output = compiled.executable().execute(&session, moved).unwrap();
             output.block_until_ready().unwrap();
             assert_eq!(read_addressable_f32s(&output), [vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0]]);
@@ -8025,11 +8072,7 @@ mod tests {
     #[test]
     fn test_array_device_placement_strategy_agrees_across_processes() {
         let client = cpu_client(2);
-        let local = Session::builder().client(client).build().unwrap().addressable_devices().unwrap();
-        assert_eq!(local.iter().map(Device::process_index).collect::<Vec<_>>(), [0, 0]);
-        let next_id = local.iter().map(Device::id).max().unwrap() + 1;
-        let remote = [Device::new(next_id, 1), Device::new(next_id + 1, 1)];
-        let session = session_with_remote_devices(client, remote);
+        let (session, local, remote) = two_process_session(client);
         let replicated = |mesh: &DeviceMesh| Sharding::replicated(mesh.logical_mesh().clone(), 2);
         let sharded = |mesh: &DeviceMesh| {
             let dimensions = vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()];
@@ -8247,18 +8290,29 @@ mod tests {
                 process-local on two devices -> replicated on process 0: compiled reshard | compiled reshard on its owner
                 process-local on two devices -> sharded on process 1: exact shards on its owner | exact shards"},
         );
+    }
 
+    #[test]
+    fn test_array_device_placement_strategy_agrees_on_contributions_that_move_between_processes() {
         // A pending sum over both processes that moves onto the reversed devices only moves its contributions, so both
         // processes plan whole shards, and each one sends its contribution to the other instead of completing the sum.
-        let unreduced = |mesh: &DeviceMesh| replicated(mesh).with_unreduced_axes(["x"]).unwrap();
+        let (session, local, remote) = two_process_session(cpu_client(2));
+        let r#type = ArrayType::new_static(DataType::F32, [2, 2]);
+        let unreduced = |mesh: &DeviceMesh| {
+            Sharding::replicated(mesh.logical_mesh().clone(), 2).with_unreduced_axes(["x"]).unwrap()
+        };
         let views = shared_views(&session, &r#type, &[local[0], remote[0]], &unreduced);
         let reversed = explicit_mesh(&[remote[0], local[0]]);
         assert_eq!(placement_agreement(&views, &reversed, &unreduced(&reversed)), Ok("exact shards".to_string()));
+    }
 
+    #[test]
+    fn test_array_device_placement_strategy_agrees_on_shard_regions_of_uneven_splits_across_processes() {
         // A replicated `u8[5]` split unevenly over both processes needs only a slice of the replica that each process
         // already holds, so a declared layout and a memory that each process stages its replica out of on its own
         // devices leave every process with shard regions. That includes a strided layout, which each process converts
         // on its own devices.
+        let (session, local, remote) = two_process_session(cpu_client(2));
         let vector = ArrayType::new_static(DataType::U8, [5]);
         let split_mesh = explicit_mesh(&[local[0], remote[0]]);
         let split = Sharding::new(split_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -8289,7 +8343,10 @@ mod tests {
                 unpinned host memory -> uneven split: shard regions
                 strided layout in host memory -> uneven split: shard regions"},
         );
+    }
 
+    #[test]
+    fn test_array_device_placement_strategy_agrees_on_shard_regions_that_compiled_reshards_do_not_support() {
         // A replicated column-major `u8[4,2]` split evenly over the manual axis `m`, and a replicated column-major
         // `u8[5,2]` split unevenly over the explicit axis `x`, on devices that process 1 owns alone, take shard
         // regions, which convert each source shard that they read to the dense row-major layout on its own device,
@@ -8298,6 +8355,9 @@ mod tests {
         // A pending sum that a target over both processes introduces along `s`, whose devices at coordinate
         // zero are those of process 1, first places the uneven split on those devices with regions, and process 0
         // only writes its additive identities.
+        let (session, local, remote) = two_process_session(cpu_client(2));
+        let replicated = |mesh: &DeviceMesh| Sharding::replicated(mesh.logical_mesh().clone(), 2);
+        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let manual_mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
             remote.to_vec(),
@@ -8341,38 +8401,6 @@ mod tests {
                 ("uneven split with an introduced sum", introduced, Ok(2)),
             ],
         );
-
-        // A process that imported only the metadata of a tile that the plan has it send (i.e., without a buffer for it
-        // or for any local replica) agrees on the plan, and then fails before it issues any transfer, while its peer
-        // issues its receive and waits. This is the accepted limit of the PJRT cross-host transfers that
-        // `.tasks/plan_placement_decisions.md` records, because a process cannot fail the pending receive of another.
-        let views = shared_views(&session, &r#type, &[local[0]], &replicated);
-        let mesh = &explicit_mesh(&[local[0], remote[0]]);
-        let sharding = &replicated(mesh);
-        let Ok(DevicePlacementStrategy::ExactShards { plan, cross_host_layouts }) =
-            views[0].device_placement_strategy(&simulated_cross_host_layout, mesh, sharding, 0)
-        else {
-            panic!("a replica that crosses processes must move as a whole shard");
-        };
-        let sends = plan.moves_with_role(0, MoveRole::Send).map(|movement| movement.target_device).collect::<Vec<_>>();
-        assert_eq!(sends, [remote[0]]);
-        assert_eq!(
-            plan.moves_with_role(1, MoveRole::Receive)
-                .map(|movement| movement.source_device)
-                .collect::<Vec<_>>(),
-            [local[0]],
-        );
-        let error = views[0]
-            .place_exact_shards(mesh, sharding, Memory::Device, &plan, &cross_host_layouts)
-            .err()
-            .unwrap();
-        assert!(matches!(
-            &error,
-            Error::Array(error) if matches!(
-                error.as_ref(),
-                ArrayError::MissingShardBuffer { shard_index: 0, device_id } if *device_id == local[0].id(),
-            ),
-        ));
     }
 
     #[test]
