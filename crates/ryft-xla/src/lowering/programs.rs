@@ -4,14 +4,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, AtomId, BroadcastLikeOperation, BroadcastOperation, CallOperation, CastOperation,
-    ConstrainShardingOperation, DataType, DeviceMesh, Dimension, DynamicBroadcastOperation, DynamicReshapeOperation,
-    EffectClass, ExternalReferenceBinding, FillLikeOperation, GatherOperation, IotaLikeOperation, IotaOperation,
-    LogicalMesh, Memory, MeshAxisType, OneLikeOperation, OneOperation, Parameterized, PlaceOperation, PlacementRequest,
-    Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RequestedPlacement, ReshapeOperation,
-    ReshardOperation, ScatterOperation, Shape, ShardMapOperation, Sharding, ShardingDimension, StopGradientOperation,
-    TagOperation, TransferToMemoryOperation, Type as CoreType, Typed, TypedProgram, Value, ZeroLikeOperation,
-    ZeroOperation,
+    ArrayType, AtomId, BroadcastOperation, CallOperation, DataType, DeviceMesh, Dimension, EffectClass,
+    ExternalReferenceBinding, LogicalMesh, Memory, MeshAxisType, Parameterized, PlaceOperation, PlacementRequest,
+    Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RequestedPlacement, Shape, Sharding,
+    ShardingDimension, StopGradientOperation, TagOperation, TransferToMemoryOperation, Type as CoreType, Typed,
+    TypedProgram, Value,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -22,12 +19,11 @@ use ryft_mlir::{
 use crate::arrays::host::ReductionChange;
 use crate::devices::MemoryExtension;
 use crate::lowering::emissions::{
-    collect_session_constants, emitted_regions, omits_regions, partition_session_constants, unread_entry_inputs,
+    collect_session_constants, omits_regions, partition_session_constants, unread_entry_inputs,
 };
 use crate::lowering::modules::{
-    broadcast_changes_explicit_sharding, cast_changes_explicit_placement, contains_unresolved_references,
-    contains_unresolved_state, declare_constrained_mesh, merge_logical_meshes, normalize_function_name,
-    remove_shardy_operations, render_devices, serialize_lowered_module,
+    contains_unresolved_references, contains_unresolved_state, normalize_function_name, remove_shardy_operations,
+    render_devices, serialize_lowered_module,
 };
 use crate::lowering::reductions::{
     ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
@@ -262,22 +258,9 @@ impl MlirProgramSignature {
         self
     }
 
-    /// Returns whether the logical input at `index` is erased because the executable never reads it (refer to
-    /// `with_unread_inputs`).
-    #[inline]
-    pub fn is_unread_input(&self, index: usize) -> bool {
-        self.unread_inputs.get(index).copied().unwrap_or(false)
-    }
-
-    /// Returns whether each logical input is erased because the executable never reads it (refer to
-    /// `with_unread_inputs`), or an empty slice when every input is read.
-    #[inline]
-    pub fn unread_inputs(&self) -> &[bool] {
-        &self.unread_inputs
-    }
-
     /// Attaches the effect metadata known at compilation time, also used when restoring persistent executable metadata.
     /// `device_ordered_io` is only meaningful together with `ordered_io` and is cleared otherwise.
+    #[inline]
     pub(crate) fn with_effects(
         mut self,
         ordered_io: bool,
@@ -302,6 +285,19 @@ impl MlirProgramSignature {
     #[inline]
     pub fn output_mapping(&self) -> &[Option<usize>] {
         &self.output_mapping
+    }
+
+    /// Returns whether each logical input is erased because the executable never reads it, or an empty slice when every
+    /// input is read.
+    #[inline]
+    pub fn unread_inputs(&self) -> &[bool] {
+        &self.unread_inputs
+    }
+
+    /// Returns whether the logical input at `index` is erased because the executable never reads it.
+    #[inline]
+    pub fn is_unread_input(&self, index: usize) -> bool {
+        self.unread_inputs.get(index).copied().unwrap_or(false)
     }
 
     /// Returns the hidden scalar inputs of bounded dynamic input dimensions in physical executable order.
@@ -2506,13 +2502,13 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayOperation, ArrayType, CALL_OPERATION_NAME, CompositeKey, CompositeOperation, ConstrainSharding,
-        CustomRuleDefinition, CustomRuleRegistration, DataType, Device, DeviceMesh, Dimension, DimensionBounds,
-        DimensionValue, DimensionVariable, DomainTracingContext, EffectClass, FlatProgram, ImportingContext,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite, PLACE_OPERATION_NAME, Place, PlaceOperation,
-        Placeholder, Placement, PlacementRequest, Print, ProgramBuilder, Reshard, ScanOperation, Shape,
-        ShardMapOptions, Sharding, ShardingDimension, Sin, StopGradient, Tag, TransferToMemory, TypeError, Typed,
-        ValueProjection, shard_map,
+        ArrayOperation, ArrayType, CALL_OPERATION_NAME, CastOperation, CompositeKey, CompositeOperation,
+        ConstrainSharding, CustomRuleDefinition, CustomRuleRegistration, DataType, Device, DeviceMesh, Dimension,
+        DimensionBounds, DimensionValue, DimensionVariable, DomainTracingContext, EffectClass, FlatProgram,
+        ImportingContext, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite, PLACE_OPERATION_NAME, Place,
+        PlaceOperation, Placeholder, Placement, PlacementRequest, Print, ProgramBuilder, ReshapeOperation, Reshard,
+        ScanOperation, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin, StopGradient, Tag, TransferToMemory,
+        TypeError, Typed, ValueProjection, shard_map,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
