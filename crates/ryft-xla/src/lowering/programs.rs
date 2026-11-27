@@ -116,13 +116,11 @@ impl MlirProgram {
     }
 }
 
-// TODO(eaplatanios): Review this.
 /// Mapping from the logical inputs and outputs of one XLA executable boundary to its physical inputs and outputs.
-///
-/// Ryft retains every logical leaf in its staged and compiled function metadata. Statically shaped
-/// [`DataType::Zero`] leaves carry no runtime payload and are omitted from the StableHLO/PJRT signature, and each
-/// mapping stores the corresponding physical ordinal for materialized leaves and `None` for erased leaves. Dynamically
-/// shaped [`DataType::Zero`] leaves deliberately retain private `i1` carriers because the current executable ABI has no
+/// Ryft retains every logical leaf in its staged and compiled function metadata. Statically shaped [`DataType::Zero`]
+/// leaves carry no runtime payload and are omitted from the StableHLO/PJRT signature, and each mapping stores
+/// the corresponding physical ordinal for materialized leaves and `None` for erased leaves. Dynamically shaped
+/// [`DataType::Zero`] leaves deliberately retain private `i1` carriers because the current executable ABI has no
 /// independent shape transport. Current XLA compilation may impose stricter limits on dynamic tensors than this
 /// projection layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,26 +128,25 @@ pub struct MlirProgramSignature {
     /// Physical input ordinal for each logical flattened input.
     input_mapping: Arc<[Option<usize>]>,
 
-    /// Whether each logical flattened input is erased because the executable never reads it (refer to
-    /// [`Self::with_unread_inputs`]), or empty when every input is read.
+    /// Whether each logical flattened input is erased because the executable never reads it, or empty when every input
+    /// is read.
     unread_inputs: Arc<[bool]>,
 
     /// Physical output ordinal for each logical flattened output.
     output_mapping: Arc<[Option<usize>]>,
 
     /// Hidden scalar inputs that restore bounded dynamic dimensions on physicalized input tensors.
-    input_dimensions: Arc<[InputDimension]>,
+    input_dimensions: Arc<[MlirProgramSignatureInputDimension]>,
 
     /// Hidden scalar outputs that report bounded dynamic logical output extents.
-    output_dimensions: Arc<[OutputDimension]>,
+    output_dimensions: Arc<[MlirProgramSignatureOutputDimension]>,
 
     /// Whether the executable carries the ordered I/O boundary token (i.e., whether the program contains
-    /// [`OrderedIo`](ryft_core::EffectClass::OrderedIo) or [`DeviceOrderedIo`](ryft_core::EffectClass::DeviceOrderedIo)
-    /// effects).
+    /// [`OrderedIo`](EffectClass::OrderedIo) or [`DeviceOrderedIo`](EffectClass::DeviceOrderedIo) effects).
     ordered_io: bool,
 
-    /// Whether every ordered I/O occurrence is `DeviceOrderedIo`, so the boundary token only needs per-device ordering
-    /// and the executable may run on several devices.
+    /// Whether every ordered I/O occurrence is [`DeviceOrderedIo`](EffectClass::DeviceOrderedIo), so the boundary token
+    /// only needs per-device ordering and the executable may run on several devices.
     device_ordered_io: bool,
 
     /// Whether the executable contains unordered I/O.
@@ -184,7 +181,11 @@ impl MlirProgramSignature {
         for (logical_input_index, input_type) in input_types.iter().enumerate() {
             for (axis, dimension) in input_type.shape().dimensions().iter().enumerate() {
                 if dimension.value().is_none() && dimension.upper_bound().is_some() {
-                    input_dimensions.push(InputDimension { axis, logical_input_index, physical_input_index });
+                    input_dimensions.push(MlirProgramSignatureInputDimension {
+                        axis,
+                        logical_input_index,
+                        physical_input_index,
+                    });
                     physical_input_index += 1;
                 }
             }
@@ -195,7 +196,11 @@ impl MlirProgramSignature {
         for (logical_output_index, output_type) in output_types.iter().enumerate() {
             for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
                 if dimension.value().is_none() && dimension.upper_bound().is_some() {
-                    output_dimensions.push(OutputDimension { axis, logical_output_index, physical_output_index });
+                    output_dimensions.push(MlirProgramSignatureOutputDimension {
+                        axis,
+                        logical_output_index,
+                        physical_output_index,
+                    });
                     physical_output_index += 1;
                 }
             }
@@ -244,11 +249,14 @@ impl MlirProgramSignature {
                 Some(physical_index - 1)
             })
             .collect();
-        let input_dimensions = self
-            .input_dimensions
-            .iter()
-            .enumerate()
-            .map(|(offset, dimension)| InputDimension { physical_input_index: physical_index + offset, ..*dimension });
+        let input_dimensions =
+            self.input_dimensions
+                .iter()
+                .enumerate()
+                .map(|(offset, dimension)| MlirProgramSignatureInputDimension {
+                    physical_input_index: physical_index + offset,
+                    ..*dimension
+                });
         self.input_dimensions = input_dimensions.collect();
         self.unread_inputs = unread_inputs.into();
         self
@@ -336,13 +344,13 @@ impl MlirProgramSignature {
 
     /// Returns the hidden scalar inputs of bounded dynamic input dimensions in physical executable order.
     #[inline]
-    pub fn input_dimensions(&self) -> &[InputDimension] {
+    pub fn input_dimensions(&self) -> &[MlirProgramSignatureInputDimension] {
         &self.input_dimensions
     }
 
     /// Returns the hidden extent outputs of bounded dynamic output dimensions in physical executable order.
     #[inline]
-    pub fn output_dimensions(&self) -> &[OutputDimension] {
+    pub fn output_dimensions(&self) -> &[MlirProgramSignatureOutputDimension] {
         &self.output_dimensions
     }
 
@@ -472,7 +480,7 @@ impl MlirProgramSignature {
 // TODO(eaplatanios): Review this.
 /// One bounded dynamic input axis transported as a hidden scalar physical input of the executable.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct InputDimension {
+pub struct MlirProgramSignatureInputDimension {
     /// Axis within the logical input.
     axis: usize,
 
@@ -484,7 +492,7 @@ pub struct InputDimension {
 }
 
 // TODO(eaplatanios): Review this.
-impl InputDimension {
+impl MlirProgramSignatureInputDimension {
     /// Returns the dynamic axis within the logical input.
     #[inline]
     pub fn axis(self) -> usize {
@@ -507,7 +515,7 @@ impl InputDimension {
 // TODO(eaplatanios): Review this.
 /// One bounded dynamic output axis transported as a hidden scalar physical output of the executable.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct OutputDimension {
+pub struct MlirProgramSignatureOutputDimension {
     /// Axis within the logical output.
     axis: usize,
 
@@ -519,7 +527,7 @@ pub struct OutputDimension {
 }
 
 // TODO(eaplatanios): Review this.
-impl OutputDimension {
+impl MlirProgramSignatureOutputDimension {
     /// Returns the dynamic axis within the logical output.
     #[inline]
     pub fn axis(self) -> usize {

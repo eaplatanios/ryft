@@ -186,7 +186,7 @@ pub(crate) mod types;
 
 pub use admission::DataDependentPaddingDiscipline;
 pub use programs::{
-    EntryShardingOverride, InputDimension, MlirProgram, MlirProgramSignature, OutputDimension,
+    EntryShardingOverride, MlirProgramSignatureInputDimension, MlirProgram, MlirProgramSignature, MlirProgramSignatureOutputDimension,
     ProgramLoweringExtension, ProgramLoweringOptions,
 };
 pub use sharding::{
