@@ -896,7 +896,7 @@ impl Session {
             &LoadOptions::default(),
         )?;
         let output_types_physical = executable.executable()?.output_element_types()?;
-        if output_types_physical.len() != signature.output_count()
+        if output_types_physical.len() != signature.executable_output_count()
             || signature
                 .ordered_io_output_index()
                 .is_some_and(|index| output_types_physical[index] != BufferType::Token)
@@ -931,7 +931,6 @@ impl Session {
             reference_states.into(),
             signature,
             runtime_requirements.into(),
-            metadata.requires_assertion_handler,
             donation_flags.into(),
             capture_count,
             expected_input_shardings.into(),

@@ -2292,8 +2292,7 @@ mod tests {
                     .with_reference_bindings(Vec::new(), Vec::new(), Vec::new()),
             )
             .unwrap();
-        let (stable_hlo, signature, requires_assertion_handler, runtime_requirements) = lowered.into_parts();
-        assert!(requires_assertion_handler);
+        let (stable_hlo, signature, runtime_requirements) = lowered.into_parts();
         assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin(ASSERT_CUSTOM_CALL_TARGET)]);
         assert!(signature.requires_assertion_handler());
         assert!(signature.has_effects());
@@ -2301,7 +2300,7 @@ mod tests {
         assert!(!signature.has_unordered_io());
         assert_eq!(signature.ordered_io_input_index(), None);
         assert_eq!(signature.ordered_io_output_index(), None);
-        assert_eq!(signature.input_count(), 2);
+        assert_eq!(signature.executable_input_count(), 2);
         assert_eq!(
             stable_hlo,
             indoc! {"

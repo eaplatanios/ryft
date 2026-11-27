@@ -200,8 +200,9 @@ impl ExecutionPlan {
         capture_count: usize,
         mesh: &DeviceMesh,
     ) -> Result<Self, Error> {
-        let physical_input_logical_indices = signature.project_inputs(&(0..input_types.len()).collect::<Vec<_>>());
-        let mut physical_input_types = signature.physical_input_types(input_types);
+        let physical_input_logical_indices =
+            signature.select_input_entries(&(0..input_types.len()).collect::<Vec<_>>())?;
+        let mut physical_input_types = signature.executable_input_types(input_types)?;
         let compiled_executable = executable.executable()?;
         // A plugin without the layouts extension (e.g., the MPS plugin) does not report the layouts of its executables.
         // The validation below then rejects an input type that declares a layout, which it cannot confirm, and an
@@ -215,7 +216,7 @@ impl ExecutionPlan {
                 Err(error) => return Err(error.into()),
             }
         };
-        let physical_output_types = signature.physical_output_types(output_types);
+        let physical_output_types = signature.executable_output_types(output_types)?;
         let output_layouts = if physical_output_types.iter().any(|array_type| array_type.layout().is_some()) {
             compiled_executable.output_layouts()?
         } else {
@@ -314,7 +315,7 @@ impl ExecutionPlan {
         }
         let logical_donation_flags =
             std::iter::repeat_n(false, capture_count).chain(donation_flags.iter().copied()).collect::<Vec<_>>();
-        let mut default_donation_flags = signature.project_inputs(logical_donation_flags.as_slice());
+        let mut default_donation_flags = signature.select_input_entries(logical_donation_flags.as_slice())?;
         default_donation_flags.extend(std::iter::repeat_n(false, signature.input_dimensions().len()));
         for (donation, input_type) in default_donation_flags.iter_mut().zip(physical_input_types.iter()) {
             if input_type.data_type().is_zero() {
@@ -869,7 +870,7 @@ impl Session {
                 })?;
                 *flag = donation;
             }
-            let mut donation_flags = program.signature().project_inputs(logical_donation_flags.as_slice());
+            let mut donation_flags = program.signature().select_input_entries(logical_donation_flags.as_slice())?;
             donation_flags.extend(std::iter::repeat_n(false, program.signature().input_dimensions().len()));
             for (donation, input_type) in donation_flags.iter_mut().zip(plan.physical_input_types.iter()) {
                 if input_type.data_type().is_zero() {
@@ -1405,7 +1406,7 @@ impl Session {
             arguments
                 .inputs_by_device()
                 .iter()
-                .all(|inputs| inputs.len() == program.signature().input_count())
+                .all(|inputs| inputs.len() == program.signature().executable_input_count())
         );
         #[cfg(test)]
         if tests::take_stateful_failure_injection(tests::StatefulFailureInjection::BeforeSubmission) {
@@ -1428,7 +1429,7 @@ impl Session {
             .then(|| ExecutionFence::join(std::iter::once(fence.clone()).chain(input_fences)));
         // Reference publication must happen after every successful handoff, including a subsequent marshalling error.
         after_submission(joined_fence.as_ref().unwrap_or(&fence));
-        let output_count = program.signature().output_count();
+        let output_count = program.signature().executable_output_count();
         debug_assert_eq!(array_output_count, program.signature().output_array_count());
         let invalid_outputs = device_outputs
             .iter()
@@ -1585,8 +1586,8 @@ impl Session {
     ) -> Result<Vec<Array>, Error> {
         assert_eq!(declared_types.len(), inputs.len());
         assert_eq!(actual_types.len(), inputs.len());
-        let physical_types = signature.physical_input_types(declared_types);
-        let mut physical_inputs = signature.project_inputs(inputs.as_slice());
+        let physical_types = signature.executable_input_types(declared_types)?;
+        let mut physical_inputs = signature.select_input_entries(inputs.as_slice())?;
         for logical_input_index in 0..inputs.len() {
             if !signature
                 .input_dimensions()
@@ -5231,7 +5232,7 @@ mod tests {
         assert_eq!(inputs.len(), 2);
         assert_eq!(inputs[0], zero);
 
-        let physical_types = signature.physical_input_types(std::slice::from_ref(&declared_type));
+        let physical_types = signature.executable_input_types(std::slice::from_ref(&declared_type)).unwrap();
         let carriers = session.materialize_zero_space_carriers(&mesh, &physical_types, inputs).unwrap();
         assert_eq!(carriers[0].data_type(), DataType::Boolean);
         assert_eq!(carriers[0].shape().as_slice(), &[3]);

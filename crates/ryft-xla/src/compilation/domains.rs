@@ -857,7 +857,7 @@ impl Session {
                 *donation = false;
             }
         }
-        let expected_input_shardings = signature.physical_input_shardings(logical_input_shardings.as_slice());
+        let expected_input_shardings = signature.executable_input_shardings(logical_input_shardings.as_slice())?;
         let embeds_kernels = emitted_regions(program.entry_region_ref(), target_platform).any(|region| {
             region.instructions().iter().any(|instruction| match instruction.operation() {
                 Operation::CustomCall(operation) | Operation::Array(ArrayOperation::CustomCall(operation)) => {

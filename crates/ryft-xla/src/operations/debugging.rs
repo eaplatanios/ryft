@@ -801,7 +801,7 @@ mod tests {
                         .with_reference_bindings(Vec::new(), Vec::new(), Vec::new()),
                 )
                 .unwrap();
-            let (stable_hlo, signature, _, runtime_requirements) = lowered.into_parts();
+            let (stable_hlo, signature, runtime_requirements) = lowered.into_parts();
             assert_eq!(signature.has_ordered_io(), ordered);
             let requirements = if ordered {
                 vec![
@@ -818,7 +818,7 @@ mod tests {
             assert!(!signature.requires_assertion_handler());
             assert_eq!(signature.ordered_io_input_index(), ordered.then_some(1));
             assert_eq!(signature.ordered_io_output_index(), ordered.then_some(0));
-            assert_eq!(signature.input_count(), 1 + usize::from(ordered));
+            assert_eq!(signature.executable_input_count(), 1 + usize::from(ordered));
             let expected = if ordered {
                 indoc! {"
                     module {

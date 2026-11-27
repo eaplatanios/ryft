@@ -923,7 +923,7 @@ mod tests {
             .unwrap();
         let lowered = program.to_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
-        let (stable_hlo, _, _, runtime_requirements) = lowered.into_parts();
+        let (stable_hlo, _, runtime_requirements) = lowered.into_parts();
         assert_eq!(runtime_requirements.as_ref(), &[first, second]);
         assert_eq!(
             stable_hlo,
@@ -1237,11 +1237,11 @@ mod tests {
                     .with_output_types(&vec![alias_type, ArrayType::new_static(DataType::F32, [3, 3])]),
             )
             .unwrap();
-        let (stable_hlo, signature, requires_assertion_handler, runtime_requirements) = lowered.into_parts();
+        let (stable_hlo, signature, runtime_requirements) = lowered.into_parts();
         assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin("ryft.assert")]);
         // This direct lowering fixture has no ordered boundary slot and needs no transport admission.
         assert!(!signature.has_ordered_io());
-        assert!(requires_assertion_handler);
+        assert!(signature.requires_assertion_handler());
         let module = stable_hlo;
         assert_eq!(
             module,

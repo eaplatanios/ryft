@@ -1805,7 +1805,7 @@ mod tests {
             .unwrap();
         let lowered = program.to_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
-        let (stable_hlo, _, _, runtime_requirements) = lowered.into_parts();
+        let (stable_hlo, _, runtime_requirements) = lowered.into_parts();
         assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin("test.active")]);
         assert_eq!(
             stable_hlo,
@@ -1850,7 +1850,7 @@ mod tests {
         let lowered =
             program.to_mlir("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda"))).unwrap();
 
-        let (stable_hlo, _, _, runtime_requirements) = lowered.into_parts();
+        let (stable_hlo, _, runtime_requirements) = lowered.into_parts();
         assert!(runtime_requirements.is_empty());
         assert_eq!(
             stable_hlo,

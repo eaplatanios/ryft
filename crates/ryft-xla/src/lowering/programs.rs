@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, AtomId, BroadcastOperation, CallOperation, DataType, DeviceMesh, Dimension, EffectClass,
     ExternalReferenceBinding, LogicalMesh, Memory, MeshAxisType, Parameterized, PlaceOperation, PlacementRequest,
@@ -53,10 +54,6 @@ pub struct MlirProgram {
     /// physical inputs and outputs.
     signature: MlirProgramSignature,
 
-    // TODO(eaplatanios): Why do we need this? Is `runtime_requirements` being non-empty not sufficient?
-    /// Whether execution requires the host runtime assertion handler.
-    requires_assertion_handler: bool,
-
     /// Canonical runtime contracts required by emitted calls and synthesized checks.
     runtime_requirements: Arc<[RuntimeRequirement]>,
 
@@ -66,17 +63,16 @@ pub struct MlirProgram {
 }
 
 impl MlirProgram {
-    /// Pairs the rendered `stable_hlo` module with the `signature` of its entry function, whether executing it
-    /// requires the host runtime assertion handler, its canonical `runtime_requirements`, and its module `mesh`.
+    /// Pairs the rendered `stable_hlo` module with the `signature` of its entry function, its canonical
+    /// `runtime_requirements`, and its module `mesh`.
     #[inline]
     fn new(
         stable_hlo: String,
         signature: MlirProgramSignature,
-        requires_assertion_handler: bool,
         runtime_requirements: Arc<[RuntimeRequirement]>,
         mesh: Option<LogicalMesh>,
     ) -> Self {
-        Self { stable_hlo, signature, requires_assertion_handler, runtime_requirements, mesh }
+        Self { stable_hlo, signature, runtime_requirements, mesh }
     }
 
     /// Returns the rendered StableHLO module of this [`MlirProgram`].
@@ -105,10 +101,12 @@ impl MlirProgram {
         self.stable_hlo
     }
 
-    /// Consumes the textual module, executable signature, assertion classification, and runtime requirements.
+    /// Consumes this [`MlirProgram`] and returns its textual module, the signature of its entry function, and its
+    /// runtime requirements. Whether executing it requires the host runtime assertion handler is part of the
+    /// signature.
     #[inline]
-    pub fn into_parts(self) -> (String, MlirProgramSignature, bool, Arc<[RuntimeRequirement]>) {
-        (self.stable_hlo, self.signature, self.requires_assertion_handler, self.runtime_requirements)
+    pub fn into_parts(self) -> (String, MlirProgramSignature, Arc<[RuntimeRequirement]>) {
+        (self.stable_hlo, self.signature, self.runtime_requirements)
     }
 }
 
@@ -389,9 +387,15 @@ impl MlirProgramSignature {
         self.output_array_count() + usize::from(self.ordered_io)
     }
 
-    /// Returns the executable's array input types. Bounded dynamic dimensions use their maximum extents, and hidden
-    /// extent scalars follow the data inputs. When present, the ordered I/O token occupies a separate slot.
-    pub fn executable_input_types(&self, inputs: &[ArrayType]) -> Vec<ArrayType> {
+    /// Returns the executable's array input types for the types of the logical `inputs`, one per flattened logical
+    /// input. Bounded dynamic dimensions use their maximum extents, and hidden extent scalars follow the data inputs.
+    /// When present, the ordered I/O token occupies a separate slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidInputCount`] when `inputs` does not have one entry per logical input.
+    pub fn executable_input_types(&self, inputs: &[ArrayType]) -> Result<Vec<ArrayType>, Error> {
+        check_count!("input", inputs, self.input_mapping.len(), ProgramError);
         let mut physical = Self::select_mapped_entries(&self.input_mapping, inputs);
         let mut converted = vec![false; physical.len()];
         for input_dimension in self.input_dimensions.iter() {
@@ -418,87 +422,112 @@ impl MlirProgramSignature {
             physical[physical_index] = physical[physical_index].clone().with_shape(Shape::new(dimensions));
         }
         physical.extend(self.input_dimensions.iter().map(|_| ArrayType::scalar(DataType::I32)));
-        physical
+        Ok(physical)
     }
 
-    /// Returns the executable's array output types, with hidden extent scalars after the data outputs. When present,
-    /// the ordered I/O token occupies a separate slot.
-    pub fn executable_output_types(&self, outputs: &[ArrayType]) -> Vec<ArrayType> {
+    /// Returns the executable's array output types for the types of the logical `outputs`, one per flattened logical
+    /// output, with hidden extent scalars after the data outputs. When present, the ordered I/O token occupies a
+    /// separate slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidOutputCount`] when `outputs` does not have one entry per logical output.
+    pub fn executable_output_types(&self, outputs: &[ArrayType]) -> Result<Vec<ArrayType>, Error> {
+        check_count!("output", outputs, self.output_mapping.len(), ProgramError);
         let mut physical = Self::select_mapped_entries(&self.output_mapping, outputs);
         physical.extend(self.output_dimensions.iter().map(|_| ArrayType::scalar(DataType::I64)));
-        physical
+        Ok(physical)
     }
 
-    /// Returns input shardings in executable order, with a replicated scalar sharding for each hidden extent on
-    /// the mesh of the input that owns it.
-    pub fn executable_input_shardings(&self, shardings: &[Sharding]) -> Vec<Sharding> {
+    /// Returns the input `shardings`, one per flattened logical input, in executable order, with a replicated scalar
+    /// sharding for each hidden extent on the mesh of the input that owns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidInputCount`] when `shardings` does not have one entry per logical input.
+    pub fn executable_input_shardings(&self, shardings: &[Sharding]) -> Result<Vec<Sharding>, Error> {
+        check_count!("input", shardings, self.input_mapping.len(), ProgramError);
         let mut physical = Self::select_mapped_entries(&self.input_mapping, shardings);
         physical.extend(
             self.input_dimensions
                 .iter()
                 .map(|dimension| Sharding::replicated(shardings[dimension.logical_input_index].mesh().clone(), 0)),
         );
-        physical
+        Ok(physical)
     }
 
     /// Returns input shardings like [`Self::executable_input_shardings`], leaving a hidden extent input unannotated
     /// when the input that owns it is unannotated.
-    fn executable_optional_input_shardings(&self, shardings: &[Option<Sharding>]) -> Vec<Option<Sharding>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidInputCount`] when `shardings` does not have one entry per logical input.
+    fn executable_optional_input_shardings(
+        &self,
+        shardings: &[Option<Sharding>],
+    ) -> Result<Vec<Option<Sharding>>, Error> {
+        check_count!("input", shardings, self.input_mapping.len(), ProgramError);
         let mut physical = Self::select_mapped_entries(&self.input_mapping, shardings);
         physical.extend(self.input_dimensions.iter().map(|dimension| {
             shardings[dimension.logical_input_index]
                 .as_ref()
                 .map(|sharding| Sharding::replicated(sharding.mesh().clone(), 0))
         }));
-        physical
+        Ok(physical)
     }
 
-    /// Returns output shardings in executable order, including the sharding of each hidden extent output, which is
-    /// replicated on the mesh of the output that owns the extent, or absent when that output is unannotated.
-    pub fn executable_optional_output_shardings(&self, shardings: &[Option<Sharding>]) -> Vec<Option<Sharding>> {
+    /// Returns the output `shardings`, one per flattened logical output, in executable order, including the sharding
+    /// of each hidden extent output, which is replicated on the mesh of the output that owns the extent, or absent
+    /// when that output is unannotated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidOutputCount`] when `shardings` does not have one entry per logical output.
+    pub fn executable_optional_output_shardings(
+        &self,
+        shardings: &[Option<Sharding>],
+    ) -> Result<Vec<Option<Sharding>>, Error> {
+        check_count!("output", shardings, self.output_mapping.len(), ProgramError);
         let mut physical = Self::select_mapped_entries(&self.output_mapping, shardings);
         physical.extend(self.output_dimensions.iter().map(|dimension| {
             shardings[dimension.logical_output_index]
                 .as_ref()
                 .map(|sharding| Sharding::replicated(sharding.mesh().clone(), 0))
         }));
-        physical
+        Ok(physical)
     }
 
     /// Clones the entries in `inputs` for logical inputs that have an executable array slot. Supply one entry per
     /// flattened logical input, including captures. For example, the input mapping `[Some(0), None, Some(1)]` maps
     /// `[a, b, c]` to `[a, c]`. Hidden extent scalars and effect tokens have separate slots.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `inputs` has a different length from [`Self::input_mapping`].
+    /// Returns [`ProgramError::InvalidInputCount`] when `inputs` does not have one entry per logical input.
     #[inline]
-    pub fn select_input_entries<T: Clone>(&self, inputs: &[T]) -> Vec<T> {
-        Self::select_mapped_entries(&self.input_mapping, inputs)
+    pub fn select_input_entries<T: Clone>(&self, inputs: &[T]) -> Result<Vec<T>, Error> {
+        check_count!("input", inputs, self.input_mapping.len(), ProgramError);
+        Ok(Self::select_mapped_entries(&self.input_mapping, inputs))
     }
 
     /// Clones the entries in `outputs` for logical outputs that have an executable array slot. Supply one entry per
     /// flattened logical output. For example, the output mapping `[None, Some(0)]` maps `[a, b]` to `[b]`. Hidden
     /// extent scalars and effect tokens have separate slots.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `outputs` has a different length from [`Self::output_mapping`].
+    /// Returns [`ProgramError::InvalidOutputCount`] when `outputs` does not have one entry per logical output.
     #[inline]
-    pub fn select_output_entries<T: Clone>(&self, outputs: &[T]) -> Vec<T> {
-        Self::select_mapped_entries(&self.output_mapping, outputs)
+    pub fn select_output_entries<T: Clone>(&self, outputs: &[T]) -> Result<Vec<T>, Error> {
+        check_count!("output", outputs, self.output_mapping.len(), ProgramError);
+        Ok(Self::select_mapped_entries(&self.output_mapping, outputs))
     }
-
-    // TODO(eaplatanios): Review this.
 
     /// Clones entries from `values` whose corresponding entries in `mapping` are `Some(_)`. The signature assigns
     /// physical indices consecutively in logical order, so keeping these entries in sequence gives executable order.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `mapping` and `values` have different lengths.
+    /// `mapping` and `values` must have the same length, which every caller validates before it selects.
     fn select_mapped_entries<T: Clone>(mapping: &[Option<usize>], values: &[T]) -> Vec<T> {
-        assert_eq!(mapping.len(), values.len());
+        debug_assert_eq!(mapping.len(), values.len());
         mapping
             .iter()
             .zip(values)
@@ -877,9 +906,8 @@ where
             signature.require_assertion_handler();
         }
 
-        let requires_assertion_handler = signature.requires_assertion_handler();
         let mut runtime_requirements = lowering_state.runtime_requirements();
-        if requires_assertion_handler {
+        if signature.requires_assertion_handler() {
             runtime_requirements.push(RuntimeRequirement::builtin("ryft.assert"));
         }
 
@@ -889,13 +917,7 @@ where
 
         let runtime_requirements = normalize_runtime_requirements(runtime_requirements)?.into();
 
-        Ok(MlirProgram::new(
-            serialize_lowered_module(&module, &lowering_state)?,
-            signature,
-            requires_assertion_handler,
-            runtime_requirements,
-            mesh,
-        ))
+        Ok(MlirProgram::new(serialize_lowered_module(&module, &lowering_state)?, signature, runtime_requirements, mesh))
     }
 }
 
@@ -1531,7 +1553,7 @@ impl ProgramBoundary {
             physical_output_tensor_types.push(context.stable_hlo_token_type()?.as_ref());
         }
         let mut argument_sharding_attributes = signature
-            .executable_optional_input_shardings(logical_input_shardings)
+            .executable_optional_input_shardings(logical_input_shardings)?
             .iter()
             .map(|sharding| {
                 sharding.as_ref().map(|sharding| sharding.lower(OpenDimensions::None, location)).transpose()
@@ -1540,9 +1562,9 @@ impl ProgramBoundary {
         // Results whose placement over auto mesh axes the compiler chooses are open over those axes, like JAX lowers
         // the shardings of output types without `out_shardings` (refer to `ShardingExtension::lower`).
         let physical_open_outputs =
-            if open_outputs.is_empty() { Vec::new() } else { signature.select_output_entries(open_outputs) };
+            if open_outputs.is_empty() { Vec::new() } else { signature.select_output_entries(open_outputs)? };
         let mut result_sharding_attributes = signature
-            .executable_optional_output_shardings(output_shardings)
+            .executable_optional_output_shardings(output_shardings)?
             .iter()
             .enumerate()
             .map(|(index, sharding)| {
@@ -1809,7 +1831,7 @@ impl ProgramBoundary {
             lowering_state,
             &mut effect_tokens,
         )?;
-        let mut physical_outputs = signature.select_output_entries(logical_outputs.as_slice());
+        let mut physical_outputs = signature.select_output_entries(logical_outputs.as_slice())?;
         // XLA writes the runtime-size trailer of a bounded dynamic result only in the `SliceToDynamic` that
         // `DynamicPadder` inserts before each output leaf. When several such leaves carry values that XLA proves
         // equal (e.g., the same SSA value or equal computations merged by CSE), one `SliceToDynamic` survives and
@@ -2281,8 +2303,8 @@ where
             output_shardings,
         )?;
 
-        let physical_input_types = signature.executable_input_types(logical_input_types.as_slice());
-        let physical_output_types = signature.executable_output_types(output_types);
+        let physical_input_types = signature.executable_input_types(logical_input_types.as_slice())?;
+        let physical_output_types = signature.executable_output_types(output_types)?;
 
         Ok(ProgramBoundary {
             function_name,
@@ -2586,8 +2608,6 @@ mod tests {
 
         assert_eq!(signature.input_mapping(), &[None, Some(0), Some(1)]);
         assert_eq!(signature.output_mapping(), &[Some(0), None]);
-        assert_eq!(signature.select_input_entries(&[0, 1, 2]), vec![1, 2]);
-        assert_eq!(signature.select_output_entries(&[0, 1]), vec![0]);
         assert_eq!(signature.executable_input_count(), 3);
         assert_eq!(signature.input_dimensions().len(), 1);
         assert_eq!(signature.input_dimensions()[0].logical_input_index(), 2);
@@ -2672,12 +2692,16 @@ mod tests {
         );
         let signature = MlirProgramSignature::new(&[static_zero.clone(), dynamic.clone()], &[]);
         assert_eq!(
-            signature.executable_input_types(&[static_zero, dynamic]),
+            signature.executable_input_types(&[static_zero.clone(), dynamic]).unwrap(),
             vec![
                 ArrayType::new_static(DataType::F32, [2, 4]),
                 ArrayType::scalar(DataType::I32),
                 ArrayType::scalar(DataType::I32),
             ],
+        );
+        assert_eq!(
+            signature.executable_input_types(&[static_zero]),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }.into()),
         );
     }
 
@@ -2688,8 +2712,12 @@ mod tests {
         let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
         let signature = MlirProgramSignature::new(&[], &[dynamic.clone(), static_zero.clone()]);
         assert_eq!(
-            signature.executable_output_types(&[dynamic.clone(), static_zero]),
-            vec![dynamic, ArrayType::scalar(DataType::I64)],
+            signature.executable_output_types(&[dynamic.clone(), static_zero]).unwrap(),
+            vec![dynamic.clone(), ArrayType::scalar(DataType::I64)],
+        );
+        assert_eq!(
+            signature.executable_output_types(&[dynamic]),
+            Err(ProgramError::InvalidOutputCount { expected: 2, actual: 1 }.into()),
         );
     }
 
@@ -2704,16 +2732,26 @@ mod tests {
         let vector_sharding = Sharding::replicated(mesh.clone(), 1);
         let scalar_sharding = Sharding::replicated(mesh, 0);
         assert_eq!(
-            signature.executable_input_shardings(&[
-                vector_sharding.clone(),
-                vector_sharding.clone(),
-                vector_sharding.clone(),
-            ]),
+            signature
+                .executable_input_shardings(&[
+                    vector_sharding.clone(),
+                    vector_sharding.clone(),
+                    vector_sharding.clone(),
+                ])
+                .unwrap(),
             vec![vector_sharding.clone(), vector_sharding.clone(), scalar_sharding.clone(), scalar_sharding.clone()],
         );
         assert_eq!(
-            signature.executable_optional_input_shardings(&[None, Some(vector_sharding.clone()), None]),
+            signature.executable_input_shardings(std::slice::from_ref(&vector_sharding)),
+            Err(ProgramError::InvalidInputCount { expected: 3, actual: 1 }.into()),
+        );
+        assert_eq!(
+            signature.executable_optional_input_shardings(&[None, Some(vector_sharding.clone()), None]).unwrap(),
             vec![Some(vector_sharding), None, Some(scalar_sharding), None],
+        );
+        assert_eq!(
+            signature.executable_optional_input_shardings(&[None]),
+            Err(ProgramError::InvalidInputCount { expected: 3, actual: 1 }.into()),
         );
     }
 
@@ -2724,8 +2762,39 @@ mod tests {
         let signature = MlirProgramSignature::new(&[], &[dynamic.clone(), dynamic]);
         let vector_sharding = Sharding::replicated(mesh.clone(), 1);
         assert_eq!(
-            signature.executable_optional_output_shardings(&[Some(vector_sharding.clone()), None]),
+            signature.executable_optional_output_shardings(&[Some(vector_sharding.clone()), None]).unwrap(),
             vec![Some(vector_sharding), None, Some(Sharding::replicated(mesh, 0)), None],
+        );
+        assert_eq!(
+            signature.executable_optional_output_shardings(&[None]),
+            Err(ProgramError::InvalidOutputCount { expected: 2, actual: 1 }.into()),
+        );
+    }
+
+    #[test]
+    fn test_mlir_program_signature_select_input_entries() {
+        // The erased static zero has no executable slot, and the hidden extent input of the dynamic zero is not an
+        // entry of the selection.
+        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
+        let dynamic_zero = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
+        let boolean = ArrayType::new_static(DataType::Boolean, [3]);
+        let signature = MlirProgramSignature::new(&[static_zero, boolean, dynamic_zero], &[]);
+        assert_eq!(signature.select_input_entries(&[0, 1, 2]).unwrap(), vec![1, 2]);
+        assert_eq!(
+            signature.select_input_entries(&[0, 1]),
+            Err(ProgramError::InvalidInputCount { expected: 3, actual: 2 }.into()),
+        );
+    }
+
+    #[test]
+    fn test_mlir_program_signature_select_output_entries() {
+        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
+        let dynamic_zero = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
+        let signature = MlirProgramSignature::new(&[], &[dynamic_zero, static_zero]);
+        assert_eq!(signature.select_output_entries(&[0, 1]).unwrap(), vec![0]);
+        assert_eq!(
+            signature.select_output_entries(&[0, 1, 2]),
+            Err(ProgramError::InvalidOutputCount { expected: 2, actual: 3 }.into()),
         );
     }
 

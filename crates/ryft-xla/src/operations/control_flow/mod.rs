@@ -696,8 +696,8 @@ mod tests {
             .unwrap();
         assert_eq!(lowered_effect_classes(&jvp).unwrap(), EffectClasses::single(EffectClass::OrderedAssertion));
         let active = jvp.to_mlir("main", &ProgramLoweringOptions::new()).unwrap();
-        let (_, _, requires_assertion_handler, runtime_requirements) = active.into_parts();
-        assert!(requires_assertion_handler);
+        let (_, signature, runtime_requirements) = active.into_parts();
+        assert!(signature.requires_assertion_handler());
         assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin("ryft.assert")],);
 
         let mut builder = ProgramBuilder::<Constant, Operation>::new();
@@ -718,8 +718,8 @@ mod tests {
         let dormant = program.to_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert!(lowered_effect_classes(&program).unwrap().is_empty());
-        let (stable_hlo, _, requires_assertion_handler, runtime_requirements) = dormant.into_parts();
-        assert!(!requires_assertion_handler);
+        let (stable_hlo, signature, runtime_requirements) = dormant.into_parts();
+        assert!(!signature.requires_assertion_handler());
         assert!(runtime_requirements.is_empty());
         assert_eq!(
             stable_hlo,

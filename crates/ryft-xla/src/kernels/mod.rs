@@ -938,8 +938,8 @@ pub(crate) mod tests {
                     .without_boundary_shardings(),
             )
             .unwrap();
-        let (module, _signature, requires_assertion_handler, _requirements) = lowered.into_parts();
-        assert!(requires_assertion_handler);
+        let (module, signature, _requirements) = lowered.into_parts();
+        assert!(signature.requires_assertion_handler());
         let semantic = hex::encode(Sha256::digest(definition.semantic_key().unwrap().as_bytes()));
         let configuration = "e0d25cb2744279b74773008d0f4c001169484be52de590f2f2ce90c699015e4a";
         assert_eq!(
@@ -1094,8 +1094,8 @@ pub(crate) mod tests {
                     .without_boundary_shardings(),
             )
             .unwrap();
-        let (module, _signature, requires_assertion_handler, _requirements) = lowered.into_parts();
-        assert!(!requires_assertion_handler);
+        let (module, signature, _requirements) = lowered.into_parts();
+        assert!(!signature.requires_assertion_handler());
         let semantic = hex::encode(Sha256::digest(definition.semantic_key().unwrap().as_bytes()));
         let configuration = "6dea220b6278c1cf02bdf72bf1a7969892b830605f8a1a1baea5af53bfcad12e";
         assert_eq!(

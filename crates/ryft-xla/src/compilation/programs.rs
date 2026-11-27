@@ -119,7 +119,7 @@ impl ProgramLowering {
         mesh: DeviceMesh,
         kernel_execution_facts: Option<Vec<u8>>,
     ) -> Self {
-        let (stable_hlo, signature, requires_assertion_handler, runtime_requirements) = module.into_parts();
+        let (stable_hlo, signature, runtime_requirements) = module.into_parts();
         Self {
             stable_hlo: stable_hlo.into(),
             invocation: InvocationMetadata {
@@ -130,7 +130,6 @@ impl ProgramLowering {
                 input_types,
                 signature,
                 runtime_requirements,
-                requires_assertion_handler,
                 donation_flags,
                 capture_count,
                 expected_input_shardings,
@@ -423,7 +422,7 @@ impl LoweredProgram {
     /// Returns whether execution requires Ryft's host runtime assertion handler.
     #[inline]
     pub(super) fn requires_assertion_handler(&self) -> bool {
-        self.lowering.invocation.requires_assertion_handler
+        self.lowering.invocation.signature.requires_assertion_handler()
     }
 
     /// Returns the number of leading logical inputs supplied by the staged capture table, followed by the hidden
@@ -603,7 +602,6 @@ impl CompiledProgram {
     ///   - `reference_states`: External reference states of the program.
     ///   - `signature`: Mapping between the logical boundary and the physical inputs and outputs.
     ///   - `runtime_requirements`: Runtime contracts that executions of the program need.
-    ///   - `requires_assertion_handler`: Whether executions need the runtime assertion handler.
     ///   - `donation_flags`: Donation declaration of each public input.
     ///   - `capture_count`: Number of leading inputs that are lowered captures.
     ///   - `expected_input_shardings`: Sharding that each physical input must have at the call boundary.
@@ -629,7 +627,6 @@ impl CompiledProgram {
         reference_states: Arc<[ExternalReferenceBinding]>,
         signature: MlirProgramSignature,
         runtime_requirements: Arc<[RuntimeRequirement]>,
-        requires_assertion_handler: bool,
         donation_flags: Arc<[bool]>,
         capture_count: usize,
         expected_input_shardings: Arc<[Sharding]>,
@@ -656,7 +653,6 @@ impl CompiledProgram {
                 reference_states,
                 signature,
                 runtime_requirements,
-                requires_assertion_handler,
                 donation_flags,
                 capture_count,
                 expected_input_shardings,
@@ -832,7 +828,7 @@ impl CompiledProgram {
     /// Returns whether the executable requires the host runtime assertion handler.
     #[inline]
     pub fn requires_assertion_handler(&self) -> bool {
-        self.invocation.requires_assertion_handler
+        self.invocation.signature.requires_assertion_handler()
     }
 
     /// Returns the backend's optimized program only when explicitly requested.
@@ -964,9 +960,6 @@ pub(super) struct InvocationMetadata {
     /// Canonical runtime contracts resolved against the invoking session.
     runtime_requirements: Arc<[RuntimeRequirement]>,
 
-    /// Whether execution requires Ryft's host runtime assertion handler.
-    requires_assertion_handler: bool,
-
     /// Donation declarations for public inputs. Captures are never donatable.
     donation_flags: Arc<[bool]>,
 
@@ -1037,8 +1030,6 @@ impl InvocationMetadata {
             Some("device mesh")
         } else if self.kernel_execution_facts != other.kernel_execution_facts {
             Some("kernel execution facts")
-        } else if self.requires_assertion_handler != other.requires_assertion_handler {
-            Some("assertion-handler requirement")
         } else {
             None
         }
@@ -1149,7 +1140,6 @@ mod tests {
             output_device_assignment: OutputDeviceAssignment::Fixed,
             open_outputs: None,
             mesh,
-            requires_assertion_handler: false,
             kernel_execution_facts: None,
         };
         assert_eq!(current.incompatible_field(&current), None);
@@ -1218,7 +1208,6 @@ mod tests {
             output_device_assignment: OutputDeviceAssignment::Fixed,
             open_outputs: None,
             mesh,
-            requires_assertion_handler: false,
             kernel_execution_facts: None,
         };
         let replacement = InvocationMetadata { kernel_execution_facts: Some(b"changed".to_vec()), ..current.clone() };
@@ -1254,11 +1243,13 @@ mod tests {
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
                 if reason == "replacement executable has incompatible reference-state signature",
         ));
-        let replacement = InvocationMetadata { requires_assertion_handler: true, ..current.clone() };
+        // Whether an executable requires the runtime assertion handler is part of its signature.
+        let asserting = current.signature.clone().with_effects(false, false, true, false);
+        let replacement = InvocationMetadata { signature: asserting, ..current.clone() };
         assert!(matches!(
             current.validate_replacement(&replacement),
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
-                if reason == "replacement executable has incompatible assertion-handler requirement",
+                if reason == "replacement executable has incompatible executable signature",
         ));
 
         // Boundary types compare through the persistent encoding, which numbers dimension variables canonically.
