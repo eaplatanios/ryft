@@ -1013,7 +1013,7 @@ where
 /// [`stable_hlo::ComparisonType::Signed`]. Every other element type (e.g., complex) routes to
 /// [`stable_hlo::ComparisonType::Float`]. Logical signed one-bit inputs must be widened before calling this function,
 /// because their MLIR carrier alone cannot distinguish them from Boolean inputs.
-fn comparison_type_for_mlir_type<'c, 't>(r#type: TypeRef<'c, 't>) -> Result<stable_hlo::ComparisonType, Error> {
+fn comparison_type_for_mlir_type(r#type: TypeRef) -> Result<stable_hlo::ComparisonType, Error> {
     let element_type = if let Some(tensor) = r#type.cast::<TensorTypeRef>() { tensor.element_type()? } else { r#type };
     if element_type.is::<FloatTypeRef>() {
         return Ok(stable_hlo::ComparisonType::Float);

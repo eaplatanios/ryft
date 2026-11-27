@@ -7,6 +7,7 @@
 //! operations, and this module also provides the elementwise operand normalization and the result accuracy conversion
 //! that those lowerings share.
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -23,7 +24,7 @@ use ryft_core::{
     DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
     DivOperation, DotOperation, DropoutOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
     DynamicSliceOperation, DynamicUpdateSliceOperation, ErfOperation, ExpM1Operation, ExpOperation, FillLikeOperation,
-    FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaLikeOperation, IotaOperation,
+    FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, Instruction, IotaLikeOperation, IotaOperation,
     LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation,
     MaxOperation, MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
     Operation as CoreOperation, OperationProvider, OrOperation, PadOperation, ParallelAllGatherOperation,
@@ -33,13 +34,13 @@ use ryft_core::{
     RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionKind, ReferenceAccessDescriptor,
     ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation,
     ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
-    Region as CoreRegion, RegionRef, RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation,
-    RngBitGeneratorOperation, RoundOperation, RsqrtOperation, SaturatingSubOperation, ScaledDotOperation,
-    ScanOperation, ScatterMode, ScatterOperation, ScatterReductionKind, SelectOperation, ShardMapOperation,
-    SignOperation, SinOperation, SliceOperation, SortDirection, SortOperation, SqrtOperation, StopGradientOperation,
-    SubOperation, TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, Transform, TransformArtifact,
-    TransposeOperation, UnavailableCustomRules, UpdateSliceOperation, Value, ValueProjection, WhileOperation,
-    XorOperation, ZeroLikeOperation, ZeroOperation,
+    Region as CoreRegion, RegionId, RegionPlacementRequests, RegionRef, RemOperation, RematerializeOperation,
+    ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation,
+    SaturatingSubOperation, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation, ScatterReductionKind,
+    SelectOperation, ShardMapOperation, SignOperation, SinOperation, SliceOperation, SortDirection, SortOperation,
+    SqrtOperation, StopGradientOperation, SubOperation, TagOperation, TanOperation, TanhOperation,
+    TransferToMemoryOperation, Transform, TransformArtifact, TransposeOperation, UnavailableCustomRules,
+    UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_kernels::KernelReferenceOperation;
 use ryft_mlir::dialects::stable_hlo;
@@ -50,8 +51,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked, XlaZeroPadded};
-use crate::lowering::emissions::emitted_capture_reads;
-use crate::lowering::extensions::without_stale_call_meshes;
+use crate::lowering::emissions::{emitted_capture_reads, omits_regions};
 use crate::lowering::types::{lower_restore_dynamic_dimensions, lower_tensor_type, physical_bound_type};
 use crate::lowering::{DataDependentPaddingDiscipline, MlirLowerableValue, validate_local_output_placement};
 use crate::operations::composites::NamedCompositeImplementation;
@@ -828,6 +828,7 @@ impl LowerableOperation for Operation {
         }
     }
 
+    // TODO(eaplatanios): Review this.
     #[inline]
     fn without_stale_call_meshes<Input, Output>(
         program: Program<Constant, Self, Input, Output>,
@@ -837,7 +838,62 @@ impl LowerableOperation for Operation {
         Input: Parameterized<Constant>,
         Output: Parameterized<Constant>,
     {
-        without_stale_call_meshes(program, target_platform)
+        // A call records the devices that its callee names when the callee is staged, from its whole program, so a call
+        // whose outputs pruning dropped together with the only request that named them names no devices anymore, and it
+        // is lowered as a call that names none. Whether a callee names devices is derived once for each region of the
+        // pruned program (refer to `RegionPlacementRequests::names_devices_predicate`), so nested calls cost one pass
+        // over the program. Most programs have no call that records a mesh and pay one scan of their calls. The regions
+        // that lowering omits are those of `RegionPlacementRequestsExtension::for_lowering`.
+        let arena = program.entry_region_ref().arena();
+        let omitted: &dyn Fn(RegionRef<'_, Constant, Self>, &Instruction<Self>) -> bool =
+            &|region, instruction| target_platform.is_some() && omits_regions(region, instruction, target_platform);
+        let mut names_devices = RegionPlacementRequests::names_devices_predicate(program.entry_region_ref(), omitted);
+        let mut stale = HashSet::new();
+        for (index, region) in program.regions().iter().enumerate() {
+            let region_ref = RegionRef::new(arena, RegionId::new(index)).unwrap();
+            for (position, instruction) in region.instructions().iter().enumerate() {
+                let Self::Call(call) = instruction.operation() else { continue };
+                if call.mesh().is_some()
+                    && let Ok(callee) = region_ref.with_id(instruction.regions()[0])
+                    && call.names_devices(|| names_devices(callee)).is_none()
+                {
+                    stale.insert((index, position));
+                }
+            }
+        }
+
+        if stale.is_empty() {
+            return Ok(program);
+        }
+
+        let regions = program
+            .regions()
+            .iter()
+            .enumerate()
+            .map(|(index, region)| {
+                let instructions = region
+                    .instructions()
+                    .iter()
+                    .enumerate()
+                    .map(|(position, instruction)| match instruction.operation() {
+                        Self::Call(call) if stale.contains(&(index, position)) => {
+                            let (_, inputs, outputs, regions, provenance) = instruction.clone().into_parts();
+                            Instruction::new(Self::Call(call.without_mesh()), inputs, outputs, regions)
+                                .with_provenance(provenance)
+                        }
+                        _ => instruction.clone(),
+                    })
+                    .collect();
+                CoreRegion::new(
+                    region.atoms().to_vec(),
+                    region.input_ids().to_vec(),
+                    region.output_ids().to_vec(),
+                    instructions,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        Program::new(program.input_structure().clone(), program.output_structure().clone(), regions, program.entry())
     }
 
     #[inline]

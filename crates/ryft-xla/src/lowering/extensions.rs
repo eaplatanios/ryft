@@ -1,18 +1,18 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use ryft_core::{
-    ArrayType, AtomId, BroadcastOperation, CallOperation, DeviceMesh, ExternalReferenceBinding, Instruction,
-    LogicalMesh, MeshAxisType, Parameterized, PlaceOperation, PlacementRequest, Program, ProgramError,
-    Region as CoreRegion, RegionId, RegionPlacementRequests, RegionRef, RequestedPlacement, Sharding,
-    ShardingDimension, StopGradientOperation, TagOperation, TransferToMemoryOperation, Type as CoreType, Typed, Value,
+    ArrayType, AtomId, BroadcastOperation, CallOperation, DeviceMesh, ExternalReferenceBinding, LogicalMesh,
+    MeshAxisType, Parameterized, PlaceOperation, PlacementRequest, Program, ProgramError, RegionId,
+    RegionPlacementRequests, RegionRef, RequestedPlacement, Sharding, ShardingDimension, StopGradientOperation,
+    TagOperation, TransferToMemoryOperation, Type as CoreType, Typed, Value,
 };
 
 use crate::lowering::emissions::{collect_session_constants, omits_regions};
 use crate::lowering::modules::{LoweredModule, render_devices};
 use crate::lowering::{LowerableOperationFamily, LoweringError, RaggedDotLoweringStrategy};
-use crate::{Constant, Error, Operation, RetainedArray, Type};
+use crate::{Constant, Error, RetainedArray, Type};
 
 /// Options for lowering a staged [`Program`] with [`LowerableProgram`]. By default, the entry signature is read from
 /// the program. The global types of its inputs and outputs are those of the program, and the arrays that the program
@@ -576,6 +576,9 @@ where
 
 /// Prepares XLA programs for lowering and analyzes their entry placements.
 pub(crate) trait ProgramLoweringExtension: Sized {
+    /// Operation family of the program.
+    type Operation: LowerableOperationFamily;
+
     /// Returns this program as lowering emits it, without the unused outputs of its instructions that carry regions,
     /// together with the computations that only those outputs use (i.e., like [`Program::into_pruned`]), and without
     /// every other instruction that neither an output nor an observable effect needs (i.e., like
@@ -610,7 +613,7 @@ pub(crate) trait ProgramLoweringExtension: Sized {
     /// replaces is not counted, and with [`None`] no region is replaced.
     fn has_placement_requests(&self, target_platform: Option<&str>, includes_memory_requests: bool) -> bool
     where
-        Self: 'static;
+        Self::Operation: 'static;
 
     /// Returns where the sharding of each of the first `output_count` outputs of this program comes from (refer to
     /// [`OutputShardingSource`]), or [`None`] for an output whose sharding the program does not determine. An output
@@ -653,6 +656,8 @@ where
     Input: Parameterized<Constant>,
     Output: Parameterized<Constant>,
 {
+    type Operation = O;
+
     #[inline]
     fn pruned_for_lowering(&self, target_platform: Option<&str>) -> Result<Self, ProgramError> {
         O::without_stale_call_meshes(self.clone().into_pruned()?.into_simplified()?, target_platform)
@@ -661,7 +666,7 @@ where
     #[inline]
     fn has_placement_requests(&self, target_platform: Option<&str>, includes_memory_requests: bool) -> bool
     where
-        Self: 'static,
+        Self::Operation: 'static,
     {
         RegionPlacementRequests::for_lowering(self.entry_region_ref(), target_platform)
             .has_requests(includes_memory_requests)
@@ -969,78 +974,6 @@ pub(crate) fn merge_requested_placement<'r>(
         }
     }
     Ok(())
-}
-
-// TODO(eaplatanios): Review this.
-/// Returns `program`, which must be pruned, without the mesh of each `call` whose callee names no devices anymore
-/// when it is lowered for `target_platform`. This is the [`LowerableOperation::without_stale_call_meshes`] function
-/// of the built-in [`Operation`] family.
-///
-/// [`LowerableOperation::without_stale_call_meshes`]: crate::LowerableOperation::without_stale_call_meshes
-pub(crate) fn without_stale_call_meshes<Input, Output>(
-    program: Program<Constant, Operation, Input, Output>,
-    target_platform: Option<&str>,
-) -> Result<Program<Constant, Operation, Input, Output>, ProgramError>
-where
-    Input: Parameterized<Constant>,
-    Output: Parameterized<Constant>,
-{
-    // A call records the devices that its callee names when the callee is staged, from its whole program, so a call
-    // whose outputs pruning dropped together with the only request that named them names no devices anymore, and it
-    // is lowered as a call that names none. Whether a callee names devices is derived once for each region of the
-    // pruned program (refer to `RegionPlacementRequests::names_devices_predicate`), so nested calls cost one pass
-    // over the program. Most programs have no call that records a mesh and pay one scan of their calls. The regions
-    // that lowering omits are those of `RegionPlacementRequestsExtension::for_lowering`.
-    let arena = program.entry_region_ref().arena();
-    let omitted: &dyn Fn(RegionRef<'_, Constant, Operation>, &Instruction<Operation>) -> bool =
-        &|region, instruction| target_platform.is_some() && omits_regions(region, instruction, target_platform);
-    let mut names_devices = RegionPlacementRequests::names_devices_predicate(program.entry_region_ref(), omitted);
-    let mut stale = HashSet::new();
-    for (index, region) in program.regions().iter().enumerate() {
-        let region_ref = RegionRef::new(arena, RegionId::new(index)).unwrap();
-        for (position, instruction) in region.instructions().iter().enumerate() {
-            let Operation::Call(call) = instruction.operation() else { continue };
-            if call.mesh().is_some()
-                && let Ok(callee) = region_ref.with_id(instruction.regions()[0])
-                && call.names_devices(|| names_devices(callee)).is_none()
-            {
-                stale.insert((index, position));
-            }
-        }
-    }
-
-    if stale.is_empty() {
-        return Ok(program);
-    }
-
-    let regions = program
-        .regions()
-        .iter()
-        .enumerate()
-        .map(|(index, region)| {
-            let instructions = region
-                .instructions()
-                .iter()
-                .enumerate()
-                .map(|(position, instruction)| match instruction.operation() {
-                    Operation::Call(call) if stale.contains(&(index, position)) => {
-                        let (_, inputs, outputs, regions, provenance) = instruction.clone().into_parts();
-                        Instruction::new(Operation::Call(call.without_mesh()), inputs, outputs, regions)
-                            .with_provenance(provenance)
-                    }
-                    _ => instruction.clone(),
-                })
-                .collect();
-            CoreRegion::new(
-                region.atoms().to_vec(),
-                region.input_ids().to_vec(),
-                region.output_ids().to_vec(),
-                instructions,
-            )
-        })
-        .collect::<Vec<_>>();
-
-    Program::new(program.input_structure().clone(), program.output_structure().clone(), regions, program.entry())
 }
 
 /// Returns the sharding with which the entry function of a program annotates each of its outputs, whose types are
