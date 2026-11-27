@@ -6,21 +6,14 @@ use ryft_core::{
     COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation, CompositeTransposeOperation,
     CustomRuleSource, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
     DifferentiableType, FlatProgram, Operation, Parameter, Parameterized, Placeholder, Program, ProgramError, RegionId,
-    RegionRef, RegionRole, RematerializationOptimizationBarrier, ScaledDotOperation, Typed, TypedProgram,
+    RegionRef, RegionRole, RematerializationOptimizationBarrier, ScaledDotOperation, Typed,
 };
+use ryft_mlir::ValueRef;
 #[cfg(test)]
-use ryft_mlir::Operation as _;
-use ryft_mlir::dialects::func;
-use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Region, SymbolVisibility, Type as MlirType,
-    TypeAndAttributes, Value as MlirValue, ValueRef,
-};
+use ryft_mlir::{Block as _, Operation as _, Value as _};
 
-use crate::lowering::EffectTokens;
 use crate::lowering::emissions::omits_regions;
 use crate::lowering::regions::NestedProgramLoweringExtension;
-use crate::lowering::states::ProgramLoweringState;
-use crate::lowering::types::TypeLoweringExtension;
 use crate::operations::attention::{AttentionConfigurationLoweringExtension, select_attention_implementation};
 use crate::operations::call::lower_shared_function_call;
 use crate::operations::quantization::{
@@ -196,7 +189,7 @@ where
         if let Some(key) = self.key() {
             let input_types = input_types.iter().cloned().map(Into::into).collect::<Vec<Type>>();
             let output_types = output_types.iter().cloned().map(Into::into).collect::<Vec<Type>>();
-            let target_platform = lowerer.lowering_state().target_platform();
+            let target_platform = lowerer.lowering_context().target_platform();
             if let Some(backend) =
                 NamedCompositeImplementation::select(key, &input_types, &output_types, target_platform)
             {
@@ -258,16 +251,17 @@ where
         // programs (i.e., those of `while`, `scan`, `condition`, and `linear_call`) share the enclosing capture scope
         // and keep inheriting it.
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-        let (effect_tokens, regions, captured_values, nested_functions, lowering_state) = lowerer.split_effect_tokens();
+        let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
+            lowerer.split_effect_tokens();
         regions[0].lower_inline(
             input_values,
             &mut block,
             context,
             location,
-            lowering_state.session_values(captured_values),
+            lowering_context.session_values(captured_values),
             &RematerializationOptimizationBarrier::None,
             nested_functions,
-            lowering_state,
+            lowering_context,
             effect_tokens,
         )
     }
@@ -349,6 +343,12 @@ impl NamedCompositionFunction {
     #[inline]
     pub(crate) fn symbol(&self) -> &str {
         &self.symbol
+    }
+
+    /// Returns the canonical typed decomposition program.
+    #[inline]
+    pub(crate) fn program(&self) -> &FlatProgram<Session> {
+        &self.program
     }
 }
 
@@ -485,68 +485,6 @@ impl NamedCompositionFunctionMap {
     }
 }
 
-/// Emits the private decomposition function of one named composition into `module_block`.
-pub(crate) fn emit_named_composition_function<'b, 'c: 'b, 't: 'c>(
-    module_block: &mut BlockRef<'b, 'c, 't>,
-    function: &NamedCompositionFunction,
-    lowering_state: &ProgramLoweringState,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<(), Error> {
-    let input_types = function.program.input_types();
-    let output_types = function.program.output_types();
-    let argument_tensor_types =
-        input_types.iter().map(|r#type| r#type.lower(context, location)).collect::<Result<Vec<_>, _>>()?;
-    let result_tensor_types =
-        output_types.iter().map(|r#type| r#type.lower(context, location)).collect::<Result<Vec<_>, _>>()?;
-    let function_block = context.block(
-        argument_tensor_types
-            .iter()
-            .map(|tensor_type| (*tensor_type, location))
-            .collect::<Vec<_>>()
-            .as_slice(),
-    );
-    {
-        let mut function_block_ref = function_block.as_ref();
-        let input_values = (0..input_types.len())
-            .map(|index| function_block.argument(index).unwrap().as_ref())
-            .collect::<Vec<_>>();
-        let mut effect_tokens = EffectTokens::default();
-        let outputs = function.program.lower_inline(
-            input_values.as_slice(),
-            &mut function_block_ref,
-            context,
-            location,
-            &[],
-            &RematerializationOptimizationBarrier::None, // Decompositions are traced independently of the lowered program and contain no `call` sharing.
-            None,
-            lowering_state,
-            &mut effect_tokens,
-        )?;
-        function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
-    }
-    let mut function_region = context.region();
-    function_region.append_block(function_block)?;
-    module_block.append_operation(func::func(
-        function.symbol.as_str(),
-        func::FuncAttributes {
-            arguments: argument_tensor_types
-                .iter()
-                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
-                .collect(),
-            results: result_tensor_types
-                .iter()
-                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
-                .collect(),
-            visibility: SymbolVisibility::Private,
-            ..Default::default()
-        },
-        function_region,
-        location,
-    )?)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -564,6 +502,7 @@ mod tests {
     use ryft_mlir::{Block, Context as MlirContext, Location};
 
     use crate::lowering::emissions::lowers_without_regions;
+    use crate::lowering::states::ProgramLoweringContext;
     use crate::lowering::tests::test_vector_type;
     use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;
@@ -666,8 +605,8 @@ mod tests {
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
         let block = context.block_with_no_arguments();
-        let mut lowerer =
-            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(Vec::<FlatProgram<Session>>::new());
         let unavailable = NamedCompositeImplementation::FusedAttentionUnavailable {
             name: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
             reason: "the inputs are not `bf16`".to_string(),
@@ -779,8 +718,8 @@ mod tests {
         let location = context.unknown_location().as_ref();
         let block = context.block_with_no_arguments();
         let operation = CompositeOperation::<Constant, Operation>::from_rule_regions(CompositeJvpRule::Explicit, false);
-        let mut lowerer =
-            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(Vec::<FlatProgram<Session>>::new());
         assert!(matches!(
             operation.lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
@@ -789,8 +728,8 @@ mod tests {
                     if *message == "`composite` expected a primal region but got no regions",
             ),
         ));
-        let mut lowerer =
-            Lowerer::new(block.as_ref(), &context, location).with_regions(vec![doubled_body().as_ref().clone()]);
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(vec![doubled_body().as_ref().clone()]);
         assert!(matches!(
             operation.lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(

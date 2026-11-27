@@ -33,12 +33,13 @@ use ryft_mlir::{
 
 use crate::lowering::EffectTokens;
 use crate::lowering::regions::NestedProgramLoweringExtension;
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, TypeLoweringExtension, lower_constant_output,
-    lower_static_index_constants, stable_hlo_dynamic_dimension_bound, static_dimensions,
+    ArrayTypeLoweringExtension, TypeLoweringExtension, lower_constant_output, lower_static_index_constants,
+    stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 use crate::operations::call::CallFunctionMap;
+use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::control_flow::{
     append_loop_effect_tokens, lower_explicit_sharding_constraints, lower_refined_region_input,
     lower_refined_region_outputs, lower_region_guard, lowered_effect_classes, set_threaded_effect_tokens,
@@ -93,7 +94,8 @@ impl LowerableOperation for ScanOperation<Type> {
         self.validate_region_count(lowerer.regions().len())?;
         let (context, location) = (lowerer.context(), lowerer.location());
         let block = &mut lowerer.block();
-        let (effect_tokens, regions, captured_values, nested_functions, lowering_state) = lowerer.split_effect_tokens();
+        let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
+            lowerer.split_effect_tokens();
         let body = &regions[0];
         let (carry_count, length) = (self.carry_count(), self.iteration_count());
         let body_input_types = body.input_types();
@@ -184,7 +186,7 @@ impl LowerableOperation for ScanOperation<Type> {
             location,
             captured_values,
             nested_functions,
-            lowering_state,
+            lowering_context,
         };
 
         // Initial carries only need to refine the carry types, so each one is converted to the lowered type of its
@@ -281,7 +283,7 @@ impl LowerableOperation for ScanOperation<Type> {
         // length, which the output types of the scan may refine (e.g., to the trip count of an exact runtime length).
         let results =
             lower_refined_region_outputs(results, &region_output_types, output_types, block, context, location)?;
-        lower_explicit_sharding_constraints(results, output_types, lowering_state, block, location)
+        lower_explicit_sharding_constraints(results, output_types, lowering_context, block, location)
     }
 }
 
@@ -338,8 +340,8 @@ struct ScanLoopInputs<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> {
     /// Nested functions that `call` operations in the body lower against.
     nested_functions: Option<&'o Rc<CallFunctionMap<O>>>,
 
-    /// Program lowering state shared with the enclosing function.
-    lowering_state: &'o ProgramLoweringState,
+    /// Program lowering context of the enclosing function.
+    lowering_context: &'o ProgramLoweringContext,
 }
 
 impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b, 'c, 't, O> {
@@ -613,7 +615,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
             self.captured_values,
             &RematerializationOptimizationBarrier::None,
             self.nested_functions,
-            self.lowering_state,
+            self.lowering_context,
             effect_tokens,
         )?;
         let stacked_outputs = body_outputs.split_off(self.carry_count);
@@ -875,7 +877,8 @@ mod tests {
         };
 
         // The plain array family cannot carry a body region, so scans lower only from the array IR family.
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![body.clone()]);
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(vec![body.clone()]);
         let expected_message =
             "higher-order operation `scan` must be stored directly in the enclosing backend operation family";
         assert!(matches!(
@@ -888,8 +891,8 @@ mod tests {
         ));
 
         // An array IR scan needs exactly one body region.
-        let mut lowerer =
-            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(Vec::<FlatProgram<Session>>::new());
         assert!(matches!(
             ScanOperation::<Type>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
@@ -900,7 +903,8 @@ mod tests {
         ));
 
         // It also needs one input per carry and per stacked input.
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![body.clone()]);
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(vec![body.clone()]);
         assert!(matches!(
             ScanOperation::<Type>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
@@ -923,7 +927,8 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let input_values = (0..2).map(|index| block.as_ref().argument(index).unwrap().as_ref()).collect::<Vec<_>>();
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![body]);
+        let mut lowerer =
+            Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new()).with_regions(vec![body]);
         assert!(matches!(
             ScanOperation::<Type>::new(1, Dimension::Dynamic(length)).lower(
                 &mut lowerer,
@@ -1024,7 +1029,7 @@ mod tests {
             .map(|r#type| (r#type.lower(&context, location).unwrap(), location))
             .collect::<Vec<_>>();
         let block = context.block(&block_arguments);
-        let lowering_state = ProgramLoweringState::new();
+        let lowering_context = ProgramLoweringContext::new();
         let lower = |threaded_effects| {
             let inputs = ScanLoopInputs {
                 body: &body,
@@ -1040,7 +1045,7 @@ mod tests {
                 location,
                 captured_values: &[],
                 nested_functions: None,
-                lowering_state: &lowering_state,
+                lowering_context: &lowering_context,
             };
             let state_values = (0..3).map(|index| block.as_ref().argument(index).unwrap().as_ref()).collect();
             inputs.lower_loop(state_values, 1, &mut block.as_ref(), &mut EffectTokens::default())

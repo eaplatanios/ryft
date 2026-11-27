@@ -694,6 +694,7 @@ mod tests {
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
+    use crate::lowering::states::ProgramLoweringContext;
     use crate::lowering::tests::{
         ProgramBuilder, test_matrix_type, to_rendered_mlir_for_plain_program, unproject_plain_program,
     };
@@ -1966,7 +1967,8 @@ mod tests {
             (index_type, location),
         ]);
         let inputs = (0..3).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
-        let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
+        let mut lowerer: Lowerer<'_, '_, '_, Operation> =
+            Lowerer::new(block.as_ref(), &context, location.as_ref(), ProgramLoweringContext::new());
         let output_types = vec![Type::Array(ArrayType::new_static(DataType::I64, [2]))];
         assert!(matches!(
             DynamicSliceOperation::<Type>::from_rank(1).lower(&mut lowerer, &inputs, &[], &output_types),

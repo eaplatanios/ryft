@@ -282,6 +282,7 @@ mod tests {
     };
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
+    use crate::lowering::states::ProgramLoweringContext;
     use crate::lowering::tests::{MixedValue, ProgramBuilder, execute_mixed_program, unproject_plain_program};
     use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::operations::Operation;
@@ -524,7 +525,8 @@ mod tests {
             (ArrayType::scalar(DataType::I64).lower(&context, location).unwrap(), location),
         ]);
         let inputs = vec![block.argument(0).unwrap().as_ref(), block.argument(1).unwrap().as_ref()];
-        let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
+        let mut lowerer: Lowerer<'_, '_, '_, Operation> =
+            Lowerer::new(block.as_ref(), &context, location.as_ref(), ProgramLoweringContext::new());
         let output_types = vec![state_type.into(), ArrayType::new_static(DataType::U32, [3]).into()];
         assert!(matches!(
             operation.lower(&mut lowerer, &inputs, &[], &output_types),
@@ -550,7 +552,8 @@ mod tests {
             (ArrayType::scalar(DataType::I64).lower(&context, location).unwrap(), location),
         ]);
         let inputs = vec![block.argument(0).unwrap().as_ref(), block.argument(1).unwrap().as_ref()];
-        let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
+        let mut lowerer: Lowerer<'_, '_, '_, Operation> =
+            Lowerer::new(block.as_ref(), &context, location.as_ref(), ProgramLoweringContext::new());
         let input_types = vec![state_type.clone().into(), ArrayType::scalar(DataType::I64).into()];
         let output_types = vec![state_type.into(), bits_type.into()];
         assert!(matches!(

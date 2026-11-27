@@ -104,6 +104,7 @@ mod tests {
     use ryft_mlir::{Block, Context as MlirContext, Location};
 
     use crate::Session;
+    use crate::lowering::states::ProgramLoweringContext;
 
     use super::*;
 
@@ -114,8 +115,8 @@ mod tests {
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
         let block = context.block_with_no_arguments();
-        let mut lowerer =
-            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(Vec::<FlatProgram<Session>>::new());
         operation.lower(&mut lowerer, &[], &[], &[]).map(|values| values.len())
     }
 

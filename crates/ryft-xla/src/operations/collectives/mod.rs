@@ -5,7 +5,7 @@ use ryft_mlir::{
 };
 
 use crate::Error;
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::ArrayTypeLoweringExtension;
 
 /// StableHLO lowering of `axis_index`.
@@ -29,9 +29,9 @@ pub(crate) mod parallel_sum_scatter;
 /// StableHLO lowering of `parallel_vary`.
 pub(crate) mod parallel_vary;
 
-/// Resolves the manual regions that bind the axes of a collective from a [`ProgramLoweringState`] and derives what the
+/// Resolves the manual regions that bind the axes of a collective from a [`ProgramLoweringContext`] and derives what the
 /// lowering of the collective needs from them (i.e., its mesh, the validation of its recorded types against the policy
-/// of its binders, and its replica groups). The state only records the enclosing manual regions, and what they mean
+/// of its binders, and its replica groups). The context records the enclosing manual regions, and what they mean
 /// for a collective is defined here, next to the lowerings of the collectives that use it.
 pub(crate) trait CollectiveLoweringExtension {
     /// Resolves a collective's actual manual binder and checks any payload mesh against it before communication, and
@@ -98,7 +98,7 @@ pub(crate) trait CollectiveLoweringExtension {
     ) -> Result<(Vec<Vec<usize>>, usize), Error>;
 }
 
-impl CollectiveLoweringExtension for ProgramLoweringState {
+impl CollectiveLoweringExtension for ProgramLoweringContext {
     fn checked_collective_mesh<'o, A: Into<CollectiveAxes>>(
         &'o self,
         operation_name: &str,
@@ -327,7 +327,7 @@ mod tests {
     use ryft_mlir::{Block, Location, Value as MlirValue};
     use ryft_pjrt::{BufferType, Program};
 
-    use crate::lowering::states::ProgramLoweringState;
+    use crate::lowering::states::ProgramLoweringContext;
     use crate::lowering::tests::{shard_map_module, static_sharded_array_type, test_manual_mesh, test_vector_type};
     use crate::operations::Operation;
     use crate::operations::sharding::shard_map::tests::execute_inputs_on_cpu_devices;
@@ -343,7 +343,7 @@ mod tests {
     /// a collective channel or emitting a new instruction.
     fn lower_state_cast(
         operation: &ArrayOperation<CoreArray>,
-        state: ProgramLoweringState,
+        lowering_context: ProgramLoweringContext,
         input_type: ArrayType,
         output_types: &[ArrayType],
     ) -> Result<(), Error> {
@@ -353,9 +353,9 @@ mod tests {
         let block = context.block(&[(tensor_type, location)]);
         let input = block.argument(0).unwrap().as_ref();
         let mut lowerer: Lowerer<'_, '_, '_, Operation> =
-            Lowerer::new(block.as_ref(), &context, location.as_ref()).with_lowering_state(state.clone());
+            Lowerer::new(block.as_ref(), &context, location.as_ref(), lowering_context.clone());
         let result = operation.lower(&mut lowerer, &[input], &[input_type], output_types);
-        assert_eq!(state.next_channel_id(), 1);
+        assert_eq!(lowering_context.next_channel_id(), 1);
         assert!(block.operations()?.collect::<Result<Vec<_>, _>>()?.is_empty());
         let outputs = result?;
         assert_eq!(outputs, vec![input]);
@@ -363,15 +363,15 @@ mod tests {
     }
 
     #[test]
-    fn test_program_lowering_state_checked_collective_mesh() {
+    fn test_program_lowering_context_checked_collective_mesh() {
         let outer_mesh = test_manual_mesh("x", 2);
         let inner_mesh = test_manual_mesh("x", 3);
         let outer = ShardMapBoundary::new(outer_mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
         let inner = ShardMapBoundary::new(inner_mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
-        let state = ProgramLoweringState::new().enter_manual_region(outer).enter_manual_region(inner);
-        assert_eq!(state.checked_collective_mesh("parallel_permute", "x", 3, None).unwrap(), &inner_mesh);
+        let lowering_context = ProgramLoweringContext::new().enter_manual_region(outer).enter_manual_region(inner);
+        assert_eq!(lowering_context.checked_collective_mesh("parallel_permute", "x", 3, None).unwrap(), &inner_mesh);
         assert!(matches!(
-            state.checked_collective_mesh("parallel_permute", "x", 3, Some(&outer_mesh)),
+            lowering_context.checked_collective_mesh("parallel_permute", "x", 3, Some(&outer_mesh)),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 CoreError::Program(ProgramError::MalformedProgram(message))
@@ -379,7 +379,7 @@ mod tests {
             ),
         ));
         assert!(matches!(
-            state.checked_collective_mesh("parallel_permute", "x", 2, Some(&outer_mesh)),
+            lowering_context.checked_collective_mesh("parallel_permute", "x", 2, Some(&outer_mesh)),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 CoreError::Program(ProgramError::MalformedProgram(message))
@@ -395,7 +395,7 @@ mod tests {
         ])
         .unwrap();
         let binder = ShardMapBoundary::new(binder_mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
-        let state = ProgramLoweringState::new().enter_manual_region(binder);
+        let lowering_context = ProgramLoweringContext::new().enter_manual_region(binder);
         let free_axis_retyped_mesh = binder_mesh.with_axis_types(["y"], MeshAxisType::Auto).unwrap();
         let manual_axis_retyped_mesh = binder_mesh.with_axis_types(["x"], MeshAxisType::Explicit).unwrap();
         let other_topology_mesh = LogicalMesh::new(vec![
@@ -403,14 +403,16 @@ mod tests {
             MeshAxis::new("y", 4, MeshAxisType::Auto).unwrap(),
         ])
         .unwrap();
-        assert_eq!(state.checked_collective_mesh("parallel_permute", "x", 2, None).unwrap(), &binder_mesh);
+        assert_eq!(lowering_context.checked_collective_mesh("parallel_permute", "x", 2, None).unwrap(), &binder_mesh);
         assert_eq!(
-            state.checked_collective_mesh("parallel_permute", "x", 2, Some(&free_axis_retyped_mesh)).unwrap(),
+            lowering_context
+                .checked_collective_mesh("parallel_permute", "x", 2, Some(&free_axis_retyped_mesh))
+                .unwrap(),
             &free_axis_retyped_mesh,
         );
         for payload_mesh in [&manual_axis_retyped_mesh, &other_topology_mesh] {
             assert!(matches!(
-                state.checked_collective_mesh("parallel_permute", "x", 2, Some(payload_mesh)),
+                lowering_context.checked_collective_mesh("parallel_permute", "x", 2, Some(payload_mesh)),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
                     CoreError::Program(ProgramError::MalformedProgram(message))
@@ -421,17 +423,17 @@ mod tests {
     }
 
     #[test]
-    fn test_program_lowering_state_validate_manual_collective_uses_owner_policy() {
+    fn test_program_lowering_context_validate_manual_collective_uses_owner_policy() {
         let mesh = test_manual_mesh("x", 2);
         let boundary = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
-        let checked = ProgramLoweringState::new().enter_manual_region(boundary.clone());
+        let checked = ProgramLoweringContext::new().enter_manual_region(boundary.clone());
         checked
             .validate_manual_collective("parallel_permute", "x", 2, None, &[1usize], |inference_mesh| {
                 assert_eq!(inference_mesh, Some(&mesh));
                 Ok(vec![1])
             })
             .unwrap();
-        let unchecked = ProgramLoweringState::new().enter_manual_region(boundary.with_check_manual_variation(false));
+        let unchecked = ProgramLoweringContext::new().enter_manual_region(boundary.with_check_manual_variation(false));
         unchecked
             .validate_manual_collective("parallel_permute", "x", 2, None, &[1usize], |inference_mesh| {
                 assert_eq!(inference_mesh, None);
@@ -441,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_lowering_state_validate_manual_collective_uses_each_axis_owner() {
+    fn test_program_lowering_context_validate_manual_collective_uses_each_axis_owner() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -449,32 +451,32 @@ mod tests {
         .unwrap();
         let outer = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec!["x".to_string()]).unwrap();
         let inner = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec!["y".to_string()]).unwrap();
-        let state = ProgramLoweringState::new()
+        let lowering_context = ProgramLoweringContext::new()
             .enter_manual_region(outer.clone())
             .enter_manual_region(inner.clone().with_check_manual_variation(false));
-        state
+        lowering_context
             .validate_manual_collective("parallel_permute", "x", 2, None, &[1usize], |inference_mesh| {
                 assert_eq!(inference_mesh, Some(&mesh));
                 Ok(vec![1])
             })
             .unwrap();
-        state
+        lowering_context
             .validate_manual_collective("parallel_permute", "y", 2, None, &[1usize], |inference_mesh| {
                 assert_eq!(inference_mesh, None);
                 Ok(vec![1])
             })
             .unwrap();
 
-        let state = ProgramLoweringState::new()
+        let lowering_context = ProgramLoweringContext::new()
             .enter_manual_region(outer.with_check_manual_variation(false))
             .enter_manual_region(inner);
-        state
+        lowering_context
             .validate_manual_collective("parallel_permute", "x", 2, None, &[1usize], |inference_mesh| {
                 assert_eq!(inference_mesh, None);
                 Ok(vec![1])
             })
             .unwrap();
-        state
+        lowering_context
             .validate_manual_collective("parallel_permute", "y", 2, None, &[1usize], |inference_mesh| {
                 assert_eq!(inference_mesh, Some(&mesh));
                 Ok(vec![1])
@@ -483,15 +485,16 @@ mod tests {
     }
 
     #[test]
-    fn test_program_lowering_state_validate_manual_collective_rejects_tracked_unchecked_payload() {
+    fn test_program_lowering_context_validate_manual_collective_rejects_tracked_unchecked_payload() {
         let mesh = test_manual_mesh("x", 2);
         let boundary = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), Vec::new())
             .unwrap()
             .with_check_manual_variation(false);
-        let state = ProgramLoweringState::new().enter_manual_region(boundary);
-        let result = state.validate_manual_collective("parallel_permute", "x", 2, Some(&mesh), &[1usize], |_| {
-            panic!("tracked payload must be rejected before ordinary inference");
-        });
+        let lowering_context = ProgramLoweringContext::new().enter_manual_region(boundary);
+        let result =
+            lowering_context.validate_manual_collective("parallel_permute", "x", 2, Some(&mesh), &[1usize], |_| {
+                panic!("tracked payload must be rejected before ordinary inference");
+            });
         assert!(matches!(
             result,
             Err(Error::Core(core_error)) if matches!(
@@ -503,15 +506,16 @@ mod tests {
     }
 
     #[test]
-    fn test_program_lowering_state_validate_manual_collective_retains_unchecked_validation() {
+    fn test_program_lowering_context_validate_manual_collective_retains_unchecked_validation() {
         let mesh = test_manual_mesh("x", 2);
         let boundary = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), Vec::new())
             .unwrap()
             .with_check_manual_variation(false);
-        let state = ProgramLoweringState::new().enter_manual_region(boundary);
-        let wrong_size = state.validate_manual_collective("parallel_permute", "x", 3, None, &[1usize], |_| {
-            panic!("axis size must be validated before ordinary inference");
-        });
+        let lowering_context = ProgramLoweringContext::new().enter_manual_region(boundary);
+        let wrong_size =
+            lowering_context.validate_manual_collective("parallel_permute", "x", 3, None, &[1usize], |_| {
+                panic!("axis size must be validated before ordinary inference");
+            });
         assert!(matches!(
             wrong_size,
             Err(Error::Core(core_error)) if matches!(
@@ -522,10 +526,16 @@ mod tests {
         ));
 
         let other_mesh = test_manual_mesh("x", 3);
-        let wrong_mesh =
-            state.validate_manual_collective("parallel_permute", "x", 2, Some(&other_mesh), &[1usize], |_| {
+        let wrong_mesh = lowering_context.validate_manual_collective(
+            "parallel_permute",
+            "x",
+            2,
+            Some(&other_mesh),
+            &[1usize],
+            |_| {
                 panic!("payload mesh must be validated before ordinary inference");
-            });
+            },
+        );
         assert!(matches!(
             wrong_mesh,
             Err(Error::Core(core_error)) if matches!(
@@ -536,7 +546,8 @@ mod tests {
         ));
 
         let wrong_outputs =
-            state.validate_manual_collective("parallel_permute", "x", 2, None, &[1usize], |_| Ok(vec![2usize]));
+            lowering_context
+                .validate_manual_collective("parallel_permute", "x", 2, None, &[1usize], |_| Ok(vec![2usize]));
         assert!(matches!(
             wrong_outputs,
             Err(Error::Core(core_error)) if matches!(
@@ -548,25 +559,28 @@ mod tests {
     }
 
     #[test]
-    fn test_program_lowering_state_mesh_axis_replica_groups() {
+    fn test_program_lowering_context_mesh_axis_replica_groups() {
         // Devices are linearized row-major, so device `3 * x + y` has coordinates `(x, y)`.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let state = ProgramLoweringState::new()
+        let lowering_context = ProgramLoweringContext::new()
             .enter_manual_region(ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap());
-        assert_eq!(state.mesh_axis_replica_groups("x").unwrap(), (vec![vec![0, 3], vec![1, 4], vec![2, 5]], 2));
-        assert_eq!(state.mesh_axis_replica_groups("y").unwrap(), (vec![vec![0, 1, 2], vec![3, 4, 5]], 3));
+        assert_eq!(
+            lowering_context.mesh_axis_replica_groups("x").unwrap(),
+            (vec![vec![0, 3], vec![1, 4], vec![2, 5]], 2)
+        );
+        assert_eq!(lowering_context.mesh_axis_replica_groups("y").unwrap(), (vec![vec![0, 1, 2], vec![3, 4, 5]], 3));
 
         // The first name of a combined axis is major.
-        assert_eq!(state.mesh_axis_replica_groups(["x", "y"]).unwrap(), (vec![vec![0, 1, 2, 3, 4, 5]], 6));
-        assert_eq!(state.mesh_axis_replica_groups(["y", "x"]).unwrap(), (vec![vec![0, 3, 1, 4, 2, 5]], 6));
+        assert_eq!(lowering_context.mesh_axis_replica_groups(["x", "y"]).unwrap(), (vec![vec![0, 1, 2, 3, 4, 5]], 6));
+        assert_eq!(lowering_context.mesh_axis_replica_groups(["y", "x"]).unwrap(), (vec![vec![0, 3, 1, 4, 2, 5]], 6));
     }
 
     #[test]
-    fn test_program_lowering_state_mesh_axis_replica_groups_rejects_unresolvable_axes() {
+    fn test_program_lowering_context_mesh_axis_replica_groups_rejects_unresolvable_axes() {
         let outer_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
@@ -577,11 +591,11 @@ mod tests {
             MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let state = ProgramLoweringState::new()
+        let lowering_context = ProgramLoweringContext::new()
             .enter_manual_region(ShardMapBoundary::new(outer_mesh, Vec::new(), Vec::new(), Vec::new()).unwrap())
             .enter_manual_region(ShardMapBoundary::new(inner_mesh, Vec::new(), Vec::new(), Vec::new()).unwrap());
         assert!(matches!(
-            state.mesh_axis_replica_groups(Vec::<String>::new()),
+            lowering_context.mesh_axis_replica_groups(Vec::<String>::new()),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 CoreError::Program(ProgramError::MalformedProgram(message))
@@ -589,7 +603,7 @@ mod tests {
             ),
         ));
         assert!(matches!(
-            state.mesh_axis_replica_groups(["x", "y"]),
+            lowering_context.mesh_axis_replica_groups(["x", "y"]),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 CoreError::Program(ProgramError::MalformedProgram(message))
@@ -598,7 +612,7 @@ mod tests {
             ),
         ));
         assert!(matches!(
-            state.mesh_axis_replica_groups("z"),
+            lowering_context.mesh_axis_replica_groups("z"),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 CoreError::Program(ProgramError::UnsupportedOperation { message })
@@ -608,7 +622,7 @@ mod tests {
             ),
         ));
         assert!(matches!(
-            ProgramLoweringState::new().mesh_axis_replica_groups("x"),
+            ProgramLoweringContext::new().mesh_axis_replica_groups("x"),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 CoreError::Program(ProgramError::UnsupportedOperation { message })
@@ -618,23 +632,26 @@ mod tests {
     }
 
     #[test]
-    fn test_program_lowering_state_replica_groups() {
+    fn test_program_lowering_context_replica_groups() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 4, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let state = ProgramLoweringState::new()
+        let lowering_context = ProgramLoweringContext::new()
             .enter_manual_region(ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap());
-        assert_eq!(state.replica_groups("y", 4, None).unwrap(), (vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]], 4),);
+        assert_eq!(
+            lowering_context.replica_groups("y", 4, None).unwrap(),
+            (vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]], 4),
+        );
 
         // Logical participant groups expand within every fixed coordinate of the other axes, in order.
         assert_eq!(
-            state.replica_groups("y", 4, Some(&[vec![0, 2], vec![3, 1]])).unwrap(),
+            lowering_context.replica_groups("y", 4, Some(&[vec![0, 2], vec![3, 1]])).unwrap(),
             (vec![vec![0, 2], vec![3, 1], vec![4, 6], vec![7, 5]], 2),
         );
         assert!(matches!(
-            state.replica_groups("y", 2, None),
+            lowering_context.replica_groups("y", 2, None),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 CoreError::Program(ProgramError::MalformedProgram(message))
@@ -642,7 +659,7 @@ mod tests {
             ),
         ));
         assert!(matches!(
-            state.replica_groups("y", 4, Some(&[vec![0, 4]])),
+            lowering_context.replica_groups("y", 4, Some(&[vec![0, 4]])),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 CoreError::Program(ProgramError::MalformedProgram(message))
@@ -871,14 +888,14 @@ mod tests {
         ] {
             let input_type = test_vector_type(2).with_sharding(input_sharding).unwrap();
             let output_types = operation.infer_output_types(std::slice::from_ref(&input_type), &[]).unwrap();
-            let state = ProgramLoweringState::new().enter_manual_region(checked.clone());
-            lower_state_cast(&operation, state, input_type.clone(), &output_types).unwrap();
+            let lowering_context = ProgramLoweringContext::new().enter_manual_region(checked.clone());
+            lower_state_cast(&operation, lowering_context, input_type.clone(), &output_types).unwrap();
 
             // A raw cast is tracked even though its payload carries no mesh. An unchecked frontend would omit it.
-            let state =
-                ProgramLoweringState::new().enter_manual_region(checked.clone().with_check_manual_variation(false));
+            let lowering_context =
+                ProgramLoweringContext::new().enter_manual_region(checked.clone().with_check_manual_variation(false));
             assert!(matches!(
-                lower_state_cast(&operation, state, input_type.clone(), &output_types),
+                lower_state_cast(&operation, lowering_context, input_type.clone(), &output_types),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
                     CoreError::Program(ProgramError::MalformedProgram(message))
@@ -889,9 +906,9 @@ mod tests {
                 ),
             ));
 
-            let state = ProgramLoweringState::new().enter_manual_region(checked.clone());
+            let lowering_context = ProgramLoweringContext::new().enter_manual_region(checked.clone());
             assert!(matches!(
-                lower_state_cast(&operation, state, input_type.clone(), std::slice::from_ref(&input_type)),
+                lower_state_cast(&operation, lowering_context, input_type.clone(), std::slice::from_ref(&input_type)),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
                     CoreError::Program(ProgramError::MalformedProgram(message))
@@ -909,9 +926,9 @@ mod tests {
             ])
             .unwrap();
             let foreign = ShardMapBoundary::new(foreign_mesh, Vec::new(), Vec::new(), vec!["x".to_string()]).unwrap();
-            let state = ProgramLoweringState::new().enter_manual_region(foreign);
+            let lowering_context = ProgramLoweringContext::new().enter_manual_region(foreign);
             assert!(matches!(
-                lower_state_cast(&operation, state, input_type.clone(), &output_types),
+                lower_state_cast(&operation, lowering_context, input_type.clone(), &output_types),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
                     CoreError::Program(ProgramError::MalformedProgram(message))
@@ -922,9 +939,9 @@ mod tests {
                 ),
             ));
 
-            let state = ProgramLoweringState::new();
+            let lowering_context = ProgramLoweringContext::new();
             assert!(matches!(
-                lower_state_cast(&operation, state, input_type, &output_types),
+                lower_state_cast(&operation, lowering_context, input_type, &output_types),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
                     CoreError::Program(ProgramError::UnsupportedOperation { message })
@@ -950,16 +967,16 @@ mod tests {
             ArrayOperation::ParallelCast(ParallelCastOperation::new("x".to_string(), ParallelCastTarget::Reduced)),
         ] {
             let output_types = operation.infer_output_types(std::slice::from_ref(&input_type), &[]).unwrap();
-            let state = ProgramLoweringState::new()
+            let lowering_context = ProgramLoweringContext::new()
                 .enter_manual_region(outer.clone())
                 .enter_manual_region(inner.clone().with_check_manual_variation(false));
-            lower_state_cast(&operation, state, input_type.clone(), &output_types).unwrap();
+            lower_state_cast(&operation, lowering_context, input_type.clone(), &output_types).unwrap();
 
-            let state = ProgramLoweringState::new()
+            let lowering_context = ProgramLoweringContext::new()
                 .enter_manual_region(outer.clone().with_check_manual_variation(false))
                 .enter_manual_region(inner.clone());
             assert!(matches!(
-                lower_state_cast(&operation, state, input_type.clone(), &output_types),
+                lower_state_cast(&operation, lowering_context, input_type.clone(), &output_types),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
                     CoreError::Program(ProgramError::MalformedProgram(message))
@@ -970,9 +987,9 @@ mod tests {
                 ),
             ));
 
-            let state = ProgramLoweringState::new().enter_manual_region(inner.clone());
+            let lowering_context = ProgramLoweringContext::new().enter_manual_region(inner.clone());
             assert!(matches!(
-                lower_state_cast(&operation, state, input_type.clone(), &output_types),
+                lower_state_cast(&operation, lowering_context, input_type.clone(), &output_types),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
                     CoreError::Program(ProgramError::UnsupportedOperation { message })
@@ -1012,9 +1029,9 @@ mod tests {
                 let tensor_type = input_type.lower(&context, location).unwrap();
                 let block = context.block(&[(tensor_type, location)]);
                 let input = block.argument(0).unwrap().as_ref();
-                let state = ProgramLoweringState::new().enter_manual_region(boundary.clone());
+                let lowering_context = ProgramLoweringContext::new().enter_manual_region(boundary.clone());
                 let mut lowerer: Lowerer<'_, '_, '_, Operation> =
-                    Lowerer::new(block.as_ref(), &context, location.as_ref()).with_lowering_state(state.clone());
+                    Lowerer::new(block.as_ref(), &context, location.as_ref(), lowering_context.clone());
                 let result = operation.lower(&mut lowerer, &[input], &[input_type], &output_types);
                 let matching_mesh = match &operation {
                     ArrayOperation::ParallelAllToAll(operation) => operation.mesh().is_none(),
@@ -1046,7 +1063,7 @@ mod tests {
                         assert_eq!(error.as_ref(), &CoreError::Program(expected));
                         // Reject the contract before allocating a channel or emitting a communication operation, so
                         // the next channel of the state is still its first one.
-                        assert_eq!(state.next_channel_id(), 1);
+                        assert_eq!(lowering_context.next_channel_id(), 1);
                     }
                     (result, expected) => panic!("{operation}: expected {expected:?} but got {result:?}"),
                 }

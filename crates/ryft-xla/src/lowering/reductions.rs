@@ -20,7 +20,7 @@ use crate::arrays::host::{
 };
 use crate::lowering::LoweringError;
 use crate::lowering::sharding::OpenDimensions;
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::{Error, Type};
 
 // TODO(eaplatanios): Review this module.
@@ -315,14 +315,14 @@ pub(super) trait ShardingReductionExtension {
     /// [`constrain_unreduced_intermediates`]), so a closed constraint adds no communication for a value whose placement
     /// the program states. Over a mesh without auto axes, the two constraints are the same. Inside a manual region, the
     /// constraint is the same, without the bound manual axes (refer to
-    /// [`ProgramLoweringState::lower_sharding_constraint`]): with a split dimension left open there, `y = x + x; y + y`
+    /// [`ProgramLoweringContext::lower_sharding_constraint`]): with a split dimension left open there, `y = x + x; y + y`
     /// of a value split along an auto axis and unreduced along an explicit axis in a `shard_map` body all-reduced each
     /// operand over the explicit axis and restored the pending state with a select. The constraint is lowered in the
-    /// scope of `lowering_state`, which also records its mesh as the mesh of the module.
+    /// scope of `lowering_context`, which also records its mesh as the mesh of the module.
     fn lower_pending_reduction_constraint<'b, 'c: 'b, 't: 'c>(
         &self,
         value: ValueRef<'b, 'c, 't>,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         block: &mut BlockRef<'b, 'c, 't>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error>;
@@ -332,12 +332,12 @@ impl ShardingReductionExtension for Sharding {
     fn lower_pending_reduction_constraint<'b, 'c: 'b, 't: 'c>(
         &self,
         value: ValueRef<'b, 'c, 't>,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         block: &mut BlockRef<'b, 'c, 't>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         let closed = self.with_unconstrained_dimensions_replicated();
-        lowering_state.lower_sharding_constraint(&closed, value, OpenDimensions::None, block, location)
+        lowering_context.lower_sharding_constraint(&closed, value, OpenDimensions::None, block, location)
     }
 }
 
@@ -574,11 +574,11 @@ pub(super) fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
     input_types: &[Type],
     outputs: &[ValueRef<'b, 'c, 't>],
     output_types: &[Type],
-    lowering_state: &ProgramLoweringState,
+    lowering_context: &ProgramLoweringContext,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<Option<Rc<[ShardingDimension]>>>, Error> {
-    let bound_manual_axes = lowering_state.bound_manual_axes();
+    let bound_manual_axes = lowering_context.bound_manual_axes();
     let mut pending_reductions = input_values
         .iter()
         .zip(input_types)
@@ -742,7 +742,7 @@ pub(super) fn constrain_unreduced_intermediates<'b, 'c: 'b, 't: 'c>(
                 continue;
             };
             let sharding = reduction.sharding(mesh, rank, dimensions.as_deref())?;
-            let constrained = sharding.lower_pending_reduction_constraint(result, lowering_state, block, location)?;
+            let constrained = sharding.lower_pending_reduction_constraint(result, lowering_context, block, location)?;
             let constraint = constrained.cast::<OperationResultRef>().unwrap().operation()?;
             // The constraint is appended to the block, and moved right after the operation that produces its operand
             // (or after the constraint of the previous result), so that it dominates every later use of that operand.
@@ -770,11 +770,11 @@ pub(super) fn constrain_unreduced_outputs<'b, 'c: 'b, 't: 'c>(
     outputs: &mut [ValueRef<'b, 'c, 't>],
     output_types: &[Type],
     output_dimensions: &[Option<Rc<[ShardingDimension]>>],
-    lowering_state: &ProgramLoweringState,
+    lowering_context: &ProgramLoweringContext,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
-    let bound_manual_axes = lowering_state.bound_manual_axes();
+    let bound_manual_axes = lowering_context.bound_manual_axes();
     let is_declared = |output: &ValueRef<'b, 'c, 't>| {
         output
             .cast::<OperationResultRef>()
@@ -802,7 +802,7 @@ pub(super) fn constrain_unreduced_outputs<'b, 'c: 'b, 't: 'c>(
                 }
                 _ => sharding,
             };
-            *output = sharding.lower_pending_reduction_constraint(*output, lowering_state, block, location)?;
+            *output = sharding.lower_pending_reduction_constraint(*output, lowering_context, block, location)?;
         }
     }
     Ok(())
@@ -1593,13 +1593,17 @@ mod tests {
         let location = location.as_ref();
 
         // Every dimension is closed, even over a mesh with the auto axis `y`, and an unconstrained one is replicated.
-        let state = ProgramLoweringState::new();
-        let output = sharding.lower_pending_reduction_constraint(input, &state, &mut block_ref, location).unwrap();
+        let lowering_context = ProgramLoweringContext::new();
+        let output = sharding
+            .lower_pending_reduction_constraint(input, &lowering_context, &mut block_ref, location)
+            .unwrap();
 
         // An axis that an enclosing manual region binds is left out of the constraint.
         let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
-        let state = state.enter_manual_region(boundary);
-        sharding.lower_pending_reduction_constraint(input, &state, &mut block_ref, location).unwrap();
+        let lowering_context = lowering_context.enter_manual_region(boundary);
+        sharding
+            .lower_pending_reduction_constraint(input, &lowering_context, &mut block_ref, location)
+            .unwrap();
         let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(output, operations[0].result(0).unwrap().as_ref());
         assert_eq!(

@@ -1,5 +1,3 @@
-//! State that the lowering of one program shares across the nested lowering scopes of its module.
-
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -14,31 +12,24 @@ use crate::{Error, RetainedArray, RuntimeRequirement, normalize_runtime_requirem
 
 // TODO(eaplatanios): Review this module.
 
-/// Lowering state of one program, which is lowered to one module, shared across the nested lowering scopes of that
-/// module. It holds the state of the whole program (i.e., the allocator of the channels of collectives, what lowering
-/// records about the module, the registry of named compositions, and the target and representation policy that other
-/// lowerings consume) together with the state of the lowering scope that it is used in (i.e., the enclosing
-/// `sdy.manual_computation` regions, whose innermost [`ShardMapBoundary`] StableHLO collectives use, and the session
-/// constants that the scope can reach).
+/// Context for lowering a program in the current scope of its MLIR module. Each instruction lowerer holds a clone
+/// of this handle, sharing the module resources and the current scope's bindings through one [`Rc`].
 ///
-/// The state is created once per lowered module and cloned per instruction lowerer. Every clone shares the state of
-/// the program, whose mutable members and registries are shared through [`Rc`], while its immutable target and
-/// representation policies are copied or cloned. [`enter_manual_region`](Self::enter_manual_region) keeps the state of
-/// the program and derives the state of the nested scope, in which its [`ShardMapBoundary`] is the innermost region.
+/// [`enter_manual_region`](Self::enter_manual_region) derives a context for the body of an `sdy.manual_computation`.
+/// Its manual axes and reachable session constants belong to that scope. The child inherits the module's target and
+/// lowering policy, looks up the same named compositions, and continues to allocate channels and record module
+/// requirements alongside the enclosing context.
 #[derive(Clone)]
-pub(crate) struct ProgramLoweringState {
-    /// State of the whole program, which every lowering scope of the program shares.
-    shared: SharedLoweringState,
-
-    /// State of the lowering scope that this state is used in.
-    scope: LoweringScopeState,
+pub(crate) struct ProgramLoweringContext {
+    /// Module resources and copy-on-write scope bindings.
+    state: Rc<ProgramLoweringContextState>,
 }
 
-impl ProgramLoweringState {
-    /// Creates the lowering state for one module, outside any manual region and without target information.
+impl ProgramLoweringContext {
+    /// Creates a context for one module, outside any manual region and without target information.
     pub(crate) fn new() -> Self {
         Self {
-            shared: SharedLoweringState {
+            state: Rc::new(ProgramLoweringContextState {
                 channel_ids: Rc::new(Cell::new(1)),
                 target_platform: None,
                 ragged_dot_lowering_strategy: RaggedDotLoweringStrategy::default(),
@@ -47,46 +38,48 @@ impl ProgramLoweringState {
                 has_assertions: Rc::new(Cell::new(false)),
                 runtime_requirements: Rc::new(RefCell::new(Vec::new())),
                 mesh: Rc::new(RefCell::new(None)),
-            },
-            scope: LoweringScopeState::default(),
+                manual_regions: Vec::new(),
+                bound_manual_axes: Vec::new(),
+                session_constants: Rc::default(),
+            }),
         }
     }
 
-    /// Returns a copy of this state whose scope reaches the hidden entry inputs carrying `session_constants`.
+    /// Makes the hidden entry inputs carrying `session_constants` reachable in this context.
     pub(crate) fn with_session_constants(mut self, session_constants: &[RetainedArray]) -> Self {
         let indices = session_constants.iter().enumerate().map(|(index, constant)| (constant.clone(), index)).collect();
-        self.scope.session_constants = Rc::new(indices);
+        Rc::make_mut(&mut self.state).session_constants = Rc::new(indices);
         self
     }
 
-    /// Returns a copy of this state carrying the PJRT platform name of the compilation target.
+    /// Returns this context carrying the PJRT platform name of the compilation target.
     pub(crate) fn with_target_platform(mut self, target_platform: Option<&str>) -> Self {
-        self.shared.target_platform = target_platform.map(Rc::from);
+        Rc::make_mut(&mut self.state).target_platform = target_platform.map(Rc::from);
         self
     }
 
-    /// Returns a copy of this state carrying the [`RaggedDotLoweringStrategy`] of the module.
+    /// Returns this context carrying the [`RaggedDotLoweringStrategy`] of the module.
     pub(crate) fn with_ragged_dot_lowering_strategy(mut self, strategy: RaggedDotLoweringStrategy) -> Self {
-        self.shared.ragged_dot_lowering_strategy = strategy;
+        Rc::make_mut(&mut self.state).ragged_dot_lowering_strategy = strategy;
         self
     }
 
-    /// Returns a copy of this state carrying the registry of the private decompositions of the named compositions of
+    /// Returns this context carrying the registry of the private decompositions of the named compositions of
     /// the module.
     pub(super) fn with_named_compositions(mut self, named_compositions: Rc<NamedCompositionFunctionMap>) -> Self {
-        self.shared.named_compositions = Some(named_compositions);
+        Rc::make_mut(&mut self.state).named_compositions = Some(named_compositions);
         self
     }
 
     /// Returns the PJRT platform name of the compilation target, or `None` when the lowering has no target
     /// information.
     pub(crate) fn target_platform(&self) -> Option<&str> {
-        self.shared.target_platform.as_deref()
+        self.state.target_platform.as_deref()
     }
 
     /// Returns the ragged dot lowering strategy for this module.
     pub(crate) fn ragged_dot_lowering_strategy(&self) -> RaggedDotLoweringStrategy {
-        self.shared.ragged_dot_lowering_strategy
+        self.state.ragged_dot_lowering_strategy
     }
 
     /// Returns the suffix of `captured_values` that holds the values of the session constants reachable in this scope.
@@ -94,18 +87,18 @@ impl ProgramLoweringState {
     pub(crate) fn session_values<'o, V>(&self, captured_values: &'o [V]) -> &'o [V] {
         captured_values
             .len()
-            .checked_sub(self.scope.session_constants.len())
+            .checked_sub(self.state.session_constants.len())
             .map_or(&[], |start| &captured_values[start..])
     }
 
     /// Returns the innermost enclosing manual region's [`ShardMapBoundary`], or `None` outside manual regions.
     pub(crate) fn manual_shard_map(&self) -> Option<&ShardMapBoundary> {
-        self.scope.manual_regions.last().map(Rc::as_ref)
+        self.state.manual_regions.last().map(Rc::as_ref)
     }
 
     /// Returns the nearest enclosing region binding `axis_name`.
     pub(crate) fn manual_axis_region(&self, axis_name: &str) -> Option<&ShardMapBoundary> {
-        self.scope
+        self.state
             .manual_regions
             .iter()
             .rev()
@@ -116,19 +109,19 @@ impl ProgramLoweringState {
     /// Returns `true` if any recursive lowering path constructed a location specific to an instruction from a known
     /// [`Provenance`].
     pub(crate) fn has_provenance(&self) -> bool {
-        self.shared.has_provenance.get()
+        self.state.has_provenance.get()
     }
 
     /// Returns `true` if lowering has emitted an assertion in this module.
     #[inline]
     pub(super) fn has_assertions(&self) -> bool {
-        self.shared.has_assertions.get()
+        self.state.has_assertions.get()
     }
 
     /// Returns the runtime requirements that lowering has recorded for this module so far.
     #[inline]
     pub(super) fn runtime_requirements(&self) -> Vec<RuntimeRequirement> {
-        self.shared.runtime_requirements.borrow().clone()
+        self.state.runtime_requirements.borrow().clone()
     }
 
     /// Returns the mesh that lowering has recorded for this module so far (refer to
@@ -136,13 +129,13 @@ impl ProgramLoweringState {
     /// that lowering has emitted refers to a mesh.
     #[inline]
     pub(super) fn mesh(&self) -> Option<LogicalMesh> {
-        self.shared.mesh.borrow().clone()
+        self.state.mesh.borrow().clone()
     }
 
     /// Records that lowering has emitted an assertion in this module.
     #[inline]
     pub(super) fn record_assertion(&self) {
-        self.shared.has_assertions.set(true);
+        self.state.has_assertions.set(true);
     }
 
     /// Records `requirement` as a runtime requirement of this module.
@@ -152,7 +145,7 @@ impl ProgramLoweringState {
     /// Returns the errors of `normalize_runtime_requirements` when `requirement` conflicts with a requirement that is
     /// already recorded.
     pub(super) fn require_runtime(&self, requirement: RuntimeRequirement) -> Result<(), Error> {
-        let mut requirements = self.shared.runtime_requirements.borrow_mut();
+        let mut requirements = self.state.runtime_requirements.borrow_mut();
         let mut updated = requirements.clone();
         updated.push(requirement);
         *requirements = normalize_runtime_requirements(updated)?;
@@ -171,7 +164,7 @@ impl ProgramLoweringState {
     /// Returns [`LoweringError::MismatchedMeshTopology`] when the axis names or sizes of `mesh` differ from those of
     /// the recorded mesh, including in order.
     pub(crate) fn require_mesh(&self, mesh: &LogicalMesh) -> Result<(), Error> {
-        let mut recorded = self.shared.mesh.borrow_mut();
+        let mut recorded = self.state.mesh.borrow_mut();
         match recorded.as_ref() {
             Some(recorded) if !recorded.has_same_topology(mesh) => {
                 Err(Error::Lowering(LoweringError::MismatchedMeshTopology {
@@ -190,28 +183,35 @@ impl ProgramLoweringState {
     /// Returns the axes bound by every enclosing manual region, excluded from shard-local placement constraints.
     #[inline]
     pub(crate) fn bound_manual_axes(&self) -> &[String] {
-        &self.scope.bound_manual_axes
+        &self.state.bound_manual_axes
     }
 
     /// Returns the module-owned private decompositions used by named StableHLO composites.
     #[inline]
     pub(crate) fn named_compositions(&self) -> Option<&Rc<NamedCompositionFunctionMap>> {
-        self.shared.named_compositions.as_ref()
+        self.state.named_compositions.as_ref()
     }
 
     /// Returns a fresh module-unique channel id for one channeled collective.
     pub(crate) fn next_channel_id(&self) -> usize {
-        let channel_id = self.shared.channel_ids.get();
-        self.shared.channel_ids.set(channel_id + 1);
+        let channel_id = self.state.channel_ids.get();
+        self.state.channel_ids.set(channel_id + 1);
         channel_id
     }
 
-    /// Derives the state used inside the body of one `sdy.manual_computation` region. The state of the program (i.e.,
-    /// the target platform, ragged dot lowering strategy, named compositions, provenance state, and module channel
-    /// allocator, among others) is inherited, while the provided [`ShardMapBoundary`] becomes the innermost manual
-    /// region of the scope, which cannot reach the session constants of the enclosing scope.
+    /// Derives a child context whose innermost manual region binds the axes of `boundary`. The body is isolated from
+    /// above, so its operations cannot use the enclosing scope's hidden entry inputs for session constants.
     pub(crate) fn enter_manual_region(&self, boundary: ShardMapBoundary) -> Self {
-        Self { shared: self.shared.clone(), scope: self.scope.entering_manual_region(boundary) }
+        let mut child = self.clone();
+        let state = Rc::make_mut(&mut child.state);
+        for axis in boundary.manual_axes() {
+            if !state.bound_manual_axes.contains(axis) {
+                state.bound_manual_axes.push(axis.clone());
+            }
+        }
+        state.manual_regions.push(Rc::new(boundary));
+        state.session_constants = Rc::default();
+        child
     }
 
     /// Lowers a tensor placement constraint of `input_value` to `sharding` in this scope and returns the constrained
@@ -254,11 +254,11 @@ impl ProgramLoweringState {
         captured_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         let values = self.session_values(captured_values);
-        self.scope
+        self.state
             .session_constants
             .get(constant)
             .copied()
-            .filter(|_| values.len() == self.scope.session_constants.len())
+            .filter(|_| values.len() == self.state.session_constants.len())
             .map(|index| values[index])
             .ok_or_else(|| {
                 Error::Lowering(LoweringError::UnreachableSessionConstant { constant: constant.to_string() })
@@ -299,16 +299,15 @@ impl ProgramLoweringState {
         if provenance.is_unknown() {
             return base;
         }
-        self.shared.has_provenance.set(true);
+        self.state.has_provenance.set(true);
         lower(context, provenance, base)
     }
 }
 
-/// State of a whole program in a [`ProgramLoweringState`], which every lowering scope of the program shares. Lowering
-/// mutates some of its members while it emits the module, and those are shared through [`Rc`], so that every clone of
-/// this state allocates from and records into the same program.
+/// State held by a [`ProgramLoweringContext`]. Deriving a scope copies its bindings and retains the [`Rc`]s for
+/// resources that all scopes update while emitting the module.
 #[derive(Clone)]
-struct SharedLoweringState {
+struct ProgramLoweringContextState {
     /// Module-scoped counter producing the next collective channel id.
     channel_ids: Rc<Cell<usize>>,
 
@@ -338,12 +337,7 @@ struct SharedLoweringState {
     /// Mesh that the emitted shardings of every nested lowering scope refer to, which the module declares, or [`None`]
     /// while nothing that lowering has emitted refers to a mesh.
     mesh: Rc<RefCell<Option<LogicalMesh>>>,
-}
 
-/// State of one lowering scope in a [`ProgramLoweringState`] (e.g., the entry function of the module, or the body of an
-/// `sdy.manual_computation` region), which the scopes nested in it derive their own state from.
-#[derive(Clone, Default)]
-struct LoweringScopeState {
     /// Enclosing manual regions, ordered from outermost to innermost for named-axis resolution.
     manual_regions: Vec<Rc<ShardMapBoundary>>,
 
@@ -357,58 +351,39 @@ struct LoweringScopeState {
     session_constants: Rc<HashMap<RetainedArray, usize>>,
 }
 
-impl LoweringScopeState {
-    /// Returns the state of the scope inside the body of an `sdy.manual_computation` region that this scope encloses,
-    /// in which `boundary` is the innermost manual region and its manual axes are bound as well.
-    fn entering_manual_region(&self, boundary: ShardMapBoundary) -> Self {
-        let mut bound_manual_axes = self.bound_manual_axes.clone();
-        for axis in boundary.manual_axes() {
-            if !bound_manual_axes.contains(axis) {
-                bound_manual_axes.push(axis.clone());
-            }
-        }
-        let mut manual_regions = self.manual_regions.clone();
-        manual_regions.push(Rc::new(boundary));
-        Self {
-            manual_regions,
-            bound_manual_axes,
-            // `sdy.manual_computation` bodies are isolated from above, so they cannot use entry function arguments.
-            session_constants: Rc::default(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayType, DataType, Dimension, MeshAxis, MeshAxisType, ParallelReduce, ReductionKind, Shape, ShardMapOptions,
-        ShardingDimension, shard_map,
+        ArrayType, DataType, Dimension, MeshAxis, MeshAxisType, ParallelReduce, ProvenanceScope, ReductionKind, Shape,
+        ShardMapOptions, ShardingDimension, shard_map,
     };
     use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue};
 
     use crate::lowering::sharding::tests::{test_input_type, test_mesh};
     use crate::lowering::types::ArrayTypeLoweringExtension;
-    use crate::{ArrayTracer, ProgramLoweringExtension, ProgramLoweringOptions, TracedProgram, trace};
+    use crate::sessions::tests::{domain_mesh, f32_scalar};
+    use crate::tests::cpu_client;
+    use crate::{ArrayTracer, ProgramLoweringExtension, ProgramLoweringOptions, Session, TracedProgram, trace};
 
     use super::*;
 
     #[test]
-    fn test_program_lowering_state_require_mesh() {
+    fn test_program_lowering_context_require_mesh() {
         let mesh = |axes: [(&str, usize); 2], r#type: MeshAxisType| {
             LogicalMesh::new(axes.map(|(name, size)| MeshAxis::new(name, size, r#type).unwrap()).to_vec()).unwrap()
         };
         let explicit = mesh([("x", 2), ("y", 2)], MeshAxisType::Explicit);
-        let state = ProgramLoweringState::new();
-        assert_eq!(state.mesh(), None);
-        state.require_mesh(&explicit).unwrap();
-        assert_eq!(state.mesh(), Some(explicit.clone()));
+        let lowering_context = ProgramLoweringContext::new();
+        assert_eq!(lowering_context.mesh(), None);
+        lowering_context.require_mesh(&explicit).unwrap();
+        assert_eq!(lowering_context.mesh(), Some(explicit.clone()));
 
         // A mesh that differs only in axis types shares the module mesh, which keeps the axis types of its first mesh.
         let manual = mesh([("x", 2), ("y", 2)], MeshAxisType::Manual);
-        state.require_mesh(&manual).unwrap();
-        assert_eq!(state.mesh(), Some(explicit.clone()));
+        lowering_context.require_mesh(&manual).unwrap();
+        assert_eq!(lowering_context.mesh(), Some(explicit.clone()));
 
         // Device ids follow the order of the axes of the module mesh, so a reordered mesh is another topology, as is a
         // mesh with other axis names or sizes. The module mesh stays the recorded one.
@@ -418,22 +393,22 @@ mod tests {
             mesh([("x", 2), ("y", 4)], MeshAxisType::Explicit),
         ] {
             assert!(matches!(
-                state.require_mesh(&other),
+                lowering_context.require_mesh(&other),
                 Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
                     if expected == explicit && actual == other,
             ));
         }
-        assert_eq!(state.mesh(), Some(explicit));
+        assert_eq!(lowering_context.mesh(), Some(explicit));
 
         // Every lowering scope of a program records into the same module, including the body of a manual region.
-        let state = ProgramLoweringState::new();
+        let lowering_context = ProgramLoweringContext::new();
         let boundary = ShardMapBoundary::new(manual.clone(), Vec::new(), Vec::new(), vec!["x".to_string()]).unwrap();
-        state.enter_manual_region(boundary).require_mesh(&manual).unwrap();
-        assert_eq!(state.mesh(), Some(manual));
+        lowering_context.enter_manual_region(boundary).require_mesh(&manual).unwrap();
+        assert_eq!(lowering_context.mesh(), Some(manual));
     }
 
     #[test]
-    fn test_program_lowering_state_next_channel_id() {
+    fn test_program_lowering_context_next_channel_id() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
@@ -499,7 +474,59 @@ mod tests {
     }
 
     #[test]
-    fn test_program_lowering_state_lower_sharding_constraint() {
+    fn test_program_lowering_context_enter_manual_region() {
+        let mesh = test_mesh().with_axis_types(["x", "y"], MeshAxisType::Manual).unwrap();
+        let boundary =
+            |axis: &str| ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec![axis.to_string()]).unwrap();
+        let root = ProgramLoweringContext::new();
+        let outer = root.enter_manual_region(boundary("m"));
+        let inner = outer.enter_manual_region(boundary("x"));
+        let sibling = outer.enter_manual_region(boundary("y"));
+
+        // Each child sees its enclosing boundary and its own bindings.
+        assert_eq!(root.manual_shard_map(), None);
+        assert!(root.bound_manual_axes().is_empty());
+        assert_eq!(outer.bound_manual_axes(), &["m"]);
+        assert_eq!(outer.manual_axis_region("x"), None);
+        assert_eq!(inner.bound_manual_axes(), &["m", "x"]);
+        assert_eq!(inner.manual_axis_region("m"), Some(&boundary("m")));
+        assert_eq!(inner.manual_shard_map(), Some(&boundary("x")));
+        assert_eq!(inner.manual_axis_region("y"), None);
+        assert_eq!(sibling.bound_manual_axes(), &["m", "y"]);
+        assert_eq!(sibling.manual_axis_region("x"), None);
+
+        // The same allocator and module records remain visible across both levels of nesting.
+        assert_eq!(inner.next_channel_id(), 1);
+        assert_eq!(sibling.next_channel_id(), 2);
+        assert_eq!(root.next_channel_id(), 3);
+        inner.require_mesh(&mesh).unwrap();
+        assert_eq!(root.mesh(), Some(mesh));
+        let requirement = RuntimeRequirement::new("ryft.tests.nested", 1).unwrap();
+        sibling.require_runtime(requirement.clone()).unwrap();
+        assert_eq!(inner.runtime_requirements(), vec![requirement]);
+        inner.record_assertion();
+        assert!(root.has_assertions());
+        let context = MlirContext::new();
+        let provenance = Provenance::scope(ProvenanceScope::new("nested"), Provenance::unknown());
+        inner.instruction_location(&context, &provenance, context.unknown_location().as_ref());
+        assert!(sibling.has_provenance());
+    }
+
+    #[test]
+    fn test_program_lowering_context_enter_manual_region_isolates_session_constants() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let constant = RetainedArray::new(&f32_scalar(&session, &domain_mesh(client, "x", 1), 2.0));
+        let root = ProgramLoweringContext::new().with_session_constants(&[constant]);
+        let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
+        let child = root.enter_manual_region(boundary);
+        let captures = [0, 1];
+        assert!(child.session_values(&captures).is_empty());
+        assert_eq!(root.session_values(&captures), &[1]);
+    }
+
+    #[test]
+    fn test_program_lowering_context_lower_sharding_constraint() {
         // The constraints are rendered outside any function, so their detached inputs print as unknown SSA values.
         let input_type = test_input_type();
         let sharding = input_type.sharding().unwrap();
@@ -510,25 +537,25 @@ mod tests {
         let input = block.argument(0).unwrap().as_ref();
         let mut block_ref = block.as_ref();
         let location = location.as_ref();
-        let state = ProgramLoweringState::new();
-        let output = state
+        let lowering_context = ProgramLoweringContext::new();
+        let output = lowering_context
             .lower_sharding_constraint(sharding, input, OpenDimensions::None, &mut block_ref, location)
             .unwrap();
-        assert_eq!(state.mesh(), Some(test_mesh()));
+        assert_eq!(lowering_context.mesh(), Some(test_mesh()));
 
         // An axis that an enclosing manual region binds is left out of the constraint, whose mesh is still recorded.
         let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
-        let state = ProgramLoweringState::new().enter_manual_region(boundary);
-        state
+        let lowering_context = ProgramLoweringContext::new().enter_manual_region(boundary);
+        lowering_context
             .lower_sharding_constraint(sharding, input, OpenDimensions::None, &mut block_ref, location)
             .unwrap();
-        assert_eq!(state.mesh(), Some(test_mesh()));
+        assert_eq!(lowering_context.mesh(), Some(test_mesh()));
 
         // A sharding over a mesh of another topology cannot be lowered into the module, and nothing is emitted for it.
         let other = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let other_sharding = Sharding::replicated(other.clone(), 2);
         assert!(matches!(
-            state.lower_sharding_constraint(&other_sharding, input, OpenDimensions::None, &mut block_ref, location),
+            lowering_context.lower_sharding_constraint(&other_sharding, input, OpenDimensions::None, &mut block_ref, location),
             Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
                 if expected == test_mesh() && actual == other,
         ));
@@ -544,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_lowering_state_lower_replication_constraint() {
+    fn test_program_lowering_context_lower_replication_constraint() {
         // The constraints are rendered outside any function, so their detached inputs print as unknown SSA values.
         let input_type = test_input_type();
         let sharding = input_type.sharding().unwrap();
@@ -555,15 +582,19 @@ mod tests {
         let input = block.argument(0).unwrap().as_ref();
         let mut block_ref = block.as_ref();
         let location = location.as_ref();
-        let state = ProgramLoweringState::new();
-        let output = state.lower_replication_constraint(sharding, input, &[0], &mut block_ref, location).unwrap();
-        assert_eq!(state.mesh(), Some(test_mesh()));
+        let lowering_context = ProgramLoweringContext::new();
+        let output = lowering_context
+            .lower_replication_constraint(sharding, input, &[0], &mut block_ref, location)
+            .unwrap();
+        assert_eq!(lowering_context.mesh(), Some(test_mesh()));
 
         // An axis that an enclosing manual region binds is left out of the constraint, whose mesh is still recorded.
         let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
-        let state = ProgramLoweringState::new().enter_manual_region(boundary);
-        state.lower_replication_constraint(sharding, input, &[0], &mut block_ref, location).unwrap();
-        assert_eq!(state.mesh(), Some(test_mesh()));
+        let lowering_context = ProgramLoweringContext::new().enter_manual_region(boundary);
+        lowering_context
+            .lower_replication_constraint(sharding, input, &[0], &mut block_ref, location)
+            .unwrap();
+        assert_eq!(lowering_context.mesh(), Some(test_mesh()));
         let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(output, operations[0].result(0).unwrap().as_ref());
         assert_eq!(

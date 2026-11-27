@@ -10,7 +10,7 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_constant_output, lower_u64_scalar_constant,
     physical_bound_type,
@@ -30,8 +30,8 @@ impl LowerableOperation for ParallelRaggedAllToAllOperation {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("output", output_types, 1, ProgramError);
-        let lowering_state = lowerer.lowering_state().clone();
-        lowering_state.validate_manual_collective(
+        let lowering_context = lowerer.lowering_context().clone();
+        lowering_context.validate_manual_collective(
             self.name(),
             self.axis_name(),
             self.axis_size(),
@@ -46,7 +46,7 @@ impl LowerableOperation for ParallelRaggedAllToAllOperation {
             },
         )?;
         self.lower_to_mlir(
-            &lowering_state,
+            &lowering_context,
             input_values,
             input_types,
             &mut lowerer.block(),
@@ -66,9 +66,9 @@ impl MemberLowerableOperation<Type> for ParallelRaggedAllToAllOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
-        let lowering_state = lowerer.lowering_state();
+        let lowering_context = lowerer.lowering_context();
         let block = &mut lowerer.block();
-        lowering_state.validate_manual_collective(
+        lowering_context.validate_manual_collective(
             self.name(),
             self.axis_name(),
             self.axis_size(),
@@ -96,13 +96,13 @@ impl MemberLowerableOperation<Type> for ParallelRaggedAllToAllOperation {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
         <&ArrayType>::try_from(output_type)?;
-        self.lower_to_mlir(lowering_state, input_values, array_input_types.as_slice(), block, context, location)
+        self.lower_to_mlir(lowering_context, input_values, array_input_types.as_slice(), block, context, location)
     }
 }
 
 /// Emits one overwrite-mode `parallel_ragged_all_to_all` typed-FFI custom call.
 fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
-    lowering_state: &ProgramLoweringState,
+    lowering_context: &ProgramLoweringContext,
     replica_groups: &[Vec<usize>],
     inputs: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
@@ -135,7 +135,7 @@ fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let replica_groups = context.dense_i64_elements_attribute(replica_group_type, replica_group_values.as_slice())?;
-    let channel_id = lowering_state.next_channel_id();
+    let channel_id = lowering_context.next_channel_id();
     let channel_id = i64::try_from(channel_id).map_err(|_| {
         ProgramError::MalformedProgram(format!(
             "`parallel_ragged_all_to_all` channel id {channel_id} cannot be represented as an `i64` backend \
@@ -167,8 +167,8 @@ fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Rejects target platforms whose runtime does not register the accelerator ragged-collective custom call.
-fn validate_parallel_ragged_all_to_all_target(lowering_state: &ProgramLoweringState) -> Result<(), Error> {
-    if lowering_state.target_platform().is_some_and(|platform| platform.eq_ignore_ascii_case("cpu")) {
+fn validate_parallel_ragged_all_to_all_target(lowering_context: &ProgramLoweringContext) -> Result<(), Error> {
+    if lowering_context.target_platform().is_some_and(|platform| platform.eq_ignore_ascii_case("cpu")) {
         return Err(ProgramError::UnsupportedOperation {
             message: "`parallel_ragged_all_to_all` is not supported by the XLA CPU backend".to_string(),
         }
@@ -189,7 +189,7 @@ trait ParallelRaggedAllToAllOperationLoweringExtension {
     /// exchange (refer to [`ParallelRaggedAllToAllOperationLoweringExtension::lower_batched`] for more information).
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
@@ -207,7 +207,7 @@ trait ParallelRaggedAllToAllOperationLoweringExtension {
     /// cannot overflow a narrower metadata type, and the flattening requires static shapes.
     fn lower_batched<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
@@ -219,7 +219,7 @@ trait ParallelRaggedAllToAllOperationLoweringExtension {
     /// [`batch_dimension_count`](ParallelRaggedAllToAllOperation::batch_dimension_count) of this operation.
     fn lower_unbatched<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
@@ -231,7 +231,7 @@ trait ParallelRaggedAllToAllOperationLoweringExtension {
 impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAllOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
@@ -246,18 +246,18 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
             )
             .into());
         }
-        validate_parallel_ragged_all_to_all_target(lowering_state)?;
+        validate_parallel_ragged_all_to_all_target(lowering_context)?;
         check_count!("input", input_values, 6, ProgramError);
         check_count!("input", input_types, 6, ProgramError);
         if self.batch_dimension_count() > 0 {
-            return self.lower_batched(lowering_state, input_values, input_types, block, context, location);
+            return self.lower_batched(lowering_context, input_values, input_types, block, context, location);
         }
-        self.lower_unbatched(lowering_state, input_values, input_types, block, context, location)
+        self.lower_unbatched(lowering_context, input_values, input_types, block, context, location)
     }
 
     fn lower_batched<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
@@ -365,7 +365,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
         }
 
         let mut outputs = self.lower_unbatched(
-            lowering_state,
+            lowering_context,
             flat_values.as_slice(),
             flat_types.as_slice(),
             block,
@@ -378,7 +378,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
 
     fn lower_unbatched<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
@@ -386,10 +386,10 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let (replica_groups, effective_axis_size) =
-            lowering_state.replica_groups(self.axis_name(), self.axis_size(), self.axis_index_groups())?;
+            lowering_context.replica_groups(self.axis_name(), self.axis_size(), self.axis_index_groups())?;
         if !self.accumulates_updates() {
             return Ok(vec![emit_parallel_ragged_all_to_all_custom_call(
-                lowering_state,
+                lowering_context,
                 replica_groups.as_slice(),
                 input_values,
                 block,
@@ -477,7 +477,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
             block.append_operation(stable_hlo::remainder(metadata_indices, transfer_count, location)?)?;
         let transfer_slots = transfer_slots.result(0).unwrap().as_ref();
         let source_axis_index = (AxisIndexOperation::new(self.axis_name().to_string())).lower_to_coordinate(
-            lowering_state,
+            lowering_context,
             block,
             context,
             location,
@@ -544,7 +544,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
         let output_offsets = output_offsets.result(0).unwrap().as_ref();
         let transfer_inputs = [input_values[0], expanded_output, metadata[0], metadata[1], output_offsets, metadata[3]];
         let expanded = emit_parallel_ragged_all_to_all_custom_call(
-            lowering_state,
+            lowering_context,
             replica_groups.as_slice(),
             transfer_inputs.as_slice(),
             block,
@@ -1447,7 +1447,7 @@ mod tests {
         let mut block = module.body().unwrap();
         assert!(matches!(
             operation.lower_to_mlir(
-                &ProgramLoweringState::new(),
+                &ProgramLoweringContext::new(),
                 &[],
                 &[],
                 &mut block,
@@ -1479,7 +1479,7 @@ mod tests {
         let mut block = module.body().unwrap();
         assert!(matches!(
             operation.lower_batched(
-                &ProgramLoweringState::new(),
+                &ProgramLoweringContext::new(),
                 &[],
                 &[
                     operand_type,

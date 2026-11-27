@@ -7,7 +7,7 @@ use ryft_mlir::{
 };
 
 use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat};
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
@@ -18,7 +18,7 @@ pub(crate) trait ParallelReduceOperationLoweringExtension {
     /// the device mesh axis the collective names.
     ///
     /// The replica groups are the dense global device-id groups that
-    /// [`ProgramLoweringState::mesh_axis_replica_groups`] derives from the mesh's row-major device linearization,
+    /// [`ProgramLoweringContext::mesh_axis_replica_groups`] derives from the mesh's row-major device linearization,
     /// or, when the collective records explicit logical participant groups, those groups expanded inside every fixed
     /// coordinate of the mesh's other axes without reordering either the groups or their members. The emitted operation
     /// carries a module-unique channel id with a device-to-device channel type and `use_global_device_ids`, the
@@ -48,7 +48,7 @@ pub(crate) trait ParallelReduceOperationLoweringExtension {
     /// `explicit_axes` may retype the region's free axes, and the replica groups come from the region's mesh.
     fn lower_to_all_reduce<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_value: ValueRef<'b, 'c, 't>,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
@@ -60,7 +60,7 @@ pub(crate) trait ParallelReduceOperationLoweringExtension {
 impl ParallelReduceOperationLoweringExtension for ParallelReduceOperation {
     fn lower_to_all_reduce<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_value: ValueRef<'b, 'c, 't>,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
@@ -68,7 +68,7 @@ impl ParallelReduceOperationLoweringExtension for ParallelReduceOperation {
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         if let Some(mesh) = self.mesh()
-            && lowering_state
+            && lowering_context
                 .manual_axis_region(self.axis_name())
                 .is_some_and(|region| !mesh.has_same_manual_axes(region.mesh()))
         {
@@ -79,7 +79,7 @@ impl ParallelReduceOperationLoweringExtension for ParallelReduceOperation {
             .into());
         }
         let (replica_groups, effective_axis_size) = match self.axis_index_groups() {
-            Some(axis_index_groups) => lowering_state.replica_groups(
+            Some(axis_index_groups) => lowering_context.replica_groups(
                 self.axis_name(),
                 self.axis_size().ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
@@ -90,7 +90,7 @@ impl ParallelReduceOperationLoweringExtension for ParallelReduceOperation {
                 })?,
                 Some(axis_index_groups),
             )?,
-            None => lowering_state.mesh_axis_replica_groups(self.axis_name())?,
+            None => lowering_context.mesh_axis_replica_groups(self.axis_name())?,
         };
         let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
 
@@ -169,7 +169,7 @@ impl ParallelReduceOperationLoweringExtension for ParallelReduceOperation {
         let result = block.append_operation(stable_hlo::all_reduce(
             &[input_value],
             stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-            Some(lowering_state.next_channel_id()),
+            Some(lowering_context.next_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             true,
             computation,
@@ -205,17 +205,17 @@ impl LowerableOperation for ParallelReduceOperation {
         let _ = input_types;
         // This plain dispatch serves nested programs (i.e., control-flow bodies, inlined composite primals, and
         // rematerialized bodies), which can sit inside a `shard_map` manual region. The threaded
-        // `ProgramLoweringState` resolves the collective's mesh axis there and returns an error outside manual
+        // `ProgramLoweringContext` resolves the collective's mesh axis there and returns an error outside manual
         // regions. A batched axis never reaches this point, because batching consumes it into a `Reduce` when the
         // closure is traced.
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let lowering_state = lowerer.lowering_state().clone();
+        let lowering_context = lowerer.lowering_context().clone();
 
         // A mesh reduction tracks manual variation, so its binding must check it. Inside a checked binding, a meshless
         // (e.g., grouped) reduction must keep its recorded output varying along the axis, because otherwise that
         // binding would accept an output that is typed as invariant although the devices can hold different values.
-        if let Some(boundary) = lowering_state.manual_axis_region(self.axis_name()) {
+        if let Some(boundary) = lowering_context.manual_axis_region(self.axis_name()) {
             let axis_name = self.axis_name();
             let operation_name = self.name();
             if !boundary.checks_manual_variation() && self.mesh().is_some() {
@@ -239,7 +239,7 @@ impl LowerableOperation for ParallelReduceOperation {
         }
 
         let result = self.lower_to_all_reduce(
-            &lowering_state,
+            &lowering_context,
             input_values[0],
             &output_types[0],
             &mut lowerer.block(),
@@ -351,7 +351,7 @@ pub(crate) mod tests {
     fn test_parallel_reduce_operation_lower_to_all_reduce() {
         let mesh = test_manual_mesh("x", 2);
         let boundary = ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap();
-        let state = ProgramLoweringState::new().enter_manual_region(boundary);
+        let lowering_context = ProgramLoweringContext::new().enter_manual_region(boundary);
         let array_type = test_vector_type(2);
         let context = MlirContext::new();
         let location = context.unknown_location();
@@ -360,7 +360,7 @@ pub(crate) mod tests {
         let tensor_type = array_type.lower(&context, location).unwrap();
         let input = lower_f64_constant_splat(1.0, &array_type, tensor_type, &mut block, &context, location).unwrap();
         ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string())
-            .lower_to_all_reduce(&state, input, &array_type, &mut block, &context, location.as_ref())
+            .lower_to_all_reduce(&lowering_context, input, &array_type, &mut block, &context, location.as_ref())
             .unwrap();
         assert_eq!(
             module.to_string(),
@@ -794,7 +794,7 @@ pub(crate) mod tests {
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
         // The sum `parallel_reduce` sits inside a `condition` branch inside the `shard_map` body, so it lowers through
-        // the nested control flow path. The threaded program lowering state resolves the manual mesh axis inside the
+        // the nested control flow path. The enclosing program lowering context resolves the manual mesh axis inside the
         // `stablehlo.if` region and emits the same `all_reduce` as a sum `parallel_reduce` in the body itself would.
         let traced: TracedProgram<ArrayType, ArrayType> = trace(
             {
@@ -1037,14 +1037,14 @@ pub(crate) mod tests {
         let lower = |operation: &ParallelReduceOperation, boundary: &ShardMapBoundary, sharding: &Sharding| {
             let input_type = test_vector_type(2).with_sharding(sharding.clone()).unwrap();
             let output_types = operation.infer_output_types(std::slice::from_ref(&input_type), &[]).unwrap();
-            let state = ProgramLoweringState::new().enter_manual_region(boundary.clone());
+            let lowering_context = ProgramLoweringContext::new().enter_manual_region(boundary.clone());
             let context = MlirContext::new();
             let location = context.unknown_location();
             let tensor_type = input_type.lower(&context, location).unwrap();
             let block = context.block(&[(tensor_type, location)]);
             let input = block.argument(0).unwrap().as_ref();
             let mut lowerer: Lowerer<'_, '_, '_, Operation> =
-                Lowerer::new(block.as_ref(), &context, location.as_ref()).with_lowering_state(state);
+                Lowerer::new(block.as_ref(), &context, location.as_ref(), lowering_context);
             operation.lower(&mut lowerer, &[input], &[input_type], &output_types).map(|_| ())
         };
         let sum = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string());

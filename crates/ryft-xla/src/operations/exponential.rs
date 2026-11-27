@@ -126,7 +126,7 @@ impl LowerableOperation for LogAddExpOperation<ArrayType> {
             lowerer.context(),
             lowerer.location(),
         )?;
-        let form = FloatExtremumForm::for_elementwise(lowerer.lowering_state().target_platform());
+        let form = FloatExtremumForm::for_elementwise(lowerer.lowering_context().target_platform());
         let value = lower_log_add_exp_to_mlir(
             left,
             right,

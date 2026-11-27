@@ -5,13 +5,13 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::MlirLowerableValue;
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, lower_explicit_shape,
-    lower_runtime_dimension_size_i64, lower_static_index_constants, lower_unplaced_constant_output,
-    physical_bound_type,
+    ArrayTypeLoweringExtension, lower_explicit_shape, lower_runtime_dimension_size_i64, lower_static_index_constants,
+    lower_unplaced_constant_output, physical_bound_type,
 };
+use crate::lowering::values::MlirLowerableValue;
+use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::build_reduce_body_region;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
@@ -36,7 +36,7 @@ impl LowerableOperation for GatherOperation {
             return Ok(values);
         }
         check_count!("input", values, 1, ProgramError);
-        let value = lowerer.lowering_state().lower_sharding_constraint(
+        let value = lowerer.lowering_context().lower_sharding_constraint(
             output_types[0].sharding().unwrap(),
             values[0],
             OpenDimensions::All,

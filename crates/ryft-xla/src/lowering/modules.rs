@@ -8,7 +8,7 @@ use ryft_core::{
 use ryft_mlir::{Module, Operation as MlirOperation, OperationPrintingFlags, WalkOrder, WalkResult};
 
 use crate::lowering::emissions::emitted_regions;
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::{LowerableOperationFamily, LoweringError};
 use crate::{Constant, Error};
 
@@ -81,9 +81,9 @@ where
 /// never acceptable.
 pub(crate) fn serialize_lowered_module(
     module: &Module<'_, '_>,
-    lowering_state: &ProgramLoweringState,
+    lowering_context: &ProgramLoweringContext,
 ) -> Result<String, Error> {
-    if !lowering_state.has_provenance() {
+    if !lowering_context.has_provenance() {
         return Ok(module.to_string());
     }
     module

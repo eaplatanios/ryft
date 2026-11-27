@@ -59,7 +59,7 @@ impl LowerableOperation for PlaceOperation {
         // the transposed placement, which moves the cotangent there, so the program of reverse mode is rejected by the
         // target rule below when that target leaves the region, and by the program mesh check when it leaves the mesh
         // (refer to `LoweringError::PlacementOutsideProgramMesh`), when that program is compiled itself.
-        let is_inside_manual_region = !lowerer.lowering_state().bound_manual_axes().is_empty();
+        let is_inside_manual_region = !lowerer.lowering_context().bound_manual_axes().is_empty();
 
         // A placement without a target leaves its input where it is, so it lowers to nothing, also inside a manual
         // region. Its source only matters to transposition, and its copy policy is ignored like that of any other
@@ -100,7 +100,7 @@ impl LowerableOperation for PlaceOperation {
         };
         if let Some(sharding) = sharding {
             let location = lowerer.location();
-            lowerer.lowering_state().require_mesh(sharding.mesh())?;
+            lowerer.lowering_context().require_mesh(sharding.mesh())?;
             let sharding = sharding.lower(OpenDimensions::None, location)?;
             value = lowerer
                 .block()

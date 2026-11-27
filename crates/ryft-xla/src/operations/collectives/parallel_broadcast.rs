@@ -8,7 +8,7 @@ use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
 use crate::lowering::regions::NestedProgramLoweringExtension;
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer, Type};
 
@@ -23,8 +23,8 @@ impl LowerableOperation for ParallelBroadcastOperation {
         let input_count = if self.source() == ParallelBroadcastSource::Dynamic(()) { 2 } else { 1 };
         check_count!("input", input_values, input_count, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let lowering_state = lowerer.lowering_state().clone();
-        lowering_state.validate_manual_collective(
+        let lowering_context = lowerer.lowering_context().clone();
+        lowering_context.validate_manual_collective(
             self.name(),
             self.axes(),
             self.axis_size(),
@@ -41,11 +41,11 @@ impl LowerableOperation for ParallelBroadcastOperation {
         if self.source() == ParallelBroadcastSource::Dynamic(()) {
             // Trace the operation's canonical checked interpretation in the actual manual-axis environment. The
             // decomposition retains exact copies and assertion tokens on targets without native root support.
-            let axes = lowering_state
+            let axes = lowering_context
                 .bound_manual_axes()
                 .iter()
                 .map(|name| {
-                    let boundary = lowering_state.manual_axis_region(name).unwrap();
+                    let boundary = lowering_context.manual_axis_region(name).unwrap();
                     let mesh = boundary.mesh().clone();
                     let axis = mesh.axis_index(name).unwrap();
                     (
@@ -80,11 +80,11 @@ impl LowerableOperation for ParallelBroadcastOperation {
                 &[],
                 &RematerializationOptimizationBarrier::None,
                 None,
-                &lowering_state,
+                &lowering_context,
                 lowerer.effect_tokens_mut(),
             );
         }
-        self.lower_static_to_mlir(&lowering_state, input_values[0], &mut lowerer.block(), lowerer.location())
+        self.lower_static_to_mlir(&lowering_context, input_values[0], &mut lowerer.block(), lowerer.location())
     }
 }
 
@@ -102,7 +102,7 @@ trait ParallelBroadcastOperationLoweringExtension {
     /// operation and leaves the rejection to XLA's compiler. JAX registers its lowering for GPUs only.
     fn lower_static_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_value: ValueRef<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
         location: LocationRef<'c, 't>,
@@ -112,7 +112,7 @@ trait ParallelBroadcastOperationLoweringExtension {
 impl ParallelBroadcastOperationLoweringExtension for ParallelBroadcastOperation {
     fn lower_static_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_value: ValueRef<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
         location: LocationRef<'c, 't>,
@@ -120,13 +120,13 @@ impl ParallelBroadcastOperationLoweringExtension for ParallelBroadcastOperation 
         if self.axis_size() == 1 {
             return Ok(vec![input_value]);
         }
-        if lowering_state.target_platform().is_some_and(|platform| platform.eq_ignore_ascii_case("cpu")) {
+        if lowering_context.target_platform().is_some_and(|platform| platform.eq_ignore_ascii_case("cpu")) {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` is not supported by the XLA CPU backend"),
             }
             .into());
         }
-        let (replica_groups, _) = lowering_state.replica_groups(self.axes(), self.axis_size(), None)?;
+        let (replica_groups, _) = lowering_context.replica_groups(self.axes(), self.axis_size(), None)?;
         let ParallelBroadcastSource::Static(source) = self.source() else {
             unreachable!();
         };
@@ -144,7 +144,7 @@ impl ParallelBroadcastOperationLoweringExtension for ParallelBroadcastOperation 
             &[input_value],
             None,
             stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-            Some(lowering_state.next_channel_id()),
+            Some(lowering_context.next_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             location,
         )?)?;

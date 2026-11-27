@@ -11,10 +11,10 @@ use ryft_mlir::{
 
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, lower_explicit_shape,
-    lower_runtime_dimension_size_i64, lower_static_index_constants, lower_unplaced_constant_output,
-    physical_bound_type,
+    ArrayTypeLoweringExtension, lower_explicit_shape, lower_runtime_dimension_size_i64, lower_static_index_constants,
+    lower_unplaced_constant_output, physical_bound_type,
 };
+use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::operations::reductions::build_reduce_body_region;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
@@ -31,7 +31,7 @@ impl LowerableOperation for ScatterOperation {
             input_values,
             input_types,
             output_types,
-            lowerer.lowering_state().target_platform(),
+            lowerer.lowering_context().target_platform(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -40,7 +40,7 @@ impl LowerableOperation for ScatterOperation {
             return Ok(values);
         }
         check_count!("input", values, 1, ProgramError);
-        let value = lowerer.lowering_state().lower_sharding_constraint(
+        let value = lowerer.lowering_context().lower_sharding_constraint(
             output_types[0].sharding().unwrap(),
             values[0],
             OpenDimensions::All,

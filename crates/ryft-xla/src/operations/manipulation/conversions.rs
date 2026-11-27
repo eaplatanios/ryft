@@ -511,7 +511,7 @@ fn lower_cast<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     if let Some(sharding) = output_type.sharding()
         && cast_changes_explicit_placement(input_type, output_type)
     {
-        result = lowerer.lowering_state().lower_sharding_constraint(
+        result = lowerer.lowering_context().lower_sharding_constraint(
             sharding,
             result,
             OpenDimensions::All,
@@ -1150,6 +1150,7 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
+    use crate::lowering::states::ProgramLoweringContext;
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, shard_map_module, test_manual_mesh,
         to_rendered_mlir_for_plain_program,
@@ -1800,7 +1801,8 @@ mod tests {
         ]);
         let source = block.argument(0).unwrap().as_ref();
         let unrelated = block.argument(1).unwrap().as_ref();
-        let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
+        let mut lowerer: Lowerer<'_, '_, '_, Operation> =
+            Lowerer::new(block.as_ref(), &context, location.as_ref(), ProgramLoweringContext::new());
         let guarded = CastOperation::checked(exact.clone(), vec![symbolic.clone()])
             .unwrap()
             .lower(&mut lowerer, &[source], &[symbolic], std::slice::from_ref(&exact))
@@ -4425,7 +4427,8 @@ mod tests {
             let location = context.unknown_location();
             let block = context.block(&[(input_type.lower(&context, location).unwrap(), location)]);
             let source = block.argument(0).unwrap().as_ref();
-            let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
+            let mut lowerer: Lowerer<'_, '_, '_, Operation> =
+                Lowerer::new(block.as_ref(), &context, location.as_ref(), ProgramLoweringContext::new());
             let result = CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]).unwrap().lower(
                 &mut lowerer,
                 &[source],
@@ -4491,7 +4494,8 @@ mod tests {
         let location = context.unknown_location();
         let block = context.block(&[(input_type.lower(&context, location).unwrap(), location)]);
         let input = block.argument(0).unwrap().as_ref();
-        let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
+        let mut lowerer: Lowerer<'_, '_, '_, Operation> =
+            Lowerer::new(block.as_ref(), &context, location.as_ref(), ProgramLoweringContext::new());
         let output = output_type.lower_layout_conversion(input, &mut lowerer).unwrap();
         let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(output, operations.last().unwrap().result(0).unwrap().as_ref());

@@ -16,7 +16,7 @@ use ryft_mlir::{
 
 use crate::lowering::regions::lower_program_outputs_with_inputs;
 use crate::lowering::sharding::UnreducedKindExtension;
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{ArrayTypeLoweringExtension, annotate_output_memory};
 use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::control_flow::lowered_effect_classes;
@@ -53,7 +53,7 @@ impl LowerableOperation for ShardMapOperation {
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-        let (effect_tokens, _, _, _, lowering_state) = lowerer.split_effect_tokens();
+        let (effect_tokens, _, _, _, lowering_context) = lowerer.split_effect_tokens();
         lower_manual_computation(
             &mut block,
             input_values,
@@ -63,7 +63,7 @@ impl LowerableOperation for ShardMapOperation {
             global_output_types.as_slice(),
             context,
             location,
-            lowering_state,
+            lowering_context,
             effect_tokens,
         )
     }
@@ -83,7 +83,7 @@ fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: 
     global_output_types: &[ArrayType],
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-    lowering_state: &ProgramLoweringState,
+    lowering_context: &ProgramLoweringContext,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
@@ -130,7 +130,7 @@ where
     // vary along such an axis, but a checked or transformed program can still nest a map over invariant inputs this
     // way, so it is rejected here instead of emitting an invalid manual computation.
     if let Some(axis_name) =
-        boundary.manual_axes().iter().find(|axis| lowering_state.bound_manual_axes().contains(*axis))
+        boundary.manual_axes().iter().find(|axis| lowering_context.bound_manual_axes().contains(*axis))
     {
         return Err(ProgramError::from(ShardMapError::AxisAlreadyManual { axis_name: axis_name.clone() }).into());
     }
@@ -151,7 +151,7 @@ where
                 })
                 .chain(sharding.unreduced_axes())
                 .chain(sharding.reduced_axes())
-                .find(|axis_name| lowering_state.bound_manual_axes().contains(*axis_name));
+                .find(|axis_name| lowering_context.bound_manual_axes().contains(*axis_name));
             if let Some(axis_name) = axis_name {
                 let error = ShardMapError::ShardingNamesEnclosingManualAxis {
                     value_kind,
@@ -177,8 +177,8 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let mut manual_inputs = outer_inputs.to_vec();
     // The shardings of the boundary and of the effect tokens refer to the mesh of the boundary.
-    lowering_state.require_mesh(boundary.mesh())?;
-    let enclosing_manual_axes = lowering_state.bound_manual_axes();
+    lowering_context.require_mesh(boundary.mesh())?;
+    let enclosing_manual_axes = lowering_context.bound_manual_axes();
     let mut input_shardings = shardy_tensor_sharding_per_value(
         boundary.input_shardings(),
         boundary.manual_axes(),
@@ -228,7 +228,7 @@ where
     {
         let mut body_block_ref = body_block.as_ref();
         // Callees inside the shard-local body always inline. The fresh-root body has no enclosing capture namespace.
-        let body_lowering_state = lowering_state.enter_manual_region(boundary.clone());
+        let body_lowering_context = lowering_context.enter_manual_region(boundary.clone());
         let mut body_effect_tokens = EffectTokens::default();
         for (index, &effect) in threaded_effects.iter().enumerate() {
             body_effect_tokens.set(effect, body_block.argument(local_input_types.len() + index).unwrap().as_ref());
@@ -244,7 +244,7 @@ where
             context,
             location,
             None,
-            &body_lowering_state,
+            &body_lowering_context,
             &mut body_effect_tokens,
         )?;
         body_outputs.extend(threaded_effects.iter().map(|&effect| body_effect_tokens.get(effect).unwrap()));

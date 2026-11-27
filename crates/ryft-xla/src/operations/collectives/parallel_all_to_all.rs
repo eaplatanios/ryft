@@ -7,7 +7,7 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::operations::collectives::{collapse_singleton_axis, refine_collective_result_dimensions};
@@ -23,8 +23,8 @@ impl LowerableOperation for ParallelAllToAllOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let lowering_state = lowerer.lowering_state().clone();
-        lowering_state.validate_manual_collective(
+        let lowering_context = lowerer.lowering_context().clone();
+        lowering_context.validate_manual_collective(
             self.name(),
             self.axes(),
             self.axis_size(),
@@ -39,7 +39,7 @@ impl LowerableOperation for ParallelAllToAllOperation {
             },
         )?;
         self.lower_to_mlir(
-            &lowering_state,
+            &lowering_context,
             input_values[0],
             &input_types[0],
             &output_types[0],
@@ -60,9 +60,9 @@ impl MemberLowerableOperation<Type> for ParallelAllToAllOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
-        let lowering_state = lowerer.lowering_state();
+        let lowering_context = lowerer.lowering_context();
         let block = &mut lowerer.block();
-        lowering_state.validate_manual_collective(
+        lowering_context.validate_manual_collective(
             self.name(),
             self.axes(),
             self.axis_size(),
@@ -88,7 +88,7 @@ impl MemberLowerableOperation<Type> for ParallelAllToAllOperation {
         };
         let output_type = <&ArrayType>::try_from(output_type)?;
         let result = self
-            .lower_to_mlir(lowering_state, *input, input_type, output_type, block, context, location)?
+            .lower_to_mlir(lowering_context, *input, input_type, output_type, block, context, location)?
             .remove(0);
         refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
     }
@@ -100,7 +100,7 @@ trait ParallelAllToAllOperationLoweringExtension {
     /// groups.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_value: ValueRef<'b, 'c, 't>,
         input_array_type: &ArrayType,
         output_array_type: &ArrayType,
@@ -113,7 +113,7 @@ trait ParallelAllToAllOperationLoweringExtension {
 impl ParallelAllToAllOperationLoweringExtension for ParallelAllToAllOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_value: ValueRef<'b, 'c, 't>,
         input_array_type: &ArrayType,
         output_array_type: &ArrayType,
@@ -122,7 +122,7 @@ impl ParallelAllToAllOperationLoweringExtension for ParallelAllToAllOperation {
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let (replica_groups, axis_size) =
-            lowering_state.replica_groups(self.axes(), self.axis_size(), self.options().axis_index_groups())?;
+            lowering_context.replica_groups(self.axes(), self.axis_size(), self.options().axis_index_groups())?;
         let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
         let (input_value, split_axis, concatenation_axis) = match self.options().mode() {
             CollectiveMode::Tiled => (input_value, self.split_axis(), self.concatenation_axis()),
@@ -158,7 +158,7 @@ impl ParallelAllToAllOperationLoweringExtension for ParallelAllToAllOperation {
             axis_size,
             concatenation_axis,
             stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-            Some(lowering_state.next_channel_id()),
+            Some(lowering_context.next_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             true,
             location,
@@ -470,9 +470,9 @@ mod tests {
             let block = context.block(&mlir_types);
             let inputs =
                 (0..input_types.len()).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
-            let state = ProgramLoweringState::new().enter_manual_region(boundary.clone());
+            let lowering_context = ProgramLoweringContext::new().enter_manual_region(boundary.clone());
             let mut lowerer: Lowerer<'_, '_, '_, Operation> =
-                Lowerer::new(block.as_ref(), &context, location.as_ref()).with_lowering_state(state.clone());
+                Lowerer::new(block.as_ref(), &context, location.as_ref(), lowering_context.clone());
             let result = operation.lower_in_parent(&mut lowerer, &inputs, &input_types, &output_types);
             let expected = if sharding == &unreduced {
                 Some(ProgramError::Type(TypeError::invalid("`parallel_all_to_all` does not support unreduced inputs")))
@@ -489,7 +489,7 @@ mod tests {
                 (Err(Error::Core(error)), Some(expected)) => {
                     assert_eq!(error.as_ref(), &CoreError::Program(expected));
                     // Rejection happens before a channel is allocated, so the next channel is still the first one.
-                    assert_eq!(state.next_channel_id(), 1);
+                    assert_eq!(lowering_context.next_channel_id(), 1);
                 }
                 (result, expected) => panic!("{sharding}: expected {expected:?} but got {result:?}"),
             }

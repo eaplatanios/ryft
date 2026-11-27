@@ -15,7 +15,7 @@ impl LowerableOperation for ReshardOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (input_types, output_types);
         check_count!("input", input_values, 1, ProgramError);
-        let value = lowerer.lowering_state().lower_sharding_constraint(
+        let value = lowerer.lowering_context().lower_sharding_constraint(
             self.sharding(),
             input_values[0],
             OpenDimensions::All,

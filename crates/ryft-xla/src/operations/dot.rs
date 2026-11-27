@@ -12,9 +12,10 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, DataTypeLoweringExtension,
-    lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type,
+    ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_u64_scalar_constant, lower_unplaced_constant_output,
+    physical_bound_type,
 };
+use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, RaggedDotLoweringStrategy};
 
 impl LowerableOperation for DotOperation {
@@ -37,7 +38,7 @@ impl LowerableOperation for DotOperation {
         // results it reproduces and rejects every other algorithm instead of computing something else. This is the
         // allowlist of JAX's `_handle_dot_precision`, without its `DEFAULT` preset, which is the default precision.
         let targets_cpu = lowerer
-            .lowering_state()
+            .lowering_context()
             .target_platform()
             .is_some_and(|platform| platform.eq_ignore_ascii_case("cpu"));
         let supported_on_cpu = matches!(
@@ -130,7 +131,7 @@ impl LowerableOperation for RaggedDotOperation {
         check_count!("input", input_types, 3, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let dimensions = self.dimensions();
-        if lowerer.lowering_state().ragged_dot_lowering_strategy() == RaggedDotLoweringStrategy::Instruction {
+        if lowerer.lowering_context().ragged_dot_lowering_strategy() == RaggedDotLoweringStrategy::Instruction {
             // JAX applies an explicit transpose of the right-hand side input only for its TPU instruction path as a
             // backend layout workaround. Ryft emits the canonical CHLO contract and leaves target specific layout
             // selection to legalization.

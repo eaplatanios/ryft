@@ -7,14 +7,14 @@ use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, AtomId, BroadcastOperation, CallOperation, DataType, DeviceMesh, Dimension, EffectClass,
     ExternalReferenceBinding, LogicalMesh, Memory, MeshAxisType, Parameterized, PlaceOperation, PlacementRequest,
-    Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RequestedPlacement, Shape, Sharding,
-    ShardingDimension, StopGradientOperation, TagOperation, TransferToMemoryOperation, Type as CoreType, Typed,
-    TypedProgram, Value,
+    Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RematerializationOptimizationBarrier,
+    RequestedPlacement, Shape, Sharding, ShardingDimension, StopGradientOperation, TagOperation,
+    TransferToMemoryOperation, Type as CoreType, Typed, TypedProgram, Value,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
     Attribute, Block, Context as MlirContext, DetachedBlock, Location, LocationRef, Operation as MlirOperation, Region,
-    Type as MlirType, TypeAndAttributes, Value as MlirValue,
+    SymbolVisibility, Type as MlirType, TypeAndAttributes, Value as MlirValue,
 };
 
 use crate::arrays::host::ReductionChange;
@@ -30,16 +30,16 @@ use crate::lowering::reductions::{
     ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
     validate_pending_reduction_change,
 };
-use crate::lowering::regions::lower_program_outputs_with_inputs;
+use crate::lowering::regions::{NestedProgramLoweringExtension, lower_program_outputs_with_inputs};
 use crate::lowering::sharding::{LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension};
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, lower_runtime_dimension_size_i64, lower_unplaced_constant_output,
-    validate_boundary_memory,
+    ArrayTypeLoweringExtension, TypeLoweringExtension, lower_runtime_dimension_size_i64,
+    lower_unplaced_constant_output, validate_boundary_memory,
 };
 use crate::lowering::{EffectTokens, LowerableOperationFamily, LoweringError, RaggedDotLoweringStrategy};
 use crate::operations::call::{CallFunctionMap, collect_call_functions, emit_call_function};
-use crate::operations::composites::{NamedCompositionFunctionMap, emit_named_composition_function};
+use crate::operations::composites::NamedCompositionFunctionMap;
 use crate::{
     CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement, Type,
     normalize_runtime_requirements,
@@ -786,15 +786,15 @@ where
         let location = context.unknown_location();
         let mut module = context.module(location)?;
 
-        // Trace each distinct named semantic decomposition once and retain it in the lowering state of the module,
+        // Trace each distinct named semantic decomposition once and retain it in the lowering context of the module,
         // so that the entry and nested function bodies resolve the same private symbol.
         let named_compositions = Rc::new(NamedCompositionFunctionMap::for_program(program, target_platform)?);
 
-        // Module-scoped lowering state, shared between the entry function body and private functions below so channel
+        // Module-scoped lowering context, shared between the entry function body and private functions below so channel
         // ids stay unique and target, representation policy, named compositions, and provenance state reach nested
         // bodies. The arrays that the program only passes on to calls that never read them follow the session
         // constants in the table, and the entry function binds them to values that require no buffer.
-        let lowering_state = ProgramLoweringState::new()
+        let lowering_context = ProgramLoweringContext::new()
             .with_target_platform(target_platform)
             .with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy)
             .with_named_compositions(named_compositions.clone())
@@ -803,10 +803,10 @@ where
             );
 
         // The module declares the mesh that the lowered shardings refer to, which is recorded as they are lowered
-        // (refer to `ProgramLoweringState::require_mesh`). The signature shardings are recorded first, so that the
+        // (refer to `ProgramLoweringContext::require_mesh`). The signature shardings are recorded first, so that the
         // module mesh keeps their axis types.
         for sharding in logical_input_shardings.iter().chain(output_shardings).flatten() {
-            lowering_state.require_mesh(sharding.mesh())?;
+            lowering_context.require_mesh(sharding.mesh())?;
         }
 
         // Deduplicate `call` callees that occur more than once into shared private `func.func`s, so repeated nested
@@ -815,16 +815,64 @@ where
         // repeated calls, in which case every `call` inlines exactly as before.
         let nested_functions = Rc::new(collect_call_functions(program, target_platform)?);
 
+        // Each named composition is emitted as a private function that holds its decomposition, which its calls refer
+        // to by symbol.
         let mut module_block = module.body()?;
         for function in named_compositions.functions() {
-            emit_named_composition_function(&mut module_block, function, &lowering_state, &context, location.as_ref())?;
+            let program = function.program();
+            let lower_types = |types: &[Type]| {
+                types.iter().map(|r#type| r#type.lower(&context, location)).collect::<Result<Vec<_>, _>>()
+            };
+
+            let input_tensor_types = lower_types(&program.input_types())?;
+            let output_tensor_types = lower_types(&program.output_types())?;
+            let argument_types = input_tensor_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
+            let function_block = context.block(argument_types.as_slice());
+            let input_values = (0..input_tensor_types.len())
+                .map(|index| function_block.argument(index).unwrap().as_ref())
+                .collect::<Vec<_>>();
+            let mut function_block_ref = function_block.as_ref();
+            let outputs = program.lower_inline(
+                input_values.as_slice(),
+                &mut function_block_ref,
+                &context,
+                location.as_ref(),
+                &[],
+                // Decompositions are traced independently of the lowered program and contain no `call` sharing.
+                &RematerializationOptimizationBarrier::None,
+                None,
+                &lowering_context,
+                &mut EffectTokens::default(),
+            )?;
+
+            function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
+            let mut function_region = context.region();
+            function_region.append_block(function_block)?;
+            module_block.append_operation(func::func(
+                function.symbol(),
+                func::FuncAttributes {
+                    arguments: input_tensor_types
+                        .iter()
+                        .map(|r#type| TypeAndAttributes { r#type: r#type.as_ref(), attributes: None })
+                        .collect(),
+                    results: output_tensor_types
+                        .iter()
+                        .map(|r#type| TypeAndAttributes { r#type: r#type.as_ref(), attributes: None })
+                        .collect(),
+                    visibility: SymbolVisibility::Private,
+                    ..Default::default()
+                },
+                function_region,
+                location,
+            )?)?;
         }
+
         for function in nested_functions.functions() {
             emit_call_function(
                 &mut module_block,
                 function,
                 &nested_functions,
-                &lowering_state,
+                &lowering_context,
                 &context,
                 location.as_ref(),
             )?;
@@ -851,7 +899,7 @@ where
                 supports_shardy,
                 &function_block,
                 &nested_functions,
-                &lowering_state,
+                &lowering_context,
                 &context,
                 location.as_ref(),
             )?;
@@ -869,7 +917,7 @@ where
 
         // Everything that lowering emitted over a mesh refers to the recorded one, which is declared ahead of the
         // functions that refer to it.
-        let mesh = lowering_state.mesh();
+        let mesh = lowering_context.mesh();
         if let Some(mesh) = &mesh {
             module_block.insert_operation(mesh.lower(location)?, 0)?;
         }
@@ -884,11 +932,11 @@ where
             return Err(Error::Lowering(LoweringError::VerificationFailure));
         }
 
-        if lowering_state.has_assertions() {
+        if lowering_context.has_assertions() {
             signature.require_assertion_handler();
         }
 
-        let mut runtime_requirements = lowering_state.runtime_requirements();
+        let mut runtime_requirements = lowering_context.runtime_requirements();
         if signature.requires_assertion_handler() {
             runtime_requirements.push(RuntimeRequirement::builtin("ryft.assert"));
         }
@@ -899,7 +947,12 @@ where
 
         let runtime_requirements = normalize_runtime_requirements(runtime_requirements)?.into();
 
-        Ok(MlirProgram::new(serialize_lowered_module(&module, &lowering_state)?, signature, runtime_requirements, mesh))
+        Ok(MlirProgram::new(
+            serialize_lowered_module(&module, &lowering_context)?,
+            signature,
+            runtime_requirements,
+            mesh,
+        ))
     }
 }
 
@@ -1651,7 +1704,7 @@ impl ProgramBoundary {
         supports_shardy: bool,
         function_block: &'b DetachedBlock<'c, 't>,
         nested_functions: &Rc<CallFunctionMap<O>>,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<(), Error>
@@ -1751,7 +1804,7 @@ impl ProgramBoundary {
                     validate_partial_completion(data_type, kind, sharding, completed, kept, "input_shardings")?;
                     let reduced = sharding.clone().with_unreduced_axes(array_type.unreduced_axes().iter().cloned())?;
                     let block = &mut function_block_ref;
-                    reduced.lower_pending_reduction_constraint(value, lowering_state, block, location.as_ref())?
+                    reduced.lower_pending_reduction_constraint(value, lowering_context, block, location.as_ref())?
                 }
                 _ => value,
             };
@@ -1765,7 +1818,7 @@ impl ProgramBoundary {
         // third boundary form exists, so the entry input count must match one of those two shapes exactly.
         // Session constants are not program inputs, so the lifted form omits the trailing session constants of the
         // capture prefix from the entry inputs, while `capture_values` keeps them as its suffix for
-        // `ProgramLoweringState::lower_session_constant`.
+        // `ProgramLoweringContext::lower_session_constant`.
         debug_assert!(
             program.input_count() + session_count == logical_input_values.len()
                 || program.input_count() == public_input_values.len(),
@@ -1782,7 +1835,7 @@ impl ProgramBoundary {
             public_input_values
         };
         // The arrays that the program only passes on to calls that never read them are bound like unread inputs,
-        // after the session constants (refer to `lowering_state` above).
+        // after the session constants (refer to `lowering_context` above).
         let mut captured_values = Cow::Borrowed(capture_values);
         for constant in passed_on_constants {
             let r#type = constant.r#type();
@@ -1807,7 +1860,7 @@ impl ProgramBoundary {
             context,
             location.as_ref(),
             Some(nested_functions),
-            lowering_state,
+            lowering_context,
             &mut effect_tokens,
         )?;
         let mut executable_outputs = signature.select_output_entries(logical_outputs.as_slice())?;

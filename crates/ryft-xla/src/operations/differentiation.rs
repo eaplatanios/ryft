@@ -85,16 +85,17 @@ impl LowerableOperation for RematerializeOperation<Type> {
             false => &RematerializationOptimizationBarrier::None,
         };
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-        let (effect_tokens, regions, captured_values, nested_functions, lowering_state) = lowerer.split_effect_tokens();
+        let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
+            lowerer.split_effect_tokens();
         regions[0].lower_inline(
             input_values,
             &mut block,
             context,
             location,
-            lowering_state.session_values(captured_values),
+            lowering_context.session_values(captured_values),
             optimization_barrier,
             nested_functions,
-            lowering_state,
+            lowering_context,
             effect_tokens,
         )
     }
@@ -137,6 +138,7 @@ mod tests {
 
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
+    use crate::lowering::states::ProgramLoweringContext;
     use crate::lowering::tests::test_vector_type;
     use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::operations::Operation;
@@ -157,8 +159,8 @@ mod tests {
         let tensor_type = scalar_type.lower(&context, location).unwrap();
         let block = context.block(&[(tensor_type, location), (tensor_type, location)]);
         let inputs = [0, 1].map(|index| block.as_ref().argument(index).unwrap().as_ref());
-        let mut lowerer =
-            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(Vec::<FlatProgram<Session>>::new());
         let types = [scalar_type.clone(), scalar_type];
         assert_eq!(
             StopGradientOperation::<ArrayType>::new().lower(&mut lowerer, &inputs, &types, &types).unwrap(),
@@ -233,8 +235,8 @@ mod tests {
         let operation = RematerializeOperation::<Type>::new(ResidualPolicyReference::new(NothingSavable));
 
         // The plain array family cannot carry the body region.
-        let mut lowerer =
-            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(Vec::<FlatProgram<Session>>::new());
         assert!(matches!(
             RematerializeOperation::<ArrayType>::new(ResidualPolicyReference::new(NothingSavable))
                 .lower(&mut lowerer, &[], &[], &[]),
@@ -760,8 +762,8 @@ mod tests {
         let block = context.block_with_no_arguments();
 
         // The plain array family cannot carry the forward and transpose regions.
-        let mut lowerer =
-            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(Vec::<FlatProgram<Session>>::new());
         let expected_message =
             "higher-order operation `linear_call` must be stored directly in the enclosing backend operation family";
         assert!(matches!(

@@ -64,7 +64,8 @@ impl LowerableOperation for ConditionOperation<Type> {
         // internal error, reported as the operation's own region contract and input count would report it.
         self.validate_region_count(lowerer.regions().len())?;
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-        let (effect_tokens, regions, captured_values, nested_functions, lowering_state) = lowerer.split_effect_tokens();
+        let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
+            lowerer.split_effect_tokens();
         let (true_branch, false_branch) = (&regions[0], &regions[1]);
         let branch_input_types = true_branch.input_types();
         let expected = branch_input_types.len() + 1;
@@ -115,7 +116,7 @@ impl LowerableOperation for ConditionOperation<Type> {
                 location,
                 captured_values,
                 nested_functions,
-                lowering_state,
+                lowering_context,
                 entry_effect_tokens,
                 threaded_effects,
             )
@@ -131,7 +132,7 @@ impl LowerableOperation for ConditionOperation<Type> {
             operation.result(output_count + offset).unwrap().as_ref()
         });
         let outputs = (0..output_count).map(|index| operation.result(index).unwrap().as_ref()).collect();
-        lower_explicit_sharding_constraints(outputs, output_types, lowering_state, &mut block, location)
+        lower_explicit_sharding_constraints(outputs, output_types, lowering_context, &mut block, location)
     }
 }
 
@@ -153,6 +154,7 @@ mod tests {
     use ryft_mlir::{Context as MlirContext, Location};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
+    use crate::lowering::states::ProgramLoweringContext;
     use crate::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, identity_branch, neg_branch, unproject_plain_program,
     };
@@ -1039,7 +1041,8 @@ mod tests {
         let branch = unproject_plain_program(identity_branch(ArrayType::scalar(DataType::F32)));
 
         // The plain array family cannot carry branch regions, so conditions lower only from the array IR family.
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![branch.clone(); 2]);
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(vec![branch.clone(); 2]);
         let expected_message = concat!(
             "higher-order operation `condition` must be stored directly ",
             "in the enclosing backend operation family",
@@ -1054,7 +1057,8 @@ mod tests {
         ));
 
         // An array IR condition needs exactly one region per branch.
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![branch.clone()]);
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(vec![branch.clone()]);
         assert!(matches!(
             ConditionOperation::<Type>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
@@ -1065,7 +1069,8 @@ mod tests {
         ));
 
         // It also needs the predicate followed by one input per branch input.
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![branch; 2]);
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(vec![branch; 2]);
         assert!(matches!(
             ConditionOperation::<Type>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(

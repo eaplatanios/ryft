@@ -10,7 +10,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::emissions::lowers_without_regions;
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::{
     EffectTokens, LowerableOperationFamily, Lowerer, lower_instruction, lower_instruction_operation,
 };
@@ -47,7 +47,7 @@ pub(crate) trait NestedProgramLoweringExtension<O: LowerableOperationFamily> {
         captured_values: &[ValueRef<'b, 'c, 't>],
         optimization_barrier: &RematerializationOptimizationBarrier,
         nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -63,7 +63,7 @@ impl<O: LowerableOperationFamily> NestedProgramLoweringExtension<O> for FlatProg
         captured_values: &[ValueRef<'b, 'c, 't>],
         optimization_barrier: &RematerializationOptimizationBarrier,
         nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         self.entry_region_ref().lower_inline(
@@ -74,7 +74,7 @@ impl<O: LowerableOperationFamily> NestedProgramLoweringExtension<O> for FlatProg
             captured_values,
             optimization_barrier,
             nested_functions,
-            lowering_state,
+            lowering_context,
             effect_tokens,
         )
     }
@@ -103,7 +103,7 @@ pub(crate) fn lower_program_outputs_with_inputs<
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-    lowering_state: &ProgramLoweringState,
+    lowering_context: &ProgramLoweringContext,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
@@ -123,7 +123,7 @@ where
         block,
         context,
         location,
-        |_, value, block, context, location| value.lower(captured_values, lowering_state, block, context, location),
+        |_, value, block, context, location| value.lower(captured_values, lowering_context, block, context, location),
         |instruction, inputs, block, context, location| {
             lower_instruction(
                 program,
@@ -134,7 +134,7 @@ where
                 location,
                 captured_values,
                 nested_functions,
-                lowering_state,
+                lowering_context,
                 effect_tokens,
             )
         },
@@ -155,7 +155,7 @@ trait NestedRegionLoweringExtension<O: LowerableOperationFamily> {
         captured_values: &[ValueRef<'b, 'c, 't>],
         optimization_barrier: &RematerializationOptimizationBarrier,
         nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -171,7 +171,7 @@ impl<O: LowerableOperationFamily> NestedRegionLoweringExtension<O> for RegionRef
         captured_values: &[ValueRef<'b, 'c, 't>],
         optimization_barrier: &RematerializationOptimizationBarrier,
         nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let mut input_values = input_values.to_vec();
@@ -205,7 +205,9 @@ impl<O: LowerableOperationFamily> NestedRegionLoweringExtension<O> for RegionRef
             block,
             context,
             location,
-            |_, value, block, context, location| value.lower(captured_values, lowering_state, block, context, location),
+            |_, value, block, context, location| {
+                value.lower(captured_values, lowering_context, block, context, location)
+            },
             |instruction, inputs, block, context, location| {
                 let input_types = instruction
                     .inputs()
@@ -222,7 +224,7 @@ impl<O: LowerableOperationFamily> NestedRegionLoweringExtension<O> for RegionRef
                     &input_types,
                     &output_types,
                     nested_functions,
-                    lowering_state.target_platform(),
+                    lowering_context.target_platform(),
                 ) {
                     Vec::new()
                 } else {
@@ -234,13 +236,12 @@ impl<O: LowerableOperationFamily> NestedRegionLoweringExtension<O> for RegionRef
                 };
                 // Every StableHLO operation generated from this one Ryft instruction inherits the instruction's
                 // provenance through the lowerer's shared location, with the ambient location as its base.
-                let location = lowering_state.instruction_location(context, instruction.provenance(), location);
-                let mut lowerer = Lowerer::new(*block, context, location)
+                let location = lowering_context.instruction_location(context, instruction.provenance(), location);
+                let mut lowerer = Lowerer::new(*block, context, location, lowering_context.clone())
                     .with_regions(regions)
                     .with_nested_functions(nested_functions.cloned())
                     .with_captured_values(captured_values)
-                    .with_effect_tokens(*effect_tokens)
-                    .with_lowering_state(lowering_state.clone());
+                    .with_effect_tokens(*effect_tokens);
                 let outputs = lower_instruction_operation(
                     instruction.operation(),
                     &mut lowerer,
@@ -249,7 +250,7 @@ impl<O: LowerableOperationFamily> NestedRegionLoweringExtension<O> for RegionRef
                     output_types.as_slice(),
                 )?;
                 if lowerer.effect_tokens.ordered_assertion.is_some() {
-                    lowering_state.record_assertion();
+                    lowering_context.record_assertion();
                 }
                 *effect_tokens = lowerer.effect_tokens;
                 Ok(outputs)
@@ -365,7 +366,8 @@ pub(in crate::lowering) mod tests {
 
     use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::lowering::types::ArrayTypeLoweringExtension;
-    use crate::lowering::{LowerableOperation, LoweringError, MlirLowerableValue};
+    use crate::lowering::values::MlirLowerableValue;
+    use crate::lowering::{LowerableOperation, LoweringError};
     use crate::{ArrayConstant, Operation, Session};
 
     use super::*;
@@ -377,7 +379,7 @@ pub(in crate::lowering) mod tests {
         block: &mut BlockRef<'b, 'c, 't>,
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
     where
         V: MlirLowerableValue,
@@ -418,10 +420,10 @@ pub(in crate::lowering) mod tests {
                         ),
                     }));
                 }
-                let location = lowering_state.instruction_location(context, instruction.provenance(), location);
-                let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(*block, context, location)
-                    .with_effect_tokens(std::mem::take(&mut effect_tokens))
-                    .with_lowering_state(lowering_state.clone());
+                let location = lowering_context.instruction_location(context, instruction.provenance(), location);
+                let mut lowerer: Lowerer<'_, '_, '_, Operation> =
+                    Lowerer::new(*block, context, location, lowering_context.clone())
+                        .with_effect_tokens(std::mem::take(&mut effect_tokens));
                 let outputs = instruction.operation().lower(
                     &mut lowerer,
                     inputs,
@@ -429,7 +431,7 @@ pub(in crate::lowering) mod tests {
                     output_types.as_slice(),
                 )?;
                 if lowerer.effect_tokens.ordered_assertion.is_some() {
-                    lowering_state.record_assertion();
+                    lowering_context.record_assertion();
                 }
                 effect_tokens = lowerer.effect_tokens;
                 Ok(outputs)
@@ -478,7 +480,7 @@ pub(in crate::lowering) mod tests {
                     &[],
                     optimization_barrier,
                     None,
-                    &ProgramLoweringState::new(),
+                    &ProgramLoweringContext::new(),
                     &mut effect_tokens,
                 )
                 .unwrap();
@@ -637,7 +639,7 @@ pub(in crate::lowering) mod tests {
                 &context,
                 location.as_ref(),
                 None,
-                &ProgramLoweringState::new(),
+                &ProgramLoweringContext::new(),
                 &mut EffectTokens::default(),
             ),
             Err(Error::Core(core_error)) if matches!(

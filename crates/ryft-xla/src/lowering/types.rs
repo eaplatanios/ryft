@@ -1,8 +1,5 @@
 use ryft_core::macros::check_count;
-use ryft_core::{
-    ArrayType, CaptureReference, ComparisonDirection, DataType, Dimension, DimensionError, DimensionValue, Layout,
-    Memory, ProgramError, Shape, Type as CoreType,
-};
+use ryft_core::{ArrayType, DataType, Dimension, DimensionError, Layout, Memory, ProgramError, Shape};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::CustomCallApiVersion;
 use ryft_mlir::{
@@ -12,58 +9,10 @@ use ryft_mlir::{
 };
 
 use crate::devices::MemoryExtension;
-use crate::lowering::states::ProgramLoweringState;
-use crate::lowering::{LoweringError, MlirLowerableValue};
-use crate::{ArrayConstant, ArrayError, Constant, Error, ToPjrt, Type};
+use crate::lowering::LoweringError;
+use crate::{ArrayError, Error, ToPjrt, Type};
 
 // TODO(eaplatanios): Review this module.
-
-// TODO(eaplatanios): Should we move somewhere under `ryft_xla::operations`?
-/// Lowering of a [`ComparisonDirection`] to StableHLO.
-pub trait ComparisonDirectionLoweringExtension {
-    /// Lowers this direction to the StableHLO comparison direction with the same meaning.
-    fn lower(self) -> stable_hlo::ComparisonDirection;
-
-    /// Lowers one comparison of two values in this direction to a single `stablehlo.compare`. This serves
-    /// [`CompareOperation`](ryft_core::CompareOperation) lowerings, scalar dimension comparisons, and the comparisons
-    /// inside of combiner and comparator bodies. Both inputs must already share one tensor type, because this function
-    /// neither promotes nor broadcasts them, and the output has their shape with a Boolean element type. The comparison
-    /// type (i.e., `FLOAT`, `SIGNED`, or `UNSIGNED`) follows the element type of the left-hand side input, as
-    /// [`stable_hlo::ComparisonType::for_type`] describes.
-    fn lower_comparison<'b, 'c: 'b, 't: 'c>(
-        self,
-        left: ValueRef<'b, 'c, 't>,
-        right: ValueRef<'b, 'c, 't>,
-        block: &mut BlockRef<'b, 'c, 't>,
-        location: LocationRef<'c, 't>,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
-}
-
-impl ComparisonDirectionLoweringExtension for ComparisonDirection {
-    fn lower(self) -> stable_hlo::ComparisonDirection {
-        match self {
-            ComparisonDirection::Equal => stable_hlo::ComparisonDirection::Equal,
-            ComparisonDirection::NotEqual => stable_hlo::ComparisonDirection::NotEqual,
-            ComparisonDirection::LessThan => stable_hlo::ComparisonDirection::LessThan,
-            ComparisonDirection::LessThanOrEqual => stable_hlo::ComparisonDirection::LessThanOrEqual,
-            ComparisonDirection::GreaterThan => stable_hlo::ComparisonDirection::GreaterThan,
-            ComparisonDirection::GreaterThanOrEqual => stable_hlo::ComparisonDirection::GreaterThanOrEqual,
-        }
-    }
-    fn lower_comparison<'b, 'c: 'b, 't: 'c>(
-        self,
-        left: ValueRef<'b, 'c, 't>,
-        right: ValueRef<'b, 'c, 't>,
-        block: &mut BlockRef<'b, 'c, 't>,
-        location: LocationRef<'c, 't>,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-        let direction = self.lower();
-        let left_type = left.r#type()?;
-        let comparison_type = stable_hlo::ComparisonType::for_type(left_type)?;
-        let result = block.append_operation(stable_hlo::compare(left, right, direction, comparison_type, location)?)?;
-        Ok(result.result(0).unwrap().as_ref())
-    }
-}
 
 /// Validates that a program compiled for `target_platform` can take its inputs from `memory` and return its outputs
 /// in it.
@@ -345,91 +294,6 @@ pub fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, Error> {
         .collect()
 }
 
-// TODO(eaplatanios): Should we move this to a new `ryft_xla::lowering::values` module?
-/// Lowering of a [`CaptureReference`] to StableHLO.
-pub(crate) trait CaptureReferenceLoweringExtension {
-    /// Lowers this captured constant reference by forwarding its runtime value among `captured_values`.
-    fn lower<'b, 'c: 'b, 't: 'c>(
-        &self,
-        captured_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
-}
-
-impl<T: CoreType> CaptureReferenceLoweringExtension for CaptureReference<T> {
-    fn lower<'b, 'c: 'b, 't: 'c>(
-        &self,
-        captured_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-        captured_values
-            .get(self.index())
-            .copied()
-            .ok_or(Error::Lowering(LoweringError::MissingCapturedConstant { index: self.index() }))
-    }
-}
-
-// TODO(eaplatanios): Should we move this to a new `ryft_xla::lowering::values` module?
-/// Lowering of a [`DimensionValue`] to StableHLO.
-pub(crate) trait DimensionValueLoweringExtension {
-    /// Lowers one first-class dimension extent to the scalar `i64` [`stablehlo.constant`](stable_hlo::constant) that
-    /// represents a dimension in StableHLO. Immediate [`Constant::Dimension`] atoms and staged
-    /// [`DimensionOperation::Constant`](ryft_core::DimensionOperation::Constant) instructions must agree on this
-    /// representation, and so both lowering paths route through this function.
-    fn lower<'b, 'c: 'b, 't: 'c, B, L>(
-        &self,
-        block: &mut B,
-        context: &'c MlirContext<'t>,
-        location: L,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error>
-    where
-        B: Block<'b, 'c, 't>,
-        L: Copy + Location<'c, 't>;
-}
-
-impl DimensionValueLoweringExtension for DimensionValue {
-    fn lower<'b, 'c: 'b, 't: 'c, B, L>(
-        &self,
-        block: &mut B,
-        context: &'c MlirContext<'t>,
-        location: L,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error>
-    where
-        B: Block<'b, 'c, 't>,
-        L: Copy + Location<'c, 't>,
-    {
-        let tensor_type = ArrayType::scalar(DataType::I64).lower(context, location)?;
-        let extent = dimension_extent_i64(self.extent())?;
-        let elements = DataType::I64.lower_constant_elements_attribute(tensor_type, extent, context)?;
-        let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-        Ok(constant.result(0).unwrap().as_ref())
-    }
-}
-
-impl Constant {
-    /// Lowers this traced constant atom to a StableHLO value and returns it. A captured constant forwards the hidden
-    /// capture input that carries its runtime value, and a session constant forwards the hidden entry input that
-    /// `lowering_state` assigns to it, while an immediate dimension extent is materialized in place. The latter is
-    /// exactly what makes extents usable inside a `shard_map` manual region, where no capture table is reachable.
-    pub(crate) fn lower<'b, 'c: 'b, 't: 'c, B, L>(
-        &self,
-        captured_values: &[ValueRef<'b, 'c, 't>],
-        lowering_state: &ProgramLoweringState,
-        block: &mut B,
-        context: &'c MlirContext<'t>,
-        location: L,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error>
-    where
-        B: Block<'b, 'c, 't>,
-        L: Copy + Location<'c, 't>,
-    {
-        match self {
-            Constant::Captured(value) => value.lower(captured_values),
-            Constant::Session(value) => lowering_state.lower_session_constant(value, captured_values),
-            Constant::Dimension(value) => value.lower(block, context, location),
-            Constant::Boolean(value) => ArrayConstant::Boolean(*value).lower_literal(block, context, location),
-        }
-    }
-}
-
 /// Lowers a scalar `u64` constant. It is shared by the group interval arithmetic of ragged dots, the device shard and
 /// batch item arithmetic of `parallel_ragged_all_to_all`, and the coordinate arithmetic of
 /// [`AxisIndexOperation`](ryft_core::AxisIndexOperation).
@@ -650,7 +514,14 @@ impl ArrayTypeLoweringExtension for ArrayType {
             let size = runtime_sizes[axis].unwrap();
             let size = block.append_operation(stable_hlo::broadcast(size, index_tensor_type, &[], location)?)?;
             let size = size.result(0).unwrap().as_ref();
-            let axis_in_bounds = ComparisonDirection::LessThan.lower_comparison(indices, size, block, location)?;
+            let axis_in_bounds = block.append_operation(stable_hlo::compare(
+                indices,
+                size,
+                stable_hlo::ComparisonDirection::LessThan,
+                stable_hlo::ComparisonType::for_type(indices.r#type()?)?,
+                location,
+            )?)?;
+            let axis_in_bounds = axis_in_bounds.result(0).unwrap().as_ref();
             in_bounds = Some(match in_bounds {
                 None => axis_in_bounds,
                 Some(in_bounds) => block
@@ -1149,59 +1020,12 @@ mod tests {
         Placeholder, ReferenceType, TiledLayout, ZeroOperation,
     };
 
+    use crate::ArrayConstant;
     use crate::lowering::tests::{
         ProgramBuilder, dynamic_dimension, test_vector_type, to_rendered_mlir_for_plain_program,
     };
 
     use super::*;
-
-    #[test]
-    fn test_comparison_direction_lower() {
-        for (direction, expected) in [
-            (ComparisonDirection::Equal, stable_hlo::ComparisonDirection::Equal),
-            (ComparisonDirection::NotEqual, stable_hlo::ComparisonDirection::NotEqual),
-            (ComparisonDirection::LessThan, stable_hlo::ComparisonDirection::LessThan),
-            (ComparisonDirection::LessThanOrEqual, stable_hlo::ComparisonDirection::LessThanOrEqual),
-            (ComparisonDirection::GreaterThan, stable_hlo::ComparisonDirection::GreaterThan),
-            (ComparisonDirection::GreaterThanOrEqual, stable_hlo::ComparisonDirection::GreaterThanOrEqual),
-        ] {
-            assert_eq!(direction.lower(), expected);
-        }
-    }
-
-    #[test]
-    fn test_comparison_direction_lower_comparison() {
-        // The comparison type follows the element type of the inputs.
-        let context = MlirContext::new();
-        let location = context.unknown_location();
-        let block = context.block(&[
-            (test_vector_type(2).lower(&context, location).unwrap(), location),
-            (ArrayType::new_static(DataType::I32, [2]).lower(&context, location).unwrap(), location),
-            (ArrayType::new_static(DataType::U32, [2]).lower(&context, location).unwrap(), location),
-        ]);
-        let inputs = (0..3).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
-        let mut block_ref = block.as_ref();
-        let location = location.as_ref();
-        let outputs = [ComparisonDirection::LessThan, ComparisonDirection::Equal, ComparisonDirection::GreaterThan]
-            .into_iter()
-            .zip(inputs)
-            .map(|(direction, input)| direction.lower_comparison(input, input, &mut block_ref, location).unwrap())
-            .collect::<Vec<_>>();
-        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
-        let results = operations.iter().map(|operation| operation.result(0).unwrap().as_ref()).collect::<Vec<_>>();
-        assert_eq!(outputs, results);
-        assert_eq!(
-            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            vec![
-                "%0 = stablehlo.compare LT, <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>>, FLOAT : (tensor<2xf32>, \
-                 tensor<2xf32>) -> tensor<2xi1>",
-                "%0 = stablehlo.compare EQ, <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>>, SIGNED : (tensor<2xi32>, \
-                 tensor<2xi32>) -> tensor<2xi1>",
-                "%0 = stablehlo.compare GT, <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>>, UNSIGNED : (tensor<2xui32>, \
-                 tensor<2xui32>) -> tensor<2xi1>",
-            ],
-        );
-    }
 
     #[test]
     fn test_validate_boundary_memory() {
@@ -1391,63 +1215,6 @@ mod tests {
                 ArrayError::DynamicShape { shape } if shape == dynamic_type.shape(),
             ),
         ));
-    }
-
-    #[test]
-    fn test_capture_reference_lower() {
-        let context = MlirContext::new();
-        let location = context.unknown_location();
-        let tensor_type = test_vector_type(2).lower(&context, location).unwrap();
-        let block = context.block(&[(tensor_type, location), (tensor_type, location)]);
-        let captured_values = [block.argument(0).unwrap().as_ref(), block.argument(1).unwrap().as_ref()];
-        let reference = CaptureReference::new(1, test_vector_type(2));
-        assert_eq!(reference.lower(&captured_values).unwrap(), captured_values[1]);
-        let reference = CaptureReference::new(2, test_vector_type(2));
-        assert!(matches!(
-            reference.lower(&captured_values),
-            Err(Error::Lowering(LoweringError::MissingCapturedConstant { index: 2 })),
-        ));
-    }
-
-    #[test]
-    fn test_dimension_value_lower() {
-        let context = MlirContext::new();
-        let location = context.unknown_location();
-        let block = context.block_with_no_arguments();
-        let output = DimensionValue::constant(3).unwrap().lower(&mut block.as_ref(), &context, location).unwrap();
-        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
-        assert_eq!(output, operations[0].result(0).unwrap().as_ref());
-        assert_eq!(
-            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            vec!["%c = stablehlo.constant dense<3> : tensor<i64>"],
-        );
-    }
-
-    #[test]
-    fn test_constant_lower() {
-        // A captured constant forwards its capture input, while dimension extents and Boolean predicates are
-        // materialized in place.
-        let context = MlirContext::new();
-        let location = context.unknown_location();
-        let tensor_type = test_vector_type(2).lower(&context, location).unwrap();
-        let block = context.block(&[(tensor_type, location)]);
-        let captured_values = [block.argument(0).unwrap().as_ref()];
-        let lowering_state = ProgramLoweringState::new();
-        let mut block_ref = block.as_ref();
-        let mut lower = |constant: Constant| {
-            constant.lower(&captured_values, &lowering_state, &mut block_ref, &context, location).unwrap()
-        };
-        let captured = lower(Constant::Captured(CaptureReference::new(0, Type::Array(test_vector_type(2)))));
-        let dimension = lower(Constant::Dimension(DimensionValue::constant(3).unwrap()));
-        let boolean = lower(Constant::Boolean(true));
-        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
-        assert_eq!(captured, captured_values[0]);
-        assert_eq!(dimension, operations[0].result(0).unwrap().as_ref());
-        assert_eq!(boolean, operations[1].result(0).unwrap().as_ref());
-        assert_eq!(
-            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            vec!["%c = stablehlo.constant dense<3> : tensor<i64>", "%c = stablehlo.constant dense<true> : tensor<i1>"],
-        );
     }
 
     #[test]

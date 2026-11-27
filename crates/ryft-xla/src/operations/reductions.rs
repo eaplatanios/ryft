@@ -12,10 +12,10 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, DataTypeLoweringExtension,
-    lower_f64_constant_splat, lower_signed_one_bit_to_mlir, lower_unplaced_constant_output, physical_bound_type,
-    signed_integer_width, unsigned_integer_width,
+    ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_f64_constant_splat, lower_signed_one_bit_to_mlir,
+    lower_unplaced_constant_output, physical_bound_type, signed_integer_width, unsigned_integer_width,
 };
+use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
@@ -332,7 +332,7 @@ impl LowerableOperation for ReduceOperation {
             Some(_) if has_distributable_combiner(self.kind(), element_type, FloatExtremumForm::TotalOrder) => {
                 FloatExtremumForm::TotalOrder
             }
-            _ => FloatExtremumForm::for_combiner(lowerer.lowering_state().target_platform()),
+            _ => FloatExtremumForm::for_combiner(lowerer.lowering_context().target_platform()),
         };
 
         // A combiner that XLA cannot distribute in any form reduces a copy of the input that is replicated along the
@@ -343,7 +343,7 @@ impl LowerableOperation for ReduceOperation {
         if let Some(sharding) = shardable_sharding
             && !has_distributable_combiner(self.kind(), element_type, form)
         {
-            input_value = lowerer.lowering_state().lower_replication_constraint(
+            input_value = lowerer.lowering_context().lower_replication_constraint(
                 sharding,
                 input_value,
                 self.axes(),

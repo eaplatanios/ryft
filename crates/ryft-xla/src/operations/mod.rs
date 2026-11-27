@@ -53,7 +53,8 @@ use ryft_mlir::{
 use crate::lowering::DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked, XlaZeroPadded};
 use crate::lowering::emissions::{emitted_capture_reads, omits_regions};
 use crate::lowering::types::{ArrayTypeLoweringExtension, physical_bound_type};
-use crate::lowering::{DataDependentPaddingDiscipline, MlirLowerableValue, validate_local_output_placement};
+use crate::lowering::values::MlirLowerableValue;
+use crate::lowering::{DataDependentPaddingDiscipline, validate_local_output_placement};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::{
@@ -134,6 +135,7 @@ pub(crate) mod tagging;
 /// StableHLO lowering of trigonometric and hyperbolic operations.
 pub(crate) mod trigonometric;
 
+pub use comparisons::ComparisonDirectionLoweringExtension;
 pub use debugging::{
     PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE, ensure_print_handler_registered, with_captured_prints,
 };
@@ -916,7 +918,7 @@ impl LowerableOperation for Operation {
         // exactly once. A nested `shard_map` instead validates its boundary shardings against the enclosing
         // manual axes itself, reporting the more specific `ShardMapError::ShardingNamesEnclosingManualAxis`.
         if !matches!(self, Self::ShardMap(_)) {
-            validate_local_output_placement(self.name(), output_types, lowerer.lowering_state().bound_manual_axes())?;
+            validate_local_output_placement(self.name(), output_types, lowerer.lowering_context().bound_manual_axes())?;
         }
         lower_operation_variants!(
             self, Operation, lowerer, input_values, input_types, output_types;

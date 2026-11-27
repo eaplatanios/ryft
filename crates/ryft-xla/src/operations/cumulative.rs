@@ -32,7 +32,7 @@ impl LowerableOperation for CumulativeOperation {
             self.reverse(),
             input_values[0],
             &output_types[0],
-            lowerer.lowering_state().target_platform(),
+            lowerer.lowering_context().target_platform(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),

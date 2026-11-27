@@ -7,7 +7,7 @@
 //!
 //!   - Lowering constrains the inputs and the outputs that have overrides where the call executes, as an execution of
 //!     the function annotates its inputs and outputs, and the module declares the mesh of these constraints (refer to
-//!     `ProgramLoweringState::require_mesh`). Compiling a caller for other devices than those of
+//!     `ProgramLoweringContext::require_mesh`). Compiling a caller for other devices than those of
 //!     a call that names devices, or for the replicas of a bounded dynamic program while an override splits a value,
 //!     fails with an exact error (refer to `validate_placements`), as JAX rejects a nested `jit` with an incompatible
 //!     device assignment. Lowering emits each callee inline or, when it occurs more than once, as a call of one shared
@@ -49,7 +49,7 @@ use crate::lowering::emissions::{omits_regions, partition_session_constants, unr
 use crate::lowering::programs::RegionPlacementRequestsExtension;
 use crate::lowering::reductions::validate_declared_pending_reduction;
 use crate::lowering::regions::NestedProgramLoweringExtension;
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{TypeLoweringExtension, lower_unplaced_constant_output};
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::TypeCastLoweringExtension;
@@ -285,16 +285,14 @@ where
 /// Emits the shared private `func.func` for one deduplicated callee into `module_block`.
 ///
 /// The body is lowered with `nested_functions` in scope so that any repeated `call`s inside this callee also
-/// lower to `func.call`s. Calls between shared functions are resolved by symbol, so emission order does not matter. The
-/// body is also lowered with the module's `lowering_state`, so module-scoped lowering state (i.e., the shared channel
-/// id counter and the target platform that gates platform-specific fast paths such as fused attention) reaches the
-/// callee body exactly like it reaches inlined callees. The mesh and manual region state intentionally resets per
-/// function.
+/// lower to `func.call`s. Calls between shared functions are resolved by symbol, so emission order does not matter.
+/// Private functions start outside manual regions and use the module's `lowering_context` to share its channel
+/// allocator, mesh, and target platform with the entry function.
 pub(crate) fn emit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     module_block: &mut BlockRef<'b, 'c, 't>,
     function: &CallFunction<O>,
     nested_functions: &Rc<CallFunctionMap<O>>,
-    lowering_state: &ProgramLoweringState,
+    lowering_context: &ProgramLoweringContext,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
@@ -332,7 +330,7 @@ pub(crate) fn emit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily
             &[],
             &RematerializationOptimizationBarrier::None,
             Some(nested_functions),
-            lowering_state,
+            lowering_context,
             &mut effect_tokens,
         )?;
         function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
@@ -904,7 +902,7 @@ impl LowerableOperation for CallOperation<Type> {
             capture_count => unread_call_captures(
                 lowerer.regions()[0].entry_region_ref(),
                 capture_count,
-                lowerer.lowering_state().target_platform(),
+                lowerer.lowering_context().target_platform(),
             ),
         };
         let input_values = input_values
@@ -936,7 +934,7 @@ impl LowerableOperation for CallOperation<Type> {
             .collect::<Result<Vec<_>, Error>>()?;
         let output_values = {
             let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-            let (effect_tokens, regions, captured_values, nested_functions, lowering_state) =
+            let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
                 lowerer.split_effect_tokens();
             let [callee] = regions else { unreachable!("validated call region count") };
 
@@ -964,7 +962,7 @@ impl LowerableOperation for CallOperation<Type> {
                 context,
                 location,
                 nested_functions,
-                lowering_state,
+                lowering_context,
                 effect_tokens,
             )?;
             output_values
@@ -1301,7 +1299,7 @@ trait CallProgramLoweringExtension<O: LowerableOperationFamily> {
     /// exact leading lifted-capture prefix length. Deriving it from capture-constant indices instead would conflate the
     /// independent capture namespaces of nested calls inside the callee arena. `caller_captured_values` are the
     /// captured values of the calling scope, whose session-constant suffix the inlined callee inherits (refer to
-    /// [`ProgramLoweringState::session_values`]).
+    /// [`ProgramLoweringContext::session_values`]).
     fn lower_call<'b, 'c: 'b, 't: 'c>(
         &self,
         capture_count: usize,
@@ -1311,7 +1309,7 @@ trait CallProgramLoweringExtension<O: LowerableOperationFamily> {
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
         nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -1327,7 +1325,7 @@ impl<O: LowerableOperationFamily> CallProgramLoweringExtension<O> for FlatProgra
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
         nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // Only pure callees are ever deduplicated (`collect_call_functions` skips effectful programs), so the shared
@@ -1355,7 +1353,7 @@ impl<O: LowerableOperationFamily> CallProgramLoweringExtension<O> for FlatProgra
         }
         // The callee's capture references name its own leading inputs, while session constants remain module-scoped.
         let mut captured_values = input_values[..capture_count].to_vec();
-        captured_values.extend_from_slice(lowering_state.session_values(caller_captured_values));
+        captured_values.extend_from_slice(lowering_context.session_values(caller_captured_values));
         self.lower_inline(
             input_values,
             block,
@@ -1364,7 +1362,7 @@ impl<O: LowerableOperationFamily> CallProgramLoweringExtension<O> for FlatProgra
             captured_values.as_slice(),
             &RematerializationOptimizationBarrier::None,
             nested_functions,
-            lowering_state,
+            lowering_context,
             effect_tokens,
         )
     }
@@ -1395,7 +1393,7 @@ fn lower_boundary_constraint<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     let untracked_type = array_type.clone().with_sharding(None)?;
     let declared = sharding.with_unconstrained_dimensions_replicated();
     // The constraint is lowered for the untracked type, so what the value already carries is read from its own type.
-    let bound_manual_axes = lowerer.lowering_state().bound_manual_axes();
+    let bound_manual_axes = lowerer.lowering_context().bound_manual_axes();
     validate_declared_pending_reduction(
         &declared,
         array_type.sharding(),

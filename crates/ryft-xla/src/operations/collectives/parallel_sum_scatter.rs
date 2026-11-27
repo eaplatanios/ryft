@@ -9,7 +9,7 @@ use ryft_mlir::{
 };
 
 use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::operations::collectives::{collapse_singleton_axis, refine_collective_result_dimensions};
@@ -27,8 +27,8 @@ impl LowerableOperation for ParallelSumScatterOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let lowering_state = lowerer.lowering_state().clone();
-        lowering_state.validate_manual_collective(
+        let lowering_context = lowerer.lowering_context().clone();
+        lowering_context.validate_manual_collective(
             self.name(),
             self.axes(),
             self.axis_size(),
@@ -43,7 +43,7 @@ impl LowerableOperation for ParallelSumScatterOperation {
             },
         )?;
         self.lower_to_mlir(
-            &lowering_state,
+            &lowering_context,
             input_values[0],
             &output_types[0],
             &mut lowerer.block(),
@@ -63,9 +63,9 @@ impl MemberLowerableOperation<Type> for ParallelSumScatterOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
-        let lowering_state = lowerer.lowering_state();
+        let lowering_context = lowerer.lowering_context();
         let block = &mut lowerer.block();
-        lowering_state.validate_manual_collective(
+        lowering_context.validate_manual_collective(
             self.name(),
             self.axes(),
             self.axis_size(),
@@ -86,7 +86,7 @@ impl MemberLowerableOperation<Type> for ParallelSumScatterOperation {
             return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
         };
         let output_type = <&ArrayType>::try_from(output_type)?;
-        let result = self.lower_to_mlir(lowering_state, *input, output_type, block, context, location)?.remove(0);
+        let result = self.lower_to_mlir(lowering_context, *input, output_type, block, context, location)?.remove(0);
         refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
     }
 }
@@ -101,7 +101,7 @@ trait ParallelSumScatterOperationLoweringExtension {
     /// of a `parallel_all_gather` is such a sum scatter, so it reaches the same check.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_value: ValueRef<'b, 'c, 't>,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
@@ -113,7 +113,7 @@ trait ParallelSumScatterOperationLoweringExtension {
 impl ParallelSumScatterOperationLoweringExtension for ParallelSumScatterOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_value: ValueRef<'b, 'c, 't>,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
@@ -132,7 +132,7 @@ impl ParallelSumScatterOperationLoweringExtension for ParallelSumScatterOperatio
             .into());
         }
         let (replica_groups, _) =
-            lowering_state.replica_groups(self.axes(), self.axis_size(), self.options().axis_index_groups())?;
+            lowering_context.replica_groups(self.axes(), self.axis_size(), self.options().axis_index_groups())?;
         let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
         let computation = build_reduce_body_region(
             ReductionKind::Sum,
@@ -152,7 +152,7 @@ impl ParallelSumScatterOperationLoweringExtension for ParallelSumScatterOperatio
             input_value,
             self.scatter_axis(),
             stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-            Some(lowering_state.next_channel_id()),
+            Some(lowering_context.next_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             true,
             computation,

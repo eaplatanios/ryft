@@ -26,7 +26,7 @@ impl LowerableOperation for BroadcastOperation {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let lowering_state = lowerer.lowering_state();
+        let lowering_context = lowerer.lowering_context();
         let block = &mut lowerer.block();
         let (context, location) = (lowerer.context(), lowerer.location());
         check_count!("input", input_values, 1, ProgramError);
@@ -120,7 +120,7 @@ impl LowerableOperation for BroadcastOperation {
         };
         let result = if broadcast_changes_explicit_sharding(&input_types[0], &output_types[0], self.output_axes()) {
             let sharding = output_types[0].sharding().unwrap();
-            lowering_state.lower_sharding_constraint(sharding, result, OpenDimensions::All, block, location)?
+            lowering_context.lower_sharding_constraint(sharding, result, OpenDimensions::All, block, location)?
         } else {
             result
         };
@@ -159,7 +159,7 @@ impl LowerableOperation for BroadcastLikeOperation {
         let sources = (0..output_type.rank()).map(|axis| (input_values[1], axis)).collect::<Vec<_>>();
         let result = output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)?;
         let result = if broadcast_changes_explicit_sharding(&input_types[0], output_type, self.output_axes()) {
-            lowerer.lowering_state().lower_sharding_constraint(
+            lowerer.lowering_context().lower_sharding_constraint(
                 output_type.sharding().unwrap(),
                 result,
                 OpenDimensions::All,
@@ -183,7 +183,7 @@ impl LowerableOperation for DynamicBroadcastOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let context = lowerer.context();
         let location = lowerer.location();
-        let lowering_state = lowerer.lowering_state();
+        let lowering_context = lowerer.lowering_context();
         let block = &mut lowerer.block();
         let Some((input, output_extents)) = input_values.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -267,7 +267,7 @@ impl LowerableOperation for DynamicBroadcastOperation {
             }
         };
         let result = if broadcast_changes_explicit_sharding(input_type, output_type, self.output_axes()) {
-            lowering_state.lower_sharding_constraint(
+            lowering_context.lower_sharding_constraint(
                 output_type.sharding().unwrap(),
                 result,
                 OpenDimensions::All,

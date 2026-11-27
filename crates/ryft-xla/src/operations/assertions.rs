@@ -20,10 +20,10 @@ use ryft_pjrt::extensions::ffi::{
 use ryft_pjrt::{Client, Error as PjrtError};
 
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, lower_runtime_dimension_size_i64,
-    lower_static_index_constants,
+    ArrayTypeLoweringExtension, lower_runtime_dimension_size_i64, lower_static_index_constants,
 };
 use crate::lowering::{EffectTokens, current_or_new_token};
+use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::manipulation::conversions::TypeCastLoweringExtension;
 use crate::sessions::effects::EffectCallbackGuard;
 use crate::{

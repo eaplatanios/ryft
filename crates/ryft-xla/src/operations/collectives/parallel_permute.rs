@@ -3,7 +3,7 @@ use ryft_core::{ArrayType, Operation, ParallelPermuteOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
@@ -17,8 +17,8 @@ impl LowerableOperation for ParallelPermuteOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let lowering_state = lowerer.lowering_state().clone();
-        lowering_state.validate_manual_collective(
+        let lowering_context = lowerer.lowering_context().clone();
+        lowering_context.validate_manual_collective(
             self.name(),
             self.axes(),
             self.axis_size(),
@@ -32,7 +32,7 @@ impl LowerableOperation for ParallelPermuteOperation {
                 operation.infer_output_types(input_types, &[])
             },
         )?;
-        self.lower_to_mlir(&lowering_state, input_values[0], &mut lowerer.block(), lowerer.location())
+        self.lower_to_mlir(&lowering_context, input_values[0], &mut lowerer.block(), lowerer.location())
     }
 }
 
@@ -42,7 +42,7 @@ trait ParallelPermuteOperationLoweringExtension {
     /// `(source, target)` pairs to global device pairs across the named mesh axis's replica groups.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_value: ValueRef<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
         location: LocationRef<'c, 't>,
@@ -52,12 +52,12 @@ trait ParallelPermuteOperationLoweringExtension {
 impl ParallelPermuteOperationLoweringExtension for ParallelPermuteOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         input_value: ValueRef<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let (replica_groups, _) = lowering_state.replica_groups(self.axes(), self.axis_size(), None)?;
+        let (replica_groups, _) = lowering_context.replica_groups(self.axes(), self.axis_size(), None)?;
         let mut source_target_pairs = Vec::with_capacity(replica_groups.len() * self.source_target_pairs().len());
         for group in &replica_groups {
             for (source, target) in self.source_target_pairs() {
@@ -67,7 +67,7 @@ impl ParallelPermuteOperationLoweringExtension for ParallelPermuteOperation {
         let result = block.append_operation(stable_hlo::collective_permute(
             input_value,
             source_target_pairs.as_slice(),
-            Some(lowering_state.next_channel_id()),
+            Some(lowering_context.next_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             location,
         )?)?;

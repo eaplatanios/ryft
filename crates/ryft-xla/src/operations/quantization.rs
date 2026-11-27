@@ -104,7 +104,7 @@ impl LowerableOperation for ScaledDotOperation {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let lowering_state = lowerer.lowering_state();
+        let lowering_context = lowerer.lowering_context();
         let block = &mut lowerer.block();
         let (context, location) = (lowerer.context(), lowerer.location());
         let expected_input_count = 2 + usize::from(self.has_lhs_scale()) + usize::from(self.has_rhs_scale());
@@ -113,7 +113,7 @@ impl LowerableOperation for ScaledDotOperation {
         check_count!("output", output_types, 1, ProgramError);
         let input_values = &lower_scaled_dot_input_barrier(input_values, input_types, block, location)?;
         if let Some(permutations) =
-            block_scaled_dot_custom_call_permutations(self, input_types, lowering_state.target_platform())?
+            block_scaled_dot_custom_call_permutations(self, input_types, lowering_context.target_platform())?
         {
             return self.lower_block_custom_call(
                 &permutations,
@@ -126,16 +126,16 @@ impl LowerableOperation for ScaledDotOperation {
             );
         }
         let uses_physical_boundary =
-            scaled_dot_uses_cuda_physical_boundary(self, input_types, lowering_state.target_platform())?;
+            scaled_dot_uses_cuda_physical_boundary(self, input_types, lowering_context.target_platform())?;
         // The composition types are present because the call does not lower to the custom call.
         let (composition_input_types, composition_output_types) =
-            scaled_dot_composition_types(self, input_types, output_types, lowering_state.target_platform())?.unwrap();
-        let decomposition = match lowering_state.named_compositions() {
+            scaled_dot_composition_types(self, input_types, output_types, lowering_context.target_platform())?.unwrap();
+        let decomposition = match lowering_context.named_compositions() {
             Some(functions) => functions.get(self, &composition_input_types, &composition_output_types)?,
             None => None,
         };
         if let Some(function) = decomposition {
-            if lowering_state.target_platform() == Some("cuda") && !uses_physical_boundary {
+            if lowering_context.target_platform() == Some("cuda") && !uses_physical_boundary {
                 let output_types = output_types.iter().cloned().map(Type::from).collect::<Vec<_>>();
                 return lower_shared_function_call(
                     function.symbol(),

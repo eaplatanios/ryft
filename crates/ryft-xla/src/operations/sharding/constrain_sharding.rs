@@ -20,7 +20,7 @@ impl LowerableOperation for ConstrainShardingOperation {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let sharding = self.lowered_sharding(&output_types[0]).map_err(ProgramError::from)?;
-        let value = lowerer.lowering_state().lower_sharding_constraint(
+        let value = lowerer.lowering_context().lower_sharding_constraint(
             &sharding,
             input_values[0],
             OpenDimensions::None,
@@ -41,7 +41,7 @@ mod tests {
     use ryft_mlir::{Block, Context as MlirContext, Location, Operation as MlirOperation, Value as MlirValue};
 
     use crate::lowering::sharding::tests::{test_input_type, test_mesh};
-    use crate::lowering::states::ProgramLoweringState;
+    use crate::lowering::states::ProgramLoweringContext;
     use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::operations::Operation;
     use crate::sessions::tests::two_device_mesh;
@@ -63,7 +63,8 @@ mod tests {
         let tensor_type = input_type.lower(&context, location).unwrap();
         let block = context.block(&[(tensor_type, location)]);
         let input = block.argument(0).unwrap().as_ref();
-        let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
+        let mut lowerer: Lowerer<'_, '_, '_, Operation> =
+            Lowerer::new(block.as_ref(), &context, location.as_ref(), ProgramLoweringContext::new());
         let outputs = operation.lower(&mut lowerer, &[input], &[input_type], &output_types).unwrap();
         let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(outputs, vec![operations[0].result(0).unwrap().as_ref()]);
@@ -100,10 +101,10 @@ mod tests {
         let tensor_type = input_type.lower(&context, location).unwrap();
         let block = context.block(&[(tensor_type, location)]);
         let input = block.argument(0).unwrap().as_ref();
-        let state = ProgramLoweringState::new()
+        let lowering_context = ProgramLoweringContext::new()
             .enter_manual_region(ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap());
         let mut lowerer: Lowerer<'_, '_, '_, Operation> =
-            Lowerer::new(block.as_ref(), &context, location.as_ref()).with_lowering_state(state);
+            Lowerer::new(block.as_ref(), &context, location.as_ref(), lowering_context);
         operation.lower(&mut lowerer, &[input], &[input_type], &output_types).unwrap();
         let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(

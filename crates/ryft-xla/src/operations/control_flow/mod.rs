@@ -16,7 +16,7 @@ use ryft_mlir::{
 use crate::lowering::emissions::emitted_regions;
 use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::lowering::sharding::OpenDimensions;
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, dimension_extent_i64, lower_unplaced_constant_output, physical_bound_type,
 };
@@ -359,7 +359,7 @@ pub(crate) trait ControlFlowRegionLoweringExtension<O: LowerableOperationFamily>
         location: LocationRef<'c, 't>,
         captured_values: &[ValueRef<'b, 'c, 't>],
         nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         entry_effect_tokens: EffectTokens<'b, 'c, 't>,
         threaded_effects: EffectClasses,
     ) -> Result<DetachedRegion<'c, 't>, Error>;
@@ -375,7 +375,7 @@ impl<O: LowerableOperationFamily> ControlFlowRegionLoweringExtension<O> for Flat
         location: LocationRef<'c, 't>,
         captured_values: &[ValueRef<'b, 'c, 't>],
         nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-        lowering_state: &ProgramLoweringState,
+        lowering_context: &ProgramLoweringContext,
         entry_effect_tokens: EffectTokens<'b, 'c, 't>,
         threaded_effects: EffectClasses,
     ) -> Result<DetachedRegion<'c, 't>, Error> {
@@ -392,7 +392,7 @@ impl<O: LowerableOperationFamily> ControlFlowRegionLoweringExtension<O> for Flat
                 captured_values,
                 &RematerializationOptimizationBarrier::None,
                 nested_functions,
-                lowering_state,
+                lowering_context,
                 &mut region_effect_tokens,
             )?;
             validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, threaded_effects)?;
@@ -496,12 +496,12 @@ pub(crate) fn threaded_effect_token_values<'b, 'c: 'b, 't: 'c>(
 /// region may return a replicated constant), so propagation could otherwise assign the output a placement other than
 /// the one that its type states. Outputs without a sharding, outputs whose mesh has no explicit axis (e.g., only `Auto`
 /// or `Manual` axes), references, and first-class dimensions remain unconstrained. The constraints are lowered in the
-/// scope of `lowering_state` (refer to [`ProgramLoweringState::lower_sharding_constraint`]), which excludes the mesh
+/// scope of `lowering_context` (refer to [`ProgramLoweringContext::lower_sharding_constraint`]), which excludes the mesh
 /// axes that the enclosing manual regions bind and records the mesh of each constraint as the mesh of the module.
 pub(crate) fn lower_explicit_sharding_constraints<'b, 'c: 'b, 't: 'c>(
     outputs: Vec<ValueRef<'b, 'c, 't>>,
     output_types: &[Type],
-    lowering_state: &ProgramLoweringState,
+    lowering_context: &ProgramLoweringContext,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
@@ -515,7 +515,7 @@ pub(crate) fn lower_explicit_sharding_constraints<'b, 'c: 'b, 't: 'c>(
         };
         constrained.push(match explicit_sharding {
             Some(sharding) => {
-                lowering_state.lower_sharding_constraint(sharding, output, OpenDimensions::All, block, location)?
+                lowering_context.lower_sharding_constraint(sharding, output, OpenDimensions::All, block, location)?
             }
             None => output,
         });
@@ -911,7 +911,7 @@ mod tests {
                     location,
                     &[],
                     None,
-                    &ProgramLoweringState::new(),
+                    &ProgramLoweringContext::new(),
                     EffectTokens::default(),
                     EffectClasses::NONE,
                 )
@@ -962,7 +962,7 @@ mod tests {
                 location,
                 &[],
                 None,
-                &ProgramLoweringState::new(),
+                &ProgramLoweringContext::new(),
                 EffectTokens::default(),
                 threaded_effects,
             )

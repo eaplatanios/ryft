@@ -23,9 +23,10 @@ use ryft_mlir::{Block, Operation as MlirOperation, Region, Type as MlirType, Val
 use crate::lowering::EffectTokens;
 use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, ComparisonDirectionLoweringExtension, TypeLoweringExtension, lower_explicit_shape,
-    lower_runtime_dimension_size_i64, lower_static_index_constants, physical_bound_type,
+    ArrayTypeLoweringExtension, TypeLoweringExtension, lower_explicit_shape, lower_runtime_dimension_size_i64,
+    lower_static_index_constants, physical_bound_type,
 };
+use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::control_flow::{
     ControlFlowRegionLoweringExtension, append_loop_effect_tokens, lower_explicit_sharding_constraints,
     lower_refined_region_input, lower_refined_region_outputs, lower_region_guard, lowered_effect_classes,
@@ -82,7 +83,8 @@ impl LowerableOperation for WhileOperation<Type> {
         self.validate_region_count(lowerer.regions().len())?;
         let (context, location) = (lowerer.context(), lowerer.location());
         let block = &mut lowerer.block();
-        let (effect_tokens, regions, captured_values, nested_functions, lowering_state) = lowerer.split_effect_tokens();
+        let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
+            lowerer.split_effect_tokens();
         let (condition, body) = (&regions[0], &regions[1]);
         let state_types = body.input_types();
         let state_count = state_types.len();
@@ -182,7 +184,7 @@ impl LowerableOperation for WhileOperation<Type> {
                 captured_values,
                 &RematerializationOptimizationBarrier::None,
                 nested_functions,
-                lowering_state,
+                lowering_context,
                 effect_tokens,
             )?;
             state_values.push(initial_predicate[0]);
@@ -238,7 +240,7 @@ impl LowerableOperation for WhileOperation<Type> {
                     captured_values,
                     &RematerializationOptimizationBarrier::None,
                     nested_functions,
-                    lowering_state,
+                    lowering_context,
                     &mut condition_effect_tokens,
                 )?;
                 // The condition region of a `stablehlo.while` returns only the predicate, so it threads no token.
@@ -289,7 +291,7 @@ impl LowerableOperation for WhileOperation<Type> {
                 captured_values,
                 &RematerializationOptimizationBarrier::None,
                 nested_functions,
-                lowering_state,
+                lowering_context,
                 &mut body_effect_tokens,
             )?;
             // For a batched predicate, mask each carry update under the carried predicate of the incoming state, so
@@ -424,7 +426,7 @@ impl LowerableOperation for WhileOperation<Type> {
                         location,
                         captured_values,
                         nested_functions,
-                        lowering_state,
+                        lowering_context,
                         body_effect_tokens,
                         threaded_effects,
                     )?;
@@ -457,7 +459,7 @@ impl LowerableOperation for WhileOperation<Type> {
                         captured_values,
                         &RematerializationOptimizationBarrier::None,
                         nested_functions,
-                        lowering_state,
+                        lowering_context,
                         &mut body_effect_tokens,
                     )?;
                     Some(next_predicate[0])
@@ -487,7 +489,7 @@ impl LowerableOperation for WhileOperation<Type> {
         let results =
             (0..state_count).map(|index| operation.result(counter_offset + index).unwrap().as_ref()).collect();
         let results = lower_refined_region_outputs(results, &state_types, output_types, block, context, location)?;
-        lower_explicit_sharding_constraints(results, output_types, lowering_state, block, location)
+        lower_explicit_sharding_constraints(results, output_types, lowering_context, block, location)
     }
 }
 
@@ -503,6 +505,7 @@ mod tests {
     };
     use ryft_mlir::{Context as MlirContext, Location};
 
+    use crate::lowering::states::ProgramLoweringContext;
     use crate::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, identity_branch, unproject_plain_program,
     };
@@ -569,7 +572,8 @@ mod tests {
 
         // The plain array family cannot carry the condition and body regions, so loops lower only from the array IR
         // family.
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(regions.clone());
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(regions.clone());
         let expected_message =
             "higher-order operation `while` must be stored directly in the enclosing backend operation family";
         assert!(matches!(
@@ -582,8 +586,8 @@ mod tests {
         ));
 
         // An array IR loop needs exactly one condition region and one body region.
-        let mut lowerer =
-            Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram<Session>>::new());
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new())
+            .with_regions(Vec::<FlatProgram<Session>>::new());
         assert!(matches!(
             WhileOperation::<Type>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(
@@ -594,7 +598,8 @@ mod tests {
         ));
 
         // It also needs one input per loop state.
-        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(regions);
+        let mut lowerer =
+            Lowerer::new(block.as_ref(), &context, location, ProgramLoweringContext::new()).with_regions(regions);
         assert!(matches!(
             WhileOperation::<Type>::new().lower(&mut lowerer, &[], &[], &[]),
             Err(Error::Core(core_error)) if matches!(

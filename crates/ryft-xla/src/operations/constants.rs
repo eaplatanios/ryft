@@ -9,13 +9,13 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::MlirLowerableValue;
 use crate::lowering::sharding::OpenDimensions;
-use crate::lowering::states::ProgramLoweringState;
+use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, annotate_output_memory, lower_constant_output, physical_bound_type,
     stable_hlo_dynamic_dimension_bound,
 };
+use crate::lowering::values::MlirLowerableValue;
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{
     Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation, Type,
@@ -197,7 +197,7 @@ impl LowerableOperation for IotaOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             vec![result],
             output_types.first(),
-            lowerer.lowering_state(),
+            lowerer.lowering_context(),
             &mut lowerer.block(),
             lowerer.location(),
         )
@@ -251,7 +251,7 @@ impl LowerableOperation for FillLikeOperation<ArrayType> {
             result,
             input_values[0],
             &output_types[0],
-            lowerer.lowering_state(),
+            lowerer.lowering_context(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -284,7 +284,7 @@ impl LowerableOperation for IotaLikeOperation<ArrayType> {
             result,
             input_values[0],
             &output_types[0],
-            lowerer.lowering_state(),
+            lowerer.lowering_context(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -309,7 +309,7 @@ impl LowerableOperation for ZeroOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             output_types.first(),
-            lowerer.lowering_state(),
+            lowerer.lowering_context(),
             &mut lowerer.block(),
             lowerer.location(),
         )
@@ -333,7 +333,7 @@ impl LowerableOperation for OneOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             output_types.first(),
-            lowerer.lowering_state(),
+            lowerer.lowering_context(),
             &mut lowerer.block(),
             lowerer.location(),
         )
@@ -353,7 +353,7 @@ impl LowerableOperation for ZeroLikeOperation<ArrayType> {
             input_values,
             output_types,
             0,
-            lowerer.lowering_state(),
+            lowerer.lowering_context(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -374,7 +374,7 @@ impl LowerableOperation for OneLikeOperation<ArrayType> {
             input_values,
             output_types,
             1,
-            lowerer.lowering_state(),
+            lowerer.lowering_context(),
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
@@ -403,7 +403,7 @@ impl MemberLowerableOperation<Type> for ZeroOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             output_type,
-            lowerer.lowering_state(),
+            lowerer.lowering_context(),
             &mut lowerer.block(),
             location,
         )
@@ -431,7 +431,7 @@ impl MemberLowerableOperation<Type> for OneOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             output_type,
-            lowerer.lowering_state(),
+            lowerer.lowering_context(),
             &mut lowerer.block(),
             location,
         )
@@ -469,7 +469,7 @@ impl MemberLowerableOperation<Type> for IotaOperation<ArrayType> {
         lower_constructor_sharding_constraint(
             result,
             Some(&output_type),
-            lowerer.lowering_state(),
+            lowerer.lowering_context(),
             &mut lowerer.block(),
             location,
         )
@@ -481,7 +481,7 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     integer_value: i64,
-    lowering_state: &ProgramLoweringState,
+    lowering_context: &ProgramLoweringContext,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -533,7 +533,8 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
         return Ok(result);
     };
     check_count!("input", result, 1, ProgramError);
-    let result = lowering_state.lower_sharding_constraint(sharding, result[0], OpenDimensions::All, block, location)?;
+    let result =
+        lowering_context.lower_sharding_constraint(sharding, result[0], OpenDimensions::All, block, location)?;
     Ok(vec![result])
 }
 
@@ -545,7 +546,7 @@ fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
     result: ValueRef<'b, 'c, 't>,
     exemplar: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
-    lowering_state: &ProgramLoweringState,
+    lowering_context: &ProgramLoweringContext,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -557,7 +558,7 @@ fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
     let result = output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)?;
     let result = match output_type.sharding() {
         Some(sharding) => {
-            lowering_state.lower_sharding_constraint(sharding, result, OpenDimensions::All, block, location)?
+            lowering_context.lower_sharding_constraint(sharding, result, OpenDimensions::All, block, location)?
         }
         None => result,
     };
@@ -572,7 +573,7 @@ fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
 fn lower_constructor_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     result: Vec<ValueRef<'b, 'c, 't>>,
     output_type: Option<&ArrayType>,
-    lowering_state: &ProgramLoweringState,
+    lowering_context: &ProgramLoweringContext,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
@@ -580,7 +581,8 @@ fn lower_constructor_sharding_constraint<'b, 'c: 'b, 't: 'c>(
         return Ok(result);
     };
     check_count!("input", result, 1, ProgramError);
-    let result = lowering_state.lower_sharding_constraint(sharding, result[0], OpenDimensions::All, block, location)?;
+    let result =
+        lowering_context.lower_sharding_constraint(sharding, result[0], OpenDimensions::All, block, location)?;
     Ok(vec![result])
 }
 

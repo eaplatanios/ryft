@@ -28,7 +28,7 @@ impl LowerableOperation for MaxOperation<ArrayType> {
         // Floating-point values take the form of the target, because the native operation does not propagate NaNs
         // or order the signed zeros on every backend (e.g., XLA's CPU backend returns its left-hand side input when
         // the right-hand side one is a NaN and for a tie between the signed zeros).
-        let form = FloatExtremumForm::for_elementwise(lowerer.lowering_state().target_platform());
+        let form = FloatExtremumForm::for_elementwise(lowerer.lowering_context().target_platform());
         Ok(vec![lower_extremum_to_mlir(
             true,
             output_types[0].data_type(),
@@ -60,7 +60,7 @@ impl LowerableOperation for MinOperation<ArrayType> {
         // Floating-point values take the form of the target, because the native operation does not propagate NaNs
         // or order the signed zeros on every backend (e.g., XLA's CPU backend returns its left-hand side input when
         // the right-hand side one is a NaN and for a tie between the signed zeros).
-        let form = FloatExtremumForm::for_elementwise(lowerer.lowering_state().target_platform());
+        let form = FloatExtremumForm::for_elementwise(lowerer.lowering_context().target_platform());
         Ok(vec![lower_extremum_to_mlir(
             false,
             output_types[0].data_type(),
@@ -109,7 +109,7 @@ impl LowerableOperation for ClampOperation<ArrayType> {
                 )
             });
             let (lower, upper) = (lower?, upper?);
-            let form = FloatExtremumForm::for_elementwise(lowerer.lowering_state().target_platform());
+            let form = FloatExtremumForm::for_elementwise(lowerer.lowering_context().target_platform());
             let clamped_below =
                 lower_extremum_to_mlir(true, data_type, input, lower, form, &mut lowerer.block(), lowerer.location())?;
             return Ok(vec![lower_extremum_to_mlir(

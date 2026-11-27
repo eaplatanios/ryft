@@ -1,10 +1,57 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, CompareOperation, DataType, ProgramError};
-use ryft_mlir::ValueRef;
+use ryft_core::{ArrayType, CompareOperation, ComparisonDirection, DataType, ProgramError};
+use ryft_mlir::dialects::stable_hlo;
+use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::lowering::types::{ComparisonDirectionLoweringExtension, lower_signed_one_bit_to_mlir};
+use crate::lowering::types::lower_signed_one_bit_to_mlir;
 use crate::operations::normalize_binary_elementwise_inputs;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
+
+/// Lowering of a [`ComparisonDirection`] to StableHLO.
+pub trait ComparisonDirectionLoweringExtension {
+    /// Lowers this direction to the StableHLO comparison direction with the same meaning.
+    fn lower(self) -> stable_hlo::ComparisonDirection;
+
+    /// Lowers one comparison of two values in this direction to a single `stablehlo.compare`. This serves
+    /// [`CompareOperation`](ryft_core::CompareOperation) lowerings, scalar dimension comparisons, and the comparisons
+    /// inside of combiner and comparator bodies. Both inputs must already share one tensor type, because this function
+    /// neither promotes nor broadcasts them, and the output has their shape with a Boolean element type. The comparison
+    /// type (i.e., `FLOAT`, `SIGNED`, or `UNSIGNED`) follows the element type of the left-hand side input, as
+    /// [`stable_hlo::ComparisonType::for_type`] describes.
+    fn lower_comparison<'b, 'c: 'b, 't: 'c>(
+        self,
+        left: ValueRef<'b, 'c, 't>,
+        right: ValueRef<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+}
+
+impl ComparisonDirectionLoweringExtension for ComparisonDirection {
+    fn lower(self) -> stable_hlo::ComparisonDirection {
+        match self {
+            ComparisonDirection::Equal => stable_hlo::ComparisonDirection::Equal,
+            ComparisonDirection::NotEqual => stable_hlo::ComparisonDirection::NotEqual,
+            ComparisonDirection::LessThan => stable_hlo::ComparisonDirection::LessThan,
+            ComparisonDirection::LessThanOrEqual => stable_hlo::ComparisonDirection::LessThanOrEqual,
+            ComparisonDirection::GreaterThan => stable_hlo::ComparisonDirection::GreaterThan,
+            ComparisonDirection::GreaterThanOrEqual => stable_hlo::ComparisonDirection::GreaterThanOrEqual,
+        }
+    }
+    fn lower_comparison<'b, 'c: 'b, 't: 'c>(
+        self,
+        left: ValueRef<'b, 'c, 't>,
+        right: ValueRef<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        let direction = self.lower();
+        let left_type = left.r#type()?;
+        let comparison_type = stable_hlo::ComparisonType::for_type(left_type)?;
+        let result = block.append_operation(stable_hlo::compare(left, right, direction, comparison_type, location)?)?;
+        Ok(result.result(0).unwrap().as_ref())
+    }
+}
 
 impl LowerableOperation for CompareOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -71,12 +118,63 @@ fn comparison_operand_type(input_types: &[ArrayType], output_types: &[ArrayType]
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{Compare, ComparisonDirection, DataTypeError, Error as CoreError, Typed};
+    use ryft_mlir::{Context as MlirContext, Location};
 
+    use crate::lowering::tests::test_vector_type;
+    use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::sessions::tests::{domain_mesh, f32_vector};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Options, Session};
 
     use super::*;
+
+    #[test]
+    fn test_comparison_direction_lower() {
+        for (direction, expected) in [
+            (ComparisonDirection::Equal, stable_hlo::ComparisonDirection::Equal),
+            (ComparisonDirection::NotEqual, stable_hlo::ComparisonDirection::NotEqual),
+            (ComparisonDirection::LessThan, stable_hlo::ComparisonDirection::LessThan),
+            (ComparisonDirection::LessThanOrEqual, stable_hlo::ComparisonDirection::LessThanOrEqual),
+            (ComparisonDirection::GreaterThan, stable_hlo::ComparisonDirection::GreaterThan),
+            (ComparisonDirection::GreaterThanOrEqual, stable_hlo::ComparisonDirection::GreaterThanOrEqual),
+        ] {
+            assert_eq!(direction.lower(), expected);
+        }
+    }
+
+    #[test]
+    fn test_comparison_direction_lower_comparison() {
+        // The comparison type follows the element type of the inputs.
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let block = context.block(&[
+            (test_vector_type(2).lower(&context, location).unwrap(), location),
+            (ArrayType::new_static(DataType::I32, [2]).lower(&context, location).unwrap(), location),
+            (ArrayType::new_static(DataType::U32, [2]).lower(&context, location).unwrap(), location),
+        ]);
+        let inputs = (0..3).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
+        let mut block_ref = block.as_ref();
+        let location = location.as_ref();
+        let outputs = [ComparisonDirection::LessThan, ComparisonDirection::Equal, ComparisonDirection::GreaterThan]
+            .into_iter()
+            .zip(inputs)
+            .map(|(direction, input)| direction.lower_comparison(input, input, &mut block_ref, location).unwrap())
+            .collect::<Vec<_>>();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        let results = operations.iter().map(|operation| operation.result(0).unwrap().as_ref()).collect::<Vec<_>>();
+        assert_eq!(outputs, results);
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "%0 = stablehlo.compare LT, <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>>, FLOAT : (tensor<2xf32>, \
+                 tensor<2xf32>) -> tensor<2xi1>",
+                "%0 = stablehlo.compare EQ, <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>>, SIGNED : (tensor<2xi32>, \
+                 tensor<2xi32>) -> tensor<2xi1>",
+                "%0 = stablehlo.compare GT, <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>>, UNSIGNED : (tensor<2xui32>, \
+                 tensor<2xui32>) -> tensor<2xi1>",
+            ],
+        );
+    }
 
     #[test]
     fn test_compare_operation_lower() {
