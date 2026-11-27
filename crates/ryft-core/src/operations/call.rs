@@ -952,8 +952,8 @@ impl CallOperation<ArrayIrType> {
     }
 
     /// Folds or residualizes this call as a whole (refer to [`PartialEvaluationContext::fold_or_residualize`]). The
-    /// callee is bound as a shared program (refer to [`shared_call_callee`]), so that repeated calls of one callee keep
-    /// sharing one region in the known-side context and in the residual program.
+    /// callee is bound as a shared program (refer to [`RegionRef::to_shared_program`]), so that repeated calls of one
+    /// callee keep sharing one region in the known-side context and in the residual program.
     fn fold_or_residualize<V, C, D>(
         &self,
         context: &PartialEvaluationContext<C>,
@@ -977,7 +977,7 @@ impl CallOperation<ArrayIrType> {
         // residualizes (e.g., the tangent call of an eager linearization), whose residual program an eager context
         // applies too (e.g., the pullback of an eager VJP, which transposes it). A call placed into a known or a
         // residual program of a staged known side follows its caller.
-        let callee = shared_call_callee(driver.region(0)?)?;
+        let callee = driver.region(0)?.to_shared_program();
         let operation = if context.parent().is_eager() { self.clone() } else { self.without_function_mesh() };
         context.fold_or_residualize(
             C::Operation::from(operation),
@@ -1306,6 +1306,24 @@ impl CallOperation<ArrayIrType> {
                 PartialEvaluationOutput::Unknown(index) => residual_outputs[index].clone(),
             })
             .collect())
+    }
+
+    /// Returns whether a split of `callee` with `inputs` can be cached and reused across call sites. References and
+    /// lifted capture constants can require the original boundary, and nominal type identities require call-local
+    /// identities. The all-known paths check effects separately.
+    fn can_share_split<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>, W: Value>(
+        callee: RegionRef<'_, V, O>,
+        inputs: &[PartialEvaluationValue<W>],
+    ) -> bool {
+        !inputs.iter().any(|input| {
+            let r#type = input.r#type();
+            r#type.is_reference() || r#type.identities().next().is_some()
+        }) && !callee.contains_atom_in_closure(|atom| {
+            let r#type = atom.r#type();
+            r#type.is_reference()
+                || r#type.identities().next().is_some()
+                || atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
+        })
     }
 }
 
@@ -1795,20 +1813,6 @@ where
         let all_known = inputs.iter().all(PartialEvaluationValue::is_known);
         let callee = driver.region(0)?;
 
-        // A cached split can be shared across call sites when the inputs and callee carry no references or nominal
-        // type identities and the callee has no lifted capture constants. All-known forwarding also checks effects.
-        let can_share_split = || {
-            !inputs.iter().any(|input| {
-                let r#type = input.r#type();
-                r#type.is_reference() || r#type.identities().next().is_some()
-            }) && !callee.contains_atom_in_closure(|atom| {
-                let r#type = atom.r#type();
-                r#type.is_reference()
-                    || r#type.identities().next().is_some()
-                    || atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
-            })
-        };
-
         if all_known || inputs.iter().all(PartialEvaluationValue::is_unknown) {
             // An all-known call folds as a whole, unless its callee holds work that must not fold under this context
             // (e.g., a copy that every execution of a specialized program must make), in which case the default rule
@@ -1817,7 +1821,7 @@ where
             if all_known
                 && context.residual_policy().is_some()
                 && callee.effects().classes().is_empty()
-                && can_share_split()
+                && Self::can_share_split(callee, inputs)
             {
                 return Ok(self.resolve_forwarded_outputs(callee, inputs, outputs));
             }
@@ -1843,7 +1847,7 @@ where
 
         // Retain mixed splits without references, captures, or nominal identities. Unlike all-known replay,
         // partitioning a mixed effectful call preserves its effects and shares only the structural split.
-        if can_share_split() {
+        if Self::can_share_split(callee, inputs) {
             let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
             let partition =
                 |callee: RegionRef<'_, V, C::Operation>| driver.partition_program(context, callee, &input_known);
@@ -1953,16 +1957,7 @@ where
         if !inputs.iter().all(PartialEvaluationValue::is_known)
             || context.residual_policy().is_none()
             || !callee.effects().classes().is_empty()
-            || inputs.iter().any(|input| {
-                let r#type = input.r#type();
-                r#type.is_reference() || r#type.identities().next().is_some()
-            })
-            || callee.contains_atom_in_closure(|atom| {
-                let r#type = atom.r#type();
-                r#type.is_reference()
-                    || r#type.identities().next().is_some()
-                    || atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
-            })
+            || !Self::can_share_split(callee, inputs)
         {
             return Ok(None);
         }
@@ -2296,7 +2291,7 @@ where
             let program = activity.jvp_program();
             let mut fused_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
             if live_tangent_slots.is_empty() && !program.effects().is_retained_when_unused() {
-                let callee = shared_call_callee(callee)?;
+                let callee = callee.to_shared_program();
                 return context
                     .primal()
                     .bind(C::Operation::from(self.clone()), AttachedRegions::Callees(&[callee]), &fused_inputs)?
@@ -2388,7 +2383,7 @@ where
         };
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         if !output_activity.contains(&true) && !tangent_program.effects().is_retained_when_unused() {
-            let callee = shared_call_callee(callee)?;
+            let callee = callee.to_shared_program();
             return context
                 .primal()
                 .bind(C::Operation::from(self.clone()), AttachedRegions::Callees(&[callee]), &primal_inputs)?
@@ -3302,38 +3297,6 @@ enum CallSplitKind {
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Returns the callee of a `call` bound over `callee` as a shared program, which is the program that `callee` was
-/// interned from, if any, and otherwise a copy of `callee` that the region transform cache of `callee` retains.
-fn shared_call_callee<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>>(
-    callee: RegionRef<'_, V, O>,
-) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, ProgramError> {
-    /// [`Region`] [`Transform`] marker for the shared copy of the callee of a `call` that this function retains for a
-    /// callee region that is not interned as a shared region (e.g., the entry region of a shared callee program that a
-    /// rule binds directly, such as the primal or tangent callee of a linearized call). Binding that copy instead of a
-    /// fresh copy of the region lets every call of one callee share one region.
-    struct CallCalleeTransform;
-
-    impl<V, O> Transform<Region<V, O>> for CallCalleeTransform
-    where
-        V: Value<Type = ArrayIrType>,
-        O: Operation<Type = ArrayIrType>,
-    {
-        type Arguments = ();
-        type Artifact = TransformArtifact<V, O, ()>;
-
-        const DEFAULT_CACHE_CAPACITY: usize = 1;
-    }
-
-    if let Some(callee) = callee.interned_callee() {
-        return Ok(callee.clone());
-    }
-
-    let artifact = callee.transform::<CallCalleeTransform, _, ProgramError>((), |callee, _| {
-        Ok(TransformArtifact::new(vec![Arc::new(callee.to_program())], ()))
-    })?;
-    Ok(artifact.programs()[0].clone())
-}
 
 /// Returns `callee`, the callee of a call whose effective boundary is `boundary` (refer to
 /// `CallOperation::effective_input_boundary`), with each input type that declares no sharding refined to the

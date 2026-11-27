@@ -40,10 +40,9 @@ use crate::arrays::host::{
     HostValue, ValueComparison, array_value_digest, combined_digest, dense_host_value_bytes, validate_mesh_devices,
 };
 use crate::arrays::shards::ArrayShard;
-use crate::arrays::transfers::devices_span_processes;
 use crate::arrays::{Array, ArrayError};
 use crate::compilation::domains::captured_type;
-use crate::devices::PjrtDeviceExtension;
+use crate::devices::{PjrtDeviceExtension, devices_span_processes};
 use crate::sessions::effects::ensure_effect_dispatch_is_allowed;
 use crate::{CompileTracer, Error, FromPjrt, Session, Value};
 

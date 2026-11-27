@@ -26,6 +26,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::Index;
@@ -43,7 +44,7 @@ use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming, Ty
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::transforms::{RegionContentIdentity, RegionTransformCache};
+use crate::programs::transforms::{RegionContentIdentity, RegionTransformCache, Transform, TransformArtifact};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::{LiteralIdentity, Value};
 
@@ -1620,6 +1621,40 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
             entry,
         )
         .unwrap()
+    }
+
+    /// Returns this [`Region`] and its complete reachable region closure as a shared [`Program`], for supplying through
+    /// [`AttachedRegions::Callees`] when an operation or transform rule binds this region again unchanged. This is the
+    /// shared callee recorded for this root when there is one (i.e., [`Self::interned_callee`]), and otherwise a copy
+    /// of this region (via [`Self::to_program`]) that the transform cache of this region retains, so that every call
+    /// of this function on one region returns the same [`Arc`]. Instructions that bind the result therefore share one
+    /// region, and a backend that deduplicates callees by allocation identity sees one callee, where binding the result
+    /// of [`Self::to_program`] would give each instruction a copy of its own.
+    ///
+    /// The first call for a region without a recorded shared callee takes time and space proportional to the size
+    /// of its reachable region graph, and later calls only look the copy up. The retained copy lives as long as the
+    /// regions that share the transform cache of this region. As for [`Self::interned_callee`], the allocation identity
+    /// of the result does not establish semantic equivalence with other programs.
+    pub fn to_shared_program(self) -> Arc<Program<V, O, Vec<V>, Vec<V>>> {
+        /// [`Transform`] marker under which a region retains the shared copy of itself.
+        struct SharedProgram;
+
+        impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for SharedProgram {
+            type Arguments = ();
+            type Artifact = TransformArtifact<V, O, ()>;
+
+            const DEFAULT_CACHE_CAPACITY: usize = 1;
+        }
+
+        if let Some(program) = self.interned_callee() {
+            return program.clone();
+        }
+
+        let Ok(artifact) = self.transform::<SharedProgram, _, Infallible>((), |region, _| {
+            Ok(TransformArtifact::new(vec![Arc::new(region.to_program())], ()))
+        });
+
+        artifact.programs()[0].clone()
     }
 }
 
@@ -4847,6 +4882,35 @@ pub(crate) mod tests {
         assert_eq!(materialized.instructions()[0].regions(), materialized.instructions()[1].regions());
         assert_eq!(materialized.input_types(), vec![ArrayType::scalar(DataType::F64)]);
         assert_eq!(materialized.output_types(), vec![ArrayType::scalar(DataType::F64)]);
+    }
+
+    #[test]
+    fn test_region_ref_to_shared_program() {
+        // A region that was not interned from a shared program retains one copy of itself, so every request returns
+        // the same program, also through a clone of the owning program, while an independently built program with
+        // identical contents retains a copy of its own.
+        let identity_program = || {
+            let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let program = identity_program();
+        let shared = program.entry_region_ref().to_shared_program();
+        assert!(Arc::ptr_eq(&shared, &program.entry_region_ref().to_shared_program()));
+        assert!(Arc::ptr_eq(&shared, &program.clone().entry_region_ref().to_shared_program()));
+        assert!(!Arc::ptr_eq(&shared, &identity_program().entry_region_ref().to_shared_program()));
+        assert_eq!(shared.to_string(), program.to_string());
+
+        // A region that was interned from a shared program returns that program.
+        let callee = Arc::new(identity_program());
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let region = builder.intern_callee(&callee, None).unwrap();
+        let outputs = builder.add_instruction(TestRegionOperation::Call, vec![region], vec![input], None).unwrap();
+        let outputs = outputs.to_vec();
+        let caller = builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder]).unwrap();
+        let region = caller.instructions()[0].regions()[0];
+        assert!(Arc::ptr_eq(&caller.region_ref(region).unwrap().to_shared_program(), &callee));
     }
 
     #[test]

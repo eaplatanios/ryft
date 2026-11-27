@@ -14,6 +14,14 @@ use ryft_pjrt::{Device as PjrtDevice, Memory as PjrtMemory};
 
 use crate::{ArrayError, Error, FromPjrt};
 
+/// Returns whether `devices` contains devices with different [`Device::process_index`] values. An empty collection
+/// or a collection whose devices all belong to one process returns `false`.
+pub fn devices_span_processes<'a>(devices: impl IntoIterator<Item = &'a Device>) -> bool {
+    let mut processes = devices.into_iter().map(Device::process_index);
+    let first = processes.next();
+    processes.any(|process| Some(process) != first)
+}
+
 impl FromPjrt<PjrtDevice<'_>> for Device {
     type Output = Result<Self, ryft_pjrt::Error>;
 
@@ -100,6 +108,17 @@ mod tests {
     use crate::tests::{cpu_client, execution_client};
 
     use super::*;
+
+    #[test]
+    fn test_devices_span_processes() {
+        let first = Device::new(0, 0);
+        let same_process = Device::new(1, 0);
+        let other_process = Device::new(2, 1);
+        assert!(!devices_span_processes([]));
+        assert!(!devices_span_processes([&first]));
+        assert!(!devices_span_processes([&first, &same_process]));
+        assert!(devices_span_processes([&first, &same_process, &other_process]));
+    }
 
     #[test]
     fn test_device_from_pjrt() {

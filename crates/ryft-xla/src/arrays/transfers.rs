@@ -206,7 +206,7 @@ use crate::arrays::shards::{
     ArrayShard, ShardContribution, ShardDescriptor, ShardIndex, ShardLayout, read_shard_to_host,
 };
 use crate::arrays::{Array, ArrayError};
-use crate::devices::PjrtDeviceExtension;
+use crate::devices::{PjrtDeviceExtension, devices_span_processes};
 use crate::sessions::synchronization::WorkReservation;
 use crate::sharding::DeviceMeshExtension;
 use crate::types::DataTypeExtension;
@@ -2646,7 +2646,9 @@ impl ShardMovePlan {
 
     /// Returns the moves that cross processes, whatever processes they cross between.
     fn cross_host_moves(&self) -> impl Iterator<Item = &ShardMove> {
-        self.moves.iter().filter(|movement| movement.is_cross_host())
+        self.moves
+            .iter()
+            .filter(|movement| movement.source_device.process_index() != movement.target_device.process_index())
     }
 }
 
@@ -2677,11 +2679,6 @@ impl ShardMove {
     /// Returns the static shape of the moved slice.
     fn shape(&self) -> StaticShape {
         StaticShape::new(self.slice.iter().map(Range::len).collect::<Vec<_>>())
-    }
-
-    /// Returns whether this move crosses processes, which needs a PJRT cross-host transfer.
-    fn is_cross_host(&self) -> bool {
-        self.source_device.process_index() != self.target_device.process_index()
     }
 
     /// Returns the part that the process with index `process_index` takes in this move, or `None` when it owns neither
@@ -2887,13 +2884,6 @@ impl HostRoundTripCause {
             Self::Device(error) => error.clone(),
         }
     }
-}
-
-/// Returns whether `devices` names more than one process.
-pub(super) fn devices_span_processes<'a>(devices: impl IntoIterator<Item = &'a Device>) -> bool {
-    let mut processes = devices.into_iter().map(Device::process_index);
-    let first = processes.next();
-    processes.any(|process| Some(process) != first)
 }
 
 /// Buffer- and session-independent source of a placement plan.

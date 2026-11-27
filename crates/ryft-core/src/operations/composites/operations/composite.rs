@@ -1052,34 +1052,24 @@ impl<V: Typed + Parameter, P, S, O: Operation<Type = ArrayIrType>> LockstepOpera
 }
 
 // The default partial-evaluation semantics are the desired ones here, as they fold the call when every input is known
-// and otherwise residualize the complete call, so that its rules remain available to later differentiation. A call
-// whose primal region is an interned shared callee (e.g., a named composite call) folds or residualizes with that
-// callee instead of a materialized copy of its body, so that partial evaluation keeps sharing it rather than copying
-// it per call.
+// and otherwise residualize the complete call, so that its rules remain available to later differentiation. The call
+// folds or residualizes with the shared program of each of its regions (refer to `RegionRef::to_shared_program`)
+// instead of a materialized copy, so that calls that share a region (e.g., named composite calls, whose primal
+// region is an interned shared callee) keep sharing it rather than copying it per call.
 impl<C: Context<Type: DifferentiableType + Eq + Hash>, S: CustomRuleSource<C::Constant, C::Operation>>
     PartiallyEvaluatableOperation<C> for CompositeOperation<C::Constant, C::Operation, S>
 where
     C::Operation: From<CompositeOperation<C::Constant, C::Operation, S>>,
 {
+    #[inline]
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
         context: &PartialEvaluationContext<C>,
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        let callee = match driver.region_count() {
-            1 => driver.region(0).ok().and_then(|region| region.interned_callee().cloned()),
-            _ => None,
-        };
-        match callee {
-            Some(callee) => context.fold_or_residualize(
-                self.clone(),
-                AttachedRegions::Callees(std::slice::from_ref(&callee)),
-                inputs,
-                None,
-            ),
-            None => context.fold_or_residualize(self.clone(), driver.region_programs(), inputs, None),
-        }
+        let callees = driver.regions().map(RegionRef::to_shared_program).collect::<Vec<_>>();
+        context.fold_or_residualize(self.clone(), AttachedRegions::Callees(&callees), inputs, None)
     }
 }
 
@@ -4708,6 +4698,46 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(traces.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_composite_partial_evaluation_shared_imported_body() {
+        // Calls that share one region that was not interned from a shared program keep sharing it when they are
+        // residualized, because each of them binds the one shared program that the region retains.
+        let traces = Arc::new(AtomicUsize::new(0));
+        let key = CompositeKey::new("ryft.tests.partial_evaluation_shared_imported_body", 1);
+        let registration = CustomRuleRegistration::new(named_cube_definition(key, &traces));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let body = registration.reference().body(std::slice::from_ref(&scalar_type)).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let region = builder.import_program(body.as_ref().clone());
+        let mut value = builder.add_input(scalar_type.clone());
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let operation = CompositeOperation::new(registration.reference());
+            value = builder.add_instruction(operation, vec![region], vec![value], None).unwrap()[0];
+            outputs.push(value);
+        }
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder; 2]).unwrap();
+        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(scalar_type)]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = composite [key=\"ryft.tests.partial_evaluation_shared_imported_body.v1\"] %0 [
+                    primal=^0={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                            %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                    %2:f64[] = composite [key=\"ryft.tests.partial_evaluation_shared_imported_body.v1\"] %1 [
+                        primal=^0,
+                    ]
+                in (%1, %2)"},
+        );
     }
 
     #[test]
