@@ -1,7 +1,7 @@
 //! Admission of data-dependent bounded-dynamic programs to XLA lowering.
 //!
 //! A dimension produced by `dimension_from_scalar` derives its extent from runtime data, so every operation that
-//! consumes such a dimension lowers to bounded-dynamic StableHLO and must keep its physical padding unobservable.
+//! consumes such a dimension lowers to bounded-dynamic StableHLO and must keep its padding unobservable.
 //! [`validate_data_dependent_compilation`] admits only the operation configurations with a known padding discipline and
 //! rejects every other consumer before any MLIR is constructed.
 
@@ -20,7 +20,7 @@ use crate::{Constant, Error, Type};
 /// Validates the bounded-dynamic compilation contract for dimensions produced by `dimension_from_scalar`.
 ///
 /// [`XlaMasked`] and [`XlaZeroPadded`] are explicit delegation decisions, because the bounded dynamic XLA legalizer
-/// owns those transformations. [`RyftMasked`] operations instead materialize their physical kernel inputs and restore
+/// owns those transformations. [`RyftMasked`] operations instead pad their kernel inputs to the bounds and restore
 /// logical extents in the lowering of Ryft.
 /// Only configurations with execution evidence are admitted, and unbounded gateways and unsupported consumers are
 /// rejected before MLIR construction. Only the regions that lowering emits (i.e., the entry region and its executed
@@ -119,7 +119,7 @@ pub(crate) fn validate_data_dependent_compilation<O: LowerableOperationFamily>(
 }
 
 /// Padding contract used when admitting one staged operation to data-dependent bounded-dynamic lowering (i.e., how
-/// the operation keeps the physical padding of a bounded dynamic value unobservable when one of its dimensions is
+/// the operation keeps the padding of a bounded dynamic value unobservable when one of its dimensions is
 /// derived from runtime data). Each operation family states the discipline of its operations through the
 /// [`data_dependent_padding_discipline`] function of `LowerableOperation`.
 ///
@@ -137,8 +137,8 @@ pub enum DataDependentPaddingDiscipline {
     /// Ryft delegates padding the contraction positions with zeros to the bounded dynamic legalizer of XLA.
     XlaZeroPadded,
 
-    /// Ryft explicitly materializes bounded physical inputs with operation-specific padding values or masks and
-    /// restores dynamic output metadata after the physical computation.
+    /// Ryft pads inputs to their bounds with operation-specific values or masks and restores the runtime extents
+    /// after the operation.
     RyftMasked,
 
     /// Ryft lacks sufficient semantic or execution evidence to admit this operation safely.

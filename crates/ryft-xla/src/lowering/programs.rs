@@ -108,12 +108,12 @@ impl MlirProgram {
     }
 }
 
-/// Mapping from logical inputs and outputs to the corresponding slots of an XLA executable.
-/// Ryft retains every logical leaf in its staged and compiled function metadata. Statically shaped [`DataType::Zero`]
-/// leaves carry no runtime payload and are omitted from the StableHLO/PJRT signature, and each mapping stores an
-/// executable index for each materialized leaf and `None` for each erased leaf. Dynamically shaped [`DataType::Zero`]
-/// leaves deliberately retain private `i1` carriers because the current executable ABI has no independent shape
-/// transport. Current XLA compilation may impose stricter limits on dynamic tensors than this projection layer.
+/// Mapping from logical inputs and outputs to the corresponding slots of an XLA executable. Ryft retains every program
+/// input and output in its staged and compiled function metadata. Statically shaped [`DataType::Zero`] leaves carry no
+/// runtime payload and are omitted from the StableHLO/PJRT signature, and each mapping stores an executable index for
+/// each materialized leaf and `None` for each erased leaf. Dynamically shaped [`DataType::Zero`] leaves deliberately
+/// retain private `i1` carriers because the current executable ABI has no independent shape transport. Current XLA
+/// compilation may impose stricter limits on dynamic tensors than this projection layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MlirProgramSignature {
     /// Executable slot index for each flattened logical input, or `None` for an erased input.
@@ -533,7 +533,6 @@ impl MlirProgramSignature {
     }
 }
 
-// TODO(eaplatanios): Review this.
 /// A bounded dynamic input axis whose extent is carried by a hidden scalar executable input.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MlirProgramSignatureInputDimension {
@@ -547,28 +546,26 @@ pub struct MlirProgramSignatureInputDimension {
     executable_input_index: usize,
 }
 
-// TODO(eaplatanios): Review this.
 impl MlirProgramSignatureInputDimension {
     /// Returns the dynamic axis within the logical input.
     #[inline]
-    pub fn axis(self) -> usize {
+    pub fn axis(&self) -> usize {
         self.axis
     }
 
     /// Returns the logical flattened input containing this dynamic axis.
     #[inline]
-    pub fn logical_input_index(self) -> usize {
+    pub fn logical_input_index(&self) -> usize {
         self.logical_input_index
     }
 
     /// Returns the index of the executable input slot that carries the runtime extent.
     #[inline]
-    pub fn executable_input_index(self) -> usize {
+    pub fn executable_input_index(&self) -> usize {
         self.executable_input_index
     }
 }
 
-// TODO(eaplatanios): Review this.
 /// A bounded dynamic output axis whose extent is carried by a hidden scalar executable output.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MlirProgramSignatureOutputDimension {
@@ -582,23 +579,22 @@ pub struct MlirProgramSignatureOutputDimension {
     executable_output_index: usize,
 }
 
-// TODO(eaplatanios): Review this.
 impl MlirProgramSignatureOutputDimension {
     /// Returns the dynamic axis within the logical output.
     #[inline]
-    pub fn axis(self) -> usize {
+    pub fn axis(&self) -> usize {
         self.axis
     }
 
     /// Returns the logical flattened output containing this dynamic axis.
     #[inline]
-    pub fn logical_output_index(self) -> usize {
+    pub fn logical_output_index(&self) -> usize {
         self.logical_output_index
     }
 
     /// Returns the index of the executable output slot that carries the runtime extent.
     #[inline]
-    pub fn executable_output_index(self) -> usize {
+    pub fn executable_output_index(&self) -> usize {
         self.executable_output_index
     }
 }
@@ -952,10 +948,10 @@ pub struct ProgramLoweringOptions {
     /// Shardings of the outputs that replace those that the program and their global types give them.
     output_shardings: Option<Vec<Sharding>>,
 
-    /// Shardings of the logical inputs of the entry function that are attached as they are, in place of derived ones.
+    /// Shardings supplied directly for the program's entry inputs, including captures, in place of derived ones.
     exact_input_shardings: Option<EntryShardingOverride>,
 
-    /// Shardings of the outputs of the entry function that are attached as they are, in place of derived ones.
+    /// Shardings supplied directly for the program's entry outputs, in place of derived ones.
     exact_output_shardings: Option<EntryShardingOverride>,
 
     /// Whether the program is pruned and simplified before it is lowered.
@@ -1051,19 +1047,19 @@ impl ProgramLoweringOptions {
         self
     }
 
-    /// Returns these options with `input_shardings` attached to the logical inputs of the entry function as they are
-    /// (i.e., one optional sharding per logical input, with the hidden capture inputs first), in place of the shardings
-    /// that the default options derive. An input without a sharding is left unannotated.
+    /// Returns these options with `input_shardings` attached directly to the program's entry inputs, in place of the
+    /// shardings that the default options derive. Supply one optional sharding per input, with the hidden capture
+    /// inputs first. An input without a sharding is left unannotated.
     #[inline]
     pub fn with_exact_input_shardings(mut self, input_shardings: Vec<Option<Sharding>>) -> Self {
         self.exact_input_shardings = Some(EntryShardingOverride::Values(input_shardings));
         self
     }
 
-    /// Returns these options with `output_shardings` attached to the outputs of the entry function as they are (i.e.,
-    /// one optional sharding per output), in place of the shardings that the default options derive. An output without
-    /// a sharding is left unannotated. Outputs are closed over auto mesh axes by default. Use
-    /// [`Self::with_open_outputs`] to choose which annotated outputs to leave open.
+    /// Returns these options with `output_shardings` attached directly to the program's entry outputs, in place of the
+    /// shardings that the default options derive. Supply one optional sharding per output. An output without a sharding
+    /// is left unannotated. Outputs are closed over auto mesh axes by default. Use [`Self::with_open_outputs`] to
+    /// choose which annotated outputs to leave open.
     #[inline]
     pub fn with_exact_output_shardings(mut self, output_shardings: Vec<Option<Sharding>>) -> Self {
         self.exact_output_shardings = Some(EntryShardingOverride::Values(output_shardings));
@@ -1106,7 +1102,7 @@ impl ProgramLoweringOptions {
         self
     }
 
-    /// Returns these options with the logical external reference state aliases of a discharged program recorded on its
+    /// Returns these options with the external reference state aliases of a discharged program recorded on its
     /// entry boundary, and with the entry function exporting its ordered I/O token chain.
     ///
     /// `reference_bindings` are the external state recipes of the discharge artifact, and each must name a distinct

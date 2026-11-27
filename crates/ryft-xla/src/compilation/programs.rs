@@ -1,10 +1,10 @@
 //! Lowered and compiled program artifacts of the XLA [`Session`].
 //!
 //! Lowering a staged program produces a [`LoweredProgram`], which holds the StableHLO module, the effective PJRT
-//! compilation options, and the invocation contract that maps logical values to physical executable slots. Compiling
+//! compilation options, and the invocation contract that maps logical values to executable slots. Compiling
 //! it produces a [`CompiledProgram`], which retains the loaded PJRT executable together with the same invocation
-//! contract and a reusable execution plan. Both artifacts implement [`TypedProgram`] for their public logical
-//! signature, and replacement executables must preserve the complete invocation contract of the program they replace.
+//! contract and a reusable execution plan. Both artifacts expose the public program input and output types through
+//! [`TypedProgram`]. Replacement executables must preserve the complete invocation contract of the program they replace.
 
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
@@ -79,7 +79,7 @@ pub(super) struct ProgramLowering {
 }
 
 impl ProgramLowering {
-    /// Combines the lowered module with the logical and physical invocation contract that produced it.
+    /// Combines the lowered module with the logical metadata and executable signature that produced it.
     ///
     /// # Parameters
     ///
@@ -93,7 +93,7 @@ impl ProgramLowering {
     ///   - `donation_flags`: Donation declaration of each public input.
     ///   - `capture_count`: Number of leading inputs that are lowered captures.
     ///   - `session_constants`: Bindings of session constants to the arrays that execution passes as captures.
-    ///   - `expected_input_shardings`: Sharding that each physical input must have at the call boundary.
+    ///   - `expected_input_shardings`: Sharding that each executable array input must have at the call boundary.
     ///   - `output_shardings`: Declared sharding of each output.
     ///   - `open_outputs`: Whether the compiler chooses the placement of each output over auto mesh axes.
     ///   - `committed_outputs`: Whether executions commit each output whatever the commitment of their inputs.
@@ -152,13 +152,13 @@ impl ProgramLowering {
 
 /// Plans a pure, statically shaped eager output on a process that owns no device of its singleton mesh.
 pub(crate) struct RemoteEagerProgram {
-    /// Expected runtime sharding for every logical input, with `None` for unread inputs.
+    /// Expected runtime sharding for each program input, with `None` for unread inputs.
     input_shardings: Vec<Option<Sharding>>,
 
     /// Number of leading inputs sourced from session constants.
     capture_count: usize,
 
-    /// Output plans in logical output order, with no local buffer positions.
+    /// Output plans in program output order, with no local buffer positions.
     outputs: Vec<ArrayOutputPlan>,
 
     /// Whether each output's lowering commits it independently of its inputs.
@@ -183,11 +183,11 @@ impl RemoteEagerProgram {
             .iter()
             .zip(program.input_types.iter())
             .enumerate()
-            .map(|(index, (physical_index, input_type))| {
+            .map(|(index, (executable_index, input_type))| {
                 if signature.is_unread_input(index) {
                     return None;
                 }
-                Some(match physical_index {
+                Some(match executable_index {
                     Some(index) => program.expected_input_shardings[*index].clone(),
                     None => CallOperation::declared_input_sharding(input_type, program.mesh.logical_mesh()),
                 })
@@ -253,11 +253,11 @@ impl EagerDispatchProgram {
 /// StableHLO lowering and metadata of the call boundary produced before PJRT compilation.
 ///
 /// A [`Session`] lowers a staged program into this artifact with its effective compilation
-/// options and the mapping between logical values and physical executable slots. PJRT compilation produces a
+/// options and the mapping between logical values and executable slots. PJRT compilation produces a
 /// [`CompiledProgram`] retaining the same invocation contract.
 ///
-/// This flat artifact implements [`TypedProgram`] for its logical signature. Typed function handles in
-/// [`functions`](crate::compilation::functions) additionally retain the Rust input and output container structures.
+/// This flat artifact exposes the public program input and output types through [`TypedProgram`]. Typed function
+/// handles in [`functions`](crate::compilation::functions) also retain the Rust input and output container structures.
 /// Hidden final reference states remain in the internal metadata but are excluded from the public output types.
 #[derive(Clone, Debug)]
 pub struct LoweredProgram {
@@ -333,15 +333,15 @@ impl LoweredProgram {
         &self.lowering.stable_hlo
     }
 
-    /// Returns the effective public logical flat output types, including leaves of zero size erased from the
+    /// Returns the effective types of the flattened public outputs, including leaves of zero size erased from the
     /// executable ABI but excluding the hidden final state output suffix appended by reference discharge.
     #[inline]
     pub fn output_types(&self) -> &[ArrayType] {
         &self.lowering.invocation.output_types[..self.lowering.invocation.output_count]
     }
 
-    /// Returns every logical flat output type (i.e., the public outputs that [`Self::output_types`] returns followed by
-    /// the hidden final state outputs appended by reference discharge).
+    /// Returns the types of all flattened program outputs, with the public outputs from [`Self::output_types`]
+    /// followed by the hidden final state outputs appended by reference discharge.
     #[inline]
     pub(super) fn all_output_types(&self) -> &[ArrayType] {
         &self.lowering.invocation.output_types
@@ -371,7 +371,7 @@ impl LoweredProgram {
         &self.lowering.invocation.compilation_options
     }
 
-    /// Returns the default donation flag of each public logical input, excluding captures.
+    /// Returns the default donation flag of each public input.
     #[inline]
     pub fn donation_flags(&self) -> &[bool] {
         &self.lowering.invocation.donation_flags
@@ -395,25 +395,25 @@ impl LoweredProgram {
         &self.device_kinds
     }
 
-    /// Returns the mapping between the logical boundary of the program and the physical boundary of its executable.
+    /// Returns the mapping between the logical boundary of the program and the slots of its executable.
     pub(crate) fn signature(&self) -> &MlirProgramSignature {
         &self.lowering.invocation.signature
     }
 
-    /// Returns the number of leading logical outputs exposed through the structured public function output.
+    /// Returns the number of leading program outputs exposed through the structured public function output.
     #[inline]
     pub(super) fn output_count(&self) -> usize {
         self.lowering.invocation.output_count
     }
 
-    /// Returns the logical binding recipes of external reference states in canonical source order.  Flat input
+    /// Returns the binding recipes for external reference states in canonical source order. Flat input
     /// positions are derived from each binding's source and [`Self::capture_count`].
     #[inline]
     pub(super) fn reference_states(&self) -> &[ExternalReferenceBinding] {
         &self.lowering.invocation.reference_states
     }
 
-    /// Returns the effective logical input types, including captures first.
+    /// Returns the effective program input types, with captures first.
     #[inline]
     pub(super) fn input_types(&self) -> &[ArrayType] {
         &self.lowering.invocation.input_types
@@ -425,14 +425,14 @@ impl LoweredProgram {
         self.lowering.invocation.signature.requires_assertion_handler()
     }
 
-    /// Returns the number of leading logical inputs supplied by the staged capture table, followed by the hidden
+    /// Returns the number of leading program inputs supplied by the staged capture table, followed by the hidden
     /// inputs that carry [`Self::session_constants`].
     #[inline]
     pub(super) fn capture_count(&self) -> usize {
         self.lowering.invocation.capture_count
     }
 
-    /// Returns the effective sharding expected for every physical input, including materialized captures first.
+    /// Returns the effective sharding expected for every executable array input, including materialized captures first.
     #[inline]
     pub(super) fn expected_input_shardings(&self) -> &[Sharding] {
         &self.lowering.invocation.expected_input_shardings
@@ -447,14 +447,14 @@ impl LoweredProgram {
         &self.lowering.invocation.output_shardings
     }
 
-    /// Returns whether lowering left each logical output open over auto mesh axes, so that the compiler chooses its
+    /// Returns whether lowering left each program output open over auto mesh axes, so that the compiler chooses its
     /// placement over them, as JAX does for outputs without `out_shardings`.
     #[inline]
     pub(super) fn open_outputs(&self) -> &[bool] {
         self.lowering.invocation.open_outputs.as_deref().unwrap()
     }
 
-    /// Returns whether executions of this lowering commit each logical output to its devices whatever the commitment
+    /// Returns whether executions of this lowering commit each program output to its devices whatever the commitment
     /// of their inputs (refer to [`CompiledProgram::committed_outputs`]).
     #[inline]
     pub(super) fn committed_outputs(&self) -> &[bool] {
@@ -509,9 +509,9 @@ impl TypedProgram for LoweredProgram {
 
 /// Loaded PJRT executable plus the metadata required to invoke it safely.
 ///
-/// Compilation retains the [`LoweredProgram`]'s logical inputs, outputs, captures, reference bindings, and physical
-/// boundary mapping alongside a reusable execution plan. This flat artifact implements [`TypedProgram`] for its
-/// logical signature, excluding hidden final reference states from public output types. Typed function handles in
+/// Compilation retains the [`LoweredProgram`]'s input and output types, captures, reference bindings, and
+/// executable boundary mapping alongside a reusable execution plan. This flat artifact exposes the public program
+/// input and output types through [`TypedProgram`], excluding hidden final reference states. Typed function handles in
 /// [`functions`](crate::compilation::functions) retain the Rust container structures separately. Reused and
 /// replacement executables must preserve the complete invocation contract before execution.
 ///
@@ -600,11 +600,11 @@ impl CompiledProgram {
     ///   - `output_types`: Flat output types, including the hidden final reference states.
     ///   - `output_count`: Number of public outputs.
     ///   - `reference_states`: External reference states of the program.
-    ///   - `signature`: Mapping between the logical boundary and the physical inputs and outputs.
+    ///   - `signature`: Mapping between the logical boundary and the executable's input and output slots.
     ///   - `runtime_requirements`: Runtime contracts that executions of the program need.
     ///   - `donation_flags`: Donation declaration of each public input.
     ///   - `capture_count`: Number of leading inputs that are lowered captures.
-    ///   - `expected_input_shardings`: Sharding that each physical input must have at the call boundary.
+    ///   - `expected_input_shardings`: Sharding that each executable array input must have at the call boundary.
     ///   - `output_shardings`: Resolved sharding of each output.
     ///   - `committed_outputs`: Whether executions commit each output whatever the commitment of their inputs.
     ///   - `output_device_assignment`: Whether this invocation takes output assignment from the caller.
@@ -729,7 +729,7 @@ impl CompiledProgram {
         &self.invocation.input_types
     }
 
-    /// Returns the public logical flat output types in the order that users see, including reconstructed leaves of
+    /// Returns the types of the flattened public outputs in the order that users see, including reconstructed leaves of
     /// zero size but excluding the hidden final state output suffix appended by reference discharge.
     #[inline]
     pub fn output_types(&self) -> &[ArrayType] {
@@ -742,8 +742,8 @@ impl CompiledProgram {
         &self.invocation.mesh
     }
 
-    /// Returns every logical flat output type, i.e., the public outputs that [`Self::output_types`] returns followed by
-    /// the hidden final state outputs appended by reference discharge.
+    /// Returns the types of all flattened program outputs, with the public outputs from [`Self::output_types`]
+    /// followed by the hidden final state outputs appended by reference discharge.
     #[inline]
     pub(crate) fn all_output_types(&self) -> &[ArrayType] {
         &self.invocation.output_types
@@ -755,25 +755,25 @@ impl CompiledProgram {
         &self.invocation.reference_states
     }
 
-    /// Returns the mapping between the logical boundary of the program and the physical boundary of its executable.
+    /// Returns the mapping between the logical boundary of the program and the slots of its executable.
     #[inline]
     pub(crate) fn signature(&self) -> &MlirProgramSignature {
         &self.invocation.signature
     }
 
-    /// Returns the default donation flag of each public logical input, excluding captures.
+    /// Returns the default donation flag of each public input.
     #[inline]
     pub(crate) fn donation_flags(&self) -> &[bool] {
         &self.invocation.donation_flags
     }
 
-    /// Returns the number of leading logical inputs that captures supply.
+    /// Returns the number of leading program inputs that captures supply.
     #[inline]
     pub(crate) fn capture_count(&self) -> usize {
         self.invocation.capture_count
     }
 
-    /// Returns the sharding that the executable expects of each physical input, in physical input order.
+    /// Returns the expected sharding of each array input in executable order.
     #[inline]
     pub(crate) fn expected_input_shardings(&self) -> &[Sharding] {
         &self.invocation.expected_input_shardings
@@ -785,7 +785,7 @@ impl CompiledProgram {
         &self.invocation.output_shardings
     }
 
-    /// Returns whether executions of this program commit each logical output to its devices whatever the commitment of
+    /// Returns whether executions of this program commit each program output to its devices whatever the commitment of
     /// their inputs. This is the case for every public output of a lowering that requests a
     /// placement explicitly anywhere (i.e., through an input or output sharding override, or through a `place` with a
     /// target or a `constrain_sharding` in any region that it emits), as JAX commits the results of `jit` functions
@@ -855,7 +855,7 @@ impl CompiledProgram {
                     == canonical_boundary_types(inputs, outputs))
     }
 
-    /// Returns the number of leading logical outputs exposed through the structured public output.
+    /// Returns the number of leading program outputs exposed through the structured public output.
     #[inline]
     pub(super) fn output_count(&self) -> usize {
         self.invocation.output_count
@@ -940,21 +940,21 @@ pub(super) struct InvocationMetadata {
     /// Effective PJRT compilation options, including SPMD partition count.
     compilation_options: CompilationOptions,
 
-    /// Effective logical output types after applying output sharding overrides.
+    /// Effective program output types after applying output sharding overrides.
     output_types: Arc<[ArrayType]>,
 
-    /// Number of leading logical outputs exposed through the structured public function output.
+    /// Number of leading program outputs exposed through the structured public function output.
     output_count: usize,
 
-    /// Logical binding recipes of external reference states in canonical source order.
+    /// Binding recipes for external reference states in canonical source order.
     ///
     /// Flat input positions are derived from each binding's source and [`LoweredProgram::capture_count`].
     reference_states: Arc<[ExternalReferenceBinding]>,
 
-    /// Effective logical input types, including captures first.
+    /// Effective program input types, with captures first.
     input_types: Arc<[ArrayType]>,
 
-    /// Mapping from the logical boundary to the physical StableHLO and PJRT boundary.
+    /// Mapping from the logical boundary to the executable boundary shared by StableHLO and PJRT.
     signature: MlirProgramSignature,
 
     /// Canonical runtime contracts resolved against the invoking session.
@@ -963,10 +963,10 @@ pub(super) struct InvocationMetadata {
     /// Donation declarations for public inputs. Captures are never donatable.
     donation_flags: Arc<[bool]>,
 
-    /// Number of leading logical inputs supplied by the staged capture table and [`LoweredProgram::session_constants`].
+    /// Number of leading program inputs supplied by the staged capture table and [`LoweredProgram::session_constants`].
     capture_count: usize,
 
-    /// Effective sharding expected for every physical input, including materialized captures first.
+    /// Effective sharding expected for every executable array input, including materialized captures first.
     expected_input_shardings: Arc<[Sharding]>,
 
     /// Runtime placement of every logical output over all mesh axes, including the auto mesh axes that output types
@@ -975,11 +975,11 @@ pub(super) struct InvocationMetadata {
     /// resolves its placement over auto mesh axes from the executable.
     output_shardings: Arc<[Sharding]>,
 
-    /// Whether lowering left each logical output open over auto mesh axes, so that the compiler chooses its placement
+    /// Whether lowering left each program output open over auto mesh axes, so that the compiler chooses its placement
     /// over them, as JAX does for outputs without `out_shardings`. Compiled programs have `None` here.
     open_outputs: Option<Arc<[bool]>>,
 
-    /// Whether executions commit each logical output to its devices whatever the commitment of their inputs (refer to
+    /// Whether executions commit each program output to its devices whatever the commitment of their inputs (refer to
     /// [`CompiledProgram::committed_outputs`]).
     committed_outputs: Arc<[bool]>,
 

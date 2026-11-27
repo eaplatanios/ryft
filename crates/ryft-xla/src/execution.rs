@@ -1790,7 +1790,7 @@ impl Session {
             .iter()
             .filter(|dimension| logical_indices.contains(&dimension.logical_output_index()))
         {
-            let physical_output_index = output_dimension.physical_output_index();
+            let physical_output_index = output_dimension.executable_output_index();
             let physical_output =
                 physical_outputs.get_mut(physical_output_index).and_then(Option::take).ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(

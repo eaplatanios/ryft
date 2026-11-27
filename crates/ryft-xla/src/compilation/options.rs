@@ -148,7 +148,7 @@ pub struct Options {
     /// Optional override for the shardings of the inputs. An override may place an input over auto mesh axes, which
     /// the staged input type does not record (refer to
     /// [`ArrayType::with_sharding`](ryft_core::ArrayType::with_sharding)). The type carries the override without its
-    /// auto mesh axes, and the physical input is placed as the override requests.
+    /// auto mesh axes, and the executable input is placed as the override requests.
     input_shardings: Option<Vec<Sharding>>,
 
     /// Optional override for the shardings of the outputs. Like [`Self::input_shardings`], an override may place an
@@ -158,7 +158,7 @@ pub struct Options {
     /// Runtime placements of the flat public inputs of one executable specialization, which retained dispatch derives
     /// from the concrete input arrays (refer to
     /// [`CompilationDomain::dispatch_signature`](ryft_core::CompilationDomain::dispatch_signature)).
-    /// They place the physical input of each input without an override over the auto mesh axes that input types
+    /// They place the executable input of each input without an override over the auto mesh axes that input types
     /// never record, like JAX compiles for the shardings of committed input arrays. Entries of inputs that are not
     /// arrays are [`None`].
     input_placements: Option<Arc<[Option<Sharding>]>>,
@@ -314,7 +314,7 @@ impl Options {
     }
 
     /// Records which flat public inputs the program never reads, one flag for each public input. Such an input with a
-    /// static shape has no physical input, like a capture that no emitted region reads (refer to
+    /// static shape has no executable input, like a capture that no emitted region reads (refer to
     /// `emitted_capture_reads`). The program of an eager call states its inputs that are captures which the callee
     /// never reads, so that the call requires of them what an execution of the callee requires, which is nothing.
     #[inline]
@@ -346,7 +346,7 @@ impl Options {
     /// Returns the optional override for the shardings of the inputs. An override may place an input over auto mesh
     /// axes, which the staged input type does not record (refer to
     /// [`ArrayType::with_sharding`](ryft_core::ArrayType::with_sharding)). The type carries the override without its
-    /// auto mesh axes, and the physical input is placed as the override requests.
+    /// auto mesh axes, and the executable input is placed as the override requests.
     #[inline]
     pub fn input_shardings(&self) -> Option<&[Sharding]> {
         self.input_shardings.as_deref()
@@ -362,7 +362,7 @@ impl Options {
     /// Returns the runtime placements of the flat public inputs of one executable specialization, which retained
     /// dispatch derives from the concrete input arrays (refer to
     /// [`CompilationDomain::dispatch_signature`](ryft_core::CompilationDomain::dispatch_signature)). They place the
-    /// physical input of each input without an override over the auto mesh axes that input types never record, like
+    /// executable input of each input without an override over the auto mesh axes that input types never record, like
     /// JAX compiles for the shardings of committed input arrays. Entries of inputs that are not arrays are [`None`].
     #[inline]
     pub(crate) fn input_placements(&self) -> Option<&[Option<Sharding>]> {
@@ -376,7 +376,7 @@ impl Options {
         self.capture_placements.as_deref()
     }
 
-    /// Returns, for each flat public input, whether the program never reads it, so that it has no physical input
+    /// Returns, for each flat public input, whether the program never reads it, so that it has no executable input
     /// (refer to [`Self::with_unread_inputs`]). `None` states that the program reads every public input.
     #[inline]
     pub(crate) fn unread_inputs(&self) -> Option<&[bool]> {

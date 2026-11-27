@@ -3,7 +3,7 @@
 //! `CompiledProgram::serialize` writes a versioned envelope that consists of a fixed magic header, the little-endian
 //! length of a JSON metadata record, that record, and the serialized PJRT executable bytes. The metadata records
 //! everything that executions need besides the native executable (i.e., the logical signature with its shared dynamic
-//! dimension variables, the mapping between logical values and physical executable slots, external reference states,
+//! dimension variables, the mapping between logical values and executable slots, external reference states,
 //! effects, runtime requirements, shardings, the device mesh and assignment, and the identity of the target and the
 //! compiler) in stable explicit encodings rather than Rust enum discriminants.
 //!
@@ -12,8 +12,8 @@
 //! callers can recompile, while malformed metadata of a supported schema is an error. Persistent cache directories
 //! must be trusted sources of executable code.
 //!
-//! `PersistentArraySignature::into_canonical` also provides the representation of logical boundary types that
-//! compilation keys use, which omits the diagnostic names of dimension variables.
+//! `PersistentArraySignature::into_canonical` also provides the representation of program input and output types
+//! that compilation keys use, which omits the diagnostic names of dimension variables.
 
 use std::time::Duration;
 
@@ -39,7 +39,7 @@ use crate::{Error, RuntimeRequirement, Session, normalize_runtime_requirements};
 /// Fixed header identifying the executable envelope.
 const PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXL01";
 
-/// Metadata schema emitted by executable serialization. Version 2 added the commitment of every logical output, and
+/// Metadata schema emitted by executable serialization. Version 2 added the commitment of each program output, and
 /// version 3 stopped committing the outputs of a lowering that captures a committed array, so that executables of
 /// older versions, which can record that commitment, are not restored.
 const PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 3;
@@ -47,7 +47,7 @@ const PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 3;
 /// Required features for reference states, dynamic extents, effects, and runtime contracts.
 const PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 15;
 
-/// Persisted binding recipe for one logical reference state.
+/// Persisted binding recipe for one program reference state.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct PersistentReferenceState {
     /// Source of the external reference among the captures or the public inputs.
@@ -56,14 +56,14 @@ pub(super) struct PersistentReferenceState {
     /// Redundant flat position retained solely for corruption detection.
     logical_input_index: u64,
 
-    /// Hidden logical output containing the final state, or `None` for a read-only reference.
+    /// Hidden program output containing the final state, or `None` for a read-only reference.
     logical_output_index: Option<u64>,
 }
 
 impl PersistentReferenceState {
-    /// Encodes logical reference state slots in their stable shape without runtime reference handles.
+    /// Encodes program reference state bindings in their stable format without runtime reference handles.
     ///
-    /// The record redundantly stores each flat logical input position. Deriving that coordinate from the canonical
+    /// The record redundantly stores each flattened program input position. Deriving it from the canonical
     /// source keeps valid serialized bytes unchanged without reintroducing the redundant field into
     /// [`ExternalReferenceBinding`].
     pub(super) fn encode(states: &[ExternalReferenceBinding], capture_count: usize) -> Result<Vec<Self>, Error> {
@@ -84,8 +84,8 @@ impl PersistentReferenceState {
             .collect()
     }
 
-    /// Decodes logical reference state slots without runtime reference handles and validates the redundant flat input
-    /// coordinate.
+    /// Decodes program reference state bindings without runtime reference handles and validates the redundant flat
+    /// input position.
     fn decode(states: Vec<Self>, capture_count: usize) -> Result<Vec<ExternalReferenceBinding>, Error> {
         states
             .into_iter()
@@ -137,7 +137,7 @@ impl PersistentReferenceState {
     }
 }
 
-/// Persisted mapping from a logical axis to a hidden physical slot for one bounded dynamic dimension.
+/// Persisted mapping from a logical axis to a hidden executable slot for one bounded dynamic dimension.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct PersistentBoundaryDimension {
     /// Logical flattened input or output index containing the dynamic axis.
@@ -146,8 +146,9 @@ pub(super) struct PersistentBoundaryDimension {
     /// Axis within the logical array.
     axis: u64,
 
-    /// Hidden physical input or output index carrying the runtime extent.
-    physical_index: u64,
+    /// Executable index of the hidden input or output carrying the runtime extent.
+    #[serde(rename = "physical_index")]
+    executable_index: u64,
 }
 
 impl PersistentBoundaryDimension {
@@ -159,7 +160,7 @@ impl PersistentBoundaryDimension {
             .map(|dimension| Self {
                 logical_index: dimension.logical_input_index() as u64,
                 axis: dimension.axis() as u64,
-                physical_index: dimension.physical_input_index() as u64,
+                executable_index: dimension.executable_input_index() as u64,
             })
             .collect()
     }
@@ -172,23 +173,23 @@ impl PersistentBoundaryDimension {
             .map(|dimension| Self {
                 logical_index: dimension.logical_output_index() as u64,
                 axis: dimension.axis() as u64,
-                physical_index: dimension.physical_output_index() as u64,
+                executable_index: dimension.executable_output_index() as u64,
             })
             .collect()
     }
 }
 
-/// Logical boundary types with a shared table of dimension variables. Decoding recreates each variable once and
-/// preserves its diagnostic name.
+/// Program input and output types with a shared table of dimension variables. Decoding recreates each variable once
+/// and preserves its diagnostic name.
 #[derive(Serialize, Deserialize)]
 pub(super) struct PersistentArraySignature {
     /// Shared dynamic variables numbered by first occurrence across inputs and outputs.
     variables: Vec<PersistentDimensionVariable>,
 
-    /// Logical input array types, including captures.
+    /// Program input array types, including captures.
     input_types: Vec<PersistentArrayType>,
 
-    /// Logical output array types, including hidden final reference states.
+    /// Program output array types, including hidden final reference states.
     output_types: Vec<PersistentArrayType>,
 }
 
@@ -325,17 +326,17 @@ impl PersistentArraySignature {
     }
 }
 
-/// Cache identity for logical boundary types. Variable names are omitted and variables are numbered by first
-/// occurrence, preserving their sharing and bounds.
+/// Cache identity for program input and output types. Variable names are omitted and variables are numbered by
+/// first occurrence, preserving their sharing and bounds.
 #[derive(Serialize)]
 pub(super) struct PersistentCanonicalArraySignature {
     /// Shared dynamic variables numbered by first occurrence across inputs and outputs.
     variables: Vec<PersistentCanonicalDimensionVariable>,
 
-    /// Logical input array types, including captures.
+    /// Program input array types, including captures.
     input_types: Vec<PersistentArrayType>,
 
-    /// Logical output array types, including hidden final reference states.
+    /// Program output array types, including hidden final reference states.
     output_types: Vec<PersistentArrayType>,
 }
 
@@ -473,7 +474,7 @@ pub(super) fn persistent_mapping(mapping: &[Option<usize>]) -> Result<Vec<Option
                 .map(|index| {
                     u64::try_from(index).map_err(|_| {
                         Error::Compilation(CompilationError::InvalidPersistentExecutable {
-                            reason: format!("physical signature index {index} does not fit in `u64`"),
+                            reason: format!("executable signature index {index} does not fit in `u64`"),
                         })
                     })
                 })
@@ -556,7 +557,7 @@ impl Session {
     /// Validates and loads a versioned executable envelope for this session. Unsupported schemas, target
     /// configurations, or PJRT loading return `None`. Malformed supported metadata returns an error.
     ///
-    /// The envelope, target, runtime contracts, and signature mapping logical values to physical executable slots are
+    /// The envelope, target, runtime contracts, and signature mapping logical values to executable slots are
     /// validated before loading the native PJRT executable bytes. Persistent cache directories must be trusted sources
     /// of executable code.
     pub(crate) fn deserialize_compiled_program(&self, bytes: &[u8]) -> Result<Option<CompiledProgram>, Error> {
@@ -809,20 +810,20 @@ impl Session {
                 reason: "output commitment metadata does not match the output count".into(),
             }));
         }
-        let physical_input_count = signature.input_array_count();
-        if expected_input_shardings.len() != physical_input_count {
+        let executable_array_input_count = signature.input_array_count();
+        if expected_input_shardings.len() != executable_array_input_count {
             return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
-                reason: "expected input shardings do not match the physical input count".into(),
+                reason: "expected input shardings do not match the executable array input count".into(),
             }));
         }
         for (state, &expected_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
-            let physical_input = signature.input_mapping()[expected_input_index].ok_or_else(|| {
+            let executable_input_index = signature.input_mapping()[expected_input_index].ok_or_else(|| {
                 Error::Compilation(CompilationError::InvalidPersistentExecutable {
                     reason: "reference-state input is erased from the executable boundary".into(),
                 })
             })?;
             let input_type = &input_types[expected_input_index];
-            let expected_sharding = &expected_input_shardings[physical_input];
+            let expected_sharding = &expected_input_shardings[executable_input_index];
             if input_type.static_shape().is_none() && !expected_sharding.is_replicated() {
                 return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
                     reason: format!(
@@ -895,14 +896,14 @@ impl Session {
             Some(&compilation_options),
             &LoadOptions::default(),
         )?;
-        let output_types_physical = executable.executable()?.output_element_types()?;
-        if output_types_physical.len() != signature.executable_output_count()
+        let output_element_types = executable.executable()?.output_element_types()?;
+        if output_element_types.len() != signature.executable_output_count()
             || signature
                 .ordered_io_output_index()
-                .is_some_and(|index| output_types_physical[index] != BufferType::Token)
+                .is_some_and(|index| output_element_types[index] != BufferType::Token)
         {
             return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
-                reason: "effect signature does not match executable physical outputs".into(),
+                reason: "effect signature does not match executable outputs".into(),
             }));
         }
         let device_assignment = executable.device_assignment()?;
@@ -966,7 +967,7 @@ struct PersistentExecutableMetadata {
     /// Logical array types with shared dynamic dimension variables.
     signature: PersistentArraySignature,
 
-    /// Physical input position for each logical input, or `None` for erased arrays.
+    /// Executable input slot for each logical input, or `None` for erased arrays.
     input_mapping: Vec<Option<u64>>,
 
     /// Whether each logical input is erased because the executable never reads it, or empty when every input is read,
@@ -974,16 +975,16 @@ struct PersistentExecutableMetadata {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     unread_inputs: Vec<bool>,
 
-    /// Physical output position for each logical output, or `None` for erased arrays.
+    /// Executable output slot for each logical output, or `None` for erased arrays.
     output_mapping: Vec<Option<u64>>,
 
-    /// Physical extent inputs for bounded dynamic input dimensions.
+    /// Hidden extent inputs for bounded dynamic input dimensions.
     input_dimensions: Vec<PersistentBoundaryDimension>,
 
-    /// Physical extent outputs for bounded dynamic output dimensions.
+    /// Hidden extent outputs for bounded dynamic output dimensions.
     output_dimensions: Vec<PersistentBoundaryDimension>,
 
-    /// Number of leading logical outputs in the public outputs.
+    /// Number of leading program outputs exposed in the public result.
     output_count: u64,
 
     /// External reference binding recipes without live reference handles.
@@ -1007,19 +1008,19 @@ struct PersistentExecutableMetadata {
     /// Version of the hidden effect calling convention.
     effect_abi_version: u32,
 
-    /// Donation flags for public logical inputs, excluding captures.
+    /// Donation flags for public inputs.
     donation_flags: Vec<bool>,
 
-    /// Number of leading logical inputs supplied by captures.
+    /// Number of leading program inputs supplied by captures.
     capture_count: u64,
 
-    /// Shardings of all physical inputs in physical input order.
+    /// Array input shardings in executable order.
     expected_input_shardings: Vec<PersistentSharding>,
 
     /// Runtime placements of all logical outputs, including the auto mesh axes that output types never record.
     output_shardings: Vec<PersistentSharding>,
 
-    /// Whether executions commit each logical output whatever the commitment of their inputs. Envelopes of earlier
+    /// Whether executions commit each program output whatever the commitment of their inputs. Envelopes of earlier
     /// schemas do not record it, so it defaults to empty, which lets them decode and be rejected by their version.
     #[serde(default)]
     committed_outputs: Vec<bool>,
@@ -1062,7 +1063,7 @@ struct PersistentExecutableMetadata {
     compilation_duration_nanoseconds: Option<u64>,
 }
 
-/// Persisted source descriptor for one logical external reference state. It contains no runtime reference handle.
+/// Persisted source descriptor for one external reference state of a program. It contains no runtime reference handle.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum PersistentReferenceSource {
@@ -2094,7 +2095,7 @@ mod tests {
                 if reason == "reference-state metadata has an invalid output count",
         ));
 
-        // Dropping one expected input sharding leaves the persisted list shorter than the physical boundary, so
+        // Dropping one expected sharding leaves the persisted list shorter than the executable's array input list, so
         // no reference state input could be checked against its own expected sharding.
         let mut truncated_expected_shardings = decode_envelope(&bytes).0;
         assert_eq!(truncated_expected_shardings.expected_input_shardings.len(), 2);
@@ -2103,7 +2104,7 @@ mod tests {
         assert!(matches!(
             session.deserialize_compiled_program(corrupted.as_slice()),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
-                if reason == "expected input shardings do not match the physical input count",
+                if reason == "expected input shardings do not match the executable array input count",
         ));
 
         let mut reordered = decode_envelope(&bytes).0;
@@ -2441,7 +2442,7 @@ mod tests {
         assert!(matches!(
             session.deserialize_compiled_program(&corrupted),
             Err(Error::Compilation(CompilationError::InvalidPersistentExecutable { reason }))
-                if reason == "effect signature does not match executable physical outputs",
+                if reason == "effect signature does not match executable outputs",
         ));
     }
 

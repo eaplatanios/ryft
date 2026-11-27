@@ -47,7 +47,7 @@ pub(super) static COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
 ///
 /// Exact dispatch preserves nominal [`DimensionVariable`] identity and shares its type slice with the effective staged
 /// signature, so keying a call costs no deep type clone. Dispatch with [`InputBoundBucketing`] instead uses a
-/// structural signature over physical bounds with dimension variables numbered by first occurrence, so calls routed to
+/// structural signature over allocation bounds, numbering dimension variables by first occurrence. Calls routed to
 /// the same bucket share one staged and compiled specialization. Bucketed keys exclude diagnostic names, which survive
 /// only in the effective staged types.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -141,7 +141,7 @@ impl LoweredProgram {
 ///
 /// The key must capture everything that the eager lowering reads besides the session itself, whose client, and thus
 /// [`Target`](crate::Target), is fixed. That is the operation including all of its attributes, the contents of every
-/// attached region (e.g., of `condition`, `while`, `scan`, `call`, or `shard_map` operations), the physical type of
+/// attached region (e.g., of `condition`, `while`, `scan`, `call`, or `shard_map` operations), the runtime type of
 /// every array input including its sharding, the extent of every dimension input, because eager binding bakes dimension
 /// inputs into the traced program as constants, and the device mesh that the lowering compiles against. The default
 /// compilation options of the session are immutable, so they are not part of the key. Attached regions are keyed by
@@ -186,7 +186,7 @@ impl EagerDispatchKey {
 /// One input of an [`EagerDispatchKey`].
 #[derive(Clone)]
 pub(crate) enum EagerDispatchInput {
-    /// Array input, keyed by its physical [`ArrayType`], including its sharding, and by its runtime placement, which
+    /// Array input, keyed by its runtime [`ArrayType`], including its sharding, and by its runtime placement, which
     /// also covers the auto mesh axes that its type never records.
     Array(ArrayType, Sharding),
 
@@ -197,7 +197,7 @@ pub(crate) enum EagerDispatchInput {
 /// Borrowed form of one [`EagerDispatchInput`], which owned keys and borrowed queries compare and hash alike.
 #[derive(PartialEq, Eq, Hash)]
 pub(crate) enum EagerDispatchInputRef<'o> {
-    /// Array input, keyed by its physical [`ArrayType`], including its sharding, and by its runtime placement.
+    /// Array input, keyed by its runtime [`ArrayType`], including its sharding, and by its runtime placement.
     Array(Cow<'o, ArrayType>, &'o Sharding),
 
     /// Dimension input, keyed by its extent, which is how [`DimensionValue`]s compare.
@@ -485,7 +485,7 @@ struct PersistentKey<'o> {
     /// Logical array types with shared dynamic dimension variables.
     signature: PersistentCanonicalArraySignature,
 
-    /// Physical input position for each logical input, or `None` for erased arrays.
+    /// Executable input slot for each logical input, or `None` for erased arrays.
     input_mapping: Vec<Option<u64>>,
 
     /// Whether each logical input is erased because the executable never reads it, or empty when every input is read,
@@ -494,16 +494,16 @@ struct PersistentKey<'o> {
     #[serde(skip_serializing_if = "<[bool]>::is_empty")]
     unread_inputs: &'o [bool],
 
-    /// Physical output position for each logical output, or `None` for erased arrays.
+    /// Executable output slot for each logical output, or `None` for erased arrays.
     output_mapping: Vec<Option<u64>>,
 
-    /// Physical extent inputs for bounded dynamic input dimensions.
+    /// Hidden extent inputs for bounded dynamic input dimensions.
     input_dimensions: Vec<PersistentBoundaryDimension>,
 
-    /// Physical extent outputs for bounded dynamic output dimensions.
+    /// Hidden extent outputs for bounded dynamic output dimensions.
     output_dimensions: Vec<PersistentBoundaryDimension>,
 
-    /// Number of leading logical outputs in the public outputs.
+    /// Number of leading program outputs exposed in the public result.
     output_count: u64,
 
     /// External reference binding recipes without live reference handles.
@@ -527,21 +527,21 @@ struct PersistentKey<'o> {
     /// Version of the hidden effect calling convention.
     effect_abi_version: u32,
 
-    /// Donation flags for public logical inputs, excluding captures.
+    /// Donation flags for public inputs.
     donation_flags: &'o [bool],
 
-    /// Number of leading logical inputs supplied by captures.
+    /// Number of leading program inputs supplied by captures.
     capture_count: u64,
 
-    /// Shardings of all physical inputs in physical input order.
+    /// Array input shardings in executable order.
     expected_input_shardings: Vec<PersistentSharding>,
 
     /// Runtime placements of all logical outputs, including the auto mesh axes that output types never record.
     output_shardings: Vec<PersistentSharding>,
 
-    /// Whether executions commit each logical output whatever the commitment of their inputs, which lowerings of the
-    /// same module can differ in (e.g., the identity and a placement onto the memory that a device array is already
-    /// in, which lowers to nothing but commits the output).
+    /// Whether executions commit each program output whatever the commitment of their inputs. Lowerings of the same
+    /// module can differ here. For example, placing an array in memory it already occupies lowers to the same module
+    /// as the identity but commits the output.
     committed_outputs: &'o [bool],
 
     /// Concrete compilation and execution mesh.

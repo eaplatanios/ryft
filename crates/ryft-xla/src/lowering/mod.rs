@@ -86,7 +86,7 @@ pub enum LoweringError {
     #[error("unresolved state in `{construct}` must be discharged before XLA lowering")]
     UnresolvedState { construct: String },
 
-    /// The logical reference-state metadata cannot produce a valid physical executable alias.
+    /// The logical reference-state metadata cannot produce a valid executable buffer alias.
     #[error("invalid XLA reference-state ABI: {message}")]
     InvalidReferenceStateAbi { message: String },
 
@@ -186,8 +186,8 @@ pub(crate) mod types;
 
 pub use admission::DataDependentPaddingDiscipline;
 pub use programs::{
-    EntryShardingOverride, MlirProgramSignatureInputDimension, MlirProgram, MlirProgramSignature, MlirProgramSignatureOutputDimension,
-    ProgramLoweringExtension, ProgramLoweringOptions,
+    EntryShardingOverride, MlirProgram, MlirProgramSignature, MlirProgramSignatureInputDimension,
+    MlirProgramSignatureOutputDimension, ProgramLoweringExtension, ProgramLoweringOptions,
 };
 pub use sharding::{
     LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension, UnreducedKindExtension,
@@ -437,7 +437,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     }
 
     /// Declares `mesh` as the mesh that this emitted operation refers to (e.g., through the Shardy attribute of a
-    /// [`Sharding`](ryft_core::Sharding) that it lowers with [`ShardingExtension`]).
+    /// [`Sharding`] that it lowers with [`ShardingExtension`]).
     ///
     /// A module declares one mesh, under [`SHARDY_MESH_SYMBOL_NAME`], which every nested lowering scope shares, and it
     /// declares that mesh only when an emitted operation refers to it. An operation that lowers a sharding itself must
@@ -1432,7 +1432,7 @@ pub(crate) mod tests {
         DimensionVariable::new(name, DimensionBounds::non_negative(exclusive_upper_bound).unwrap()).into()
     }
 
-    /// One physical value of the mixed executable ABI used by the reshape execution tests. It is either `f64` or `i32`
+    /// One buffer of the mixed-type executable ABI used by the reshape execution tests. It is either `f64` or `i32`
     /// array storage, with its physical dimensions on input and the row-major elements inside its logical dimensions on
     /// output, or one `i64` dimension, which on output also carries the hidden runtime extents that follow the logical
     /// outputs.
@@ -2095,7 +2095,7 @@ pub(crate) mod tests {
         let attribute = empty.to_dense_elements_attribute(tensor_type, &context).unwrap();
         assert_eq!(attribute.elements_count(), 0);
 
-        // Zero literals use the established false i1 physical carrier without introducing logical payload bytes.
+        // Zero literals use the established false `i1` carrier without introducing logical payload bytes.
         let tensor_type = context
             .tensor_type(context.signless_integer_type(1), &[MlirSize::Static(2)], None, location)
             .unwrap();

@@ -212,8 +212,8 @@ pub(crate) fn unread_call_captures<O: LowerableOperationFamily>(
 
 /// Returns, for each logical input of the entry function of `program`, whose types are `logical_input_types` and whose
 /// first `capture_count` inputs are captures that end with the inputs of its `session_count` session constants, whether
-/// the executable has no physical input for it because nothing reads it. That is a capture that no region which
-/// lowering emits for `target_platform` reads (refer to [`emitted_capture_reads`]) and a public input that
+/// its executable slot is omitted because nothing reads it. This covers captures unread by any region emitted for
+/// `target_platform` (refer to [`emitted_capture_reads`]) and public inputs that
 /// `unread_inputs` flags, which the caller states because it cannot be read from `program` (refer to
 /// `Options::with_unread_inputs`), of a static shape and backing no reference state (i.e., not at one of
 /// `reference_state_inputs`). This is the one liveness decision of an executable boundary: the admission and the
@@ -253,12 +253,11 @@ where
 /// Returns the distinct [`RetainedArray`]s that `program` references in the regions that lowering emits for
 /// `target_platform` (i.e., its entry region and the executed nested regions of that region, refer to
 /// `emitted_regions`), in the order of their first occurrence in those regions. Lowering passes their arrays as hidden
-/// entry inputs that follow the lifted captures, in this order, and so the caller that assembles the physical inputs of
-/// the executable must use the same order and the same target as that lowering. Regions that lowering never reaches
-/// (e.g., the rule regions of composites, the transpose region of a `linear_call`, or a body that the implementation of
-/// a named composite replaces for the target) are skipped, so that an array that only they refer to does not become a
-/// physical input of the executable. So is an array that the emitted regions only pass on to calls as captures which
-/// their callees never read (refer to [`partition_session_constants`]).
+/// entry inputs after the lifted captures. The caller assembles executable inputs in that order and for the same
+/// target. Regions that lowering never reaches (e.g., the rule regions of composites, the transpose region of a
+/// `linear_call`, or a named composite body replaced for the target) are skipped, and their arrays get no slot unless
+/// an emitted region reads them. Arrays passed only as unread captures also get no slot (refer to
+/// [`partition_session_constants`]).
 pub(crate) fn collect_session_constants<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
     target_platform: Option<&str>,
@@ -274,8 +273,8 @@ where
 /// reference, in the order of their first occurrence in those regions, split into the session constants of the program
 /// (refer to [`collect_session_constants`]) and the arrays that those regions only pass on to calls as captures which
 /// their callees never read (refer to [`visit_emitted_reads`]). The latter require nothing of an execution, so they
-/// have no physical input, and lowering binds each of them to a value that requires no buffer (i.e., the value with
-/// which the entry function binds an erased input), which the calls receive in its place.
+/// have no input slot. Lowering binds them to the same bufferless value the entry function uses for erased inputs,
+/// and passes that value to the calls.
 pub(crate) fn partition_session_constants<O: LowerableOperationFamily>(
     entry: RegionRef<'_, Constant, O>,
     target_platform: Option<&str>,

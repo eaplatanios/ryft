@@ -71,7 +71,7 @@
 //!     [`ExecutableFunction::execute`] and [`CompiledFunctionDispatcher::execute`] run a retained executable
 //!     on the devices it was compiled for. Both fixed execution and a device-pinned call require committed public
 //!     inputs on the same ordered physical devices. Captures and uncommitted inputs can move to those devices.
-//!     See [`CallOperation`](ryft_core::CallOperation).
+//!     See [`CallOperation`].
 //!   - A staging parent (e.g., the trace of an enclosing [`compile`] or [`stage`]) records the call, and the enclosing
 //!     program lowers it as part of its own computation.
 //!   - Batching, differentiation, and partial evaluation parents rewrite the call through the ordinary rules of the
@@ -1051,7 +1051,7 @@ where
     /// whole invocation, including for a function with no array outputs. Await the returned [`Execution`] to observe
     /// asynchronous execution failures.
     ///
-    /// Erased inputs of zero size await producer completion before submission because no physical input buffer can
+    /// Erased inputs of zero size await producer completion before submission because no executable input buffer can
     /// carry their dependency. Input preparation and output reconstruction for bounded dynamic shapes can also wait
     /// for transfers.
     ///
@@ -1810,7 +1810,7 @@ where
 /// Same as [`compile`] but makes runtime arrays explicit captures of the compiled program.
 ///
 /// The closure receives capture tracers first and ordinary input tracers second. Captures are compiled as hidden
-/// physical inputs and are supplied from the returned [`CompiledFunction`] at execution time, so callers of the
+/// executable inputs and are supplied from the returned [`CompiledFunction`] at execution time, so callers of the
 /// compiled function still pass only `In` inputs.
 #[track_caller]
 pub fn compile_with_captures<F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(

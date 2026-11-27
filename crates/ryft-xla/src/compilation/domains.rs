@@ -1,8 +1,8 @@
 //! Compilation lifecycle of the XLA [`Session`], which implements [`CompilationDomain`] and [`CompilationCacheDomain`].
 //!
 //! `Session::lower_staged_program` validates the boundary of a staged program against the sharding overrides of its
-//! [`Options`]. `Session::lower_program` then selects kernels, discharges references, places every physical input
-//! and output, and emits the StableHLO module together with its invocation contract. `Session::compile_program`
+//! [`Options`]. `Session::lower_program` then selects kernels, discharges references, places the executable's array
+//! inputs and outputs, and emits the StableHLO module with its invocation contract. `Session::compile_program`
 //! compiles that module through the PJRT client of the session and derives the reusable execution plan.
 //! [`with_input_shardings`] applies input sharding overrides to input types before staging.
 
@@ -224,7 +224,7 @@ impl Session {
         Ok(lowered_program)
     }
 
-    /// Lowers a staged program to StableHLO and derives its complete logical and physical invocation contract for this
+    /// Lowers a staged program to StableHLO and derives its complete logical metadata and executable signature for this
     /// session. A mesh that assigns a device to another process than the one that owns it, or that assigns to this
     /// process a device that it cannot address, is rejected first, as a direct placement and a placement of a capture
     /// reject it (refer to `validate_mesh_devices`), before anything is lowered, compiled, or looked up in a
@@ -571,13 +571,13 @@ impl Session {
         let program_output_types = program.output_types();
         let mut public_output_types = program_output_types[..output_count].to_vec();
         apply_signature_shardings(public_output_types.iter_mut(), options.output_shardings(), "output")?;
-        // Physical inputs are placed as their runtime arrays are, or as an input override requests, including over the
+        // Executable inputs are placed as their runtime arrays are, or as an input override requests, including over
         // auto mesh axes that their types never record. A runtime placement drops a pending reduction over those axes,
         // which no value of the program can carry, whereas an input override, which states the placement with which
         // the input arrives, keeps it (refer to `receivable_input_sharding`). An input that the executable never reads
-        // has no physical input (refer to `unread_entry_inputs`), so its placement is neither resolved nor validated,
+        // has no executable slot (refer to `unread_entry_inputs`), so its placement is neither resolved nor validated,
         // whatever its runtime array is (e.g., split unevenly, or of another client), and it is annotated replicated,
-        // which no physical input carries.
+        // which disappears from the signature with that input.
         let source_capture_count = lowered_capture_count - session_constants.len();
         let unread_logical_inputs = unread_entry_inputs(
             program,
@@ -680,7 +680,7 @@ impl Session {
         // operations that return its value and placement unchanged, has the placement of its target, which states the
         // placement along every mesh axis, and one that returns an input in the same way is placed where that
         // input enters the executable (refer to `ProgramLoweringAnalysisExtension::output_sharding_sources`). Its
-        // type drops the auto mesh axes of that placement, and its output has no physical buffer whose placement the
+        // type drops the auto mesh axes of that placement, and its output has no executable buffer whose placement the
         // compiler could report when it has the zero data type, so the placement is carried to the boundary instead.
         // Outputs follow the output override first, then the placement from the program, both including over auto mesh
         // axes, and otherwise their types. The StableHLO export of traced programs follows the same rule (refer to
@@ -980,8 +980,8 @@ impl CompilationCacheDomain for Session {
     }
 }
 
-/// Returns `sharding`, the placement of a physical input that comes from a runtime array or a capture rather than from
-/// an input sharding override, without its unreduced axes that are auto mesh axes. Types do not record a pending
+/// Returns `sharding`, the placement supplied by a runtime array or capture, with its auto mesh axes removed from the
+/// unreduced axes. An input sharding override supplies its own placement. Types do not record a pending
 /// reduction over auto mesh axes (refer to [`ArrayType::with_sharding`]), so neither the input nor a value that the
 /// program computes from it can carry one, and Shardy rejects a program that drops it without a reshard (e.g., an
 /// eager `sin` of such an input, which eager dispatch places as its runtime array is). The executable therefore
@@ -1465,7 +1465,7 @@ fn validate_reference_outputs(
     Err(Error::Compilation(CompilationError::UnsupportedReferenceAbi { reason }))
 }
 
-/// Validates backend output arity and refinement of the declared logical array types.
+/// Validates the number of program outputs and checks that their types refine the declared output types.
 fn validate_output_types(declared: &[Type], actual: &[ArrayType]) -> Result<(), Error> {
     if declared.len() != actual.len() {
         return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: actual.len() }.into());
@@ -1792,9 +1792,9 @@ fn validate_placements(
 /// Returns the runtime placement of every output of `program` compiled as `executable`. The placement of an output
 /// that lowering left open over auto mesh axes, as recorded by [`LoweredProgram::open_outputs`], is the placement that
 /// the compiler chose for it, which must agree with the placement that the output type records over the other mesh
-/// axes. The compiler reports placements in a physical format that cannot name mesh axes of size one, because they do
-/// not change how a value is stored, so the declared axes of size one of each dimension are kept in front of the auto
-/// axes that the compiler added to it (refer to `with_declared_singleton_axes`).
+/// axes. Mesh axes of size one leave storage unchanged and are omitted from the compiler's `OpSharding` metadata.
+/// Output placement recovery keeps those declared axes ahead of any auto axes the compiler added to a dimension
+/// (refer to `with_declared_singleton_axes`).
 fn resolve_output_shardings(
     executable: &LoadedExecutable<'_>,
     program: &LoweredProgram,
@@ -1816,11 +1816,11 @@ fn resolve_output_shardings(
         .zip(program.open_outputs().iter())
         .enumerate()
         .map(|(index, (declared, &open))| {
-            let Some(physical_index) = program.signature().output_mapping()[index].filter(|_| open) else {
+            let Some(executable_index) = program.signature().output_mapping()[index].filter(|_| open) else {
                 return Ok(declared.clone());
             };
-            let op_sharding = op_shardings.get(physical_index).ok_or_else(|| {
-                incompatible(format!("the executable reports no sharding for output {physical_index}"))
+            let op_sharding = op_shardings.get(executable_index).ok_or_else(|| {
+                incompatible(format!("the executable reports no sharding for output {executable_index}"))
             })?;
             op_sharding
                 .to_sharding(declared.mesh(), declared.rank())
@@ -1836,39 +1836,38 @@ fn resolve_output_shardings(
         .collect()
 }
 
-/// Returns `physical`, which is a placement that the compiler reports for an output that lowering left open over auto
-/// mesh axes and which therefore names no mesh axis of size one, with the axes of each dimension of `declared` put back
-/// in front of the axes that the compiler added to that dimension, or [`None`] when `physical` does not extend
-/// `declared` that way. A dimension of `declared` that is sharded only along axes of size one is stored like a
+/// Restores the size-one mesh axes from `declared` to the output sharding `reported` by the compiler. It puts the
+/// declared axes first in each dimension and returns [`None`] if `reported` does not extend `declared` in that order.
+/// A dimension of `declared` that is sharded only along axes of size one is stored like a
 /// replicated dimension, so the compiler reports it as replicated or as sharded along auto axes alone, and the result
 /// keeps the axes that `declared` (i.e., the output type) records for it (e.g., `[{"e", "a"}]` for a declared `[{"e"}]`
 /// with `e` of size one that the compiler reports as `[{"a"}]`).
-fn with_declared_singleton_axes(physical: &Sharding, declared: &Sharding) -> Option<Sharding> {
+fn with_declared_singleton_axes(reported: &Sharding, declared: &Sharding) -> Option<Sharding> {
     let mesh = declared.mesh();
     let axes = |dimension: &ShardingDimension| match dimension {
         ShardingDimension::Sharded(axes) => axes.clone(),
         ShardingDimension::Replicated | ShardingDimension::Unconstrained => Vec::new(),
     };
-    let dimensions = physical
+    let dimensions = reported
         .dimensions()
         .iter()
         .zip(declared.dimensions())
-        .map(|(physical, declared)| {
-            let (physical, mut declared) = (axes(physical), axes(declared));
+        .map(|(reported, declared)| {
+            let (reported, mut declared) = (axes(reported), axes(declared));
             let stored = declared
                 .iter()
                 .filter(|axis| mesh.axis_index(axis).is_some_and(|index| mesh.axes()[index].size() > 1))
                 .collect::<Vec<_>>();
-            if physical.len() < stored.len()
-                || !physical.iter().zip(&stored).all(|(physical, stored)| physical == *stored)
+            if reported.len() < stored.len()
+                || !reported.iter().zip(&stored).all(|(reported, stored)| reported == *stored)
             {
                 return None;
             }
-            declared.extend(physical[stored.len()..].iter().cloned());
+            declared.extend(reported[stored.len()..].iter().cloned());
             Some(if declared.is_empty() { ShardingDimension::Replicated } else { ShardingDimension::Sharded(declared) })
         })
         .collect::<Option<Vec<_>>>()?;
-    physical.with_dimensions(dimensions).ok()
+    reported.with_dimensions(dimensions).ok()
 }
 
 #[cfg(test)]
@@ -2488,7 +2487,7 @@ mod tests {
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![placed, placed], None).unwrap()[0];
         let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
-        // An array placed with an unconstrained dimension stores that dimension replicated, so the physical input that
+        // An array placed with an unconstrained dimension stores it replicated, so the executable input that
         // it enters as is annotated with that dimension closed, whether its placement is an input override or the
         // observed placement of the runtime array. Otherwise, the compiler could shard that dimension and expect
         // smaller buffers than the array supplies.
@@ -3151,7 +3150,7 @@ mod tests {
             )
         };
 
-        // The SPMD partitioner has no uneven splits, so an executable whose physical input splits five elements over
+        // The SPMD partitioner has no uneven splits, so an executable whose executable input splits five elements over
         // two devices would expect buffers other than the `[3]` and `[2]` shards of its runtime array. Compilation
         // rejects such a placement, whether an input override requests it or a resident array has it.
         let input_options = Options::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]);
@@ -5758,7 +5757,7 @@ mod tests {
     #[test]
     fn test_session_lower_staged_program_skips_captures_that_only_omitted_regions_read() {
         // A split capture that only the body of a scan imports is checked when the scan admits an iteration, and not
-        // when its length is zero, because lowering then emits nothing of that body and the executable has no physical
+        // when its length is zero, because lowering then emits nothing of that body and the executable has no
         // input for the capture (refer to `emitted_capture_reads`). This holds for a populated capture of another
         // client, whose admission rejects it, and for a capture of this client without buffers, which only an
         // execution rejects. At length zero both compile and run through the executable. It holds alike for a capture
@@ -5952,7 +5951,7 @@ mod tests {
             assert_eq!(persisted(capture, 0), *nothing);
         }
         // A caller that passes a capture on to a call whose callee never reads it reads it neither, so its executable
-        // has no physical input for it and places nothing, and it agrees with the function at every length.
+        // has no executable input for it and places nothing, and it agrees with the function at every length.
         for (capture, nothing) in unread.into_iter().chain([(&reversed, &nothing)]) {
             assert_eq!(caller(capture, 0), *nothing);
         }

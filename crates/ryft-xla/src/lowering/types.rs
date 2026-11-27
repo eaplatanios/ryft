@@ -771,7 +771,7 @@ pub trait DataTypeLoweringExtension {
     /// `factor != 0.0`, integer splats truncate `factor`, and float splats round `factor` to the nearest representable
     /// value of the element type, for every float format that [`DataTypeLoweringExtension::lower`] supports (e.g., the
     /// `f8`, `f6`, and `f4` families). [`DataType::Zero`] admits only a zero factor, lowered as its `i1` carrier.
-    /// Integer attributes use the physical element type from [`DataTypeLoweringExtension::lower`], including signless
+    /// Integer attributes use the MLIR element type from [`DataTypeLoweringExtension::lower`], including signless
     /// `i1` for `U1`.
     fn lower_f64_scalar_elements_attribute<'c, 't>(
         self,
@@ -783,7 +783,7 @@ pub trait DataTypeLoweringExtension {
     /// Builds a splatted dense elements attribute holding `integer_value` converted to this data type. Integer splats
     /// hold the exact `i64` value, and every other data type routes through
     /// [`DataTypeLoweringExtension::lower_f64_scalar_elements_attribute`] after a widening of `integer_value` to `f64`.
-    /// Integer attributes use the physical element type from [`DataTypeLoweringExtension::lower`], including signless
+    /// Integer attributes use the MLIR element type from [`DataTypeLoweringExtension::lower`], including signless
     /// `i1` for `U1`.
     fn lower_constant_elements_attribute<'c, 't>(
         self,
@@ -1026,7 +1026,7 @@ pub(crate) fn unsigned_integer_width(data_type: DataType) -> Result<usize, Error
 
 /// Lowering of an array IR [`Type`] to StableHLO.
 pub trait TypeLoweringExtension {
-    /// Lowers an array IR type to its physical StableHLO tensor type.
+    /// Lowers an array IR type to its StableHLO tensor representation.
     fn lower<'c, 't, L: Location<'c, 't>>(
         &self,
         context: &'c MlirContext<'t>,
