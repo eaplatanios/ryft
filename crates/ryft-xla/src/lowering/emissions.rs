@@ -2,37 +2,16 @@
 //! captures and session constants those regions read).
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
-use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, AtomId, CallOperation, Instruction, Parameterized, Program, RegionRef, RegionRole, ScanOperation, Typed,
-    TypedProgram, Value,
+    ArrayType, Atom, AtomId, CallOperation, Instruction, Parameterized, Program, RegionRef, RegionRole, ScanOperation,
+    Typed, TypedProgram, Value,
 };
 
 use crate::lowering::ProgramLoweringOperation;
-use crate::operations::call::CallFunctionMap;
 use crate::{Constant, RetainedArray, Type};
 
 // TODO(eaplatanios): Review this module.
-
-/// Returns `true` if lowering `operation` at the provided boundary never reads its attached regions, because it is a
-/// named composite call, which `LowerableOperation::composite_key` identifies, that a backend implementation replaces
-/// or whose body lowers to a shared function. The lowering loops skip materializing the regions of such instructions,
-/// which would otherwise copy the body per call.
-pub(crate) fn lowers_without_regions<O: ProgramLoweringOperation>(
-    operation: &O,
-    input_types: &[Type],
-    output_types: &[Type],
-    nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-    target_platform: Option<&str>,
-) -> bool {
-    let Some(key) = operation.composite_key() else {
-        return false;
-    };
-    O::has_composite_implementation(key, input_types, output_types, target_platform)
-        || nested_functions.is_some_and(|functions| functions.named(key, input_types, output_types).is_some())
-}
 
 /// Returns `true` if lowering `instruction` of `region` for `target_platform` emits none of its regions, which holds
 /// for a named composite call whose backend implementation replaces the whole call for that target (refer to
@@ -170,11 +149,10 @@ pub(crate) fn emitted_capture_reads<'r, O: ProgramLoweringOperation>(
 
 /// Calls `visit` with every atom that `region` reads, as an input of one of its instructions or as one of its
 /// outputs, and with whether that read is live. Every read is live except an input that a `call` passes as a
-/// lifted capture which its callee never reads (refer to [`unread_call_captures`]), which the lowering of the call
-/// replaces with a value that requires no buffer. This is the one rule by which the captures of a program (refer to
-/// [`emitted_capture_reads`]) and its session constants (refer to [`partition_session_constants`]) are read, so that
-/// the admission of a function, the signature of its executable, its session constants, and the lowering of its calls
-/// agree. A call without captures costs one comparison.
+/// lifted capture that its callee never reads (see [`unread_captures`](super::LowerableOperation::unread_captures)).
+/// Call lowering replaces that input with a value that requires no buffer. Both [`emitted_capture_reads`] and
+/// [`partition_region_session_constants`] use this rule so that admission, the executable signature, and the lowering
+/// of calls agree on which arrays need buffers. A call without captures costs one comparison.
 fn visit_emitted_reads<O: ProgramLoweringOperation>(
     region: RegionRef<'_, Constant, O>,
     target_platform: Option<&str>,
@@ -187,7 +165,7 @@ fn visit_emitted_reads<O: ProgramLoweringOperation>(
             .filter(|call| call.capture_count() != 0)
             .and_then(|call| {
                 let callee = region.with_id(*instruction.regions().first()?).ok()?;
-                unread_call_captures(callee, call.capture_count(), target_platform)
+                O::unread_captures(callee, call.capture_count(), target_platform)
             });
         for (index, id) in instruction.inputs().iter().enumerate() {
             visit(*id, !unread.as_deref().is_some_and(|unread| unread.get(index).copied().unwrap_or(false)));
@@ -196,18 +174,6 @@ fn visit_emitted_reads<O: ProgramLoweringOperation>(
     for id in region.output_ids() {
         visit(*id, true);
     }
-}
-
-/// Returns, for each input of `callee`, the callee of a call whose first `capture_count` inputs are its lifted
-/// captures, whether it is a capture that the callee never reads, as the family of the call answers it (refer to
-/// `LowerableOperation::unread_captures`, which `Operation` answers with `unread_lifted_captures`), or [`None`]
-/// when every capture counts as read.
-pub(crate) fn unread_call_captures<O: ProgramLoweringOperation>(
-    callee: RegionRef<'_, Constant, O>,
-    capture_count: usize,
-    target_platform: Option<&str>,
-) -> Option<Arc<[bool]>> {
-    O::unread_captures(callee, capture_count, target_platform)
 }
 
 /// Returns, for each logical input of the entry function of `program`, whose types are `logical_input_types` and whose
@@ -249,41 +215,13 @@ where
         .collect()
 }
 
-/// Returns the distinct [`RetainedArray`]s that `program` references in the regions that lowering emits for
-/// `target_platform` (i.e., its entry region and the executed nested regions of that region, refer to
-/// `emitted_regions`), in the order of their first occurrence in those regions. Lowering passes their arrays as hidden
-/// entry inputs after the lifted captures. The caller assembles executable inputs in that order and for the same
-/// target. Regions that lowering never reaches (e.g., the rule regions of composites, the transpose region of a
-/// `linear_call`, or a named composite body replaced for the target) are skipped, and their arrays get no slot unless
-/// an emitted region reads them. Arrays passed only as unread captures also get no slot (refer to
-/// [`partition_session_constants`]).
-pub(crate) fn collect_session_constants<ProgramInput, ProgramOutput, O: ProgramLoweringOperation>(
-    program: &Program<Constant, O, ProgramInput, ProgramOutput>,
-    target_platform: Option<&str>,
-) -> Vec<RetainedArray>
-where
-    ProgramInput: Parameterized<Constant>,
-    ProgramOutput: Parameterized<Constant>,
-{
-    partition_session_constants(program.entry_region_ref(), target_platform).0
-}
-
-/// Returns the distinct [`RetainedArray`]s that the regions which lowering emits for `target_platform` below `entry`
-/// reference, in the order of their first occurrence in those regions, split into the session constants of the program
-/// (refer to [`collect_session_constants`]) and the arrays that those regions only pass on to calls as captures which
-/// their callees never read (refer to [`visit_emitted_reads`]). The latter require nothing of an execution, so they
-/// have no input slot. Lowering binds them to the same bufferless value the entry function uses for erased inputs,
-/// and passes that value to the calls.
-pub(crate) fn partition_session_constants<O: ProgramLoweringOperation>(
-    entry: RegionRef<'_, Constant, O>,
-    target_platform: Option<&str>,
-) -> (Vec<RetainedArray>, Vec<RetainedArray>) {
-    partition_region_session_constants(emitted_regions(entry, target_platform), target_platform)
-}
-
-/// Returns the distinct [`RetainedArray`]s that `regions` reference, in the order of their first occurrence in them,
-/// split into those that they read and those that they only pass on to calls as captures which the callees never read
-/// (refer to [`partition_session_constants`]).
+/// Partitions the distinct [`RetainedArray`]s in `regions`, preserving their order of first occurrence within each
+/// group. The second group contains arrays passed only as captures to callees that never read them on
+/// `target_platform` (refer to [`visit_emitted_reads`]). The first group contains all other session constants.
+///
+/// For a whole program, callers pass its [`emitted_regions`] for the same target. Arrays in the first group become
+/// hidden entry inputs after the lifted captures, in the order returned. Lowering binds arrays in the second group
+/// to bufferless values and passes those values to the calls.
 pub(crate) fn partition_region_session_constants<'r, O: ProgramLoweringOperation + 'r>(
     regions: impl Iterator<Item = RegionRef<'r, Constant, O>>,
     target_platform: Option<&str>,
@@ -297,7 +235,7 @@ pub(crate) fn partition_region_session_constants<'r, O: ProgramLoweringOperation
     for region in regions {
         let mut has_session_constants = false;
         for atom in region.atoms() {
-            if let Some(constant) = atom.as_constant().and_then(|constant| session_constant(constant)) {
+            if let Atom::Constant(Constant::Session(constant)) = atom {
                 has_session_constants = true;
                 if seen.insert(constant.clone()) {
                     session_constants.push(constant.clone());
@@ -306,8 +244,7 @@ pub(crate) fn partition_region_session_constants<'r, O: ProgramLoweringOperation
         }
         if has_session_constants {
             visit_emitted_reads(region, target_platform, |id, is_live| {
-                let atom = region.atoms().get(id.index());
-                if let Some(constant) = atom.and_then(|atom| atom.as_constant()).and_then(session_constant) {
+                if let Some(Atom::Constant(Constant::Session(constant))) = region.atoms().get(id.index()) {
                     if is_live {
                         live.insert(constant.clone())
                     } else {
@@ -323,15 +260,6 @@ pub(crate) fn partition_region_session_constants<'r, O: ProgramLoweringOperation
     session_constants
         .into_iter()
         .partition(|constant| live.contains(constant) || !passed_on.contains(constant))
-}
-
-/// Returns the array that `constant` retains if it is a session constant (i.e., a [`Constant::Session`]), and [`None`]
-/// for any other constant.
-fn session_constant(constant: &Constant) -> Option<&RetainedArray> {
-    match constant {
-        Constant::Session(constant) => Some(constant),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -361,7 +289,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_collect_session_constants_assigns_the_same_inputs_on_every_process() {
+    fn test_partition_region_session_constants_assigns_the_same_inputs_on_every_process() {
         // Two single-device clients stand for two processes. Each independently places its default scalar on global
         // device 0 twice. Only the owner can reuse the original device buffer.
         let clients = [0, 1].map(|process| {
@@ -391,8 +319,10 @@ mod tests {
                 .map(|array| builder.add_constant(Constant::Session(RetainedArray::new(array))))
                 .to_vec();
             let program = builder.build::<Vec<Constant>, Vec<Constant>>(outputs, vec![], vec![Placeholder; 5]).unwrap();
-            let constants = collect_session_constants(&program, None);
+            let regions = emitted_regions(program.entry_region_ref(), None);
+            let (constants, passed_on) = partition_region_session_constants(regions, None);
             assert_eq!(constants, [&scalar, &first, &second, &copy].map(RetainedArray::new));
+            assert!(passed_on.is_empty());
 
             // One array declared with one type twice is one constant, and declared with two types (e.g., by a function
             // compiled for a mesh of another topology, refer to `imported_constant`) two, on the process that holds its
@@ -409,7 +339,11 @@ mod tests {
             let declared_program = declared_builder
                 .build::<Vec<Constant>, Vec<Constant>>(declared_outputs, vec![], vec![Placeholder; 3])
                 .unwrap();
-            assert_eq!(collect_session_constants(&declared_program, None), vec![declared, RetainedArray::new(&first)]);
+            let regions = emitted_regions(declared_program.entry_region_ref(), None);
+            assert_eq!(
+                partition_region_session_constants(regions, None),
+                (vec![declared, RetainedArray::new(&first)], vec![]),
+            );
 
             let captures = constants.iter().map(|constant| constant.r#type().into_owned()).collect::<Vec<_>>();
             let output_types = vec![scalar.r#type().into_owned(); 5];
@@ -440,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_session_constants_ignores_dormant_regions() {
+    fn test_partition_region_session_constants_ignores_dormant_regions() {
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let constant = RetainedArray::new(&f32_scalar(&session, &domain_mesh(client, "x", 1), 2.0));
@@ -454,18 +388,19 @@ mod tests {
 
         // A session constant that only the dormant transpose region of a `linear_call` refers to is never lowered, so
         // it does not become a hidden input of the entry function, unlike one that its forward region refers to.
-        assert_eq!(
-            collect_session_constants(&linear_call_program(&with_constant(false), &with_constant(true)), None),
-            vec![],
-        );
-        assert_eq!(
-            collect_session_constants(&linear_call_program(&with_constant(true), &with_constant(false)), None),
-            vec![constant],
-        );
+        let plain_region = with_constant(false);
+        let constant_region = with_constant(true);
+        let dormant = linear_call_program(&plain_region, &constant_region);
+        let regions = emitted_regions(dormant.entry_region_ref(), None);
+        assert_eq!(partition_region_session_constants(regions, None), (vec![], vec![]));
+
+        let live = linear_call_program(&constant_region, &plain_region);
+        let regions = emitted_regions(live.entry_region_ref(), None);
+        assert_eq!(partition_region_session_constants(regions, None), (vec![constant], vec![]));
     }
 
     #[test]
-    fn test_collect_session_constants_skips_bodies_that_the_target_replaces() {
+    fn test_partition_region_session_constants_skips_bodies_that_the_target_replaces() {
         // A session constant that only the body of a named composite call refers to becomes a hidden input where
         // lowering emits the body, and not on a target whose backend implementation replaces the whole call
         // (`ryft.tests.xla_named_square` version 1 on CUDA, refer to `omits_regions`), which never lowers the body,
@@ -492,7 +427,9 @@ mod tests {
         let output = builder.add_instruction(operation, regions, vec![input], None).unwrap()[0];
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder]);
         let program = program.unwrap();
-        assert_eq!(collect_session_constants(&program, Some("cuda")), vec![]);
-        assert_eq!(collect_session_constants(&program, Some("cpu")), vec![constant]);
+        for (platform, expected) in [("cuda", vec![]), ("cpu", vec![constant])] {
+            let regions = emitted_regions(program.entry_region_ref(), Some(platform));
+            assert_eq!(partition_region_session_constants(regions, Some(platform)), (expected, vec![]));
+        }
     }
 }

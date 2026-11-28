@@ -1346,11 +1346,13 @@ mod tests {
     use ryft_core::{
         Abs, Accuracy, AddOperation, AndOperation, Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy,
         ArrayIrOperation, ArrayIrOperations, ArrayIrValue, ArrayOperation, ArrayOperations, ArrayReferenceTransform,
-        ArrayReferenceTransformIndex, ArrayType, Assert, AssertOperation, Atan2, Atan2Operation, BatchableOperation,
+        ArrayReferenceTransformIndex, ArrayType, Assert, AssertOperation, Atan2, Atan2Operation,
+        AttentionConfiguration, AttentionImplementation, AttentionInputs, BatchableOperation,
         BatchingContext, CallOperation, CaptureReference, CapturingContext, Compare, CompareOperation,
         ComparisonDirection, CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, Concatenate,
         ConditionOperation, Context, Cos, CumulativeKind, CustomRuleDefinition, CustomRuleRegistration, DataType,
-        DifferentiableType, Dimension, DimensionBounds, DimensionDivOperation, DimensionFromScalarOperation,
+        DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds, DimensionDivOperation,
+        DimensionFromScalarOperation,
         DimensionOperation, DimensionOperations, DimensionType, DimensionValue, DimensionVariable, DivOperation,
         DomainTracingContext, DotDimensionNumbers, DotsSavable, DotsWithNoBatchDimensionsSavable,
         DynamicBroadcastOperation, EffectClass, EffectClasses, EmptyRegionDriver, ErasedOperation, EverythingSavable,
@@ -1362,24 +1364,319 @@ mod tests {
         ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, Rem,
         RematerializationOptimizationBarrier, RematerializeOperation, ResidualPolicy, ResidualPolicyReference,
         ResidualZeroProvider, Rsqrt, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
-        ScanOperation, SelectOperation, Shape, Sign, Sin, SinOperation, Sqrt, StagingContext, TagOperation, Tanh,
+        ScanOperation, SelectOperation, Shape, Sign, Sin, SinOperation, Sqrt, StagingContext, StaticShape,
+        TagOperation, Tanh,
         Tolerance, Tracer as CoreTracer, TracingContext, TransferToMemoryOperation, TransposedProgramCotangent, Typed,
         TypedProgram, UnreducedKind, ValueProjection, ValueResolution, WhileOperation, XorOperation, ZeroOperation,
-        rematerialize,
+        differentiable_dot_product_attention, rematerialize,
     };
+    use ryft_pjrt::Client;
+    #[cfg(feature = "cuda-13")]
+    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
     use crate::lowering::tests::{
         ProgramBuilder as PlainProgramBuilder, UnreducedApplication, UnreducedInput, lower_unreduced_application,
         lowered_unary_module, unproject_plain_program,
     };
-    use crate::sessions::tests::domain_mesh;
-    use crate::tests::{execution_client, replicated_array, values_to_bytes, vector_type};
+    #[cfg(feature = "cuda-13")]
+    use crate::Platform;
+    use crate::sessions::tests::{domain_mesh, read_booleans, read_first_shard, replicated_scalar_type};
+    use crate::tests::{cpu_client, execution_client, replicated_array, values_to_bytes, vector_type};
     use crate::{
-        Array, ArrayConstant, ArrayTracer, Constant, ProgramLoweringExtension, ProgramLoweringOptions, Session, Tracer,
-        Type,
+        Array, ArrayConstant, ArrayTracer, CompiledProgram, Constant, Options, ProgramLoweringExtension,
+        ProgramLoweringOptions, Session, Tracer, Type,
     };
 
     use super::*;
+
+    /// Reads the first addressable shard of `array` as `bfloat16` values converted to `f32`.
+    fn read_bf16s(client: &Client<'_>, array: &Array) -> Vec<f32> {
+        read_first_shard::<u16>(client, array)
+            .into_iter()
+            .map(|bits| half::bf16::from_bits(bits).to_f32())
+            .collect()
+    }
+
+    /// Executes `compiled`, which is the compilation of `program`, on a scalar input of `size_type` that holds `size`,
+    /// and returns its outputs. Each output is first checked to have the shape, the data type, and the exact bytes of
+    /// the corresponding output of the eager interpretation of `program`, which runs at the exact types of its inputs
+    /// and so never pads.
+    fn execute_like_eager(
+        session: &Session,
+        client: &Client<'_>,
+        program: &FlatProgram<Session>,
+        compiled: &CompiledProgram,
+        size_type: &ArrayType,
+        mesh: &DeviceMesh,
+        size: i64,
+    ) -> Vec<Array> {
+        let size = size.to_ne_bytes();
+        let input = Array::from_host_buffer(session, size_type.clone(), mesh.clone(), None, size.as_slice()).unwrap();
+        let eager = program.interpret_in_context(session, vec![crate::Value::Array(input.clone())]).unwrap();
+        let compiled = session.execute_program(compiled, vec![input]).unwrap();
+        assert_eq!(compiled.len(), eager.len());
+        for (compiled, eager) in compiled.iter().zip(eager) {
+            let crate::Value::Array(eager) = eager else { panic!("the fixture returns only arrays") };
+            assert_eq!(compiled.shape(), eager.shape());
+            assert_eq!(compiled.data_type(), eager.data_type());
+            assert_eq!(read_first_shard::<u8>(client, compiled), read_first_shard::<u8>(client, &eager));
+        }
+        compiled
+    }
+
+    /// Builds the kind-sensitive bounded-dynamic padding fixture shared by CPU and CUDA execution tests.
+    fn data_derived_padding_fixture(size_type: ArrayType, extent: DimensionVariable) -> FlatProgram<Session> {
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let index_type = dynamic_type.clone().with_data_type(DataType::U64);
+        let matrix_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone()), Dimension::Static(4)]));
+
+        // The iota and its negation make physical suffix positions numerically distinguishable from every admitted live
+        // prefix. This catches both reduction identities and the opposite sentinels needed by ascending and descending
+        // sort. The boolean reductions cover their own false and true identities, and dot covers a contraction padded
+        // with zeros.
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+        let size = builder.add_input(size_type.into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let iota = builder
+            .add_instruction(IotaOperation::new(dynamic_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let indices = builder
+            .add_instruction(IotaOperation::new(index_type, 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let negative = builder.add_instruction(NegOperation::new(), Vec::new(), vec![iota], None).unwrap()[0];
+        let sorted_ascending = builder
+            .add_instruction(SortOperation::new(0, SortDirection::Ascending), Vec::new(), vec![negative], None)
+            .unwrap()[0];
+        let sorted_descending = builder
+            .add_instruction(SortOperation::new(0, SortDirection::Descending), Vec::new(), vec![iota], None)
+            .unwrap()[0];
+        let argmin_indices = builder
+            .add_instruction(SortOperation::new(0, SortDirection::Ascending), Vec::new(), vec![negative, indices], None)
+            .unwrap()[1];
+        let argmax_indices = builder
+            .add_instruction(SortOperation::new(0, SortDirection::Descending), Vec::new(), vec![iota, indices], None)
+            .unwrap()[1];
+        let sum = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![iota], None)
+            .unwrap()[0];
+        // Shift the iota to nonzero factors so including physical padding changes the product.
+        let ones =
+            builder.add_instruction(OneOperation::new(dynamic_type), Vec::new(), vec![dimension], None).unwrap()[0];
+        let factors = builder.add_instruction(AddOperation::new(), Vec::new(), vec![iota, ones], None).unwrap()[0];
+        let product = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Product), Vec::new(), vec![factors], None)
+            .unwrap()[0];
+        let maximum = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Max), Vec::new(), vec![iota], None)
+            .unwrap()[0];
+        let minimum = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Min), Vec::new(), vec![negative], None)
+            .unwrap()[0];
+        let any_input = builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan)),
+                Vec::new(),
+                vec![negative, iota],
+                None,
+            )
+            .unwrap()[0];
+        let any = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Any), Vec::new(), vec![any_input], None)
+            .unwrap()[0];
+        let all_input = builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::<ArrayType>::new(ComparisonDirection::GreaterThanOrEqual)),
+                Vec::new(),
+                vec![iota, negative],
+                None,
+            )
+            .unwrap()[0];
+        let all = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::All), Vec::new(), vec![all_input], None)
+            .unwrap()[0];
+        let dot = builder
+            .add_instruction(
+                DotOperation::new(DotDimensionNumbers::inner_product()),
+                Vec::new(),
+                vec![iota, iota],
+                None,
+            )
+            .unwrap()[0];
+
+        // The rank-2 `i + j` matrix carries the data-derived extent on an axis that neither the reduction nor the scan
+        // touches, which is the configuration that those two operations are admitted in. A log-sum-exp `reduce` consumes the
+        // static axis and still produces a dynamically shaped output, and the prefix scan consumes the static axis
+        // while every row it emits keeps the dynamic extent.
+        let rows = builder
+            .add_instruction(IotaOperation::new(matrix_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let columns = builder
+            .add_instruction(IotaOperation::new(matrix_type, 1).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let matrix = builder.add_instruction(AddOperation::new(), Vec::new(), vec![rows, columns], None).unwrap()[0];
+        let log_sum_exp = builder
+            .add_instruction(ReduceOperation::new(vec![1], ReductionKind::LogSumExp), Vec::new(), vec![matrix], None)
+            .unwrap()[0];
+        let cumulative_sum = builder
+            .add_instruction(CumulativeOperation::new(1, CumulativeKind::Sum), Vec::new(), vec![matrix], None)
+            .unwrap()[0];
+
+        // Index reductions over the data-derived axis would select a physical suffix position if its padding were not
+        // masked, because the suffix positions of the increasing iota are larger than every live position and those of
+        // its negation are smaller. The matrix covers both a reduced data-derived axis and a data-derived axis that the
+        // reduction keeps.
+        let argmax = builder
+            .add_instruction(ArgMaxOperation::new(0, DataType::I32), Vec::new(), vec![iota], None)
+            .unwrap()[0];
+        let argmin = builder
+            .add_instruction(ArgMinOperation::new(0, DataType::I32), Vec::new(), vec![negative], None)
+            .unwrap()[0];
+        let row_argmax = builder
+            .add_instruction(ArgMaxOperation::new(1, DataType::I32), Vec::new(), vec![matrix], None)
+            .unwrap()[0];
+        let column_argmax = builder
+            .add_instruction(ArgMaxOperation::new(0, DataType::I32), Vec::new(), vec![matrix], None)
+            .unwrap()[0];
+        builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![
+                    sorted_ascending,
+                    sorted_descending,
+                    argmin_indices,
+                    argmax_indices,
+                    sum,
+                    maximum,
+                    minimum,
+                    any,
+                    all,
+                    dot,
+                    log_sum_exp,
+                    cumulative_sum,
+                    product,
+                    argmax,
+                    argmin,
+                    row_argmax,
+                    column_argmax,
+                ],
+                vec![Placeholder],
+                vec![Placeholder; 17],
+            )
+            .unwrap()
+    }
+
+    /// Builds the bounded dynamic scaled dot and attention proof fixture. The attention values vary along the key and
+    /// value sequence axis, so including any physical suffix position changes every valid output row. Attention is
+    /// staged by the training function with the provided implementation, whose reverse mode differentiation calls the
+    /// forward attention definition with its residual and the backward attention definition.
+    fn data_derived_scaled_dot_attention_fixture(
+        size_type: ArrayType,
+        extent: DimensionVariable,
+        scaled_element_type: DataType,
+        scaled_scale_type: DataType,
+        attention_implementation: AttentionImplementation,
+    ) -> FlatProgram<Session> {
+        /// Binds `operation` to `inputs` in the context of `value` and returns its only output.
+        fn bind<O: Into<Operation>>(value: &Tracer, operation: O, inputs: &[Tracer]) -> Tracer {
+            value.domain().bind(operation, Vec::<FlatProgram<Session>>::new(), inputs).unwrap().remove(0)
+        }
+
+        let scaled_block_size = match scaled_element_type {
+            DataType::F8E4M3FN | DataType::F8E5M2 => 32,
+            _ => 16,
+        };
+        let attention_batch = DimensionVariable::new("attention_batch", extent.bounds());
+        let scaled_lhs_type = ArrayType::new(
+            scaled_element_type,
+            Shape::new(vec![Dimension::Dynamic(extent.clone()), Dimension::Static(scaled_block_size)]),
+        );
+        let scaled_lhs_scale_type = ArrayType::new(
+            scaled_scale_type,
+            Shape::new(vec![Dimension::Dynamic(extent.clone()), Dimension::Static(1)]),
+        );
+        let scaled_rhs_type = ArrayType::new(
+            scaled_element_type,
+            Shape::new(vec![Dimension::Static(1), Dimension::Static(scaled_block_size)]),
+        );
+        let scaled_rhs_scale_type =
+            ArrayType::new(scaled_scale_type, Shape::new(vec![Dimension::Static(1), Dimension::Static(1)]));
+        let attention_type = ArrayType::new(
+            DataType::BF16,
+            Shape::new(vec![
+                Dimension::Dynamic(attention_batch.clone()),
+                Dimension::Dynamic(extent.clone()),
+                Dimension::Static(1),
+                Dimension::Static(8),
+            ]),
+        );
+        let attention = differentiable_dot_product_attention::<Session>(
+            AttentionConfiguration::new().with_scale(1.0).with_implementation(attention_implementation),
+        );
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| {
+                let size = &inputs[0];
+                let dimension =
+                    bind(size, DimensionFromScalarOperation::new(extent.clone().into()), std::slice::from_ref(size));
+                let batch_dimension = bind(
+                    size,
+                    DimensionFromScalarOperation::new(attention_batch.clone().into()),
+                    std::slice::from_ref(size),
+                );
+
+                // The runtime row extent of `scaled_dot` is not contracted. Both dynamic element and scale inputs
+                // share it, while the static right-hand side input fixes one output column and the static block shape
+                // fixes `k` to the block size of the element type (i.e., 32 for FP8 elements and 16 otherwise).
+                let scaled_lhs =
+                    bind(size, OneOperation::new(scaled_lhs_type.clone()), std::slice::from_ref(&dimension));
+                let scaled_lhs_scales =
+                    bind(size, OneOperation::new(scaled_lhs_scale_type.clone()), std::slice::from_ref(&dimension));
+                let scaled_rhs = bind(size, OneOperation::new(scaled_rhs_type.clone()), &[]);
+                let scaled_rhs_scales = bind(size, OneOperation::new(scaled_rhs_scale_type.clone()), &[]);
+                let scaled_dot = bind(
+                    size,
+                    ScaledDotOperation::new(
+                        DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
+                        DataType::F32,
+                        true,
+                        true,
+                    ),
+                    &[scaled_lhs, scaled_rhs, scaled_lhs_scales, scaled_rhs_scales],
+                );
+
+                // Equal query and key scores make the live attention softmax uniform, while values equal their
+                // sequence index. Explicit lengths of `extent - 1` exercise the supported contract of restricting the
+                // extent further. Visible query rows return the mean `(extent - 2) / 2`, while the final logical row
+                // and all physical suffix positions stay zero. The backward pass has exact `dQ = 0`,
+                // `dK[j] = 8 * (j - mean)`, and `dV = 1` on visible rows and zeros elsewhere.
+                let extents = [batch_dimension.clone(), dimension.clone()];
+                let query = bind(size, OneOperation::new(attention_type.clone()), &extents);
+                let key = bind(size, OneOperation::new(attention_type.clone()), &extents);
+                let value = bind(size, IotaOperation::new(attention_type.clone(), 1).unwrap(), &extents);
+                let output_cotangent = bind(size, OneOperation::new(attention_type.clone()), &extents);
+                let logical_length = bind(size, DimensionToScalarOperation, std::slice::from_ref(&dimension));
+                let logical_length =
+                    bind(size, ConvertElementTypeOperation::<ArrayType>::new(DataType::I32, false), &[logical_length]);
+                let one = CoreArray::from_elements(ArrayType::scalar(DataType::I32), &[1i32]).unwrap();
+                let one = bind(size, ConstantOperation::new(one), &[]);
+                let length = bind(size, SubOperation::new(), &[logical_length, one]);
+                let lengths =
+                    bind(size, DynamicBroadcastOperation::new(Vec::new()), &[length, batch_dimension.clone()]);
+                let inputs = AttentionInputs {
+                    query_sequence_lengths: Some(lengths.clone()),
+                    key_value_sequence_lengths: Some(lengths),
+                    ..AttentionInputs::new(query, key, value)
+                };
+                let (output, pullback) = size.domain().differentiate_at(inputs).vjp(|inputs| attention.call(inputs))?;
+                let cotangents = pullback.apply_materialized(output_cotangent)?;
+                Ok(vec![scaled_dot, output, cotangents.query, cotangents.key, cotangents.value])
+            },
+            vec![Type::from(size_type)],
+        )
+        .unwrap();
+        program.into_flat_program()
+    }
 
     #[test]
     fn test_operation_values_satisfy_the_core_capability_bundles() {
@@ -2936,6 +3233,340 @@ mod tests {
                 validate_array_data_derived_dimensions(&ArrayOperation::Cumulative(CumulativeOperation::new(0, kind))),
                 Ok(()),
                 "{kind:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_operation_validate_data_derived_dimensions_admitted_operations_hide_padding() {
+        // Every output of the fixture is produced by operations that the validation passes. The compiled program
+        // pads each bounded dynamic value to its bound, so an output that equals the eager one byte for byte shows
+        // that the padding is unobservable.
+        let client = execution_client();
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let program = data_derived_padding_fixture(size_type.clone(), extent);
+
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let execute =
+            |size: i64| execute_like_eager(&session, client, &program, &compiled, &size_type, &mesh, size);
+
+        let small = execute(2);
+        assert_eq!(small[0].shape(), StaticShape::new(vec![2]));
+        assert_eq!(read_first_shard::<f32>(client, &small[0]), vec![-1.0, 0.0]);
+        assert_eq!(read_first_shard::<f32>(client, &small[1]), vec![1.0, 0.0]);
+        assert_eq!(read_first_shard::<u64>(client, &small[2]), vec![1, 0]);
+        assert_eq!(read_first_shard::<u64>(client, &small[3]), vec![1, 0]);
+        assert_eq!(read_first_shard::<f32>(client, &small[4]), vec![1.0]);
+        assert_eq!(read_first_shard::<f32>(client, &small[5]), vec![1.0]);
+        assert_eq!(read_first_shard::<f32>(client, &small[6]), vec![-1.0]);
+        assert_eq!(read_booleans(client, &small[7]), vec![true]);
+        assert_eq!(read_booleans(client, &small[8]), vec![true]);
+        assert_eq!(read_first_shard::<f32>(client, &small[9]), vec![1.0]);
+        assert_eq!(read_first_shard::<f32>(client, &small[12]), vec![2.0]);
+        assert_eq!(read_first_shard::<i32>(client, &small[13]), vec![1]);
+        assert_eq!(read_first_shard::<i32>(client, &small[14]), vec![1]);
+        assert_eq!(read_first_shard::<i32>(client, &small[15]), vec![3, 3]);
+        assert_eq!(read_first_shard::<i32>(client, &small[16]), vec![1, 1, 1, 1]);
+
+        // Row `i` of the `i + j` matrix reduces to `i + ln(1 + e + e² + e³)`, so exactly the live rows appear and a
+        // physical suffix row would show up as an extra element. The tolerance is here because the expansion runs
+        // `exp` and `log`, not because the masking is approximate, and the byte comparison against the reference
+        // kernel inside `execute` is exact.
+        assert_eq!(small[10].shape(), StaticShape::new(vec![2]));
+        let log_sum_exp = read_first_shard::<f32>(client, &small[10]);
+        assert!((log_sum_exp[0] - 3.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[1] - 4.440_19).abs() < 1e-4, "{log_sum_exp:?}");
+
+        // The prefix scan runs along the static axis, so row `i` accumulates `[i, 2i + 1, 3i + 3, 4i + 6]` while the
+        // data-derived extent rides through on the rows it never mixes.
+        assert_eq!(small[11].shape(), StaticShape::new(vec![2, 4]));
+        assert_eq!(read_first_shard::<f32>(client, &small[11]), vec![0.0, 1.0, 3.0, 6.0, 1.0, 3.0, 6.0, 10.0]);
+
+        // With a single live position, every physical suffix position of the data-derived axis is padding, which index
+        // reductions must still never select.
+        let single = execute(1);
+        assert_eq!(read_first_shard::<i32>(client, &single[13]), vec![0]);
+        assert_eq!(read_first_shard::<i32>(client, &single[14]), vec![0]);
+        assert_eq!(read_first_shard::<i32>(client, &single[15]), vec![3]);
+        assert_eq!(read_first_shard::<i32>(client, &single[16]), vec![0, 0, 0, 0]);
+
+        let at_bound = execute(4);
+        assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4]));
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[0]), vec![-3.0, -2.0, -1.0, 0.0]);
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[1]), vec![3.0, 2.0, 1.0, 0.0]);
+        assert_eq!(read_first_shard::<u64>(client, &at_bound[2]), vec![3, 2, 1, 0]);
+        assert_eq!(read_first_shard::<u64>(client, &at_bound[3]), vec![3, 2, 1, 0]);
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[4]), vec![6.0]);
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[5]), vec![3.0]);
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[6]), vec![-3.0]);
+        assert_eq!(read_booleans(client, &at_bound[7]), vec![true]);
+        assert_eq!(read_booleans(client, &at_bound[8]), vec![true]);
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[9]), vec![14.0]);
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[12]), vec![24.0]);
+        assert_eq!(read_first_shard::<i32>(client, &at_bound[13]), vec![3]);
+        assert_eq!(read_first_shard::<i32>(client, &at_bound[14]), vec![3]);
+        assert_eq!(read_first_shard::<i32>(client, &at_bound[15]), vec![3, 3, 3, 3]);
+        assert_eq!(read_first_shard::<i32>(client, &at_bound[16]), vec![3, 3, 3, 3]);
+
+        // At the bound the reduction and the scan grow by exactly the two extra live rows, which is what rules out a
+        // padded row silently participating at the smaller size.
+        assert_eq!(at_bound[10].shape(), StaticShape::new(vec![4]));
+        let log_sum_exp = read_first_shard::<f32>(client, &at_bound[10]);
+        assert!((log_sum_exp[0] - 3.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[1] - 4.440_19).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[2] - 5.440_19).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[3] - 6.440_19).abs() < 1e-4, "{log_sum_exp:?}");
+        assert_eq!(at_bound[11].shape(), StaticShape::new(vec![4, 4]));
+        assert_eq!(
+            read_first_shard::<f32>(client, &at_bound[11]),
+            vec![0.0, 1.0, 3.0, 6.0, 1.0, 3.0, 6.0, 10.0, 2.0, 5.0, 9.0, 14.0, 3.0, 7.0, 12.0, 18.0],
+        );
+    }
+
+    #[test]
+    fn test_operation_validate_data_derived_dimensions_admitted_scaled_dot_and_attention_hide_padding() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let program = data_derived_scaled_dot_attention_fixture(
+            size_type.clone(),
+            extent,
+            DataType::F32,
+            DataType::F32,
+            AttentionImplementation::Automatic,
+        );
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert!(lowered.stable_hlo().contains("stablehlo.composite \"xla.scaled_dot\""));
+        assert!(!lowered.stable_hlo().contains("__cudnn$fmha"));
+        let compiled = session.compile_program(&lowered).unwrap();
+        let execute =
+            |size: i64| execute_like_eager(&session, client, &program, &compiled, &size_type, &mesh, size);
+
+        let small = execute(2);
+        assert_eq!(small[0].shape(), StaticShape::new(vec![2, 1]));
+        assert_eq!(read_first_shard::<f32>(client, &small[0]), vec![16.0; 2]);
+        assert_eq!(small[1].shape(), StaticShape::new(vec![2, 2, 1, 8]));
+        assert_eq!(read_bf16s(client, &small[1]), vec![0.0; 32]);
+        assert_eq!(read_bf16s(client, &small[2]), vec![0.0; 32]);
+        assert_eq!(read_bf16s(client, &small[3]), vec![0.0; 32]);
+        assert_eq!(
+            read_bf16s(client, &small[4]),
+            [1.0, 0.0].into_iter().cycle().take(4).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
+        );
+
+        let at_bound = execute(4);
+        assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4, 1]));
+        assert_eq!(read_first_shard::<f32>(client, &at_bound[0]), vec![16.0; 4]);
+        assert_eq!(at_bound[1].shape(), StaticShape::new(vec![4, 4, 1, 8]));
+        assert_eq!(
+            read_bf16s(client, &at_bound[1]),
+            [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
+        );
+        assert_eq!(read_bf16s(client, &at_bound[2]), vec![0.0; 128]);
+        // Three visible keys have equal scores and values 0, 1, 2. Each query contributes
+        // `dS[j] = (1 / 3) * 8 * (j - 1)`, so summing three visible queries gives `dK[j] = 8 * (j - 1)`
+        // and `dV[j] = 3 * (1 / 3) = 1`. The rounded BF16 residual must not rescale these probabilities.
+        assert_eq!(
+            read_bf16s(client, &at_bound[3]),
+            [-8.0, 0.0, 8.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            read_bf16s(client, &at_bound[4]),
+            [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
+        );
+
+        let zero =
+            Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), None, 0i64.to_ne_bytes().as_slice())
+                .unwrap();
+        let error = session.execute_program(&compiled, vec![zero]).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "`dimension_from_scalar` failed: input dimension `extent` = 0 is outside its declared bounds [1, 5)"
+            ),
+            "{error}",
+        );
+
+        // Eager execution replays the attention calls of the bounded-dynamic program at the exact types of their
+        // inputs, so a program that explicitly requests the fused kernels reports that it cannot use them instead of
+        // silently computing the portable result.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let fused = data_derived_scaled_dot_attention_fixture(
+            size_type.clone(),
+            extent,
+            DataType::F32,
+            DataType::F32,
+            AttentionImplementation::Fused,
+        );
+        let input = Array::from_host_buffer(&session, size_type, mesh, None, 2i64.to_ne_bytes().as_slice()).unwrap();
+        let error = fused.interpret_in_context(&session, vec![crate::Value::Array(input)]).unwrap_err();
+        assert!(matches!(
+            error,
+            ProgramError::UnsupportedOperation { message }
+                if message == "cannot lower `ryft.dot_product_attention`: the fused attention implementation is \
+                    unavailable because the target platform is not CUDA",
+        ));
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_operation_validate_data_derived_dimensions_admitted_operations_hide_padding_on_cuda() {
+        let client = Platform::Cuda
+            .client(Some(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            })))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::builder().client(&client).build().unwrap().with_device_mesh(mesh.clone());
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let program = data_derived_padding_fixture(size_type.clone(), extent);
+        let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let execute = |size: i64| {
+            let input =
+                Array::from_host_buffer(&session, size_type.clone(), mesh.clone(), None, size.to_ne_bytes().as_slice())
+                    .unwrap();
+            session.execute_program(&compiled, vec![input]).unwrap()
+        };
+
+        let small = execute(2);
+        assert_eq!(read_first_shard::<f32>(&client, &small[0]), vec![-1.0, 0.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &small[1]), vec![1.0, 0.0]);
+        assert_eq!(read_first_shard::<u64>(&client, &small[2]), vec![1, 0]);
+        assert_eq!(read_first_shard::<u64>(&client, &small[3]), vec![1, 0]);
+        assert_eq!(read_first_shard::<f32>(&client, &small[4]), vec![1.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &small[5]), vec![1.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &small[6]), vec![-1.0]);
+        assert_eq!(read_booleans(&client, &small[7]), vec![true]);
+        assert_eq!(read_booleans(&client, &small[8]), vec![true]);
+        assert_eq!(read_first_shard::<f32>(&client, &small[9]), vec![1.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &small[12]), vec![2.0]);
+        assert_eq!(read_first_shard::<i32>(&client, &small[13]), vec![1]);
+        assert_eq!(read_first_shard::<i32>(&client, &small[14]), vec![1]);
+        assert_eq!(read_first_shard::<i32>(&client, &small[15]), vec![3, 3]);
+        assert_eq!(read_first_shard::<i32>(&client, &small[16]), vec![1, 1, 1, 1]);
+
+        let at_bound = execute(4);
+        assert_eq!(read_first_shard::<f32>(&client, &at_bound[0]), vec![-3.0, -2.0, -1.0, 0.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &at_bound[1]), vec![3.0, 2.0, 1.0, 0.0]);
+        assert_eq!(read_first_shard::<u64>(&client, &at_bound[2]), vec![3, 2, 1, 0]);
+        assert_eq!(read_first_shard::<u64>(&client, &at_bound[3]), vec![3, 2, 1, 0]);
+        assert_eq!(read_first_shard::<f32>(&client, &at_bound[4]), vec![6.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &at_bound[5]), vec![3.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &at_bound[6]), vec![-3.0]);
+        assert_eq!(read_booleans(&client, &at_bound[7]), vec![true]);
+        assert_eq!(read_booleans(&client, &at_bound[8]), vec![true]);
+        assert_eq!(read_first_shard::<f32>(&client, &at_bound[9]), vec![14.0]);
+        assert_eq!(read_first_shard::<f32>(&client, &at_bound[12]), vec![24.0]);
+        assert_eq!(read_first_shard::<i32>(&client, &at_bound[13]), vec![3]);
+        assert_eq!(read_first_shard::<i32>(&client, &at_bound[14]), vec![3]);
+        assert_eq!(read_first_shard::<i32>(&client, &at_bound[15]), vec![3, 3, 3, 3]);
+        assert_eq!(read_first_shard::<i32>(&client, &at_bound[16]), vec![3, 3, 3, 3]);
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_operation_validate_data_derived_dimensions_admitted_scaled_dot_and_fused_attention_hide_padding_on_cuda() {
+        let client = Platform::Cuda
+            .client(Some(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            })))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let session = Session::builder().client(&client).build().unwrap().with_device_mesh(mesh.clone());
+        for (scaled_element_type, scaled_scale_type) in [
+            (DataType::F4E2M1FN, DataType::F8E4M3FN),
+            (DataType::F8E4M3FN, DataType::F8E8M0FNU),
+            (DataType::F8E5M2, DataType::F8E8M0FNU),
+        ] {
+            let scaled_dot_value = match scaled_element_type {
+                DataType::F8E4M3FN | DataType::F8E5M2 => 32.0,
+                _ => 16.0,
+            };
+            let size_type = replicated_scalar_type(&mesh, DataType::I64);
+            let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+            let program = data_derived_scaled_dot_attention_fixture(
+                size_type.clone(),
+                extent,
+                scaled_element_type,
+                scaled_scale_type,
+                AttentionImplementation::Fused,
+            );
+            let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+            // cuDNN accepts the NVFP4 and `f8e4m3fn` MXFP8 pairs, which lower to the block-scaled-dot custom call, but
+            // not `f8e5m2` on both sides, which keeps the composite.
+            let uses_custom_call = scaled_element_type != DataType::F8E5M2;
+            assert_eq!(lowered.stable_hlo().contains("stablehlo.custom_call @__op$block_scaled_dot"), uses_custom_call);
+            assert_eq!(lowered.stable_hlo().contains("stablehlo.composite \"xla.scaled_dot\""), !uses_custom_call);
+            assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmax"));
+            assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmaxBackward"));
+            let compiled = session.compile_program(&lowered).unwrap();
+            let execute = |size: i64| {
+                let input = Array::from_host_buffer(
+                    &session,
+                    size_type.clone(),
+                    mesh.clone(),
+                    None,
+                    size.to_ne_bytes().as_slice(),
+                )
+                .unwrap();
+                session.execute_program(&compiled, vec![input]).unwrap()
+            };
+
+            let small = execute(2);
+            assert_eq!(small[0].shape(), StaticShape::new(vec![2, 1]));
+            assert_eq!(read_first_shard::<f32>(&client, &small[0]), vec![scaled_dot_value; 2]);
+            assert_eq!(small[1].shape(), StaticShape::new(vec![2, 2, 1, 8]));
+            assert_eq!(read_bf16s(&client, &small[1]), vec![0.0; 32]);
+            assert_eq!(read_bf16s(&client, &small[2]), vec![0.0; 32]);
+            assert_eq!(read_bf16s(&client, &small[3]), vec![0.0; 32]);
+            assert_eq!(
+                read_bf16s(&client, &small[4]),
+                [1.0, 0.0].into_iter().cycle().take(4).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
+            );
+
+            let at_bound = execute(4);
+            assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4, 1]));
+            assert_eq!(read_first_shard::<f32>(&client, &at_bound[0]), vec![scaled_dot_value; 4]);
+            assert_eq!(at_bound[1].shape(), StaticShape::new(vec![4, 4, 1, 8]));
+            assert_eq!(
+                read_bf16s(&client, &at_bound[1]),
+                [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
+            );
+            assert_eq!(read_bf16s(&client, &at_bound[2]), vec![0.0; 128]);
+            let actual_query_gradient = read_bf16s(&client, &at_bound[3]);
+            let expected_query_gradient =
+                [-8.0, 0.0, 8.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>();
+            // cuDNN's fused BF16 backward-attention kernel is not bit-identical to the unfused reference
+            // composition, so compare its gradients with an explicit reduced-precision tolerance.
+            actual_query_gradient.iter().zip(&expected_query_gradient).for_each(|(actual, expected)| {
+                assert!((actual - expected).abs() <= 0.25, "expected {expected} within 0.25, but found {actual}");
+            });
+            let actual_value_gradient = read_bf16s(&client, &at_bound[4]);
+            let expected_value_gradient =
+                [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>();
+            actual_value_gradient.iter().zip(&expected_value_gradient).for_each(|(actual, expected)| {
+                assert!((actual - expected).abs() <= 0.25, "expected {expected} within 0.25, but found {actual}");
+            });
+
+            let zero = Array::from_host_buffer(&session, size_type, mesh.clone(), None, 0i64.to_ne_bytes().as_slice())
+                .unwrap();
+            let error = session.execute_program(&compiled, vec![zero]).unwrap_err();
+            assert!(
+                error.to_string().contains(
+                    "`dimension_from_scalar` failed: input dimension `extent` = 0 is outside its declared bounds [1, 5)"
+                ),
+                "{error}",
             );
         }
     }

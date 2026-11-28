@@ -22,8 +22,7 @@ use crate::arrays::host::ReductionChange;
 use crate::devices::MemoryExtension;
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::emissions::{
-    collect_session_constants, emitted_regions, lowers_without_regions, omits_regions, partition_session_constants,
-    unread_entry_inputs,
+    emitted_regions, omits_regions, partition_region_session_constants, unread_entry_inputs,
 };
 use crate::lowering::reductions::{
     ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
@@ -674,7 +673,10 @@ where
         // which are annotated as their runtime arrays are placed, as compilation for a `Session` passes them.
         let session_constants = match &options.capture_types {
             Some(_) => None,
-            None => Some(collect_session_constants(program, target_platform)),
+            None => {
+                let regions = emitted_regions(program.entry_region_ref(), target_platform);
+                Some(partition_region_session_constants(regions, target_platform).0)
+            }
         };
         let capture_types = match (&options.capture_types, &session_constants) {
             (Some(capture_types), _) => capture_types.clone(),
@@ -2291,9 +2293,9 @@ where
         }
 
         // Session constants are carried by hidden inputs that form the suffix of the capture inputs. The caller
-        // declares them through the trailing `capture_types`, in the order of `collect_session_constants`.
-        let (session_constants, passed_on_constants) =
-            partition_session_constants(self.entry_region_ref(), target_platform);
+        // declares them through the trailing `capture_types`, in order of first occurrence in the emitted regions.
+        let regions = emitted_regions(self.entry_region_ref(), target_platform);
+        let (session_constants, passed_on_constants) = partition_region_session_constants(regions, target_platform);
         let session_count = session_constants.len();
         if session_count > 0
             && (capture_types.len() < session_count
@@ -2464,6 +2466,7 @@ where
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let region = self.entry_region_ref();
         let context = block.context();
+        let target_platform = lowering_context.target_platform();
         let mut constant_block = block;
         region.interpret_with(
             input_values.to_vec(),
@@ -2483,13 +2486,13 @@ where
                 // All operations emitted for this instruction inherit its provenance on top of the ambient location.
                 let location = lowering_context.instruction_location(context, instruction.provenance(), location);
                 let operation = instruction.operation();
-                let regions = if lowers_without_regions(
-                    operation,
-                    &input_types,
-                    &output_types,
-                    nested_functions,
-                    lowering_context.target_platform(),
-                ) {
+
+                // A named composite with a backend implementation or a shared function needs no copy of its body.
+                let regions = if operation.composite_key().is_some_and(|key| {
+                    O::has_composite_implementation(key, &input_types, &output_types, target_platform)
+                        || nested_functions
+                            .is_some_and(|functions| functions.named(key, &input_types, &output_types).is_some())
+                }) {
                     Vec::new()
                 } else {
                     instruction

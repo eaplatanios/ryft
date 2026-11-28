@@ -402,7 +402,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayOperation, BatchAxis, BatchingLevelExtent, Compare, ComparisonDirection, CompositeAttribute,
+        AddOperation, BatchAxis, BatchingLevelExtent, Compare, ComparisonDirection, CompositeAttribute,
         CompositeJvpRule, CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionValue, DomainTracer,
         DomainTracingContext, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Mul, MulOperation,
         NamedComposite, PrintOperation, Program, ProgramBuilder, ProjectedContext, Reduce, Shape, Sharding,
@@ -411,7 +411,6 @@ mod tests {
     use ryft_mlir::{Block, Context as MlirContext, Location};
 
     use crate::lowering::contexts::ProgramLoweringContext;
-    use crate::lowering::emissions::lowers_without_regions;
     use crate::lowering::tests::test_vector_type;
     use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;
@@ -476,19 +475,6 @@ mod tests {
                     .with_target_platform(target_platform),
             )
             .map(|module| module.into_stable_hlo())
-    }
-
-    #[test]
-    fn test_lowers_without_regions() {
-        // Only a named composite call that a backend implementation replaces, or whose body lowers to a shared
-        // function, lowers without reading its regions.
-        let types = vec![Type::Array(test_vector_type(4))];
-        let rules = named_rules_with_version("ryft.tests.xla_named_square", 1);
-        let named = Operation::Composite(CompositeOperation::new(rules.reference()));
-        assert!(lowers_without_regions(&named, &types, &types, None, Some("cuda")));
-        assert!(!lowers_without_regions(&named, &types, &types, None, None));
-        let unnamed = Operation::Array(ArrayOperation::Add(AddOperation::new()));
-        assert!(!lowers_without_regions(&unnamed, &types, &types, None, Some("cuda")));
     }
 
     #[test]

@@ -3080,8 +3080,8 @@ struct DispatchRegion {
     /// [`RetainedArray::without_storage`]).
     key: RegionKey<Constant, Operation>,
 
-    /// Distinct session constants of the region and of its computation descendants, in the order in which lowering
-    /// collects them (refer to `collect_session_constants`).
+    /// Distinct session constants of the region and its emitted computation descendants, in the order in which
+    /// lowering assigns their hidden inputs.
     constants: Arc<[RetainedArray]>,
 }
 

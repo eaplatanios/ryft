@@ -163,7 +163,6 @@ pub enum RaggedDotLoweringStrategy {
     Instruction,
 }
 
-pub(crate) mod admission;
 /// Program lowering context for nested regions and their enclosing module.
 pub(crate) mod contexts;
 /// Decisions about which regions, captures, and session constants of a program lowering emits.

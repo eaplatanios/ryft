@@ -2339,7 +2339,7 @@ mod tests {
     use crate::compilation::CompilationError;
     use crate::compilation::options::Options;
     use crate::compilation::profile_guided::AdaptiveProfileGuidedOptions;
-    use crate::lowering::emissions::collect_session_constants;
+    use crate::lowering::emissions::{emitted_regions, partition_region_session_constants};
     use crate::sessions::tests::{
         domain_mesh, read_first_shard, read_sharded_f32_array, replicated_scalar_type, replicated_vector_type,
         two_device_mesh,
@@ -2365,7 +2365,9 @@ mod tests {
         Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Type> + ParameterizedFamily<Constant>,
     {
         let program = function.source_program().to_program_with_lifted_captures().unwrap();
-        (function.source_program().captures().len(), collect_session_constants(&program, None).len())
+        let regions = emitted_regions(program.entry_region_ref(), None);
+        let (session_constants, _) = partition_region_session_constants(regions, None);
+        (function.source_program().captures().len(), session_constants.len())
     }
 
     /// Traces `f(reference, update) = { reference += update; read(reference) }` over a `ref<f32[]>` and an `f32[]` into

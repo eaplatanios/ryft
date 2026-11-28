@@ -46,7 +46,7 @@ use crate::compilation::domains::{commits_public_outputs, relocated_input_type};
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::EffectTokens;
 use crate::lowering::contexts::ProgramLoweringContext;
-use crate::lowering::emissions::{omits_regions, partition_session_constants, unread_call_captures};
+use crate::lowering::emissions::{emitted_regions, omits_regions, partition_region_session_constants};
 use crate::lowering::programs::{ProgramInlineLoweringExtension, RegionPlacementRequestsExtension};
 use crate::lowering::reductions::validate_declared_pending_reduction;
 use crate::lowering::types::{TypeLoweringExtension, lower_unplaced_constant_output};
@@ -253,8 +253,8 @@ where
         // reference session constants also inline, because only the entry function receives their hidden arguments
         // and binds the arrays that are only passed on to calls that never read them.
         if count < 2 || !lowered_effect_classes(&program)?.is_empty() || {
-            let (session_constants, passed_on) =
-                partition_session_constants(program.entry_region_ref(), target_platform);
+            let regions = emitted_regions(program.entry_region_ref(), target_platform);
+            let (session_constants, passed_on) = partition_region_session_constants(regions, target_platform);
             !session_constants.is_empty() || !passed_on.is_empty()
         } {
             continue;
@@ -825,13 +825,11 @@ impl LowerableOperation for CallOperation<Type> {
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         self.validate_region_count(lowerer.regions().len())?;
-        // A capture that the callee never reads requires nothing of the caller (refer to `unread_call_captures`), so
-        // the call receives a value that requires no buffer in its place, as the entry function binds an argument that
-        // it never reads, and neither places nor constrains it. The caller reads the input by the same decision (refer
-        // to `emitted_capture_reads` and `partition_session_constants`).
+        // A capture that the callee never reads receives a bufferless value, just like an unread entry argument.
+        // Both capture analysis and session constant partitioning use the same family decision about those inputs.
         let unread = match self.capture_count() {
             0 => None,
-            capture_count => unread_call_captures(
+            capture_count => O::unread_captures(
                 lowerer.regions()[0].entry_region_ref(),
                 capture_count,
                 lowerer.lowering_context().target_platform(),

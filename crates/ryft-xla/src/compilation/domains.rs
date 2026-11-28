@@ -33,7 +33,7 @@ use crate::compilation::programs::{
 };
 use crate::execution::{ExecutionPlan, validate_capture_reduction};
 use crate::lowering::emissions::{
-    collect_session_constants, emitted_capture_reads, emitted_regions, omits_regions, unread_entry_inputs,
+    emitted_capture_reads, emitted_regions, omits_regions, partition_region_session_constants, unread_entry_inputs,
 };
 use crate::lowering::programs::{
     OutputShardingSource, ProgramLoweringAnalysisExtension, ProgramLoweringExtension, ProgramLoweringOptions,
@@ -406,10 +406,12 @@ impl Session {
         let target = self.target()?;
         let target_platform = Some(target.platform_name());
 
-        // Data-derived dimensions need finite bounds. Search only the regions emitted for this target, so
-        // dormant rules, zero-iteration scans, and composite bodies replaced on this platform can be skipped.
+        // Data-derived dimensions need finite bounds, and their consumers must keep padding unobservable. Both are
+        // checked only in the regions emitted for this target, so dormant rules, zero-iteration scans, and composite
+        // bodies replaced on this platform are skipped.
+        let regions = emitted_regions(program.entry_region_ref(), target_platform).collect::<Vec<_>>();
         let mut data_derived_dimensions = HashSet::new();
-        for region in emitted_regions(program.entry_region_ref(), target_platform) {
+        for region in &regions {
             for instruction in region.instructions() {
                 if let Some(operation) = instruction.operation().projected_payload::<DimensionFromScalarOperation>() {
                     // A static output defines no identity and is checked against its extent.
@@ -435,7 +437,7 @@ impl Session {
             // found, then check that each consumer keeps bounded dynamic padding unobservable.
             loop {
                 let count = data_derived_dimensions.len();
-                for region in emitted_regions(program.entry_region_ref(), None) {
+                for region in &regions {
                     for instruction in region.instructions() {
                         if !instruction.inputs().iter().any(|input| {
                             region.atoms()[input.index()]
@@ -460,7 +462,7 @@ impl Session {
                 }
             }
 
-            for region in emitted_regions(program.entry_region_ref(), None) {
+            for region in &regions {
                 for instruction in region.instructions() {
                     let consumes_data_derived_extent =
                         instruction.inputs().iter().chain(instruction.outputs()).any(|atom| {
@@ -553,7 +555,8 @@ impl Session {
         }
         // Assign hidden input slots from the original constants in the program that lowering emits for the target.
         // Each constant supplies its declared type, and its placed array supplies buffers and runtime sharding.
-        let session_constants = collect_session_constants(program, target_platform)
+        let (sources, _) = partition_region_session_constants(regions.into_iter(), target_platform);
+        let session_constants = sources
             .into_iter()
             .map(|source| {
                 let input = placed_constant(self, &source, options.mesh())?.unwrap_or_else(|| source.clone());
@@ -3273,6 +3276,50 @@ mod tests {
         };
         assert_eq!(lower(&named_call("ryft.tests.xla_cpu_named_square")), Ok(()));
         assert_eq!(lower(&named_call("ryft.tests.xla_named_square")), Err(unbounded.to_string()));
+
+        // A body that the platform replaces is not checked for consumers of data-derived dimensions either. Here the
+        // dimension is derived outside the call, and each body takes the mean of its input over that dimension, which
+        // admission rejects in a region that lowering emits. The mean is unused, so the programs are lowered before
+        // pruning can remove it.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(4)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let body = {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let input = builder.add_input(vector_type.clone().into());
+            let mean = ReduceOperation::new(vec![0], ReductionKind::Mean);
+            builder.add_instruction(mean, Vec::new(), vec![input], None).unwrap();
+            Arc::new(builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap())
+        };
+        let named_call = |name: &'static str| {
+            let key = CompositeKey::new(name, 1);
+            let named =
+                NamedComposite::new(key, |types: &[Type]| Ok(types.to_vec()), |inputs| Ok(vec![inputs[0].clone()]));
+            let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("mean").with_named_composite(named));
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let size = builder.add_input(scalar_type.clone().into());
+            let gateway = DimensionFromScalarOperation::new(extent.clone().into());
+            let dimension = builder.add_instruction(gateway, Vec::new(), vec![size], None).unwrap()[0];
+            let iota = IotaOperation::new(vector_type.clone(), 0).unwrap();
+            let vector = builder.add_instruction(iota, Vec::new(), vec![dimension], None).unwrap()[0];
+            let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
+            let regions = vec![builder.intern_callee(&body, None).unwrap()];
+            let output = builder.add_instruction(operation, regions, vec![vector], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let lower = |program: &FlatProgram<Session>| {
+            let (options, output_count) = (Options::new(mesh.clone()), program.output_count());
+            let lowered = session.lower_verified_reference_free_program(program, 0, output_count, &[], &options, false);
+            lowered.map(|_| ()).map_err(|error| error.to_string())
+        };
+        assert_eq!(lower(&named_call("ryft.tests.xla_cpu_named_square")), Ok(()));
+        assert_eq!(
+            lower(&named_call("ryft.tests.xla_named_square")),
+            Err("operation `reduce` cannot consume data-derived dimensions during XLA lowering because mean over a \
+                 dynamically sized reduction axis is not supported by the XLA lowering"
+                .to_string()),
+        );
     }
 
     #[test]
