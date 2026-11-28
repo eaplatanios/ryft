@@ -4,8 +4,8 @@
 use std::collections::{HashMap, HashSet};
 
 use ryft_core::{
-    ArrayType, Atom, AtomId, CallOperation, Instruction, Parameterized, Program, RegionRef, RegionRole, ScanOperation,
-    Typed, TypedProgram, Value,
+    ArrayType, Atom, AtomId, CallOperation, Instruction, Parameterized, Program, RegionRef, RegionRole, Typed,
+    TypedProgram, Value,
 };
 
 use crate::lowering::ProgramLoweringOperation;
@@ -13,111 +13,75 @@ use crate::{Constant, RetainedArray, Type};
 
 // TODO(eaplatanios): Review this module.
 
-/// Returns `true` if lowering `instruction` of `region` for `target_platform` emits none of its regions, which holds
-/// for a named composite call whose backend implementation replaces the whole call for that target (refer to
-/// `LowerableOperation::has_composite_implementation`) and, on every target, for a scan with zero iterations (refer
-/// to [`ScanOperation::has_zero_iterations`], which its lowering reads). This is the one test of whether lowering
-/// for a target emits the regions of an instruction, which the walks that follow the regions that lowering
-/// emits read: the collector of the functions that calls share (refer to `collect_call_functions`), the traversal of
-/// the regions that lowering emits (refer to `emitted_regions`, which compilation admission also reads), the summaries
-/// of the placement requests and of the session constants of a region, and the validation of the placements of a
-/// compiled program (refer to `validate_placements`), so that a placement request or a captured array inside a region
-/// that lowering omits is never validated, placed, or passed. The eager application of an operation asks the same
-/// question of that operation (refer to [`omits_operation_regions`]).
-pub(crate) fn omits_regions<V: Value<Type = Type>, O: ProgramLoweringOperation>(
-    region: RegionRef<'_, V, O>,
-    instruction: &Instruction<O>,
-    target_platform: Option<&str>,
-) -> bool {
-    let types = |atoms: &[AtomId]| {
-        atoms.iter().map(|atom| region.atoms()[atom.index()].r#type().into_owned()).collect::<Vec<_>>()
-    };
-    omits_operation_regions(
-        instruction.operation(),
-        || (types(instruction.inputs()), types(instruction.outputs())),
-        target_platform,
-    )
+/// Whether a traversal follows a [`CallOperation`] into its callee.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CallTraversal {
+    /// Visit the computations that execute across call boundaries.
+    Enter,
+
+    /// Stay in the current capture scope. A callee's capture indices refer to its own inputs.
+    Skip,
 }
 
-/// Returns `true` if lowering `operation` for `target_platform` emits none of its regions. This is the part of
-/// [`omits_regions`] that reads only the operation, its input and output types, which `boundary_types` returns when a
-/// named composite call needs them, and the platform, so that the eager application of an operation (refer to
-/// `Session::bind`) asks the same question of the operation that it binds as the walks of the regions that lowering
-/// emits ask of each instruction.
-pub(crate) fn omits_operation_regions<O: ProgramLoweringOperation>(
-    operation: &O,
-    boundary_types: impl FnOnce() -> (Vec<Type>, Vec<Type>),
-    target_platform: Option<&str>,
-) -> bool {
-    if operation.projected_payload::<ScanOperation<Type>>().is_some_and(ScanOperation::has_zero_iterations) {
-        return true;
+/// Queries the instruction boundaries and computation regions that XLA lowers from a [`RegionRef`].
+pub(crate) trait RegionLoweringExtension<O: ProgramLoweringOperation>: Sized {
+    /// Returns the input and output types of an instruction in this region, in operand and result order.
+    fn instruction_boundary_types(self, instruction: &Instruction<O>) -> (Vec<Type>, Vec<Type>);
+
+    /// Visits this region and its emitted computation descendants once each, in the order of
+    /// [`RegionRef::computation_regions`]. Dormant rules and bodies omitted by
+    /// [`ProgramLoweringOperation::omits_regions`] are skipped. Use [`CallTraversal::Enter`] for whole-program
+    /// analyses and [`CallTraversal::Skip`] when resolving captures in this region's scope.
+    fn emitted_regions(self, target_platform: Option<&str>, calls: CallTraversal) -> impl Iterator<Item = Self>;
+}
+
+impl<V: Value<Type = Type>, O: ProgramLoweringOperation> RegionLoweringExtension<O> for RegionRef<'_, V, O> {
+    fn instruction_boundary_types(self, instruction: &Instruction<O>) -> (Vec<Type>, Vec<Type>) {
+        let types =
+            |atoms: &[AtomId]| atoms.iter().map(|atom| self.atoms()[atom.index()].r#type().into_owned()).collect();
+        (types(instruction.inputs()), types(instruction.outputs()))
     }
-    let Some(key) = operation.composite_key() else {
-        return false;
-    };
-    let (input_types, output_types) = boundary_types();
-    O::has_composite_implementation(key, &input_types, &output_types, target_platform)
-}
 
-/// Returns `entry` and the computation regions below it that lowering emits for `target_platform`, visiting shared
-/// regions once, in the order of [`RegionRef::computation_regions`]. Dormant rule regions (e.g., the transpose region
-/// of a `linear_call`) and the regions of the instructions whose lowering omits them (refer to [`omits_regions`]) are
-/// skipped, so that a region reachable only through them is never visited. This is the one traversal of the regions
-/// that lowering emits, which the collection of the module mesh and of the session constants and the selection of the
-/// partitioner read, and it visits the same regions in the same order as [`RegionRef::computation_regions`] when no
-/// instruction omits its regions.
-pub(crate) fn emitted_regions<'r, V: Value<Type = Type>, O: ProgramLoweringOperation>(
-    entry: RegionRef<'r, V, O>,
-    target_platform: Option<&'r str>,
-) -> impl Iterator<Item = RegionRef<'r, V, O>> {
-    emitted_regions_entering_calls(entry, target_platform, true)
-}
-
-/// Returns the regions of [`emitted_regions`], without the callees of the `call`s among them and the regions below
-/// those callees unless `enters_calls` is set. Without them, these are the regions of one capture scope: a constant of
-/// one of them that names capture `k` names capture `k` of `entry`, whereas the same constant in a callee names its own
-/// input `k` (refer to `CallProgramLoweringExtension::lower_call`), which the call receives as its input `k`.
-pub(crate) fn emitted_regions_entering_calls<'r, V: Value<Type = Type>, O: ProgramLoweringOperation>(
-    entry: RegionRef<'r, V, O>,
-    target_platform: Option<&'r str>,
-    enters_calls: bool,
-) -> impl Iterator<Item = RegionRef<'r, V, O>> {
-    let mut visited = vec![false; entry.arena().len()];
-    let mut pending = vec![entry.id()];
-    std::iter::from_fn(move || {
-        while let Some(id) = pending.pop() {
-            if std::mem::replace(&mut visited[id.index()], true) {
-                continue;
-            }
-            // Every pending identifier is the entry or a region of an instruction of the same arena.
-            let region = entry.with_id(id).unwrap();
-            for instruction in region.instructions() {
-                if !omits_regions(region, instruction, target_platform)
-                    && (enters_calls || instruction.operation().projected_payload::<CallOperation<Type>>().is_none())
-                {
+    fn emitted_regions(self, target_platform: Option<&str>, calls: CallTraversal) -> impl Iterator<Item = Self> {
+        let mut visited = vec![false; self.arena().len()];
+        let mut pending = vec![self.id()];
+        std::iter::from_fn(move || {
+            while let Some(id) = pending.pop() {
+                if std::mem::replace(&mut visited[id.index()], true) {
+                    continue;
+                }
+                // Every pending identifier is this region or an attachment in the same arena.
+                let region = self.with_id(id).unwrap();
+                for instruction in region.instructions() {
+                    let operation = instruction.operation();
+                    if operation.omits_regions(target_platform, || region.instruction_boundary_types(instruction))
+                        || (calls == CallTraversal::Skip
+                            && operation.projected_payload::<CallOperation<Type>>().is_some())
+                    {
+                        continue;
+                    }
                     pending.extend(instruction.regions().iter().copied().enumerate().filter_map(|(index, id)| {
-                        (instruction.operation().region_role(index) == Some(RegionRole::Computation)).then_some(id)
+                        (operation.region_role(index) == Some(RegionRole::Computation)).then_some(id)
                     }));
                 }
+                return Some(region);
             }
-            return Some(region);
-        }
-        None
-    })
+            None
+        })
+    }
 }
 
 /// Returns, for each of the first `capture_count` captures of the program whose entry region is `entry`, whether a
-/// region that lowering emits for `target_platform` reads it (refer to [`emitted_regions`]), as an input of one of
-/// its instructions or as one of its outputs. Every region names a capture through a constant whose
-/// [`Value::capture_index`] is its position, except the entry region of a program with lifted captures (i.e., when
-/// `lifted` is set), which names capture `k` through its input `k`. A capture that no emitted region reads (e.g., one
-/// that only the body of a scan with zero iterations reads) is neither admitted when a function is compiled nor passed
-/// to its executable, whose signature erases it (refer to
-/// `ProgramLoweringExtension::to_mlir`), so that admission and lowering read this one
-/// decision. A capture that a region only passes on to a call as a capture which the callee never reads is not read
-/// either (refer to [`visit_emitted_reads`]). The regions of the callees of calls are not visited, because their
-/// constants name the captures of those callees, which a callee reads only through the inputs of its call (refer to
-/// [`emitted_regions_entering_calls`]).
+/// region that lowering emits for `target_platform` reads it (refer to [`RegionLoweringExtension::emitted_regions`]),
+/// as an input of one of its instructions or as one of its outputs. Every region names a capture through a constant
+/// whose [`Value::capture_index`] is its position, except the entry region of a program with lifted captures (i.e.,
+/// when `lifted` is set), which names capture `k` through its input `k`. A capture that no emitted region reads (e.g.,
+/// one that only the body of a scan with zero iterations reads) is neither admitted when a function is compiled nor
+/// passed to its executable, whose signature erases it (refer to `ProgramLoweringExtension::to_mlir`), so that
+/// admission and lowering read this one decision. A capture that a region only passes on to a call as a capture which
+/// the callee never reads is not read either (refer to [`visit_emitted_reads`]). The regions of the callees of calls
+/// are not visited, because their constants name the captures of those callees, which a callee reads only through the
+/// inputs of its call (refer to [`CallTraversal::Skip`]).
 pub(crate) fn emitted_capture_reads<'r, O: ProgramLoweringOperation>(
     entry: RegionRef<'r, Constant, O>,
     capture_count: usize,
@@ -126,7 +90,7 @@ pub(crate) fn emitted_capture_reads<'r, O: ProgramLoweringOperation>(
 ) -> Vec<bool> {
     let mut is_read = vec![false; capture_count];
     let entry_id = entry.id();
-    for region in emitted_regions_entering_calls(entry, target_platform, false) {
+    for region in entry.emitted_regions(target_platform, CallTraversal::Skip) {
         let mut lifted_captures = HashMap::new();
         if lifted && region.id() == entry_id {
             let inputs = region.input_ids().iter().take(capture_count);
@@ -219,9 +183,9 @@ where
 /// group. The second group contains arrays passed only as captures to callees that never read them on
 /// `target_platform` (refer to [`visit_emitted_reads`]). The first group contains all other session constants.
 ///
-/// For a whole program, callers pass its [`emitted_regions`] for the same target. Arrays in the first group become
-/// hidden entry inputs after the lifted captures, in the order returned. Lowering binds arrays in the second group
-/// to bufferless values and passes those values to the calls.
+/// For a whole program, callers pass its [`RegionLoweringExtension::emitted_regions`] for the same target. Arrays in
+/// the first group become hidden entry inputs after the lifted captures, in the order returned. Lowering binds arrays
+/// in the second group to bufferless values and passes those values to the calls.
 pub(crate) fn partition_region_session_constants<'r, O: ProgramLoweringOperation + 'r>(
     regions: impl Iterator<Item = RegionRef<'r, Constant, O>>,
     target_platform: Option<&str>,
@@ -280,13 +244,39 @@ mod tests {
 
     use crate::lowering::programs::{ProgramLoweringExtension, ProgramLoweringOptions};
 
-    use crate::lowering::tests::{linear_call_program, scalar_linear_region};
+    use crate::lowering::tests::{
+        add_call, linear_call_program, neg_branch, scalar_linear_region, test_vector_type, unproject_plain_program,
+    };
 
     use crate::sessions::tests::{domain_mesh, f32_scalar};
 
     use crate::tests::{cpu_client, peer_devices, session_with_remote_devices};
 
     use super::*;
+
+    #[test]
+    fn test_region_ref_emitted_regions() {
+        let vector = test_vector_type(4);
+        let callee = Arc::new(unproject_plain_program(neg_branch(vector.clone())));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(vector.into());
+        let first = add_call(&mut builder, &callee, vec![input]);
+        let second = add_call(&mut builder, &callee, vec![first]);
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![second], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let entry = program.entry_region_ref();
+        let shared = entry.instructions()[0].regions()[0];
+        assert_eq!(entry.instructions()[1].regions(), &[shared]);
+        assert_eq!(
+            entry.emitted_regions(None, CallTraversal::Enter).map(RegionRef::id).collect::<Vec<_>>(),
+            vec![entry.id(), shared],
+        );
+        assert_eq!(
+            entry.emitted_regions(None, CallTraversal::Skip).map(RegionRef::id).collect::<Vec<_>>(),
+            vec![entry.id()],
+        );
+    }
 
     #[test]
     fn test_partition_region_session_constants_assigns_the_same_inputs_on_every_process() {
@@ -319,7 +309,7 @@ mod tests {
                 .map(|array| builder.add_constant(Constant::Session(RetainedArray::new(array))))
                 .to_vec();
             let program = builder.build::<Vec<Constant>, Vec<Constant>>(outputs, vec![], vec![Placeholder; 5]).unwrap();
-            let regions = emitted_regions(program.entry_region_ref(), None);
+            let regions = program.entry_region_ref().emitted_regions(None, CallTraversal::Enter);
             let (constants, passed_on) = partition_region_session_constants(regions, None);
             assert_eq!(constants, [&scalar, &first, &second, &copy].map(RetainedArray::new));
             assert!(passed_on.is_empty());
@@ -339,7 +329,7 @@ mod tests {
             let declared_program = declared_builder
                 .build::<Vec<Constant>, Vec<Constant>>(declared_outputs, vec![], vec![Placeholder; 3])
                 .unwrap();
-            let regions = emitted_regions(declared_program.entry_region_ref(), None);
+            let regions = declared_program.entry_region_ref().emitted_regions(None, CallTraversal::Enter);
             assert_eq!(
                 partition_region_session_constants(regions, None),
                 (vec![declared, RetainedArray::new(&first)], vec![]),
@@ -391,11 +381,11 @@ mod tests {
         let plain_region = with_constant(false);
         let constant_region = with_constant(true);
         let dormant = linear_call_program(&plain_region, &constant_region);
-        let regions = emitted_regions(dormant.entry_region_ref(), None);
+        let regions = dormant.entry_region_ref().emitted_regions(None, CallTraversal::Enter);
         assert_eq!(partition_region_session_constants(regions, None), (vec![], vec![]));
 
         let live = linear_call_program(&constant_region, &plain_region);
-        let regions = emitted_regions(live.entry_region_ref(), None);
+        let regions = live.entry_region_ref().emitted_regions(None, CallTraversal::Enter);
         assert_eq!(partition_region_session_constants(regions, None), (vec![constant], vec![]));
     }
 
@@ -428,7 +418,7 @@ mod tests {
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder]);
         let program = program.unwrap();
         for (platform, expected) in [("cuda", vec![]), ("cpu", vec![constant])] {
-            let regions = emitted_regions(program.entry_region_ref(), Some(platform));
+            let regions = program.entry_region_ref().emitted_regions(Some(platform), CallTraversal::Enter);
             assert_eq!(partition_region_session_constants(regions, Some(platform)), (expected, vec![]));
         }
     }

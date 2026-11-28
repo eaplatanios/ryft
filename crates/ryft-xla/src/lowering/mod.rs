@@ -35,8 +35,8 @@ use std::sync::Arc;
 use ryft_core::{
     ArrayType, CALL_OPERATION_NAME, CompositeKey, ConstrainShardingOperation, DataType, Device, DeviceMesh,
     EagerContext, EffectClass, EffectClasses, FlatProgram, LogicalMesh, Memory, Operation as CoreOperation,
-    OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, Program, ProgramError, RegionRef, Sharding,
-    ShardingDimension, Type as CoreType,
+    OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, Program, ProgramError, RegionRef, ScanOperation,
+    Sharding, ShardingDimension, Type as CoreType,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -662,7 +662,28 @@ pub trait LowerableOperation: CoreOperation {
 /// inside the family, for example when deduplicating calls or deciding which regions to emit.
 ///
 /// The blanket implementation covers every type that meets these bounds, including downstream operation families.
-pub trait ProgramLoweringOperation: LowerableOperation<Type = Type> + OperationPayloadProjection {}
+pub trait ProgramLoweringOperation: LowerableOperation<Type = Type> + OperationPayloadProjection {
+    /// Returns whether lowering skips the bodies of this operation's attached regions on `target_platform`.
+    /// A scan with zero iterations omits its body on every platform, though lowering still reads the body interface
+    /// to type the results. A named composite omits its body when this family supplies a
+    /// [backend implementation](LowerableOperation::has_composite_implementation) for its key and boundary types.
+    /// Only that lookup evaluates `boundary_types`, which returns the input types followed by the output types.
+    /// Staged lowering and eager dispatch use this decision to skip captures and placements in omitted regions.
+    fn omits_regions(
+        &self,
+        target_platform: Option<&str>,
+        boundary_types: impl FnOnce() -> (Vec<Type>, Vec<Type>),
+    ) -> bool {
+        if self.projected_payload::<ScanOperation<Type>>().is_some_and(ScanOperation::has_zero_iterations) {
+            return true;
+        }
+        let Some(key) = self.composite_key() else {
+            return false;
+        };
+        let (input_types, output_types) = boundary_types();
+        Self::has_composite_implementation(key, &input_types, &output_types, target_platform)
+    }
+}
 
 impl<O: LowerableOperation<Type = Type> + OperationPayloadProjection> ProgramLoweringOperation for O {}
 
@@ -1616,6 +1637,14 @@ pub(crate) mod tests {
                     .to_string(),
             })),
         );
+    }
+
+    #[test]
+    fn test_program_lowering_operation_omits_regions() {
+        // A scan can decide whether it emits its body from the iteration count alone.
+        let boundary_types = || panic!("a scan queried its boundary types");
+        assert!(Operation::<Constant>::Scan(ScanOperation::new(1, 0)).omits_regions(None, boundary_types));
+        assert!(!Operation::<Constant>::Scan(ScanOperation::new(1, 1)).omits_regions(None, boundary_types));
     }
 
     #[test]

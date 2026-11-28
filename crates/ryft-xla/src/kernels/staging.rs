@@ -33,7 +33,7 @@ use crate::kernels::{
     CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding, placed_custom_call, unbound_kernel_axis_message,
     validate_kernel_sharding,
 };
-use crate::lowering::emissions::emitted_regions;
+use crate::lowering::emissions::{CallTraversal, RegionLoweringExtension};
 use crate::{
     Constant, Error, LowerableOperation, Lowerer, LoweringError, Operation, ProgramLoweringOperation, Session, Target,
     Type,
@@ -1354,7 +1354,7 @@ impl std::hash::Hash for KernelCompilerBinding {
 /// Selects reachable kernel calls, discharges their state proven local, and extracts the remaining region closure.
 /// Dormant transform rule regions retain their unselected carriers until a transform makes them executable. A kernel
 /// operation outside a selected call is rejected only in a region that lowering emits for the platform of the
-/// execution facts (refer to `emitted_regions`).
+/// execution facts (refer to `RegionLoweringExtension::emitted_regions`).
 pub(crate) fn select_kernels(
     program: &FlatProgram<Session>,
     binding: Option<&KernelCompilerBinding>,
@@ -1481,7 +1481,7 @@ pub(crate) fn select_kernels(
         .to_program();
     // Only the regions that lowering emits for the platform of the execution facts must be free of kernel operations
     // (refer to `emitted_regions`), as lowering never emits the others.
-    for region in emitted_regions(selected.entry_region_ref(), Some(facts.platform_name())) {
+    for region in selected.entry_region_ref().emitted_regions(Some(facts.platform_name()), CallTraversal::Enter) {
         if let Some(instruction) = region
             .instructions()
             .iter()

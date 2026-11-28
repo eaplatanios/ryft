@@ -46,7 +46,7 @@ use crate::compilation::domains::{commits_public_outputs, relocated_input_type};
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::EffectTokens;
 use crate::lowering::contexts::ProgramLoweringContext;
-use crate::lowering::emissions::{emitted_regions, omits_regions, partition_region_session_constants};
+use crate::lowering::emissions::{CallTraversal, RegionLoweringExtension, partition_region_session_constants};
 use crate::lowering::programs::{ProgramInlineLoweringExtension, RegionPlacementRequestsExtension};
 use crate::lowering::reductions::validate_declared_pending_reduction;
 use crate::lowering::types::{TypeLoweringExtension, lower_unplaced_constant_output};
@@ -253,7 +253,7 @@ where
         // reference session constants also inline, because only the entry function receives their hidden arguments
         // and binds the arrays that are only passed on to calls that never read them.
         if count < 2 || !lowered_effect_classes(&program)?.is_empty() || {
-            let regions = emitted_regions(program.entry_region_ref(), target_platform);
+            let regions = program.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter);
             let (session_constants, passed_on) = partition_region_session_constants(regions, target_platform);
             !session_constants.is_empty() || !passed_on.is_empty()
         } {
@@ -1098,7 +1098,10 @@ where
             if instruction.operation().projected_payload::<ShardMapOperation>().is_some() {
                 continue;
             }
-            if omits_regions(region_ref, instruction, target_platform) {
+            if instruction
+                .operation()
+                .omits_regions(target_platform, || region_ref.instruction_boundary_types(instruction))
+            {
                 continue;
             }
             for (index, &nested) in instruction.regions().iter().enumerate() {
@@ -1139,10 +1142,7 @@ where
                     named_calls.calls[index].count += 1;
                     continue;
                 }
-                let input_types =
-                    instruction.inputs().iter().map(|atom| atom_type(atom).into_owned()).collect::<Vec<_>>();
-                let output_types =
-                    instruction.outputs().iter().map(|atom| atom_type(atom).into_owned()).collect::<Vec<_>>();
+                let (input_types, output_types) = region_ref.instruction_boundary_types(instruction);
                 named_calls.index.entry(body_region).or_default().push(named_calls.calls.len());
                 named_calls.calls.push(NamedRegionCall {
                     region: body_region,

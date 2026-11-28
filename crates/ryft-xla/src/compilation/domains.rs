@@ -13,10 +13,9 @@ use std::time::Instant;
 use ryft_core::{
     ArrayOperation, ArrayType, CALL_OPERATION_NAME, CallOperation, CapturePlacement, CompilationCacheDomain,
     CompilationDomain, Device, DeviceMesh, Dimension, DimensionFromScalarOperation, DispatchInputs,
-    ExternalReferenceBinding, FlatProgram, LogicalMesh, Memory, Operation as CoreOperation, OperationPayloadProjection,
-    PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError, ReferenceDischargeResult,
-    RegionRole, SHARD_MAP_OPERATION_NAME, Sharding, ShardingDimension, ShardingError, StagedProgram, Type as CoreType,
-    TypeError, Typed, TypedProgram,
+    ExternalReferenceBinding, FlatProgram, LogicalMesh, Memory, OperationPayloadProjection, PLACE_OPERATION_NAME,
+    Parameterized, PlaceOperation, PlacementRequest, ProgramError, ReferenceDischargeResult, SHARD_MAP_OPERATION_NAME,
+    Sharding, ShardingDimension, ShardingError, StagedProgram, Type as CoreType, TypeError, Typed, TypedProgram,
 };
 use ryft_pjrt::protos::{
     CompilationOptions, ComputationDeviceAssignment, DeviceAssignment, ExecutableCompilationOptions, OpShardingType,
@@ -33,7 +32,8 @@ use crate::compilation::programs::{
 };
 use crate::execution::{ExecutionPlan, validate_capture_reduction};
 use crate::lowering::emissions::{
-    emitted_capture_reads, emitted_regions, omits_regions, partition_region_session_constants, unread_entry_inputs,
+    CallTraversal, RegionLoweringExtension, emitted_capture_reads, partition_region_session_constants,
+    unread_entry_inputs,
 };
 use crate::lowering::programs::{
     OutputShardingSource, ProgramLoweringAnalysisExtension, ProgramLoweringExtension, ProgramLoweringOptions,
@@ -409,7 +409,10 @@ impl Session {
         // Data-derived dimensions need finite bounds, and their consumers must keep padding unobservable. Both are
         // checked only in the regions emitted for this target, so dormant rules, zero-iteration scans, and composite
         // bodies replaced on this platform are skipped.
-        let regions = emitted_regions(program.entry_region_ref(), target_platform).collect::<Vec<_>>();
+        let regions = program
+            .entry_region_ref()
+            .emitted_regions(target_platform, CallTraversal::Enter)
+            .collect::<Vec<_>>();
         let mut data_derived_dimensions = HashSet::new();
         for region in &regions {
             for instruction in region.instructions() {
@@ -932,14 +935,15 @@ impl Session {
         }
         let expected_input_shardings =
             boundary_mapping.executable_input_shardings(logical_input_shardings.as_slice())?;
-        let embeds_kernels = emitted_regions(program.entry_region_ref(), target_platform).any(|region| {
-            region.instructions().iter().any(|instruction| match instruction.operation() {
-                Operation::CustomCall(operation) | Operation::Array(ArrayOperation::CustomCall(operation)) => {
-                    operation.attributes().iter().any(|(name, _)| name == "ryft.kernel.schema")
-                }
-                _ => false,
-            })
-        });
+        let embeds_kernels =
+            program.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter).any(|region| {
+                region.instructions().iter().any(|instruction| match instruction.operation() {
+                    Operation::CustomCall(operation) | Operation::Array(ArrayOperation::CustomCall(operation)) => {
+                        operation.attributes().iter().any(|(name, _)| name == "ryft.kernel.schema")
+                    }
+                    _ => false,
+                })
+            });
         let kernel_execution_facts = if embeds_kernels {
             Some(crate::kernels::KernelExecutionFacts::from_target(target, options.mesh())?.configuration_key()?)
         } else {
@@ -1656,14 +1660,15 @@ fn validate_even_sharding(
 }
 
 /// Returns whether every array type that occurs in a region that lowering emits for `target_platform` (refer to
-/// [`emitted_regions`]) of `program` has a static shape. The walk covers the entry region and its executed nested
-/// regions, and therefore every region boundary, constant, and instruction output that lowering emits. Regions that
-/// lowering never reaches (e.g., the rule regions of composites, the transpose region of a `linear_call`, or a body that
-/// a backend implementation of a named composite replaces for the target) are skipped, so that they cannot change how
-/// the rest of the program is compiled. First-class atoms of dimension type are ignored because they lower to ordinary
-/// scalars. Only dynamically shaped *array* types make the lowered module unacceptable to the Shardy partitioner.
+/// [`RegionLoweringExtension::emitted_regions`]) of `program` has a static shape. The walk covers the entry region and
+/// its executed nested regions, and therefore every region boundary, constant, and instruction output that lowering
+/// emits. Regions that lowering never reaches (e.g., the rule regions of composites, the transpose region of a
+/// `linear_call`, or a body that a backend implementation of a named composite replaces for the target) are skipped,
+/// so that they cannot change how the rest of the program is compiled. First-class atoms of dimension type are ignored
+/// because they lower to ordinary scalars. Only dynamically shaped *array* types make the lowered module unacceptable
+/// to the Shardy partitioner.
 fn has_only_static_array_types(program: &FlatProgram<Session>, target_platform: Option<&str>) -> bool {
-    emitted_regions(program.entry_region_ref(), target_platform).all(|region| {
+    program.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter).all(|region| {
         region.atoms().iter().all(|atom| match atom.r#type().as_ref() {
             Type::Array(array_type) => array_type.static_shape().is_some(),
             Type::Dimension(_) => true,
@@ -1676,11 +1681,11 @@ fn has_only_static_array_types(program: &FlatProgram<Session>, target_platform: 
 }
 
 /// Returns whether `program` lowers a `shard_map` for `target_platform`, including inside executed nested regions but
-/// not inside regions that lowering never reaches (refer to [`emitted_regions`]). The documentation of
-/// [`ShardMapOperation`](ryft_core::ShardMapOperation) requires `shard_map` boundaries to be static, so a `shard_map`
-/// can still appear in a program that is bounded dynamic elsewhere, which this predicate detects.
+/// not inside regions that lowering never reaches (refer to [`RegionLoweringExtension::emitted_regions`]). The
+/// documentation of [`ShardMapOperation`](ryft_core::ShardMapOperation) requires `shard_map` boundaries to be static,
+/// so a `shard_map` can still appear in a program that is bounded dynamic elsewhere, which this predicate detects.
 fn contains_shard_map(program: &FlatProgram<Session>, target_platform: Option<&str>) -> bool {
-    emitted_regions(program.entry_region_ref(), target_platform).any(|region| {
+    program.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter).any(|region| {
         region
             .instructions()
             .iter()
@@ -1749,23 +1754,7 @@ fn validate_placements(
     use_shardy_partitioner: bool,
     target_platform: Option<&str>,
 ) -> Result<(), Error> {
-    // The walk follows the regions that lowering emits for `target_platform`, so it skips the regions of an instruction
-    // that lowering omits (refer to `omits_regions`), as it skips dormant regions.
-    let entry = program.entry_region_ref();
-    let mut visited = vec![false; entry.arena().len()];
-    let mut pending = vec![entry.id()];
-    while let Some(id) = pending.pop() {
-        if std::mem::replace(&mut visited[id.index()], true) {
-            continue;
-        }
-        let region = entry.with_id(id)?;
-        for instruction in region.instructions() {
-            if !omits_regions(region, instruction, target_platform) {
-                pending.extend(instruction.regions().iter().copied().enumerate().filter_map(|(index, id)| {
-                    (instruction.operation().region_role(index) == Some(RegionRole::Computation)).then_some(id)
-                }));
-            }
-        }
+    for region in program.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter) {
         for instruction in region.instructions() {
             // A call places values on the devices that its callee was compiled for, so it is valid exactly when those
             // are the devices of `mesh`, and the replicas of a bounded dynamic program cannot enforce an override that
@@ -6468,7 +6457,7 @@ mod tests {
 
         // A function that also calls a function whose own capture is numbered zero as well reads its own capture zero
         // only where its own regions read it, and the capture of its callee only through the input of the call
-        // (refer to `emitted_regions_entering_calls`). So a capture of another client that only a scan without
+        // (refer to `CallTraversal::Skip`). So a capture of another client that only a scan without
         // iterations reads stays unread when the callee reads its own capture zero, and a capture that the function
         // reads stays required when the callee never reads its own capture zero, at every entry point. Before, the
         // constant of the capture of the callee was counted as a read of the capture zero of the function, which

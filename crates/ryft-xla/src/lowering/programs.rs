@@ -22,7 +22,7 @@ use crate::arrays::host::ReductionChange;
 use crate::devices::MemoryExtension;
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::emissions::{
-    emitted_regions, omits_regions, partition_region_session_constants, unread_entry_inputs,
+    CallTraversal, RegionLoweringExtension, partition_region_session_constants, unread_entry_inputs,
 };
 use crate::lowering::reductions::{
     ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
@@ -674,7 +674,7 @@ where
         let session_constants = match &options.capture_types {
             Some(_) => None,
             None => {
-                let regions = emitted_regions(program.entry_region_ref(), target_platform);
+                let regions = program.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter);
                 Some(partition_region_session_constants(regions, target_platform).0)
             }
         };
@@ -1948,8 +1948,8 @@ pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
 
     /// Returns whether an instruction in a region that lowering emits declares ordered state. XLA cannot represent
     /// state in any such region, including state omitted from the effect summary of the enclosing operation. This
-    /// checks the regions returned by [`emitted_regions`] without a target platform, skipping dormant rules and
-    /// bodies of scans that admit no iteration.
+    /// checks the regions returned by [`RegionLoweringExtension::emitted_regions`] without a target platform, skipping
+    /// dormant rules and bodies of scans that admit no iteration.
     fn contains_unresolved_state(&self) -> bool;
 
     /// Returns whether a region that lowering emits contains a reference-typed atom or an instruction
@@ -2065,7 +2065,7 @@ where
 
     #[inline]
     fn contains_unresolved_state(&self) -> bool {
-        emitted_regions(self.entry_region_ref(), None).any(|region| {
+        self.entry_region_ref().emitted_regions(None, CallTraversal::Enter).any(|region| {
             region
                 .instructions()
                 .iter()
@@ -2077,7 +2077,7 @@ where
     fn contains_unresolved_references(&self) -> bool {
         // Checking declarations as well as atom types catches an incomplete discharge that retyped every atom but
         // left a reference operation behind.
-        emitted_regions(self.entry_region_ref(), None).any(|region| {
+        self.entry_region_ref().emitted_regions(None, CallTraversal::Enter).any(|region| {
             region.atoms().iter().any(|atom| atom.r#type().is_reference())
                 || region
                     .instructions()
@@ -2294,7 +2294,7 @@ where
 
         // Session constants are carried by hidden inputs that form the suffix of the capture inputs. The caller
         // declares them through the trailing `capture_types`, in order of first occurrence in the emitted regions.
-        let regions = emitted_regions(self.entry_region_ref(), target_platform);
+        let regions = self.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter);
         let (session_constants, passed_on_constants) = partition_region_session_constants(regions, target_platform);
         let session_count = session_constants.len();
         if session_count > 0
@@ -2472,16 +2472,7 @@ where
             input_values.to_vec(),
             |_, value| value.lower(captured_values, lowering_context, &mut constant_block, context, location),
             |instruction, inputs| {
-                let input_types = instruction
-                    .inputs()
-                    .iter()
-                    .map(|input| region.atoms()[input.index()].r#type().into_owned())
-                    .collect::<Vec<_>>();
-                let output_types = instruction
-                    .outputs()
-                    .iter()
-                    .map(|output| region.atoms()[output.index()].r#type().into_owned())
-                    .collect::<Vec<_>>();
+                let (input_types, output_types) = region.instruction_boundary_types(instruction);
 
                 // All operations emitted for this instruction inherit its provenance on top of the ambient location.
                 let location = lowering_context.instruction_location(context, instruction.provenance(), location);
@@ -2561,7 +2552,9 @@ impl RegionPlacementRequestsExtension for RegionPlacementRequests {
         match target_platform {
             None => Self::new(region),
             Some(target_platform) => Self::for_target(region, target_platform, |region, instruction| {
-                omits_regions(region, instruction, Some(target_platform))
+                instruction
+                    .operation()
+                    .omits_regions(Some(target_platform), || region.instruction_boundary_types(instruction))
             }),
         }
     }

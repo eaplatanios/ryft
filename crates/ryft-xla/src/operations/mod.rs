@@ -50,7 +50,7 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::emissions::{emitted_capture_reads, omits_regions};
+use crate::lowering::emissions::{RegionLoweringExtension, emitted_capture_reads};
 use crate::lowering::types::{ArrayTypeLoweringExtension, physical_bound_type};
 use crate::lowering::{unsupported_data_derived_dimensions, validate_local_output_placement};
 use crate::operations::composites::NamedCompositeImplementation;
@@ -843,8 +843,12 @@ impl LowerableOperation for Operation {
         // over the program. Most programs have no call that records a mesh and pay one scan of their calls. The regions
         // that lowering omits are those of `RegionPlacementRequestsExtension::for_lowering`.
         let arena = program.entry_region_ref().arena();
-        let omitted: &dyn Fn(RegionRef<'_, Constant, Self>, &Instruction<Self>) -> bool =
-            &|region, instruction| target_platform.is_some() && omits_regions(region, instruction, target_platform);
+        let omitted: &dyn Fn(RegionRef<'_, Constant, Self>, &Instruction<Self>) -> bool = &|region, instruction| {
+            target_platform.is_some()
+                && instruction
+                    .operation()
+                    .omits_regions(target_platform, || region.instruction_boundary_types(instruction))
+        };
         let mut names_devices = RegionPlacementRequests::names_devices_predicate(program.entry_region_ref(), omitted);
         let mut stale = HashSet::new();
         for (index, region) in program.regions().iter().enumerate() {

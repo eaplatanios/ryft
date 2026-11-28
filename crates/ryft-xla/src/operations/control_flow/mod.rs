@@ -14,7 +14,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::contexts::ProgramLoweringContext;
-use crate::lowering::emissions::emitted_regions;
+use crate::lowering::emissions::{CallTraversal, RegionLoweringExtension};
 use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
@@ -85,9 +85,9 @@ pub(crate) fn lower_region_guard<'b, 'c: 'b, 't: 'c>(
 /// order of [`token_threaded_effects`], even when its source program is pure, so that later assertions and I/O follow
 /// it. A region input guard joins its assertion token into the ordered I/O chain, and every assertion advances the
 /// ordered assertion chain. Only the regions that lowering emits for no target platform are searched (refer to
-/// [`emitted_regions`]), which omits only what lowering omits on every platform, so an assertion in the body of a scan
-/// that admits no iteration adds no token, while one in a body that the implementation of a named composite replaces
-/// only on some platform still adds one.
+/// [`RegionLoweringExtension::emitted_regions`]), which omits only what lowering omits on every platform, so an
+/// assertion in the body of a scan that admits no iteration adds no token, while one in a body that the implementation
+/// of a named composite replaces only on some platform still adds one.
 pub(crate) fn lowered_effect_classes<ProgramInput, ProgramOutput, O: ProgramLoweringOperation>(
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
 ) -> Result<EffectClasses, Error>
@@ -99,7 +99,7 @@ where
     if classes.contains(EffectClass::OrderedAssertion) {
         return Ok(classes);
     }
-    for region in emitted_regions(program.entry_region_ref(), None) {
+    for region in program.entry_region_ref().emitted_regions(None, CallTraversal::Enter) {
         for instruction in region.instructions() {
             let input_types = instruction
                 .inputs()

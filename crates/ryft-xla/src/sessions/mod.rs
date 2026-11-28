@@ -126,9 +126,7 @@ use crate::arrays::statistics::ArrayTracker;
 use crate::compilation::domains::{captured_type, placed_constant};
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
 use crate::compilation::programs::EagerDispatchProgram;
-use crate::lowering::emissions::{
-    emitted_regions, emitted_regions_entering_calls, omits_operation_regions, partition_region_session_constants,
-};
+use crate::lowering::emissions::{CallTraversal, RegionLoweringExtension, partition_region_session_constants};
 use crate::lowering::programs::{RegionPlacementRequestsExtension, merge_requested_placement};
 use crate::operations::call::{CallEagerExtension, EagerCallDecision};
 use crate::operations::composites::NamedCompositeImplementation;
@@ -138,7 +136,7 @@ use crate::sessions::runtimes::RuntimeRegistry;
 use crate::sessions::synchronization::{SessionWorkTracker, WorkReservation};
 use crate::{
     Array, ArrayError, ArrayShard, ArrayStatistics, Constant, Dimension, DistributedRuntime, Error, FromPjrt,
-    LiveArray, LowerableOperation, Operation, Options, RetainedArray, Type, Value,
+    LiveArray, LowerableOperation, Operation, Options, ProgramLoweringOperation, RetainedArray, Type, Value,
 };
 
 pub mod effects;
@@ -1459,11 +1457,10 @@ impl Context for Session {
 
         let omits_own_regions = !is_call
             && regions.regions().next().is_some_and(|primal| {
-                let boundary_types = || {
+                operation.omits_regions(target_platform, || {
                     let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect();
                     (input_types, primal.interface().output_types().to_vec())
-                };
-                omits_operation_regions(&operation, boundary_types, target_platform)
+                })
             });
 
         let computation_regions = || {
@@ -1473,7 +1470,7 @@ impl Context for Session {
                 .filter(|(index, _)| {
                     !omits_own_regions && operation.region_role(*index) == Some(RegionRole::Computation)
                 })
-                .flat_map(move |(_, region)| emitted_regions(region, target_platform))
+                .flat_map(move |(_, region)| region.emitted_regions(target_platform, CallTraversal::Enter))
         };
 
         // The intrinsic operation effects alone would miss state carried by regions, while effect scans alone
@@ -1599,13 +1596,10 @@ impl Context for Session {
         // arrays that its callee closes over are nor commits its outputs because of them (refer to
         // `CallEagerExtension::eager_decision`), and neither do the arrays that the callee of this application closes
         // over if it is a call, so execution places all of them on the devices of the application (refer to
-        // `placed_constant`). Lowering never emits the regions that the implementation of a named composite replaces
-        // for the platform of this session, nor the body of a scan that admits no iteration (refer to `omits_regions`),
-        // so the arrays that only they hold take no part either, and neither do the arrays of this application if it
-        // is such an operation, which the same decision recognizes (refer to `omits_operation_regions`, which reads
-        // the output types of the primal region of a composite call, as they are those of the call). The constants
-        // that a region owns depend on that region and on the platform alone, so they are derived once for each region
-        // and retained with it. The admission of reference state above already read the platform and that decision.
+        // `placed_constant`). A zero-iteration scan or a composite replaced on this platform contributes no arrays
+        // from its body. Eager dispatch uses the primal region's output types to make the same decision for the
+        // operation being bound. Each region caches its own constants per platform. Reference admission above already
+        // queried the platform and determined whether lowering omits the operation's regions.
         let captures = if is_call || omits_own_regions {
             Vec::new()
         } else {
@@ -1632,7 +1626,7 @@ impl Context for Session {
                                 // Use the original program if either transform fails so the analysis sees its captures.
                                 let entry = pruned.as_ref().unwrap_or(&program).entry_region_ref();
                                 let target_platform = target_platform.as_deref();
-                                let regions = emitted_regions_entering_calls(entry, target_platform, false);
+                                let regions = entry.emitted_regions(target_platform, CallTraversal::Skip);
                                 Arc::from(partition_region_session_constants(regions, target_platform).0)
                             } else {
                                 Arc::from([])
