@@ -25,8 +25,9 @@
 //!
 //! # Options
 //!
-//! [`RaggedDotLoweringStrategy`] selects how a compilation lowers ragged dots, and an operation declares through
-//! [`DataDependentPaddingDiscipline`] how it treats the padding of data-dependent dynamic dimensions.
+//! [`RaggedDotLoweringStrategy`] selects how a compilation lowers ragged dots, and an operation states through
+//! [`LowerableOperation::validate_data_derived_dimensions`] whether it can consume dimensions that are derived from
+//! runtime data.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -178,7 +179,6 @@ pub(crate) mod types;
 /// Lowering of the values of programs (i.e., their constants) to StableHLO values.
 pub(crate) mod values;
 
-pub use admission::DataDependentPaddingDiscipline;
 pub use programs::{
     EntryShardingOverride, MlirProgram, MlirProgramBoundaryMapping, MlirProgramBoundaryMappingInputDimension,
     MlirProgramBoundaryMappingOutputDimension, ProgramLoweringExtension, ProgramLoweringOptions,
@@ -595,19 +595,25 @@ pub trait LowerableOperation: CoreOperation {
         false
     }
 
-    /// Returns how this operation keeps the physical padding of bounded dynamic values unobservable when it consumes
-    /// a dimension that is derived from runtime data (refer to [`DataDependentPaddingDiscipline`]). Lowering admits a
-    /// program that derives dimensions from data only if every operation that consumes one states a supported
-    /// discipline. It returns [`DataDependentPaddingDiscipline::Unsupported`] unless a family overrides it, so that an
-    /// operation whose padding behavior nobody has stated is rejected and never assumed to be safe. Families answer
-    /// for each of their variants, and [`Operation`] does so with exhaustive matches, so that adding an operation to
-    /// it does not compile until its discipline is stated.
+    /// Validates that this operation can consume a dimension that is derived from runtime data (i.e., one that
+    /// `dimension_from_scalar` produces, or that dimension arithmetic derives from such a dimension). A value with
+    /// such a dimension is bounded dynamic, so an operation can consume it only if its lowering keeps the physical
+    /// padding of that value unobservable. Compilation admits a program that derives dimensions from data only if
+    /// every operation that consumes one passes this validation. Families answer for each of their variants, and
+    /// [`Operation`] does so with exhaustive matches, so that adding an operation to it does not compile until it
+    /// is stated whether that operation passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::UnsupportedOperation`], which names this operation and the reason, when this
+    /// operation cannot consume such a dimension. It returns that error unless a family overrides this function, so
+    /// that an operation whose padding behavior nobody has stated is rejected and never assumed to be safe.
     #[inline]
-    fn data_dependent_padding_discipline(&self) -> DataDependentPaddingDiscipline {
-        DataDependentPaddingDiscipline::Unsupported {
-            reason: "its operation family does not state how it keeps the padding of data-derived dimensions \
-                     unobservable",
-        }
+    fn validate_data_derived_dimensions(&self) -> Result<(), Error> {
+        Err(unsupported_data_derived_dimensions(
+            self.name(),
+            "its operation family does not state how it keeps the padding of data-derived dimensions unobservable",
+        ))
     }
 
     /// Returns `program`, a pruned program of this family, without the mesh that each of its `call`s records for the
@@ -901,6 +907,17 @@ fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         location,
     )?;
     Ok(outputs)
+}
+
+/// Returns the error with which [`LowerableOperation::validate_data_derived_dimensions`] rejects the operation named
+/// `operation_name`, which cannot consume a dimension that is derived from runtime data because of `reason`.
+pub(crate) fn unsupported_data_derived_dimensions(operation_name: &str, reason: &str) -> Error {
+    ProgramError::UnsupportedOperation {
+        message: format!(
+            "operation `{operation_name}` cannot consume data-derived dimensions during XLA lowering because {reason}",
+        ),
+    }
+    .into()
 }
 
 /// Rejects array `output_types` of the operation named `operation_name` that shard a local dimension over one of the
@@ -1587,15 +1604,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_lowerable_operation_data_dependent_padding_discipline() {
-        // A family that does not state the padding discipline of its operations is not assumed to be safe.
+    fn test_lowerable_operation_validate_data_derived_dimensions() {
+        // A family that does not state whether its operations keep the padding of data-derived dimensions
+        // unobservable is not assumed to be safe.
         let operation = BorrowingOperation { positions: &[0] };
         assert_eq!(
-            operation.data_dependent_padding_discipline(),
-            DataDependentPaddingDiscipline::Unsupported {
-                reason: "its operation family does not state how it keeps the padding of data-derived dimensions \
-                         unobservable",
-            },
+            operation.validate_data_derived_dimensions(),
+            Err(Error::from(ProgramError::UnsupportedOperation {
+                message: "operation `borrowing` cannot consume data-derived dimensions during XLA lowering because \
+                          its operation family does not state how it keeps the padding of data-derived dimensions \
+                          unobservable"
+                    .to_string(),
+            })),
         );
     }
 

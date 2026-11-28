@@ -1,37 +1,12 @@
-//! Padding disciplines for data-dependent bounded-dynamic XLA compilation.
+//! Admission of data-dependent bounded-dynamic programs to XLA compilation.
 //!
 //! A dimension produced by `dimension_from_scalar` derives its extent from runtime data, so operations that consume
-//! it must keep StableHLO padding unobservable. [`Session`](crate::Session) rejects consumers with no supported
-//! padding discipline before constructing MLIR.
+//! it must keep StableHLO padding unobservable. [`Session`](crate::Session) rejects the consumers that do not pass
+//! [`LowerableOperation::validate_data_derived_dimensions`](super::LowerableOperation::validate_data_derived_dimensions)
+//! before constructing MLIR. The tests of this module execute the operations that pass it, which is the evidence
+//! that their padding stays unobservable.
 
 // TODO(eaplatanios): Review this module.
-
-/// Padding contract used when admitting one staged operation to data-dependent bounded-dynamic lowering (i.e., how
-/// the operation keeps the padding of a bounded dynamic value unobservable when one of its dimensions is
-/// derived from runtime data). Each operation family states the discipline of its operations through the
-/// [`data_dependent_padding_discipline`] function of `LowerableOperation`.
-///
-/// [`data_dependent_padding_discipline`]: super::LowerableOperation::data_dependent_padding_discipline
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum DataDependentPaddingDiscipline {
-    /// StableHLO propagates the logical dynamic dimensions of the operation without inspecting physical padding
-    /// positions.
-    Propagated,
-
-    /// Ryft delegates masking the padding positions with identities or sentinels to the bounded dynamic legalizer of
-    /// XLA.
-    XlaMasked,
-
-    /// Ryft delegates padding the contraction positions with zeros to the bounded dynamic legalizer of XLA.
-    XlaZeroPadded,
-
-    /// Ryft pads inputs to their bounds with operation-specific values or masks and restores the runtime extents
-    /// after the operation.
-    RyftMasked,
-
-    /// Ryft lacks sufficient semantic or execution evidence to admit this operation safely.
-    Unsupported { reason: &'static str },
-}
 
 #[cfg(test)]
 mod tests {
@@ -172,7 +147,7 @@ mod tests {
             .unwrap()[0];
 
         // The rank-2 `i + j` matrix carries the data-derived extent on an axis that neither the reduction nor the scan
-        // touches, which is the configuration those two disciplines actually admit. A log-sum-exp `reduce` consumes the
+        // touches, which is the configuration that those two operations are admitted in. A log-sum-exp `reduce` consumes the
         // static axis and still produces a dynamically shaped output, and the prefix scan consumes the static axis
         // while every row it emits keeps the dynamic extent.
         let rows = builder
@@ -344,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn test_data_derived_padding_disciplines_execute_without_observable_padding() {
+    fn test_data_derived_dimension_consumers_execute_without_observable_padding() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
@@ -417,7 +392,7 @@ mod tests {
 
         // Row `i` of the `i + j` matrix reduces to `i + ln(1 + e + e² + e³)`, so exactly the live rows appear and a
         // physical suffix row would show up as an extra element. The tolerance is here because the expansion runs
-        // `exp` and `log`, not because the discipline is approximate, and the byte comparison against the reference
+        // `exp` and `log`, not because the masking is approximate, and the byte comparison against the reference
         // kernel inside `execute` is exact.
         assert_eq!(small[10].shape(), StaticShape::new(vec![2]));
         let log_sum_exp = read_first_shard::<f32>(client, &small[10]);
@@ -599,7 +574,7 @@ mod tests {
 
     #[cfg(feature = "cuda-13")]
     #[test]
-    fn test_cuda_data_derived_padding_disciplines_execute_without_observable_padding() {
+    fn test_cuda_data_derived_dimension_consumers_execute_without_observable_padding() {
         let client = Platform::Cuda
             .client(Some(ClientOptions::GPU(GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),

@@ -50,10 +50,9 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked, XlaZeroPadded};
 use crate::lowering::emissions::{emitted_capture_reads, omits_regions};
 use crate::lowering::types::{ArrayTypeLoweringExtension, physical_bound_type};
-use crate::lowering::{DataDependentPaddingDiscipline, validate_local_output_placement};
+use crate::lowering::{unsupported_data_derived_dimensions, validate_local_output_placement};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::{
@@ -773,33 +772,29 @@ impl LowerableOperation for Operation {
         NamedCompositeImplementation::select(key, input_types, output_types, target_platform).is_some()
     }
 
-    fn data_dependent_padding_discipline(&self) -> DataDependentPaddingDiscipline {
+    fn validate_data_derived_dimensions(&self) -> Result<(), Error> {
         match self {
-            Self::Array(operation) => array_data_dependent_padding_discipline(operation),
-            Self::RngBitGenerator(_) => Unsupported {
-                reason: "random generation advances state according to physical rather than logical element count",
-            },
-            Self::ParallelRaggedAllToAll(_) => {
-                Unsupported { reason: "ragged collective metadata may address physical padding positions" }
+            Self::Array(operation) => validate_array_data_derived_dimensions(operation),
+            Self::RngBitGenerator(_) => {
+                Err("random generation advances state according to physical rather than logical element count")
             }
-            Self::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
+            Self::ParallelRaggedAllToAll(_) => Err("ragged collective metadata may address physical padding positions"),
+            Self::CustomCall(_) => Err("custom-call physical-padding semantics are opaque"),
             Self::ReferenceNew(_)
             | Self::ReferenceRead(_)
             | Self::ReferenceWrite(_)
             | Self::ReferenceSwap(_)
             | Self::ReferenceAddUpdate(_)
             | Self::ReferenceAtomicAddUpdate(_)
-            | Self::ReferenceFreeze(_) => {
-                Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" }
-            }
-            Self::Kernel(_) => {
-                Unsupported { reason: "kernel calls must be selected before bounded-dynamic XLA validation" }
-            }
+            | Self::ReferenceFreeze(_) => Err("references must be discharged before bounded-dynamic XLA validation"),
+            Self::Kernel(_) => Err("kernel calls must be selected before bounded-dynamic XLA validation"),
             // Entry guards and `cast`s narrow or widen bounded-dynamic values explicitly (refer to the array arms).
-            Self::Guard(_) | Self::Cast(_) => RyftMasked,
-            Self::ShardMap(_) => Unsupported {
-                reason: "shard-map lowering requires Shardy, which does not support bounded-dynamic tensors",
-            },
+            Self::Guard(_) | Self::Cast(_) => Ok(()),
+            Self::ShardMap(_) => {
+                Err("shard-map lowering requires Shardy, which does not support bounded-dynamic tensors")
+            }
+            // StableHLO propagates the logical dynamic dimensions of these operations without inspecting physical
+            // padding positions.
             Self::Zero(_)
             | Self::DynamicOne(_)
             | Self::DynamicIota(_)
@@ -826,8 +821,9 @@ impl LowerableOperation for Operation {
             | Self::CompositeTranspose(_)
             | Self::LiftedComposite(_)
             | Self::LiftedCompositeTranspose(_)
-            | Self::Call(_) => Propagated,
+            | Self::Call(_) => Ok(()),
         }
+        .map_err(|reason| unsupported_data_derived_dimensions(self.name(), reason))
     }
 
     // TODO(eaplatanios): Review this.
@@ -968,74 +964,76 @@ impl LowerableOperation for Operation {
     }
 }
 
-/// Returns the XLA masking contract for one reduction kind. The exhaustive match makes adding a reduction kind a
-/// compile-time update to the data-dependent inventory instead of silently inheriting another kind's padding rule.
-fn reduction_data_dependent_padding_discipline(kind: ReductionKind) -> DataDependentPaddingDiscipline {
+/// Validates that a reduction of `kind` can consume data-derived dimensions, and returns the reason when it cannot.
+/// The exhaustive match makes adding a reduction kind a compile-time update to this inventory instead of silently
+/// inheriting the padding rule of another kind.
+fn validate_reduction_data_derived_dimensions(kind: ReductionKind) -> Result<(), &'static str> {
     match kind {
+        // The bounded dynamic legalizer of XLA masks the padding positions with the identity of the reduction.
         ReductionKind::Sum
         | ReductionKind::Product
         | ReductionKind::Max
         | ReductionKind::Min
         | ReductionKind::Any
-        | ReductionKind::All => XlaMasked,
+        | ReductionKind::All => Ok(()),
         // A log-sum-exp `reduce` expands into maximum and summation reductions over the same axes, so it inherits
         // the masking contract of exactly those two reduction kinds. XLA masks the operand of each reduction with the
         // identity of that reduction, which wipes the padding positions of the shifted exponentials before they are
         // summed. The rank-2 arm of `data_derived_padding_fixture` executes that expansion with the
         // data-derived extent on the kept axis, which is the admission's execution evidence.
-        ReductionKind::LogSumExp => XlaMasked,
-        ReductionKind::Mean => {
-            Unsupported { reason: "mean over a dynamically sized reduction axis is not supported by the XLA lowering" }
-        }
+        ReductionKind::LogSumExp => Ok(()),
+        ReductionKind::Mean => Err("mean over a dynamically sized reduction axis is not supported by the XLA lowering"),
     }
 }
 
-/// Returns the XLA masking contract for one sort direction. Keeping the match exhaustive means that adding a sort
-/// direction fails to compile until the inventory covers it, because ascending and descending sorts require opposite
-/// sentinels.
-fn sort_data_dependent_padding_discipline(direction: SortDirection) -> DataDependentPaddingDiscipline {
+/// Validates that a sort in `direction` can consume data-derived dimensions, and returns the reason when it cannot.
+/// Keeping the match exhaustive means that adding a sort direction fails to compile until the inventory covers it,
+/// because ascending and descending sorts require opposite sentinels.
+fn validate_sort_data_derived_dimensions(direction: SortDirection) -> Result<(), &'static str> {
     match direction {
-        SortDirection::Ascending | SortDirection::Descending => XlaMasked,
+        // The bounded dynamic legalizer of XLA masks the padding positions with the sentinel of the direction.
+        SortDirection::Ascending | SortDirection::Descending => Ok(()),
     }
 }
 
 /// Rejects every scatter combiner until its padding behavior has kind-specific execution evidence. The exhaustive
 /// match deliberately forces new combiners through the same review rather than admitting them as ordinary operations
 /// that preserve shapes.
-fn scatter_data_dependent_padding_discipline(kind: ScatterReductionKind) -> DataDependentPaddingDiscipline {
+fn validate_scatter_data_derived_dimensions(kind: ScatterReductionKind) -> Result<(), &'static str> {
     match kind {
-        ScatterReductionKind::Overwrite => Unsupported {
-            reason: "overwrite-scatter padding semantics have not been verified for data-derived dimensions",
-        },
-        ScatterReductionKind::Add => {
-            Unsupported { reason: "add-scatter padding semantics have not been verified for data-derived dimensions" }
+        ScatterReductionKind::Overwrite => {
+            Err("overwrite-scatter padding semantics have not been verified for data-derived dimensions")
         }
-        ScatterReductionKind::Mul => Unsupported {
-            reason: "multiply-scatter padding semantics have not been verified for data-derived dimensions",
-        },
-        ScatterReductionKind::Min => Unsupported {
-            reason: "minimum-scatter padding semantics have not been verified for data-derived dimensions",
-        },
-        ScatterReductionKind::Max => Unsupported {
-            reason: "maximum-scatter padding semantics have not been verified for data-derived dimensions",
-        },
+        ScatterReductionKind::Add => {
+            Err("add-scatter padding semantics have not been verified for data-derived dimensions")
+        }
+        ScatterReductionKind::Mul => {
+            Err("multiply-scatter padding semantics have not been verified for data-derived dimensions")
+        }
+        ScatterReductionKind::Min => {
+            Err("minimum-scatter padding semantics have not been verified for data-derived dimensions")
+        }
+        ScatterReductionKind::Max => {
+            Err("maximum-scatter padding semantics have not been verified for data-derived dimensions")
+        }
     }
 }
 
-/// Classifies every homogeneous array operation by the padding discipline required for data-derived dimensions.
-/// Keeping this match exhaustive makes a newly added operation a compile-time inventory update rather than silently
-/// assuming that arbitrary padding is safe.
-fn array_data_dependent_padding_discipline(
+/// Validates that a homogeneous array operation can consume data-derived dimensions (i.e., that its lowering keeps
+/// the physical padding of bounded dynamic values unobservable), and returns the reason when it cannot. Keeping this
+/// match exhaustive makes a newly added operation a compile-time inventory update rather than silently assuming
+/// that arbitrary padding is safe.
+fn validate_array_data_derived_dimensions(
     operation: &ArrayOperation<crate::values::ArrayConstant>,
-) -> DataDependentPaddingDiscipline {
+) -> Result<(), &'static str> {
     match operation {
-        ArrayOperation::Reduce(operation) => reduction_data_dependent_padding_discipline(operation.kind()),
-        ArrayOperation::Sort(operation) => sort_data_dependent_padding_discipline(operation.direction()),
+        ArrayOperation::Reduce(operation) => validate_reduction_data_derived_dimensions(operation.kind()),
+        ArrayOperation::Sort(operation) => validate_sort_data_derived_dimensions(operation.direction()),
         // XLA pads every input of the variadic reduction that these lower to with that input's own initial value along
         // a dynamic reduced axis (i.e., the extremum identity paired with index zero), which never beats a live element
         // and ties only when every live element equals the identity, where index zero is correct. Dynamic axes that
         // are not reduced pass through. `data_derived_padding_fixture` executes both configurations.
-        ArrayOperation::ArgMax(_) | ArrayOperation::ArgMin(_) => XlaMasked,
+        ArrayOperation::ArgMax(_) | ArrayOperation::ArgMin(_) => Ok(()),
         // Runtime-sized slice pullbacks use unique, in-bounds point updates. XLA masks inactive update positions, and
         // the compiled slice pullback fixture checks non-maximum and empty logical extents on CPU and CUDA.
         // Other window shapes, modes, and combiners retain their independent admission requirements.
@@ -1045,33 +1043,33 @@ fn array_data_dependent_padding_discipline(
                 && operation.unique_indices()
                 && operation.dimensions().update_window_dimensions().is_empty() =>
         {
-            XlaMasked
+            Ok(())
         }
-        ArrayOperation::Scatter(operation) => scatter_data_dependent_padding_discipline(operation.kind()),
+        ArrayOperation::Scatter(operation) => validate_scatter_data_derived_dimensions(operation.kind()),
         // A prefix scan mixes positions only along its scanned axis, and type inference already requires that axis to
         // be static, so a data-derived extent can only sit on an axis the scan treats elementwise. That reasoning is
         // the same for every combining operator, and the prefix sum in `data_derived_padding_fixture` executes this arm
         // with the data-derived extent on the unscanned axis.
-        ArrayOperation::Cumulative(_) => Propagated,
-        ArrayOperation::Dot(_) => XlaZeroPadded,
-        ArrayOperation::RaggedDot(_) => {
-            Unsupported { reason: "group-size metadata may describe positions in bounded physical padding" }
+        ArrayOperation::Cumulative(_) => Ok(()),
+        // The bounded dynamic legalizer of XLA pads the contraction positions with zeros.
+        ArrayOperation::Dot(_) => Ok(()),
+        ArrayOperation::RaggedDot(_) => Err("group-size metadata may describe positions in bounded physical padding"),
+        // The lowering pads the inputs to their bounds with masks and restores the runtime extents afterwards.
+        ArrayOperation::ScaledDot(_) => Ok(()),
+        ArrayOperation::RngBitGenerator(_) => {
+            Err("random generation advances state according to physical rather than logical element count")
         }
-        ArrayOperation::ScaledDot(_) => RyftMasked,
-        ArrayOperation::RngBitGenerator(_) => Unsupported {
-            reason: "random generation advances state according to physical rather than logical element count",
-        },
-        ArrayOperation::Dropout(_) => {
-            Unsupported { reason: "dropout masks are drawn according to physical rather than logical extents" }
-        }
+        ArrayOperation::Dropout(_) => Err("dropout masks are drawn according to physical rather than logical extents"),
         ArrayOperation::ParallelRaggedAllToAll(_) => {
-            Unsupported { reason: "ragged collective metadata may address physical padding positions" }
+            Err("ragged collective metadata may address physical padding positions")
         }
-        ArrayOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
-        ArrayOperation::Print(_) => Unsupported { reason: "print exposes the physical representation of its input" },
+        ArrayOperation::CustomCall(_) => Err("custom-call physical-padding semantics are opaque"),
+        ArrayOperation::Print(_) => Err("print exposes the physical representation of its input"),
         // Entry guards and `cast`s narrow or widen bounded dynamic values explicitly. The physical buffer is sliced or
         // padded, and every axis that stays dynamic gets its logical size back.
-        ArrayOperation::Guard(_) | ArrayOperation::Cast(_) => RyftMasked,
+        ArrayOperation::Guard(_) | ArrayOperation::Cast(_) => Ok(()),
+        // StableHLO propagates the logical dynamic dimensions of these operations without inspecting physical padding
+        // positions.
         ArrayOperation::Assert(_)
         | ArrayOperation::Zero(_)
         | ArrayOperation::ZeroLike(_)
@@ -1156,7 +1154,7 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::Rematerialize(_)
         | ArrayOperation::Composite(_)
         | ArrayOperation::CompositeTranspose(_)
-        | ArrayOperation::LinearCall(_) => Propagated,
+        | ArrayOperation::LinearCall(_) => Ok(()),
     }
 }
 
@@ -1358,10 +1356,10 @@ mod tests {
         DynamicBroadcastOperation, EffectClass, EffectClasses, EmptyRegionDriver, ErasedOperation, EverythingSavable,
         Exp, ExternalReferenceBinding, FlatProgram, LiftedCustomRules, Log, MaybeZero, Memory, MulOperation,
         NothingSavable, OffloadDotsWithNoBatchDimensions, Operation as CoreOperation, OperationPayloadProjection,
-        OrOperation, PartialValue, Placeholder, Pow, ProgramBuilder as CoreProgramBuilder, ProgramError, ReductionKind,
-        ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
-        ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, Rem,
+        OrOperation, PartialValue, Placeholder, Pow, ProgramBuilder as CoreProgramBuilder, ProgramError,
+        REFERENCE_NEW_OPERATION_NAME, ReductionKind, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
+        ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, Rem,
         RematerializationOptimizationBarrier, RematerializeOperation, ResidualPolicy, ResidualPolicyReference,
         ResidualZeroProvider, Rsqrt, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
         ScanOperation, SelectOperation, Shape, Sign, Sin, SinOperation, Sqrt, StagingContext, TagOperation, Tanh,
@@ -2853,11 +2851,19 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_data_dependent_padding_discipline() {
-        // Every reference operation shares one collapsed match arm, so one representative pins that arm.
+    fn test_operation_validate_data_derived_dimensions() {
+        // An operation whose lowering keeps padding unobservable passes, and one that does not is rejected with an
+        // error that names it and the reason. Every reference operation shares one collapsed match arm, so one
+        // representative pins that arm.
+        assert_eq!(Operation::from(AddOperation::<ArrayType>::new()).validate_data_derived_dimensions(), Ok(()));
         assert_eq!(
-            Operation::ReferenceNew(ReferenceNewOperation::new()).data_dependent_padding_discipline(),
-            Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" },
+            Operation::ReferenceNew(ReferenceNewOperation::new()).validate_data_derived_dimensions(),
+            Err(Error::from(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "operation `{REFERENCE_NEW_OPERATION_NAME}` cannot consume data-derived dimensions during XLA \
+                     lowering because references must be discharged before bounded-dynamic XLA validation",
+                ),
+            })),
         );
 
         for kind in [
@@ -2869,20 +2875,20 @@ mod tests {
             ReductionKind::Any,
             ReductionKind::All,
         ] {
-            assert_eq!(reduction_data_dependent_padding_discipline(kind), XlaMasked);
+            assert_eq!(validate_reduction_data_derived_dimensions(kind), Ok(()), "{kind:?}");
         }
         assert_eq!(
-            reduction_data_dependent_padding_discipline(ReductionKind::Mean),
-            Unsupported { reason: "mean over a dynamically sized reduction axis is not supported by the XLA lowering" },
+            validate_reduction_data_derived_dimensions(ReductionKind::Mean),
+            Err("mean over a dynamically sized reduction axis is not supported by the XLA lowering"),
         );
         for direction in [SortDirection::Ascending, SortDirection::Descending] {
-            assert_eq!(sort_data_dependent_padding_discipline(direction), XlaMasked);
+            assert_eq!(validate_sort_data_derived_dimensions(direction), Ok(()), "{direction:?}");
         }
         for operation in [
             ArrayOperation::ArgMax(ArgMaxOperation::new(0, DataType::I32)),
             ArrayOperation::ArgMin(ArgMinOperation::new(0, DataType::I32)),
         ] {
-            assert_eq!(array_data_dependent_padding_discipline(&operation), XlaMasked);
+            assert_eq!(validate_array_data_derived_dimensions(&operation), Ok(()));
         }
         for (kind, combiner) in [
             (ScatterReductionKind::Overwrite, "overwrite"),
@@ -2891,37 +2897,34 @@ mod tests {
             (ScatterReductionKind::Min, "minimum"),
             (ScatterReductionKind::Max, "maximum"),
         ] {
-            let Unsupported { reason } = scatter_data_dependent_padding_discipline(kind) else {
-                panic!("scatter combiner `{kind:?}` must be unsupported");
-            };
             assert_eq!(
-                reason,
+                validate_scatter_data_derived_dimensions(kind).unwrap_err(),
                 format!("{combiner}-scatter padding semantics have not been verified for data-derived dimensions"),
             );
         }
 
         assert_eq!(
-            array_data_dependent_padding_discipline(&ArrayOperation::ScaledDot(ScaledDotOperation::new(
+            validate_array_data_derived_dimensions(&ArrayOperation::ScaledDot(ScaledDotOperation::new(
                 DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
                 DataType::F32,
                 true,
                 true,
             ))),
-            RyftMasked,
+            Ok(()),
         );
 
-        // A log-sum-exp `reduce` expands into maximum and summation reductions, so it carries the same masking
-        // contract as those two reduction kinds.
+        // A log-sum-exp `reduce` expands into maximum and summation reductions, so it is admitted as those two
+        // reduction kinds are.
         assert_eq!(
-            array_data_dependent_padding_discipline(&ArrayOperation::Reduce(ReduceOperation::new(
+            validate_array_data_derived_dimensions(&ArrayOperation::Reduce(ReduceOperation::new(
                 vec![0],
                 ReductionKind::LogSumExp,
             ))),
-            XlaMasked,
+            Ok(()),
         );
 
-        // The prefix scans own their own arm rather than sharing the collapsed shape-preserving one, because the
-        // classification rests on type inference keeping the scanned axis static.
+        // The prefix scans own their own arm rather than sharing the collapsed shape-preserving one, because their
+        // admission rests on type inference keeping the scanned axis static.
         for kind in [
             CumulativeKind::Sum,
             CumulativeKind::Product,
@@ -2930,8 +2933,9 @@ mod tests {
             CumulativeKind::LogSumExp,
         ] {
             assert_eq!(
-                array_data_dependent_padding_discipline(&ArrayOperation::Cumulative(CumulativeOperation::new(0, kind))),
-                Propagated,
+                validate_array_data_derived_dimensions(&ArrayOperation::Cumulative(CumulativeOperation::new(0, kind))),
+                Ok(()),
+                "{kind:?}",
             );
         }
     }

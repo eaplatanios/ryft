@@ -40,8 +40,8 @@ use crate::lowering::programs::{
     entry_output_shardings, entry_outputs_with_compiler_chosen_placement,
 };
 use crate::{
-    Array, Constant, DataDependentPaddingDiscipline, Error, ExecutionError, LowerableOperation, LoweringError,
-    OpShardingExtension, Operation, RetainedArray, Session, Type, Value,
+    Array, Constant, Error, ExecutionError, LowerableOperation, LoweringError, OpShardingExtension, Operation,
+    RetainedArray, Session, Type, Value,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -469,18 +469,8 @@ impl Session {
                                 .identities()
                                 .any(|(_, identity)| data_derived_dimensions.contains(identity))
                         });
-                    if consumes_data_derived_extent
-                        && let DataDependentPaddingDiscipline::Unsupported { reason } =
-                            instruction.operation().data_dependent_padding_discipline()
-                    {
-                        return Err(ProgramError::UnsupportedOperation {
-                            message: format!(
-                                "operation `{}` cannot consume data-derived dimensions during XLA lowering because \
-                                     {reason}",
-                                instruction.operation().name(),
-                            ),
-                        }
-                        .into());
+                    if consumes_data_derived_extent {
+                        instruction.operation().validate_data_derived_dimensions()?;
                     }
                 }
             }
