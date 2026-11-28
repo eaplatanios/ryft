@@ -2569,7 +2569,6 @@ where
 {
     type Operation = O;
 
-    // TODO(eaplatanios): Review this.
     fn pruned_for_lowering(&self, target_platform: Option<&str>) -> Result<Self, ProgramError> {
         let program = self.clone().into_pruned()?.into_simplified()?;
 
@@ -2586,10 +2585,11 @@ where
                     .operation()
                     .omits_regions(target_platform, || region.instruction_boundary_types(instruction))
         };
+
         let mut names_devices = RegionPlacementRequests::names_devices_predicate(program.entry_region_ref(), omitted);
         let mut stale = HashSet::new();
         for (index, region) in program.regions().iter().enumerate() {
-            let region_ref = RegionRef::new(arena, RegionId::new(index)).unwrap();
+            let region_ref = RegionRef::new(arena, RegionId::new(index))?;
             for (position, instruction) in region.instructions().iter().enumerate() {
                 let Some(call) = instruction.operation().projected_payload::<CallOperation<Type>>() else { continue };
                 if call.mesh().is_some()
@@ -2619,6 +2619,7 @@ where
                         let Some(call) = call.filter(|_| stale.contains(&(index, position))) else {
                             return Ok(instruction.clone());
                         };
+
                         // The family holds this call, so it can hold the same call without its mesh.
                         let operation =
                             O::from_payload(ErasedOperation::new(call.without_mesh())).map_err(|payload| {
