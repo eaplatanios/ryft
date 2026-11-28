@@ -13,9 +13,8 @@ use ryft_core::{
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
-    Attribute, Block, BlockRef, Context as MlirContext, DetachedBlock, Location, LocationRef,
-    Operation as MlirOperation, Region, SymbolVisibility, TensorTypeRef, Type as MlirType, TypeAndAttributes,
-    Value as MlirValue,
+    Attribute, Block, Context as MlirContext, DetachedBlock, Location, LocationRef, Operation as MlirOperation, Region,
+    SymbolVisibility, Type as MlirType, TypeAndAttributes, Value as MlirValue,
 };
 
 use crate::arrays::host::ReductionChange;
@@ -40,7 +39,6 @@ use crate::lowering::types::{
 };
 use crate::lowering::{EffectTokens, LowerableOperationFamily, LoweringError, RaggedDotLoweringStrategy};
 use crate::operations::call::{CallFunctionMap, collect_call_functions};
-use crate::operations::composites::NamedCompositionFunctionMap;
 use crate::{
     CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement, Type,
     normalize_runtime_requirements,
@@ -787,10 +785,6 @@ where
         let location = context.unknown_location();
         let mut module = context.module(location)?;
 
-        // Trace each distinct named semantic decomposition once and retain it in the lowering context of the module,
-        // so that the entry and nested function bodies resolve the same private symbol.
-        let named_compositions = Rc::new(NamedCompositionFunctionMap::for_program(program, target_platform)?);
-
         // Module-scoped lowering context, shared between the entry function body and private functions below so channel
         // ids stay unique and target, representation policy, named compositions, and provenance state reach nested
         // bodies. The arrays that the program only passes on to calls that never read them follow the session
@@ -798,7 +792,6 @@ where
         let lowering_context = ProgramLoweringContext::new()
             .with_target_platform(target_platform)
             .with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy)
-            .with_named_compositions(named_compositions.clone())
             .with_session_constants(
                 &[boundary.session_constants.as_slice(), boundary.passed_on_constants.as_slice()].concat(),
             );
@@ -816,29 +809,17 @@ where
         // repeated calls, in which case every `call` inlines exactly as before.
         let nested_functions = Rc::new(collect_call_functions(program, target_platform)?);
 
-        // The private functions of the module are emitted ahead of its entry function. Each named composition has
-        // one that holds its decomposition, which is traced independently of the lowered program and so contains
-        // no shared `call`, and each shared callee has one, whose own repeated `call`s lower to calls of the other
-        // shared functions. Calls refer to these functions by symbol, so the order of emission does not matter.
+        // Each shared callee is emitted as a private function ahead of the entry function. Its own repeated `call`s
+        // lower to calls of the other shared functions, which are referred to by symbol, so the order of emission
+        // does not matter.
         let mut module_block = module.body()?;
         let location_ref = location.as_ref();
-        for function in named_compositions.functions() {
-            let (symbol, program) = (function.symbol(), function.program());
-            emit_private_function(symbol, program, None, &lowering_context, &mut module_block, &context, location_ref)?;
-        }
-
         for function in nested_functions.functions() {
             let (symbol, program) = (function.symbol(), function.program());
             let functions = Some(&nested_functions);
-            emit_private_function(
-                symbol,
-                program,
-                functions,
-                &lowering_context,
-                &mut module_block,
-                &context,
-                location_ref,
-            )?;
+            let function =
+                lower_private_function(symbol, program, functions, &lowering_context, &context, location_ref)?;
+            module_block.append_operation(function)?;
         }
 
         let (function_arguments, function_results) = boundary.lower_attributes(
@@ -875,6 +856,19 @@ where
                 location,
             )?
         })?;
+
+        // The decompositions of the named compositions that lowering emitted are recorded as it requests them (refer
+        // to `ProgramLoweringContext::require_named_composition`). Each one is emitted as a private function ahead of
+        // the other functions of the module, in the order of the requests. A decomposition is traced independently of
+        // the lowered program, so it contains no shared `call`, and lowering it can request further decompositions,
+        // which is why they are read by position.
+        let mut index = 0;
+        while let Some(function) = lowering_context.named_composition(index) {
+            let (symbol, program) = (function.symbol(), function.program());
+            let function = lower_private_function(symbol, program, None, &lowering_context, &context, location_ref)?;
+            module_block.insert_operation(function, index)?;
+            index += 1;
+        }
 
         let mut signature = boundary.signature;
 
@@ -2535,7 +2529,7 @@ pub(crate) fn entry_outputs_with_compiler_chosen_placement(
         .collect()
 }
 
-/// Emits the private `func.func` named `symbol`, whose body is the lowering of `program`, into `module_block`.
+/// Returns the private `func.func` named `symbol`, whose body is the lowering of `program`, for a module to hold.
 /// The function takes the inputs of `program` and returns its outputs, without attributes. The repeated `call`s of
 /// `program` lower to calls of the shared functions in `nested_functions`, if any, and inline otherwise. The body is
 /// lowered outside any manual region and with the `lowering_context` of the module, so that it shares the channel
@@ -2543,15 +2537,14 @@ pub(crate) fn entry_outputs_with_compiler_chosen_placement(
 /// lowered (e.g., `collect_call_functions` leaves out callees whose lowering has effects, including synthesized
 /// entry guards), because the function threads no effect token. It must also read no session constant, because
 /// only the entry function receives the hidden inputs that carry them.
-fn emit_private_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+fn lower_private_function<'c, 't: 'c, O: LowerableOperationFamily>(
     symbol: &str,
     program: &FlatProgram<EagerContext<Constant, O>>,
     nested_functions: Option<&Rc<CallFunctionMap<O>>>,
     lowering_context: &ProgramLoweringContext,
-    module_block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(), Error> {
+) -> Result<func::DetachedFuncOperation<'c, 't>, Error> {
     let input_tensor_types = program
         .input_types()
         .iter()
@@ -2584,7 +2577,7 @@ fn emit_private_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
     let mut function_region = context.region();
     function_region.append_block(function_block)?;
-    module_block.append_operation(func::func(
+    Ok(func::func(
         symbol,
         func::FuncAttributes {
             arguments: input_tensor_types
@@ -2600,9 +2593,7 @@ fn emit_private_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         },
         function_region,
         location,
-    )?)?;
-
-    Ok(())
+    )?)
 }
 
 #[cfg(test)]
@@ -2614,11 +2605,11 @@ mod tests {
     use ryft_core::{
         ArrayOperation, ArrayType, CALL_OPERATION_NAME, CastOperation, CompositeKey, CompositeOperation,
         ConstrainSharding, CustomRuleDefinition, CustomRuleRegistration, DataType, Device, DeviceMesh, Dimension,
-        DimensionBounds, DimensionValue, DimensionVariable, DomainTracingContext, EffectClass, FlatProgram,
-        ImportingContext, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite, PLACE_OPERATION_NAME, Place,
-        PlaceOperation, Placeholder, Placement, PlacementRequest, Print, ProgramBuilder, ReshapeOperation, Reshard,
-        ScanOperation, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin, StopGradient, Tag, TransferToMemory,
-        TypeError, Typed, ValueProjection, shard_map,
+        DimensionBounds, DimensionValue, DimensionVariable, DomainTracingContext, DotDimensionNumbers, EffectClass,
+        FlatProgram, ImportingContext, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite,
+        PLACE_OPERATION_NAME, Place, PlaceOperation, Placeholder, Placement, PlacementRequest, Print, ProgramBuilder,
+        ReshapeOperation, Reshard, ScaledDotOperation, ScanOperation, Shape, ShardMapOptions, Sharding,
+        ShardingDimension, Sin, StopGradient, Tag, TransferToMemory, TypeError, Typed, ValueProjection, shard_map,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -3204,6 +3195,45 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_program_to_mlir_emits_the_decompositions_that_lowered_scaled_dots_request() {
+        // A scaled dot in the body of a scan requests its decomposition when the length of the scan admits an
+        // iteration. When its length is zero, lowering emits nothing of the body (refer to `omits_regions`), so
+        // nothing requests the decomposition and the module holds no private function.
+        let element_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![2.into(), 16.into()]));
+        let scale_type = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![2.into(), 1.into()]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 2.into()]));
+        let carry_types = [output_type, element_type.clone(), element_type, scale_type.clone(), scale_type];
+        let body = {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let carries = carry_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect::<Vec<_>>();
+            let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
+            let operation = ScaledDotOperation::new(dimensions, DataType::F32, true, true);
+            let output = builder.add_instruction(operation, Vec::new(), carries[1..].to_vec(), None).unwrap()[0];
+            let outputs = std::iter::once(output).chain(carries[1..].iter().copied()).collect();
+            Arc::new(builder.build(outputs, vec![Placeholder; 6], vec![Placeholder; 5]).unwrap())
+        };
+        let private_functions = |length: usize| {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let inputs = carry_types.iter().map(|r#type| builder.add_input(r#type.clone().into())).collect();
+            let regions = vec![builder.intern_callee(&body, None).unwrap()];
+            let scan = ScanOperation::<Type>::new(5, length);
+            let outputs = builder.add_instruction(scan, regions, inputs, None).unwrap().to_vec();
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 5], vec![Placeholder; 5])
+                .unwrap();
+            let lowered = program.to_mlir("main", &ProgramLoweringOptions::new()).unwrap().into_stable_hlo();
+            lowered
+                .lines()
+                .filter_map(|line| line.trim_start().strip_prefix("func.func private @"))
+                .map(|line| line.split('(').next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(private_functions(0), Vec::<String>::new());
+        assert_eq!(private_functions(1), vec!["xla.scaled_dot".to_string()]);
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, CompositeKey, DataType, Dimension, DomainTracingContext, EmptyRegionDriver, FlatProgram,
-    MemberInterpretableOperation, Operation, ProgramError, ScaledDotOperation, Shape, Value,
+    MemberInterpretableOperation, ProgramError, ScaledDotOperation, Shape, Value,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -132,106 +132,94 @@ impl LowerableOperation for ScaledDotOperation {
         // The composition types are present because the call does not lower to the custom call.
         let (composition_input_types, composition_output_types) =
             scaled_dot_composition_types(self, input_types, output_types, lowering_context.target_platform())?.unwrap();
-        let decomposition = match lowering_context.named_compositions() {
-            Some(functions) => functions.get(self, &composition_input_types, &composition_output_types)?,
-            None => None,
+        // The module emits the decomposition as a private function because this call requests it here.
+        let key = scaled_dot_composition_key(self, &composition_input_types, &composition_output_types)?;
+        let symbol = lowering_context
+            .require_named_composition(key, || trace_scaled_dot_composition(self, &composition_input_types))?;
+        if lowering_context.target_platform() == Some("cuda") && !uses_physical_boundary {
+            let output_types = output_types.iter().cloned().map(Type::from).collect::<Vec<_>>();
+            return lower_shared_function_call(symbol.as_ref(), &output_types, input_values, block, context, location);
+        }
+        let composition_input_values = if uses_physical_boundary {
+            input_values
+                .iter()
+                .zip(input_types)
+                .map(|(value, r#type)| r#type.lower_physical_bound_value(*value, 0.0, block, context, location))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            input_values.to_vec()
         };
-        if let Some(function) = decomposition {
-            if lowering_context.target_platform() == Some("cuda") && !uses_physical_boundary {
-                let output_types = output_types.iter().cloned().map(Type::from).collect::<Vec<_>>();
-                return lower_shared_function_call(
-                    function.symbol(),
-                    &output_types,
-                    input_values,
+        let mut composite_values = vec![composition_input_values[0], composition_input_values[1]];
+        let mut scale_index = 2;
+        for (present, element_index, contracting_dimensions) in [
+            (self.has_lhs_scale(), 0, self.dimensions().lhs_contracting_dimensions()),
+            (self.has_rhs_scale(), 1, self.dimensions().rhs_contracting_dimensions()),
+        ] {
+            if present {
+                composite_values.push(composition_input_values[scale_index]);
+                scale_index += 1;
+                continue;
+            }
+            let dummy_type =
+                scaled_dot_dummy_scale_type(&composition_input_types[element_index], contracting_dimensions);
+            let physical_type = physical_bound_type(&dummy_type)?;
+            let physical_tensor_type = physical_type.lower(context, location)?;
+            let dummy = lower_f64_constant_splat(1.0, &physical_type, physical_tensor_type, block, context, location)?;
+            if uses_physical_boundary {
+                composite_values.push(dummy);
+            } else {
+                let sources =
+                    (0..dummy_type.rank()).map(|axis| (input_values[element_index], axis)).collect::<Vec<_>>();
+                composite_values.push(dummy_type.lower_restore_dynamic_dimensions(
+                    dummy,
+                    sources.as_slice(),
                     block,
                     context,
                     location,
-                );
+                )?);
             }
-            let composition_input_values = if uses_physical_boundary {
-                input_values
-                    .iter()
-                    .zip(input_types)
-                    .map(|(value, r#type)| r#type.lower_physical_bound_value(*value, 0.0, block, context, location))
-                    .collect::<Result<Vec<_>, _>>()?
-            } else {
-                input_values.to_vec()
-            };
-            let mut composite_values = vec![composition_input_values[0], composition_input_values[1]];
-            let mut scale_index = 2;
-            for (present, element_index, contracting_dimensions) in [
-                (self.has_lhs_scale(), 0, self.dimensions().lhs_contracting_dimensions()),
-                (self.has_rhs_scale(), 1, self.dimensions().rhs_contracting_dimensions()),
-            ] {
-                if present {
-                    composite_values.push(composition_input_values[scale_index]);
-                    scale_index += 1;
-                    continue;
-                }
-                let dummy_type =
-                    scaled_dot_dummy_scale_type(&composition_input_types[element_index], contracting_dimensions);
-                let physical_type = physical_bound_type(&dummy_type)?;
-                let physical_tensor_type = physical_type.lower(context, location)?;
-                let dummy =
-                    lower_f64_constant_splat(1.0, &physical_type, physical_tensor_type, block, context, location)?;
-                if uses_physical_boundary {
-                    composite_values.push(dummy);
-                } else {
-                    let sources =
-                        (0..dummy_type.rank()).map(|axis| (input_values[element_index], axis)).collect::<Vec<_>>();
-                    composite_values.push(dummy_type.lower_restore_dynamic_dimensions(
-                        dummy,
-                        sources.as_slice(),
-                        block,
-                        context,
-                        location,
-                    )?);
-                }
-            }
-            let render_axes = |axes: &[usize]| axes.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
-            let dimensions = format!(
-                "[[[{}], [{}]], [[{}], [{}]]]",
-                render_axes(self.dimensions().lhs_contracting_dimensions()),
-                render_axes(self.dimensions().rhs_contracting_dimensions()),
-                render_axes(self.dimensions().lhs_batching_dimensions()),
-                render_axes(self.dimensions().rhs_batching_dimensions()),
-            );
-            let attributes = HashMap::from([
-                (StringRef::from("dimension_numbers"), context.parse_attribute(dimensions.as_str())?),
-                (
-                    StringRef::from("preferred_element_type"),
-                    context.type_attribute(self.accumulation_type().lower(context)?).as_ref(),
-                ),
-            ]);
-            let result_types = composition_output_types
-                .iter()
-                .map(|r#type| r#type.lower(context, location).map(|r#type| r#type.as_ref()))
-                .collect::<Result<Vec<_>, _>>()?;
-            let composite = block.append_operation(stable_hlo::composite(
-                "xla.scaled_dot",
-                0,
-                Some(&attributes),
-                composite_values.as_slice(),
-                function.symbol(),
-                Vec::new(),
-                result_types.as_slice(),
-                location,
-            )?)?;
-            let results =
-                (0..output_types.len()).map(|index| composite.result(index).unwrap().as_ref()).collect::<Vec<_>>();
-            if !uses_physical_boundary {
-                return Ok(results);
-            }
-            return Ok(vec![output_types[0].lower_restore_dynamic_dimensions(
-                results[0],
-                scaled_dot_output_sources(self, input_values, input_types).as_slice(),
-                block,
-                context,
-                location,
-            )?]);
         }
-
-        Err(ProgramError::MalformedProgram(format!("missing typed decomposition for `{}`", self.name())).into())
+        let render_axes = |axes: &[usize]| axes.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
+        let dimensions = format!(
+            "[[[{}], [{}]], [[{}], [{}]]]",
+            render_axes(self.dimensions().lhs_contracting_dimensions()),
+            render_axes(self.dimensions().rhs_contracting_dimensions()),
+            render_axes(self.dimensions().lhs_batching_dimensions()),
+            render_axes(self.dimensions().rhs_batching_dimensions()),
+        );
+        let attributes = HashMap::from([
+            (StringRef::from("dimension_numbers"), context.parse_attribute(dimensions.as_str())?),
+            (
+                StringRef::from("preferred_element_type"),
+                context.type_attribute(self.accumulation_type().lower(context)?).as_ref(),
+            ),
+        ]);
+        let result_types = composition_output_types
+            .iter()
+            .map(|r#type| r#type.lower(context, location).map(|r#type| r#type.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let composite = block.append_operation(stable_hlo::composite(
+            "xla.scaled_dot",
+            0,
+            Some(&attributes),
+            composite_values.as_slice(),
+            symbol.as_ref(),
+            Vec::new(),
+            result_types.as_slice(),
+            location,
+        )?)?;
+        let results =
+            (0..output_types.len()).map(|index| composite.result(index).unwrap().as_ref()).collect::<Vec<_>>();
+        if !uses_physical_boundary {
+            return Ok(results);
+        }
+        return Ok(vec![output_types[0].lower_restore_dynamic_dimensions(
+            results[0],
+            scaled_dot_output_sources(self, input_values, input_types).as_slice(),
+            block,
+            context,
+            location,
+        )?]);
     }
 }
 

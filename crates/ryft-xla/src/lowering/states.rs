@@ -2,13 +2,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use ryft_core::{LogicalMesh, Provenance, ShardMapBoundary, Sharding};
+use ryft_core::{FlatProgram, LogicalMesh, Provenance, ShardMapBoundary, Sharding};
 use ryft_mlir::{AttributeRef, BlockRef, Context as MlirContext, Location, LocationRef, ValueRef};
 
 use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::lowering::{LoweringError, RaggedDotLoweringStrategy};
-use crate::operations::composites::NamedCompositionFunctionMap;
-use crate::{Error, RetainedArray, RuntimeRequirement, normalize_runtime_requirements};
+use crate::operations::composites::{NamedCompositionFunction, NamedCompositionFunctionMap, NamedCompositionKey};
+use crate::{Error, RetainedArray, RuntimeRequirement, Session, normalize_runtime_requirements};
 
 // TODO(eaplatanios): Review this module.
 
@@ -33,7 +33,7 @@ impl ProgramLoweringContext {
                 channel_ids: Rc::new(Cell::new(1)),
                 target_platform: None,
                 ragged_dot_lowering_strategy: RaggedDotLoweringStrategy::default(),
-                named_compositions: None,
+                named_compositions: Rc::default(),
                 has_provenance: Rc::new(Cell::new(false)),
                 has_assertions: Rc::new(Cell::new(false)),
                 runtime_requirements: Rc::new(RefCell::new(Vec::new())),
@@ -61,13 +61,6 @@ impl ProgramLoweringContext {
     /// Returns this context carrying the [`RaggedDotLoweringStrategy`] of the module.
     pub(crate) fn with_ragged_dot_lowering_strategy(mut self, strategy: RaggedDotLoweringStrategy) -> Self {
         Rc::make_mut(&mut self.state).ragged_dot_lowering_strategy = strategy;
-        self
-    }
-
-    /// Returns this context carrying the registry of the private decompositions of the named compositions of
-    /// the module.
-    pub(super) fn with_named_compositions(mut self, named_compositions: Rc<NamedCompositionFunctionMap>) -> Self {
-        Rc::make_mut(&mut self.state).named_compositions = Some(named_compositions);
         self
     }
 
@@ -186,10 +179,30 @@ impl ProgramLoweringContext {
         &self.state.bound_manual_axes
     }
 
-    /// Returns the module-owned private decompositions used by named StableHLO composites.
-    #[inline]
-    pub(crate) fn named_compositions(&self) -> Option<&Rc<NamedCompositionFunctionMap>> {
-        self.state.named_compositions.as_ref()
+    /// Returns the symbol of the private function of this module that holds the decomposition of the named
+    /// composition `key`, and records that the module needs that function. The first request for a key traces
+    /// `program`, which must not lower anything itself, and every later request shares its function (refer to
+    /// [`NamedCompositionFunctionMap::require`]). Whatever lowers a named composition requests its decomposition
+    /// here, so the module holds a decomposition exactly when something that lowering emitted refers to it, rather
+    /// than when an analysis of the program predicts that.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `program` when the decomposition cannot be traced.
+    pub(crate) fn require_named_composition<F: FnOnce() -> Result<FlatProgram<Session>, Error>>(
+        &self,
+        key: NamedCompositionKey,
+        program: F,
+    ) -> Result<Rc<str>, Error> {
+        let mut named_compositions = self.state.named_compositions.borrow_mut();
+        Ok(named_compositions.require(key, program)?.symbol().into())
+    }
+
+    /// Returns the decomposition at position `index` among those that lowering has requested for this module so far,
+    /// in the order of their first requests, or [`None`] when fewer were requested. The module emits them after its
+    /// other functions, and it asks by position because lowering one decomposition can request another.
+    pub(super) fn named_composition(&self, index: usize) -> Option<NamedCompositionFunction> {
+        self.state.named_compositions.borrow().functions().nth(index).cloned()
     }
 
     /// Returns a fresh module-unique channel id for one channeled collective.
@@ -319,8 +332,9 @@ struct ProgramLoweringContextState {
     /// Backend representation used to lower ragged dots in this module.
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
 
-    /// Module-owned private decompositions used by named StableHLO composites.
-    named_compositions: Option<Rc<NamedCompositionFunctionMap>>,
+    /// Private decompositions of the named StableHLO composites that the emitted operations of every nested lowering
+    /// scope refer to, which the module emits.
+    named_compositions: Rc<RefCell<NamedCompositionFunctionMap>>,
 
     /// Flag of the module recording whether any recursive lowering path constructed a location specific to an
     /// instruction (i.e., not the base location) from a known [`Provenance`]. It selects the module serialization mode
@@ -356,8 +370,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayType, DataType, Dimension, MeshAxis, MeshAxisType, ParallelReduce, ProvenanceScope, ReductionKind, Shape,
-        ShardMapOptions, ShardingDimension, shard_map,
+        ArrayType, CompositeKey, DataType, Dimension, DomainTracingContext, MeshAxis, MeshAxisType, ParallelReduce,
+        ProgramError, ProvenanceScope, ReductionKind, Shape, ShardMapOptions, ShardingDimension, shard_map,
     };
     use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue};
 
@@ -365,7 +379,9 @@ mod tests {
     use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::sessions::tests::{domain_mesh, f32_scalar};
     use crate::tests::cpu_client;
-    use crate::{ArrayTracer, ProgramLoweringExtension, ProgramLoweringOptions, Session, TracedProgram, trace};
+    use crate::{
+        ArrayTracer, ProgramLoweringExtension, ProgramLoweringOptions, Session, TracedProgram, Tracer, Type, trace,
+    };
 
     use super::*;
 
@@ -405,6 +421,42 @@ mod tests {
         let boundary = ShardMapBoundary::new(manual.clone(), Vec::new(), Vec::new(), vec!["x".to_string()]).unwrap();
         lowering_context.enter_manual_region(boundary).require_mesh(&manual).unwrap();
         assert_eq!(lowering_context.mesh(), Some(manual));
+    }
+
+    #[test]
+    fn test_program_lowering_context_require_named_composition() {
+        let boundary_type = ArrayType::scalar(DataType::F32);
+        let trace = || {
+            let input_types = vec![Type::from(boundary_type.clone())];
+            let (_, program) = DomainTracingContext::<Session>::trace(|inputs: Vec<Tracer>| Ok(inputs), input_types)?;
+            Ok(program.into_simplified()?)
+        };
+        let key = |name: &'static str| {
+            let boundary_types = vec![boundary_type.clone()];
+            NamedCompositionKey::new(CompositeKey::new(name, 1), boundary_types.clone(), boundary_types)
+        };
+        let context = ProgramLoweringContext::new();
+        assert!(context.named_composition(0).is_none());
+        assert_eq!(context.require_named_composition(key("first"), trace).unwrap().as_ref(), "first");
+
+        // Every lowering scope of a program records into the same module, including the body of a manual region, and a
+        // decomposition that was already requested is not traced again.
+        let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
+        let scope = context.enter_manual_region(boundary);
+        assert_eq!(scope.require_named_composition(key("second"), trace).unwrap().as_ref(), "second");
+        assert_eq!(scope.require_named_composition(key("first"), || unreachable!()).unwrap().as_ref(), "first");
+        let symbols = (0..3)
+            .map(|index| context.named_composition(index).map(|function| function.symbol().to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(symbols, vec![Some("first".to_string()), Some("second".to_string()), None]);
+
+        // A decomposition that cannot be traced is not recorded.
+        let error = ProgramError::MalformedProgram("no decomposition".to_string());
+        assert_eq!(
+            context.require_named_composition(key("third"), || Err(error.clone().into())),
+            Err(Error::from(error)),
+        );
+        assert!(context.named_composition(2).is_none());
     }
 
     #[test]
