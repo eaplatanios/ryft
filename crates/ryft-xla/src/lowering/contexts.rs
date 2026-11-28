@@ -2,12 +2,11 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use ryft_core::{FlatProgram, LogicalMesh, Provenance, ShardMapBoundary, Sharding};
+use ryft_core::{ArrayType, CompositeKey, FlatProgram, LogicalMesh, Provenance, ShardMapBoundary, Sharding};
 use ryft_mlir::{AttributeRef, BlockRef, Context as MlirContext, Location, LocationRef, ValueRef};
 
 use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::lowering::{LoweringError, RaggedDotLoweringStrategy};
-use crate::operations::composites::{NamedCompositionFunction, NamedCompositionFunctionMap, NamedCompositionKey};
 use crate::{Error, RetainedArray, RuntimeRequirement, Session, normalize_runtime_requirements};
 
 /// Context for lowering a program in the current scope of its MLIR module. Each instruction lowerer holds
@@ -31,12 +30,14 @@ impl ProgramLoweringContext {
             state: Rc::new(ProgramLoweringContextState {
                 target_platform: None,
                 ragged_dot_lowering_strategy: RaggedDotLoweringStrategy::default(),
-                next_channel_id: Rc::new(Cell::new(1)),
-                named_compositions: Rc::default(),
-                mesh: Rc::default(),
-                has_provenance: Rc::new(Cell::new(false)),
-                requires_assertion_handler: Rc::new(Cell::new(false)),
-                runtime_requirements: Rc::new(RefCell::new(Vec::new())),
+                module: Rc::new(ModuleResources {
+                    next_channel_id: Cell::new(1),
+                    named_compositions: RefCell::default(),
+                    mesh: OnceCell::new(),
+                    has_provenance: Cell::new(false),
+                    requires_assertion_handler: Cell::new(false),
+                    runtime_requirements: RefCell::new(Vec::new()),
+                }),
                 manual_regions: Vec::new(),
                 bound_manual_axes: Vec::new(),
                 session_constant_indices: Rc::default(),
@@ -92,32 +93,32 @@ impl ProgramLoweringContext {
     /// other functions, and it asks by position because lowering one decomposition can request another.
     #[inline]
     pub(super) fn named_composition(&self, index: usize) -> Option<NamedCompositionFunction> {
-        self.state.named_compositions.borrow().functions().nth(index).cloned()
+        self.state.module.named_compositions.borrow().functions().nth(index).cloned()
     }
 
     /// Returns the mesh that lowering has recorded for this module so far, which is the mesh that the module declares,
     /// or [`None`] when nothing that lowering has emitted refers to a mesh.
     #[inline]
     pub(super) fn mesh(&self) -> Option<LogicalMesh> {
-        self.state.mesh.get().cloned()
+        self.state.module.mesh.get().cloned()
     }
 
     /// Returns whether any scope lowered instruction provenance into an MLIR location.
     #[inline]
     pub(super) fn has_provenance(&self) -> bool {
-        self.state.has_provenance.get()
+        self.state.module.has_provenance.get()
     }
 
     /// Returns whether this module requires the runtime assertion handler.
     #[inline]
     pub(super) fn requires_assertion_handler(&self) -> bool {
-        self.state.requires_assertion_handler.get()
+        self.state.module.requires_assertion_handler.get()
     }
 
     /// Returns the runtime requirements that lowering has recorded for this module so far.
     #[inline]
     pub(super) fn runtime_requirements(&self) -> Vec<RuntimeRequirement> {
-        self.state.runtime_requirements.borrow().clone()
+        self.state.module.runtime_requirements.borrow().clone()
     }
 
     /// Returns the innermost enclosing manual region's [`ShardMapBoundary`], or `None` outside manual regions.
@@ -167,7 +168,7 @@ impl ProgramLoweringContext {
         key: NamedCompositionKey,
         program: F,
     ) -> Result<Rc<str>, Error> {
-        let mut named_compositions = self.state.named_compositions.borrow_mut();
+        let mut named_compositions = self.state.module.named_compositions.borrow_mut();
         Ok(named_compositions.require(key, program)?.symbol().into())
     }
 
@@ -183,7 +184,7 @@ impl ProgramLoweringContext {
     /// Returns [`LoweringError::MismatchedMeshTopology`] when the axis names or sizes of `mesh` differ from those
     /// of the recorded mesh, including in order.
     pub(crate) fn require_mesh(&self, mesh: &LogicalMesh) -> Result<(), Error> {
-        let recorded = self.state.mesh.get_or_init(|| mesh.clone());
+        let recorded = self.state.module.mesh.get_or_init(|| mesh.clone());
         if recorded.has_same_topology(mesh) {
             Ok(())
         } else {
@@ -197,7 +198,7 @@ impl ProgramLoweringContext {
     /// Records that this module requires the runtime assertion handler.
     #[inline]
     pub(super) fn require_assertion_handler(&self) {
-        self.state.requires_assertion_handler.set(true);
+        self.state.module.requires_assertion_handler.set(true);
     }
 
     /// Records `requirement` as a runtime requirement of this module.
@@ -208,7 +209,7 @@ impl ProgramLoweringContext {
     /// that is already recorded.
     #[inline]
     pub(super) fn require_runtime_requirement(&self, requirement: RuntimeRequirement) -> Result<(), Error> {
-        let mut requirements = self.state.runtime_requirements.borrow_mut();
+        let mut requirements = self.state.module.runtime_requirements.borrow_mut();
         let mut updated = requirements.clone();
         updated.push(requirement);
         *requirements = normalize_runtime_requirements(updated)?;
@@ -217,8 +218,8 @@ impl ProgramLoweringContext {
 
     /// Returns a fresh module-unique channel ID for one channeled collective.
     pub(crate) fn allocate_channel_id(&self) -> usize {
-        let channel_id = self.state.next_channel_id.get();
-        self.state.next_channel_id.set(channel_id + 1);
+        let channel_id = self.state.module.next_channel_id.get();
+        self.state.module.next_channel_id.set(channel_id + 1);
         channel_id
     }
 
@@ -266,6 +267,25 @@ impl ProgramLoweringContext {
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         self.require_mesh(sharding.mesh())?;
         sharding.lower_replication_constraint(input_value, axes, self.bound_manual_axes(), block, location)
+    }
+
+    /// Constrains `input_value` to a `sharding` that declares or completes a pending reduction. Every dimension is
+    /// closed, including dimensions split along auto axes. Unconstrained dimensions become replicated. Leaving a
+    /// dimension open lets Shardy reduce the operands before the operation and then recreate a pending reduction on
+    /// its result. For example, doubling contributions of 1 and 2 can then yield a global sum of 12 instead of 6.
+    /// [Intermediate values](crate::lowering::sharding::constrain_unreduced_intermediates) retain their known splits
+    /// along auto axes, so closing these dimensions preserves their placement. As with
+    /// [`Self::lower_sharding_constraint`], the module records the mesh and enclosing
+    /// manual axes are excluded.
+    pub(super) fn lower_pending_reduction_constraint<'b, 'c: 'b, 't: 'c>(
+        &self,
+        sharding: &Sharding,
+        input_value: ValueRef<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        let closed = sharding.with_unconstrained_dimensions_replicated();
+        self.lower_sharding_constraint(&closed, input_value, OpenDimensions::None, block, location)
     }
 
     /// Returns the value of `constant` in a scope whose captured values are `captured_values`.
@@ -320,14 +340,14 @@ impl ProgramLoweringContext {
             return base;
         }
 
-        self.state.has_provenance.set(true);
+        self.state.module.has_provenance.set(true);
 
         lower(context, provenance, base)
     }
 }
 
-/// State held by a [`ProgramLoweringContext`]. Deriving a scope copies its bindings and retains the [`Rc`]s for
-/// resources that all scopes update while emitting the module.
+/// State held by a [`ProgramLoweringContext`]. Deriving a scope copies its bindings and shares the
+/// [`ModuleResources`] that all scopes update while emitting the module.
 #[derive(Clone)]
 struct ProgramLoweringContextState {
     /// PJRT platform name of the compilation target (e.g., `"cuda"` or `"cpu"`), or `None` when the lowering has no
@@ -338,27 +358,8 @@ struct ProgramLoweringContextState {
     /// Backend representation used to lower ragged dots in this module.
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
 
-    /// Next unused collective channel ID in this module.
-    next_channel_id: Rc<Cell<usize>>,
-
-    /// Private decompositions of the named StableHLO composites that the emitted operations of every nested lowering
-    /// scope refer to, which the module emits.
-    named_compositions: Rc<RefCell<NamedCompositionFunctionMap>>,
-
-    /// First mesh recorded for a sharding in this module. Subsequent shardings must use the same topology.
-    mesh: Rc<OnceCell<LogicalMesh>>,
-
-    /// Flag of the module recording whether any recursive lowering path constructed a location specific to an
-    /// instruction (i.e., not the base location) from a known [`Provenance`]. It selects the module serialization
-    /// mode after lowering completes. Only a module that actually carries provenance locations is printed with debug
-    /// information, so modules without provenance keep their existing StableHLO text and cache keys byte for byte.
-    has_provenance: Rc<Cell<bool>>,
-
-    /// Whether any emitted instruction requires the runtime assertion handler.
-    requires_assertion_handler: Rc<Cell<bool>>,
-
-    /// Runtime contracts declared by emitted operations across every nested lowering scope.
-    runtime_requirements: Rc<RefCell<Vec<RuntimeRequirement>>>,
+    /// Resources of the module that every scope of the program shares.
+    module: Rc<ModuleResources>,
 
     /// Enclosing manual regions, ordered from outermost to innermost for named-axis resolution.
     manual_regions: Vec<Rc<ShardMapBoundary>>,
@@ -372,25 +373,255 @@ struct ProgramLoweringContextState {
     session_constant_indices: Rc<HashMap<RetainedArray, usize>>,
 }
 
+/// Resources of one module that every lowering scope of its program reads and updates while the module is emitted.
+/// A [`ProgramLoweringContextState`] holds them behind one [`Rc`], so a context that is derived for a nested scope
+/// shares all of them with the context that it was derived from. This type is deliberately not [`Clone`], so that
+/// no scope can end up with resources of its own.
+struct ModuleResources {
+    /// Next unused collective channel ID in this module.
+    next_channel_id: Cell<usize>,
+
+    /// Private decompositions of the named StableHLO composites that the emitted operations of every nested lowering
+    /// scope refer to, which the module emits.
+    named_compositions: RefCell<NamedCompositionFunctionMap>,
+
+    /// First mesh recorded for a sharding in this module. Subsequent shardings must use the same topology.
+    mesh: OnceCell<LogicalMesh>,
+
+    /// Flag of the module recording whether any recursive lowering path constructed a location specific to an
+    /// instruction (i.e., not the base location) from a known [`Provenance`]. It selects the module serialization
+    /// mode after lowering completes. Only a module that actually carries provenance locations is printed with debug
+    /// information, so modules without provenance keep their existing StableHLO text and cache keys byte for byte.
+    has_provenance: Cell<bool>,
+
+    /// Whether any emitted instruction requires the runtime assertion handler.
+    requires_assertion_handler: Cell<bool>,
+
+    /// Runtime contracts declared by emitted operations across every nested lowering scope.
+    runtime_requirements: RefCell<Vec<RuntimeRequirement>>,
+}
+
+/// Identity of one generated decomposition of a named composition at a concrete typed boundary.
+/// The lowering of an operation requests the private function that holds such a decomposition through
+/// [`Lowerer::require_named_composition`](crate::Lowerer::require_named_composition), and requests
+/// with equal keys share one function.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NamedCompositionKey {
+    /// Semantic identity of the composition, whose name also names the emitted private function.
+    composite: CompositeKey,
+
+    /// Logical input types of the composition boundary.
+    input_types: Vec<ArrayType>,
+
+    /// Logical output types of the composition boundary.
+    output_types: Vec<ArrayType>,
+}
+
+impl NamedCompositionKey {
+    /// Creates the key of the decomposition of `composite` at the boundary with the provided logical types.
+    #[inline]
+    pub fn new(composite: CompositeKey, input_types: Vec<ArrayType>, output_types: Vec<ArrayType>) -> Self {
+        Self { composite, input_types, output_types }
+    }
+}
+
+/// Private decomposition function emitted for one [`NamedCompositionKey`].
+#[derive(Clone)]
+pub(super) struct NamedCompositionFunction {
+    /// Module-unique decomposition symbol.
+    symbol: Rc<str>,
+
+    /// Canonical typed decomposition program.
+    program: Rc<FlatProgram<Session>>,
+}
+
+impl NamedCompositionFunction {
+    /// Returns the module-unique decomposition symbol.
+    #[inline]
+    pub(super) fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    /// Returns the canonical typed decomposition program.
+    #[inline]
+    pub(super) fn program(&self) -> &FlatProgram<Session> {
+        &self.program
+    }
+}
+
+/// Module-owned registry of canonical named compositions and their private decomposition functions.
+/// The lowering of an operation requests the function of the composition that it emits (refer to
+/// [`ProgramLoweringContext::require_named_composition`]), and the module emits the functions that were requested,
+/// so that a module holds a decomposition exactly when something that lowering emitted refers to it.
+#[derive(Default)]
+struct NamedCompositionFunctionMap {
+    /// Functions indexed by semantic operation and typed boundary.
+    functions: HashMap<NamedCompositionKey, NamedCompositionFunction>,
+
+    /// Keys in the stable order of their first occurrence, used for deterministic function emission.
+    order: Vec<NamedCompositionKey>,
+}
+
+impl NamedCompositionFunctionMap {
+    /// Returns the functions in the stable order of the first occurrence of their keys, which is the order in which
+    /// a module emits them, so that the layout of the module is deterministic.
+    #[inline]
+    fn functions(&self) -> impl Iterator<Item = &NamedCompositionFunction> {
+        self.order.iter().map(|key| &self.functions[key])
+    }
+
+    /// Returns the private function that holds the decomposition of `key`, after tracing `program` and adding the
+    /// function when `key` has none yet, so that every request for the complete semantic key shares one function.
+    /// The registry is independent of the operation family that produced `key` and `program`, and closed backend
+    /// operation enums only decide when to call this seam. A key whose composite name is already taken by another
+    /// key receives a symbol suffixed with the number of earlier keys of that name.
+    fn require<F: FnOnce() -> Result<FlatProgram<Session>, Error>>(
+        &mut self,
+        key: NamedCompositionKey,
+        program: F,
+    ) -> Result<&NamedCompositionFunction, Error> {
+        if !self.functions.contains_key(&key) {
+            let name = key.composite.name();
+            let symbol = match self.order.iter().filter(|existing| existing.composite.name() == name).count() {
+                0 => name.to_string(),
+                count => format!("{name}_{count}"),
+            };
+            let function = NamedCompositionFunction { symbol: symbol.into(), program: Rc::new(program()?) };
+            self.functions.insert(key.clone(), function);
+            self.order.push(key.clone());
+        }
+        Ok(&self.functions[&key])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
+
     use ryft_core::{
-        ArrayType, CompositeKey, DataType, Dimension, DomainTracingContext, MeshAxis, MeshAxisType, ParallelReduce,
+        CompositeAttribute, DataType, Dimension, DomainTracingContext, MeshAxis, MeshAxisType, ParallelReduce,
         ProgramError, ProvenanceScope, ReductionKind, Shape, ShardMapOptions, ShardingDimension, shard_map,
     };
     use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue};
 
     use crate::lowering::sharding::tests::{test_input_type, test_mesh};
+    use crate::lowering::tests::test_matrix_type;
     use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::sessions::tests::{domain_mesh, f32_scalar};
     use crate::tests::cpu_client;
     use crate::{
-        ArrayTracer, ProgramLoweringExtension, ProgramLoweringOptions, Session, TracedProgram, Tracer, Type, trace,
+        ArrayTracer, ProgramLoweringExtension, ProgramLoweringOptions, RuntimeError, Session, TracedProgram, Tracer,
+        Type, trace,
     };
 
     use super::*;
+
+    #[test]
+    fn test_program_lowering_context_new() {
+        // A new context has no target, is outside any manual region, and has recorded nothing about its module.
+        let lowering_context = ProgramLoweringContext::new();
+        assert_eq!(lowering_context.target_platform(), None);
+        assert_eq!(lowering_context.ragged_dot_lowering_strategy(), RaggedDotLoweringStrategy::Decomposition);
+        assert!(lowering_context.named_composition(0).is_none());
+        assert_eq!(lowering_context.mesh(), None);
+        assert!(!lowering_context.has_provenance());
+        assert!(!lowering_context.requires_assertion_handler());
+        assert_eq!(lowering_context.runtime_requirements(), Vec::new());
+        assert_eq!(lowering_context.manual_shard_map(), None);
+        assert!(lowering_context.bound_manual_axes().is_empty());
+        assert!(lowering_context.session_constant_values(&[0, 1]).is_empty());
+    }
+
+    #[test]
+    fn test_program_lowering_context_with_target_platform() {
+        // The target is a binding of the context that receives it, and the context that it was derived from keeps its
+        // own.
+        let lowering_context = ProgramLoweringContext::new();
+        let cuda_context = lowering_context.clone().with_target_platform(Some("cuda"));
+        assert_eq!(cuda_context.target_platform(), Some("cuda"));
+        assert_eq!(cuda_context.with_target_platform(None).target_platform(), None);
+        assert_eq!(lowering_context.target_platform(), None);
+    }
+
+    #[test]
+    fn test_program_lowering_context_with_ragged_dot_lowering_strategy() {
+        let lowering_context = ProgramLoweringContext::new();
+        let instruction_context =
+            lowering_context.clone().with_ragged_dot_lowering_strategy(RaggedDotLoweringStrategy::Instruction);
+        assert_eq!(instruction_context.ragged_dot_lowering_strategy(), RaggedDotLoweringStrategy::Instruction);
+        assert_eq!(lowering_context.ragged_dot_lowering_strategy(), RaggedDotLoweringStrategy::Decomposition);
+    }
+
+    #[test]
+    fn test_program_lowering_context_with_session_constants() {
+        // Session constants are bound in the order provided, and binding them again replaces the earlier bindings.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let first = RetainedArray::new(&f32_scalar(&session, &mesh, 1.0));
+        let second = RetainedArray::new(&f32_scalar(&session, &mesh, 2.0));
+        let captures = [0, 1, 2];
+        let lowering_context = ProgramLoweringContext::new().with_session_constants([&first, &second]);
+        assert_eq!(lowering_context.session_constant_values(&captures), &[1, 2]);
+        let lowering_context = lowering_context.with_session_constants([&second]);
+        assert_eq!(lowering_context.session_constant_values(&captures), &[2]);
+    }
+
+    #[test]
+    fn test_program_lowering_context_session_constant_values() {
+        // The values of the session constants are the suffix of the capture table, and a table that is too short to
+        // hold them (e.g., that of a shared private function) holds none.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let first = RetainedArray::new(&f32_scalar(&session, &mesh, 1.0));
+        let second = RetainedArray::new(&f32_scalar(&session, &mesh, 2.0));
+        let lowering_context = ProgramLoweringContext::new().with_session_constants([&first, &second]);
+        assert_eq!(lowering_context.session_constant_values(&[0, 1, 2]), &[1, 2]);
+        assert_eq!(lowering_context.session_constant_values(&[1, 2]), &[1, 2]);
+        assert!(lowering_context.session_constant_values(&[2]).is_empty());
+    }
+
+    #[test]
+    fn test_program_lowering_context_require_named_composition() {
+        // The first request for a key traces its decomposition and names its function after the composite.
+        let boundary_type = ArrayType::scalar(DataType::F32);
+        let decomposition = || {
+            let input_types = vec![Type::from(boundary_type.clone())];
+            let (_, program) = DomainTracingContext::<Session>::trace(|inputs: Vec<Tracer>| Ok(inputs), input_types)?;
+            Ok(program.into_simplified()?)
+        };
+        let key = |name: &'static str| {
+            let boundary_types = vec![boundary_type.clone()];
+            NamedCompositionKey::new(CompositeKey::new(name, 1), boundary_types.clone(), boundary_types)
+        };
+        let lowering_context = ProgramLoweringContext::new();
+        assert!(lowering_context.named_composition(0).is_none());
+        assert_eq!(lowering_context.require_named_composition(key("first"), decomposition).unwrap().as_ref(), "first");
+
+        // Every lowering scope of a program records into the same module, including the body of a manual region, and a
+        // decomposition that was already requested is not traced again.
+        let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
+        let region_context = lowering_context.enter_manual_region(boundary);
+        assert_eq!(region_context.require_named_composition(key("second"), decomposition).unwrap().as_ref(), "second");
+        assert_eq!(
+            region_context.require_named_composition(key("first"), || unreachable!()).unwrap().as_ref(),
+            "first"
+        );
+        let symbols = (0..3)
+            .map(|index| lowering_context.named_composition(index).map(|function| function.symbol().to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(symbols, vec![Some("first".to_string()), Some("second".to_string()), None]);
+
+        // A decomposition that cannot be traced is not recorded.
+        let error = ProgramError::MalformedProgram("no decomposition".to_string());
+        assert_eq!(
+            lowering_context.require_named_composition(key("third"), || Err(error.clone().into())),
+            Err(Error::from(error)),
+        );
+        assert!(lowering_context.named_composition(2).is_none());
+    }
 
     #[test]
     fn test_program_lowering_context_require_mesh() {
@@ -400,12 +631,12 @@ mod tests {
         let explicit = mesh([("x", 2), ("y", 2)], MeshAxisType::Explicit);
         let lowering_context = ProgramLoweringContext::new();
         assert_eq!(lowering_context.mesh(), None);
-        lowering_context.require_mesh(&explicit).unwrap();
+        assert_eq!(lowering_context.require_mesh(&explicit), Ok(()));
         assert_eq!(lowering_context.mesh(), Some(explicit.clone()));
 
         // A mesh that differs only in axis types shares the module mesh, which keeps the axis types of its first mesh.
         let manual = mesh([("x", 2), ("y", 2)], MeshAxisType::Manual);
-        lowering_context.require_mesh(&manual).unwrap();
+        assert_eq!(lowering_context.require_mesh(&manual), Ok(()));
         assert_eq!(lowering_context.mesh(), Some(explicit.clone()));
 
         // Device ids follow the order of the axes of the module mesh, so a reordered mesh is another topology, as is a
@@ -415,59 +646,67 @@ mod tests {
             mesh([("x", 2), ("z", 2)], MeshAxisType::Explicit),
             mesh([("x", 2), ("y", 4)], MeshAxisType::Explicit),
         ] {
-            assert!(matches!(
+            assert_eq!(
                 lowering_context.require_mesh(&other),
-                Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
-                    if expected == explicit && actual == other,
-            ));
+                Err(Error::Lowering(LoweringError::MismatchedMeshTopology {
+                    expected: explicit.clone(),
+                    actual: other,
+                })),
+            );
         }
         assert_eq!(lowering_context.mesh(), Some(explicit));
 
         // Every lowering scope of a program records into the same module, including the body of a manual region.
         let lowering_context = ProgramLoweringContext::new();
         let boundary = ShardMapBoundary::new(manual.clone(), Vec::new(), Vec::new(), vec!["x".to_string()]).unwrap();
-        lowering_context.enter_manual_region(boundary).require_mesh(&manual).unwrap();
+        assert_eq!(lowering_context.enter_manual_region(boundary).require_mesh(&manual), Ok(()));
         assert_eq!(lowering_context.mesh(), Some(manual));
     }
 
     #[test]
-    fn test_program_lowering_context_require_named_composition() {
-        let boundary_type = ArrayType::scalar(DataType::F32);
-        let trace = || {
-            let input_types = vec![Type::from(boundary_type.clone())];
-            let (_, program) = DomainTracingContext::<Session>::trace(|inputs: Vec<Tracer>| Ok(inputs), input_types)?;
-            Ok(program.into_simplified()?)
-        };
-        let key = |name: &'static str| {
-            let boundary_types = vec![boundary_type.clone()];
-            NamedCompositionKey::new(CompositeKey::new(name, 1), boundary_types.clone(), boundary_types)
-        };
-        let context = ProgramLoweringContext::new();
-        assert!(context.named_composition(0).is_none());
-        assert_eq!(context.require_named_composition(key("first"), trace).unwrap().as_ref(), "first");
+    fn test_program_lowering_context_require_assertion_handler() {
+        // The requirement is recorded for the module, so every clone of the context sees it.
+        let lowering_context = ProgramLoweringContext::new();
+        let clone = lowering_context.clone();
+        clone.require_assertion_handler();
+        assert!(lowering_context.requires_assertion_handler());
+    }
 
-        // Every lowering scope of a program records into the same module, including the body of a manual region, and a
-        // decomposition that was already requested is not traced again.
-        let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
-        let scope = context.enter_manual_region(boundary);
-        assert_eq!(scope.require_named_composition(key("second"), trace).unwrap().as_ref(), "second");
-        assert_eq!(scope.require_named_composition(key("first"), || unreachable!()).unwrap().as_ref(), "first");
-        let symbols = (0..3)
-            .map(|index| context.named_composition(index).map(|function| function.symbol().to_string()))
-            .collect::<Vec<_>>();
-        assert_eq!(symbols, vec![Some("first".to_string()), Some("second".to_string()), None]);
+    #[test]
+    fn test_program_lowering_context_require_runtime_requirement() {
+        // Requirements are recorded in canonical order (i.e., sorted by identifier), and one that is recorded again is
+        // recorded once.
+        let lowering_context = ProgramLoweringContext::new();
+        let second = RuntimeRequirement::new("ryft.tests.second", 1).unwrap();
+        let first = RuntimeRequirement::new("ryft.tests.first", 2).unwrap();
+        assert_eq!(lowering_context.require_runtime_requirement(second.clone()), Ok(()));
+        assert_eq!(lowering_context.require_runtime_requirement(first.clone()), Ok(()));
+        assert_eq!(lowering_context.require_runtime_requirement(second.clone()), Ok(()));
+        assert_eq!(lowering_context.runtime_requirements(), vec![first.clone(), second.clone()]);
 
-        // A decomposition that cannot be traced is not recorded.
-        let error = ProgramError::MalformedProgram("no decomposition".to_string());
+        // A requirement that conflicts with a recorded one (i.e., another ABI version of the same identifier) is
+        // rejected, and the recorded requirements stay as they were.
+        let conflicting = RuntimeRequirement::new("ryft.tests.first", 3).unwrap();
         assert_eq!(
-            context.require_named_composition(key("third"), || Err(error.clone().into())),
-            Err(Error::from(error)),
+            lowering_context.require_runtime_requirement(conflicting),
+            Err(Error::from(RuntimeError::ConflictingRequirements { identifier: "ryft.tests.first".to_string() })),
         );
-        assert!(context.named_composition(2).is_none());
+        assert_eq!(lowering_context.runtime_requirements(), vec![first, second]);
     }
 
     #[test]
     fn test_program_lowering_context_allocate_channel_id() {
+        // Channel IDs start at one and are allocated for the module, so every clone of the context continues the same
+        // sequence.
+        let lowering_context = ProgramLoweringContext::new();
+        let clone = lowering_context.clone();
+        assert_eq!(lowering_context.allocate_channel_id(), 1);
+        assert_eq!(clone.allocate_channel_id(), 2);
+        assert_eq!(lowering_context.allocate_channel_id(), 3);
+    }
+
+    #[test]
+    fn test_program_lowering_context_allocate_channel_id_gives_each_collective_of_a_module_its_own_channel() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
@@ -613,11 +852,16 @@ mod tests {
         // A sharding over a mesh of another topology cannot be lowered into the module, and nothing is emitted for it.
         let other = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
         let other_sharding = Sharding::replicated(other.clone(), 2);
-        assert!(matches!(
-            lowering_context.lower_sharding_constraint(&other_sharding, input, OpenDimensions::None, &mut block_ref, location),
-            Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
-                if expected == test_mesh() && actual == other,
-        ));
+        assert_eq!(
+            lowering_context.lower_sharding_constraint(
+                &other_sharding,
+                input,
+                OpenDimensions::None,
+                &mut block_ref,
+                location,
+            ),
+            Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected: test_mesh(), actual: other })),
+        );
         let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(output, operations[0].result(0).unwrap().as_ref());
         assert_eq!(
@@ -663,5 +907,157 @@ mod tests {
                 r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{}, {?}], replicated={"x"}> : tensor<4x2xf32>"#,
             ],
         );
+    }
+
+    #[test]
+    fn test_program_lowering_context_lower_pending_reduction_constraint() {
+        // The constraints are rendered outside any function, so their detached inputs print as unknown SSA values.
+        let sharding =
+            Sharding::new(test_mesh(), vec![ShardingDimension::unconstrained(), ShardingDimension::replicated()])
+                .unwrap()
+                .with_unreduced_axes(["x"])
+                .unwrap();
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = test_matrix_type(4, 2).lower(&context, location).unwrap();
+        let block = context.block(&[(tensor_type, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let mut block_ref = block.as_ref();
+        let location = location.as_ref();
+
+        // Every dimension is closed, even over a mesh with the auto axis `y`, and an unconstrained one is replicated.
+        let lowering_context = ProgramLoweringContext::new();
+        let output = lowering_context
+            .lower_pending_reduction_constraint(&sharding, input, &mut block_ref, location)
+            .unwrap();
+
+        // An axis that an enclosing manual region binds is left out of the constraint.
+        let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
+        let lowering_context = lowering_context.enter_manual_region(boundary);
+        lowering_context
+            .lower_pending_reduction_constraint(&sharding, input, &mut block_ref, location)
+            .unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output, operations[0].result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{}, {}], replicated={\"m\"}, \
+                 unreduced={\"x\"}> : tensor<4x2xf32>",
+                "%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{}, {}], unreduced={\"x\"}> : \
+                 tensor<4x2xf32>",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_program_lowering_context_lower_session_constant() {
+        // A session constant lowers to the value at its position in the suffix of the capture table.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let first = RetainedArray::new(&f32_scalar(&session, &mesh, 1.0));
+        let second = RetainedArray::new(&f32_scalar(&session, &mesh, 2.0));
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = ArrayType::scalar(DataType::F32).lower(&context, location).unwrap();
+        let block = context.block(&[(tensor_type, location); 3]);
+        let captured_values = [0, 1, 2].map(|index| block.argument(index).unwrap().as_ref());
+        let lowering_context = ProgramLoweringContext::new().with_session_constants([&first, &second]);
+        assert_eq!(lowering_context.lower_session_constant(&first, &captured_values), Ok(captured_values[1]));
+        assert_eq!(lowering_context.lower_session_constant(&second, &captured_values), Ok(captured_values[2]));
+
+        // A constant that the scope does not bind is unreachable, and so is every constant in a scope whose capture
+        // table cannot hold the session constants (e.g., a shared private function).
+        let unbound = RetainedArray::new(&f32_scalar(&session, &mesh, 3.0));
+        assert_eq!(
+            lowering_context.lower_session_constant(&unbound, &captured_values),
+            Err(Error::Lowering(LoweringError::UnreachableSessionConstant { constant: unbound.to_string() })),
+        );
+        assert_eq!(
+            lowering_context.lower_session_constant(&first, &captured_values[..1]),
+            Err(Error::Lowering(LoweringError::UnreachableSessionConstant { constant: first.to_string() })),
+        );
+    }
+
+    #[test]
+    fn test_program_lowering_context_lower_provenance() {
+        // Unknown provenance keeps the base location and records nothing for the module.
+        let context = MlirContext::new();
+        let base = context.unknown_location().as_ref();
+        let lowering_context = ProgramLoweringContext::new();
+        let location = lowering_context.lower_provenance(&context, &Provenance::unknown(), base);
+        assert_eq!(location.to_string(), "loc(unknown)");
+        assert!(!lowering_context.has_provenance());
+
+        // Each scope becomes one named location above its origin, and fused provenance becomes one fused location
+        // over its origins. Either one is recorded for the module.
+        let scope = |name: &str, origin: Provenance| Provenance::scope(ProvenanceScope::new(name), origin);
+        let nested = scope("inner", scope("outer", Provenance::unknown()));
+        let location = lowering_context.lower_provenance(&context, &nested, base);
+        assert_eq!(location.to_string(), "loc(\"inner\"(\"outer\"))");
+        assert!(lowering_context.has_provenance());
+        let fused = Provenance::fused([scope("left", Provenance::unknown()), scope("right", Provenance::unknown())]);
+        let location = lowering_context.lower_provenance(&context, &fused, base);
+        assert_eq!(location.to_string(), "loc(fused[\"left\", \"right\"])");
+    }
+
+    #[test]
+    fn test_named_composition_function_map_require() {
+        // Registration consumes a semantic key and an ordinary typed program, not a Ryft operation enum variant.
+        // Consequently a downstream lowerer can use the same sharing seam after performing its own family conversion.
+        let boundary_type = ArrayType::scalar(DataType::F32);
+        let (_, program) = DomainTracingContext::<Session>::trace(
+            |inputs: Vec<Tracer>| Ok(inputs),
+            vec![Type::from(boundary_type.clone())],
+        )
+        .unwrap();
+        let program = program.into_simplified().unwrap();
+        let key = NamedCompositionKey {
+            composite: CompositeKey::new("downstream.example", 1)
+                .with_attribute("enabled", CompositeAttribute::Boolean(true)),
+            input_types: vec![boundary_type.clone()],
+            output_types: vec![boundary_type],
+        };
+        let trace_count = Cell::new(0);
+        let mut registry = NamedCompositionFunctionMap::default();
+        for _ in 0..2 {
+            let function = registry
+                .require(key.clone(), || {
+                    trace_count.set(trace_count.get() + 1);
+                    Ok(program.clone())
+                })
+                .unwrap();
+            assert_eq!(function.symbol(), "downstream.example");
+        }
+
+        assert_eq!(trace_count.get(), 1);
+        assert_eq!(registry.functions.len(), 1);
+        assert_eq!(registry.order.len(), 1);
+    }
+
+    #[test]
+    fn test_named_composition_function_map_require_suffixes_shared_names() {
+        // Keys that share a composite name but differ in their boundary types receive distinct symbols, suffixed with
+        // the number of earlier keys of that name.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![4.into()]));
+        let composite = CompositeKey::new("downstream.example", 1);
+        let mut registry = NamedCompositionFunctionMap::default();
+        for boundary_type in [scalar_type.clone(), vector_type.clone(), scalar_type.clone()] {
+            let (_, program) = DomainTracingContext::<Session>::trace(
+                |inputs: Vec<Tracer>| Ok(inputs),
+                vec![Type::from(boundary_type.clone())],
+            )
+            .unwrap();
+            let key = NamedCompositionKey::new(composite.clone(), vec![boundary_type.clone()], vec![boundary_type]);
+            registry.require(key, || Ok(program.into_simplified().unwrap())).unwrap();
+        }
+
+        assert_eq!(
+            registry.functions().map(NamedCompositionFunction::symbol).collect::<Vec<_>>(),
+            vec!["downstream.example", "downstream.example_1"],
+        );
+        assert_eq!(registry.order[1].input_types, vec![vector_type]);
     }
 }

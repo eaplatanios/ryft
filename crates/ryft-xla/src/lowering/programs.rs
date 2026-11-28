@@ -21,11 +21,10 @@ use ryft_mlir::{
 use crate::arrays::host::ReductionChange;
 use crate::devices::MemoryExtension;
 use crate::lowering::contexts::ProgramLoweringContext;
-use crate::lowering::reductions::{
-    ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
-    validate_pending_reduction_change,
+use crate::lowering::sharding::{
+    LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension,
+    validate_declared_pending_reduction, validate_partial_completion, validate_pending_reduction_change,
 };
-use crate::lowering::sharding::{LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension};
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, TypeLoweringExtension, lower_runtime_dimension_size_i64,
     lower_unplaced_constant_output, validate_boundary_memory,
@@ -1815,7 +1814,7 @@ impl ProgramBoundary {
                     let reduced = sharding.clone().with_unreduced_axes(array_type.unreduced_axes().iter().cloned())?;
                     let block = &mut function_block_ref;
 
-                    reduced.lower_pending_reduction_constraint(value, lowering_context, block, location.as_ref())?
+                    lowering_context.lower_pending_reduction_constraint(&reduced, value, block, location.as_ref())?
                 }
                 _ => value,
             };

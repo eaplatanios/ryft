@@ -55,6 +55,13 @@ pub enum CompilationError {
     #[error("incompatible XLA executable: {reason}")]
     IncompatibleExecutable { reason: String },
 
+    /// The executable reports a memory kind different from the one declared by its input or output type.
+    #[error(
+        "incompatible XLA executable: executable {kind} {index} uses memory kind `{actual}` but its type declares \
+         `{expected}`"
+    )]
+    ExecutableMemoryKindMismatch { kind: &'static str, index: usize, expected: String, actual: String },
+
     /// Persistent executable bytes or metadata violate their versioned transport contract.
     #[error("invalid persistent XLA executable: {reason}")]
     InvalidPersistentExecutable { reason: String },

@@ -33,10 +33,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, CALL_OPERATION_NAME, CompositeKey, ConstrainShardingOperation, DataType, Device, DeviceMesh,
-    EagerContext, EffectClass, EffectClasses, FlatProgram, LogicalMesh, Memory, Operation as CoreOperation,
-    OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, Program, ProgramError, RegionRef, ScanOperation,
-    Sharding, ShardingDimension, Type as CoreType,
+    ArrayType, CALL_OPERATION_NAME, CompositeKey, DataType, Device, DeviceMesh, EagerContext, EffectClass,
+    EffectClasses, FlatProgram, LogicalMesh, Operation as CoreOperation, OperationPayloadProjection,
+    PLACE_OPERATION_NAME, Parameterized, Program, ProgramError, RegionRef, ScanOperation, Sharding, ShardingDimension,
+    Type as CoreType,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -45,12 +45,8 @@ use ryft_mlir::{
 
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::programs::ProgramInlineLoweringExtension;
-use crate::lowering::reductions::{
-    constrain_unreduced_intermediates, constrain_unreduced_outputs, validate_declared_pending_reduction,
-    validate_pending_reductions_across_regions,
-};
+use crate::lowering::sharding::{constrain_unreduced_intermediates, constrain_unreduced_outputs};
 use crate::operations::call::CallFunctionMap;
-use crate::operations::composites::NamedCompositionKey;
 use crate::{Constant, Error, Operation, RuntimeRequirement, Session, Type};
 
 // TODO(eaplatanios): Review this module.
@@ -141,9 +137,6 @@ pub enum LoweringError {
     #[error("cannot lower element type `{data_type}` for {context}")]
     UnsupportedElementType { data_type: DataType, context: String },
 
-    #[error("programs compiled for platform `{platform}` cannot take or return values in `{memory}` memory")]
-    UnsupportedBoundaryMemory { memory: Memory, platform: String },
-
     /// The constructed MLIR module failed verification without returning a native error value.
     #[error("constructed MLIR module failed verification during XLA lowering")]
     VerificationFailure,
@@ -167,15 +160,14 @@ pub enum RaggedDotLoweringStrategy {
 pub(crate) mod contexts;
 /// Options, entry points, and analysis for lowering programs and their regions.
 pub(crate) mod programs;
-/// Lowering and validation of pending reductions.
-pub(crate) mod reductions;
-/// Lowering of logical meshes, shardings, and sharding constraints to Shardy.
+/// Lowering of logical meshes and sharding constraints to Shardy, including propagation of pending reductions.
 pub(crate) mod sharding;
 /// Shared StableHLO type, constant, and dynamic-dimension lowering helpers.
 pub(crate) mod types;
 /// Lowering of the values of programs (i.e., their constants) to StableHLO values.
 pub(crate) mod values;
 
+pub use contexts::NamedCompositionKey;
 pub use programs::{
     EntryShardingOverride, MlirProgram, MlirProgramBoundaryMapping, MlirProgramBoundaryMappingInputDimension,
     MlirProgramBoundaryMappingOutputDimension, ProgramLoweringExtension, ProgramLoweringOptions,
@@ -876,19 +868,10 @@ fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     let mut block = lowerer.block();
     let location = lowerer.location();
     let bound_manual_axes = lowerer.lowering_context().bound_manual_axes();
-    if let Some(constraint) = operation.projected_payload::<ConstrainShardingOperation>()
-        && let Some(Type::Array(input_type)) = input_types.first()
-    {
-        let declared = constraint.lowered_sharding(input_type).map_err(ProgramError::from)?;
-        let carried = input_type.sharding();
-        let data_type = input_type.data_type();
-        validate_declared_pending_reduction(&declared, carried, data_type, bound_manual_axes, "constrain_sharding")?;
-    }
     let has_pending_reduction = input_types.iter().any(|input_type| match input_type {
         Type::Array(input_type) => input_type.unreduced_axes().iter().any(|axis| !bound_manual_axes.contains(axis)),
         Type::Dimension(_) | Type::Reference(_) => false,
     });
-    validate_pending_reductions_across_regions(operation.name(), input_types, output_types, bound_manual_axes)?;
     // The lowering only appends operations to the block, so the operations that follow an anchor appended before the
     // lowering are those that the lowering emits into this block, which are found without walking the operations of
     // the block that precede them. The anchor is a `stablehlo.after_all` without operands, whose result nothing uses,
