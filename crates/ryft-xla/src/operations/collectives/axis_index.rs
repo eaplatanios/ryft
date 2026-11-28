@@ -8,8 +8,9 @@ use ryft_mlir::{
 };
 
 use crate::lowering::contexts::ProgramLoweringContext;
-use crate::lowering::types::{ArrayTypeLoweringExtension, lower_u64_scalar_constant};
-use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
+use crate::{
+    ArrayTypeLoweringExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, lower_u64_scalar_constant,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -88,14 +89,14 @@ impl AxisIndexOperationLoweringExtension for AxisIndexOperation {
         let strided = if stride == 1 {
             partition_id
         } else {
-            let stride_constant = lower_u64_scalar_constant(stride as u64, block, context, location)?;
+            let stride_constant = lower_u64_scalar_constant(stride as u64, block, location)?;
             let divided = block.append_operation(stable_hlo::divide(partition_id, stride_constant, location)?)?;
             divided.result(0).unwrap().as_ref()
         };
         if axis_size == mesh.device_count() {
             return Ok(strided);
         }
-        let size_constant = lower_u64_scalar_constant(axis_size as u64, block, context, location)?;
+        let size_constant = lower_u64_scalar_constant(axis_size as u64, block, location)?;
         let coordinate = block.append_operation(stable_hlo::remainder(strided, size_constant, location)?)?;
         Ok(coordinate.result(0).unwrap().as_ref())
     }

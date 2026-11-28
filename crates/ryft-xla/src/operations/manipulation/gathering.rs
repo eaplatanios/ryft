@@ -6,15 +6,14 @@ use ryft_mlir::{
 };
 
 use crate::lowering::sharding::OpenDimensions;
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_explicit_shape, lower_static_index_constants,
-    lower_unplaced_constant_output,
-};
 use crate::lowering::values::ArrayLiteralLoweringExtension;
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::build_reduce_body_region;
-use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, ValueRefExtension};
+use crate::{
+    ArrayTypeExtension, ArrayTypeLoweringExtension, Error, LowerableOperation, Lowerer, PhysicalStoragePadding,
+    ProgramLoweringOperation, ValueRefExtension, lower_i64_vector, lower_index_constant,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -152,15 +151,15 @@ impl GatherOperationLoweringExtension for GatherOperation {
         let mut upper_bounds = Vec::with_capacity(dimensions.start_index_map().len());
         for &axis in dimensions.start_index_map() {
             let extent = match input_types[0].shape().dimensions()[axis] {
-                Dimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
+                Dimension::Static(extent) => lower_index_constant(extent, block, location)?,
                 Dimension::Dynamic(_) => input_values[0].widen_dimension_to_i64(axis, block, location)?,
             };
-            let window = lower_static_index_constants(&[self.slice_sizes()[axis]], block, context, location)?[0];
+            let window = lower_index_constant(self.slice_sizes()[axis], block, location)?;
             upper_bounds.push(
                 block.append_operation(stable_hlo::subtract(extent, window, location)?)?.result(0).unwrap().as_ref(),
             );
         }
-        let upper_bounds = lower_explicit_shape(&upper_bounds, block, context, location)?;
+        let upper_bounds = lower_i64_vector(&upper_bounds, block, location)?;
         let upper_bounds_type = ArrayType::new_static(index_data_type, [dimensions.start_index_map().len()]);
         let upper_bounds = block
             .append_operation(stable_hlo::convert(
@@ -181,7 +180,7 @@ impl GatherOperationLoweringExtension for GatherOperation {
             .result(0)
             .unwrap()
             .as_ref();
-        let zero = lower_unplaced_constant_output(&[comparison_type], 0, block, context, location)?[0];
+        let zero = comparison_type.lower_i64_splat(0, block, location)?;
         if self.mode() == &GatherMode::Clip {
             // Native gather clamps against allocation capacities, which can exceed a dynamic input's logical size.
             // Clamp explicitly before gathering, then carry query sizes from the original gather's shape computation.
@@ -223,8 +222,7 @@ impl GatherOperationLoweringExtension for GatherOperation {
             .result(0)
             .unwrap()
             .as_ref();
-        let initial =
-            lower_unplaced_constant_output(&[ArrayType::scalar(DataType::Boolean)], 1, block, context, location)?[0];
+        let initial = ArrayType::scalar(DataType::Boolean).lower_i64_splat(1, block, location)?;
         let reduction = build_reduce_body_region(
             ReductionKind::All,
             DataType::Boolean,

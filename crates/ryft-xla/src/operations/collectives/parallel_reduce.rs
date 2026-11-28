@@ -8,9 +8,8 @@ use ryft_mlir::{
 
 use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
 use crate::lowering::contexts::ProgramLoweringContext;
-use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat};
 use crate::operations::collectives::CollectiveLoweringExtension;
-use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
+use crate::{ArrayTypeLoweringExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
@@ -182,15 +181,7 @@ impl ParallelReduceOperationLoweringExtension for ParallelReduceOperation {
             return Ok(reduced);
         }
         // `Mean` is the mean over the effective participant group, so divide the all-reduced sum by the group size.
-        let output_tensor_type = output_array_type.lower(context, location)?;
-        let divisor = lower_f64_constant_splat(
-            effective_axis_size as f64,
-            output_array_type,
-            output_tensor_type,
-            block,
-            context,
-            location,
-        )?;
+        let divisor = output_array_type.lower_f64_splat(effective_axis_size as f64, block, location)?;
         let mean = block.append_operation(stable_hlo::divide(reduced, divisor, location)?)?;
         Ok(mean.result(0).unwrap().as_ref())
     }
@@ -359,8 +350,7 @@ pub(crate) mod tests {
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
         let mut block = module.body().unwrap();
-        let tensor_type = array_type.lower(&context, location).unwrap();
-        let input = lower_f64_constant_splat(1.0, &array_type, tensor_type, &mut block, &context, location).unwrap();
+        let input = array_type.lower_f64_splat(1.0, &mut block, location).unwrap();
         ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string())
             .lower_to_all_reduce(&lowering_context, input, &array_type, &mut block, &context, location.as_ref())
             .unwrap();

@@ -7,16 +7,12 @@ use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{Block, Operation as MlirOperation, Type as MlirType, Value as MlirValue, ValueRef};
 
 use crate::lowering::sharding::OpenDimensions;
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_to_i64, lower_explicit_shape,
-    lower_static_index_constants,
-};
 use crate::operations::constants::{
     ArrayTypeLayoutConstraintLoweringExtension, dynamic_constructor_types, refine_dynamic_constructor_result,
 };
 use crate::{
-    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type,
-    ValueRefExtension,
+    ArrayTypeExtension, ArrayTypeLoweringExtension, Error, LowerableOperation, Lowerer, LoweringError,
+    PhysicalStoragePadding, ProgramLoweringOperation, Type, ValueRefExtension, lower_i64_vector, lower_index_constant,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -60,8 +56,7 @@ impl LowerableOperation for BroadcastOperation {
                 .enumerate()
                 .map(|(axis, dimension)| {
                     if let Dimension::Static(extent) = dimension {
-                        dimension_extent_to_i64(*extent)?;
-                        Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0))
+                        lower_index_constant(*extent, block, location)
                     } else {
                         let input_axis =
                             self.output_axes().iter().position(|output_axis| *output_axis == axis).unwrap();
@@ -69,7 +64,7 @@ impl LowerableOperation for BroadcastOperation {
                     }
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
-            let shape = lower_explicit_shape(&extents, block, context, location)?;
+            let shape = lower_i64_vector(&extents, block, location)?;
             let broadcast = block.append_operation(stable_hlo::dynamic_broadcast(
                 input,
                 shape,
@@ -270,7 +265,7 @@ impl LowerableOperation for DynamicBroadcastOperation {
                     reason: "dynamic broadcast with explicit output layout needs finite allocation bounds".to_owned(),
                 }));
             }
-            let shape = lower_explicit_shape(output_extents, block, context, location)?;
+            let shape = lower_i64_vector(output_extents, block, location)?;
             let broadcast = block.append_operation(stable_hlo::dynamic_broadcast(
                 *input,
                 shape,
@@ -703,18 +698,17 @@ mod tests {
                         %4 = stablehlo.broadcast_in_dim %1, dims = [] : (tensor<i32>) -> tensor<4xi32>
                         %5 = stablehlo.compare LT, %3, %4, SIGNED : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi1>
                         %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
-                        %6 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<4xf64>
                         %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f64>
-                        %7 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f64>) -> tensor<4xf64>
-                        %8 = stablehlo.complex %6, %7 : tensor<4xcomplex<f64>>
-                        %9 = stablehlo.select %5, %2, %8 : tensor<4xi1>, tensor<4xcomplex<f64>>
-                        %10 = stablehlo.broadcast_in_dim %9, dims = [1] : (tensor<4xcomplex<f64>>) -> tensor<2x4xcomplex<f64>>
-                        %11 = stablehlo.custom_call @LayoutConstraint(%10) {operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<2x4xcomplex<f64>>) -> tensor<2x4xcomplex<f64>>
-                        %12 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<i32>
-                        %13 = stablehlo.set_dimension_size %11, %12, dim = 1 : (tensor<2x4xcomplex<f64>>, tensor<i32>) -> tensor<2x?xcomplex<f64>, #stablehlo.bounds<?, 4>>
-                        %14 = stablehlo.get_dimension_size %13, dim = 1 : (tensor<2x?xcomplex<f64>, #stablehlo.bounds<?, 4>>) -> tensor<i32>
-                        %15 = stablehlo.convert %14 : (tensor<i32>) -> tensor<i64>
-                        return %13, %15 : tensor<2x?xcomplex<f64>, #stablehlo.bounds<?, 4>>, tensor<i64>
+                        %6 = stablehlo.complex %cst, %cst_0 : tensor<complex<f64>>
+                        %7 = stablehlo.broadcast_in_dim %6, dims = [] : (tensor<complex<f64>>) -> tensor<4xcomplex<f64>>
+                        %8 = stablehlo.select %5, %2, %7 : tensor<4xi1>, tensor<4xcomplex<f64>>
+                        %9 = stablehlo.broadcast_in_dim %8, dims = [1] : (tensor<4xcomplex<f64>>) -> tensor<2x4xcomplex<f64>>
+                        %10 = stablehlo.custom_call @LayoutConstraint(%9) {operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<2x4xcomplex<f64>>) -> tensor<2x4xcomplex<f64>>
+                        %11 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<i32>
+                        %12 = stablehlo.set_dimension_size %10, %11, dim = 1 : (tensor<2x4xcomplex<f64>>, tensor<i32>) -> tensor<2x?xcomplex<f64>, #stablehlo.bounds<?, 4>>
+                        %13 = stablehlo.get_dimension_size %12, dim = 1 : (tensor<2x?xcomplex<f64>, #stablehlo.bounds<?, 4>>) -> tensor<i32>
+                        %14 = stablehlo.convert %13 : (tensor<i32>) -> tensor<i64>
+                        return %12, %14 : tensor<2x?xcomplex<f64>, #stablehlo.bounds<?, 4>>, tensor<i64>
                       }
                     }
                 "#},

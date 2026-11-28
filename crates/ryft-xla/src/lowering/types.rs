@@ -595,13 +595,11 @@ impl SplatValue {
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use ryft_core::{DimensionBounds, DimensionType, Error as CoreError, Placeholder, ReferenceType, ZeroOperation};
+    use ryft_core::{DimensionBounds, DimensionType, Error as CoreError, ReferenceType};
 
-    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, test_vector_type, unproject_plain_program};
-    use crate::{ArrayConstant, ProgramLoweringExtension, ProgramLoweringOptions};
+    use crate::lowering::tests::{dynamic_dimension, test_vector_type};
 
     use super::*;
 
@@ -643,33 +641,90 @@ mod tests {
     }
 
     #[test]
-    fn test_dimension_extent_to_i64() {
-        assert_eq!(dimension_extent_to_i64(0), Ok(0));
-        let maximum = i64::MAX as usize;
-        assert_eq!(dimension_extent_to_i64(maximum), Ok(maximum as i64));
-        let Some(extent) = maximum.checked_add(1) else { return };
-        let error = dimension_extent_to_i64(extent).unwrap_err();
-        let Error::Core(core_error) = error else { unreachable!() };
-        let CoreError::Type(error) = *core_error else { unreachable!() };
-        assert_eq!(
-            error.downcast_custom::<DimensionError>(),
-            Some(&DimensionError::ExtentExceedsBackendWidth { value: extent, maximum }),
-        );
+    fn test_data_type_lower() {
+        // Zero, Boolean, and unsigned one-bit values share the signless `i1` carrier, and tokens have no element type.
+        let context = MlirContext::new();
+        for (data_type, expected) in [
+            (DataType::Zero, "i1"),
+            (DataType::Boolean, "i1"),
+            (DataType::I4, "i4"),
+            (DataType::U1, "i1"),
+            (DataType::U8, "ui8"),
+            (DataType::BF16, "bf16"),
+            (DataType::F8E4M3FN, "f8E4M3FN"),
+            (DataType::C64, "complex<f32>"),
+        ] {
+            assert_eq!(data_type.lower(&context).unwrap().to_string(), expected);
+        }
+        assert!(matches!(
+            DataType::Token.lower(&context),
+            Err(Error::Lowering(LoweringError::UnsupportedDataType { data_type: DataType::Token, context }))
+                if context == "tensor element representation",
+        ));
     }
 
     #[test]
-    fn test_dimension_extent_to_i32() {
-        assert_eq!(dimension_extent_to_i32(0), Ok(0));
-        let maximum = i32::MAX as usize;
-        assert_eq!(dimension_extent_to_i32(maximum), Ok(i32::MAX));
-        let extent = maximum + 1;
-        let error = dimension_extent_to_i32(extent).unwrap_err();
-        let Error::Core(core_error) = error else { unreachable!() };
-        let CoreError::Type(error) = *core_error else { unreachable!() };
-        assert_eq!(
-            error.downcast_custom::<DimensionError>(),
-            Some(&DimensionError::ExtentExceedsBackendWidth { value: extent, maximum }),
-        );
+    fn test_data_type_lower_f64_splat_attribute() {
+        // Boolean splats hold whether the value is nonzero, integer splats truncate it, and float splats round it to
+        // the nearest value of their element type.
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let lower = |data_type: DataType, value: f64| {
+            let tensor_type = ArrayType::scalar(data_type).lower(&context, location).unwrap();
+            let attribute = data_type.lower_f64_splat_attribute(tensor_type, value, &context);
+            attribute.map(|attribute| attribute.to_string())
+        };
+        assert_eq!(lower(DataType::Boolean, 0.5).unwrap(), "dense<true> : tensor<i1>");
+        assert_eq!(lower(DataType::I32, -2.75).unwrap(), "dense<-2> : tensor<i32>");
+        assert_eq!(lower(DataType::F16, 0.1).unwrap(), "dense<9.997550e-02> : tensor<f16>");
+        assert_eq!(lower(DataType::Zero, 0.0).unwrap(), "dense<false> : tensor<i1>");
+
+        // Unsigned splats truncate too, and `U1` keeps only the lowest bit of the result in its `i1` carrier.
+        assert_eq!(lower(DataType::U8, 2.75).unwrap(), "dense<2> : tensor<ui8>");
+        assert_eq!(lower(DataType::U1, 3.75).unwrap(), "dense<true> : tensor<i1>");
+
+        // Zero admits only a zero value, and complex values have no real splat.
+        for (data_type, value) in [(DataType::Zero, 1.0), (DataType::C64, 1.0)] {
+            assert!(matches!(
+                lower(data_type, value),
+                Err(Error::Lowering(LoweringError::UnsupportedDataType { data_type: actual, context }))
+                    if actual == data_type && context == "floating-point splat constant",
+            ));
+        }
+    }
+
+    #[test]
+    fn test_data_type_lower_i64_splat_attribute() {
+        // Integer splats hold the exact value, which a conversion to `f64` would round.
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let lower = |data_type: DataType, value: i64| {
+            let tensor_type = ArrayType::scalar(data_type).lower(&context, location).unwrap();
+            data_type.lower_i64_splat_attribute(tensor_type, value, &context).unwrap().to_string()
+        };
+        assert_eq!(lower(DataType::I64, i64::MAX), "dense<9223372036854775807> : tensor<i64>");
+        assert_eq!(lower(DataType::F32, 3), "dense<3.000000e+00> : tensor<f32>");
+    }
+
+    #[test]
+    fn test_data_type_lower_i64_splat_attribute_with_unsigned_types() {
+        // Unsigned splats use the physical carrier of their element type, so `U1` keeps only the lowest bit.
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        for data_type in [DataType::U1, DataType::U8] {
+            let tensor_type = ArrayType::scalar(data_type).lower(&context, location).unwrap();
+            for value in [0, 1, 2, 3] {
+                let expected = match data_type {
+                    DataType::U1 => format!("dense<{}> : tensor<i1>", value & 1 != 0),
+                    DataType::U8 => format!("dense<{value}> : tensor<ui8>"),
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    data_type.lower_i64_splat_attribute(tensor_type, value, &context).unwrap().to_string(),
+                    expected,
+                );
+            }
+        }
     }
 
     #[test]
@@ -690,6 +745,8 @@ mod tests {
 
     #[test]
     fn test_array_type_lower_i64_splat() {
+        // An integer beyond the exact range of `f64` keeps all of its bits. The memory of the type adds no annotation,
+        // which is what `lower_i64_splat_in_declared_memory` is for.
         let context = MlirContext::new();
         let location = context.unknown_location();
         let block = context.block_with_no_arguments();
@@ -704,12 +761,36 @@ mod tests {
                 "%0 = stablehlo.broadcast_in_dim <<UNKNOWN SSA VALUE>>, dims = [] : (tensor<i64>) -> tensor<2xi64>",
             ],
         );
+
+        // A scalar needs no broadcast, and a floating-point element type receives the converted value.
+        let block = context.block_with_no_arguments();
+        let output = ArrayType::scalar(DataType::F32).lower_i64_splat(3, &mut block.as_ref(), location).unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output, operations[0].result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["%cst = stablehlo.constant dense<3.000000e+00> : tensor<f32>"],
+        );
     }
 
     #[test]
     fn test_array_type_lower_f64_splat() {
+        // The value is converted to the element type and broadcast to the shape.
         let context = MlirContext::new();
         let location = context.unknown_location();
+        let block = context.block_with_no_arguments();
+        let output = test_vector_type(2).lower_f64_splat(1.5, &mut block.as_ref(), location).unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output, operations.last().unwrap().result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "%cst = stablehlo.constant dense<1.500000e+00> : tensor<f32>",
+                "%0 = stablehlo.broadcast_in_dim <<UNKNOWN SSA VALUE>>, dims = [] : (tensor<f32>) -> tensor<2xf32>",
+            ],
+        );
+
+        // A complex element type receives the value as its real component and a zero imaginary component.
         let block = context.block_with_no_arguments();
         let output = ArrayType::new_static(DataType::C64, [2])
             .lower_f64_splat(1.5, &mut block.as_ref(), location)
@@ -722,57 +803,48 @@ mod tests {
                 "%cst = stablehlo.constant dense<1.500000e+00> : tensor<f32>",
                 "%cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>",
                 "%0 = stablehlo.complex <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>> : tensor<complex<f32>>",
-                "%0 = stablehlo.broadcast_in_dim <<UNKNOWN SSA VALUE>>, dims = [] : (tensor<complex<f32>>) -> tensor<2xcomplex<f32>>",
+                "%0 = stablehlo.broadcast_in_dim <<UNKNOWN SSA VALUE>>, dims = [] : (tensor<complex<f32>>) -> \
+                 tensor<2xcomplex<f32>>",
             ],
         );
     }
 
     #[test]
     fn test_array_type_lower_i64_splat_in_declared_memory() {
-        // Device outputs need no annotation, while host outputs gain one `annotate_device_placement` custom call in
-        // addition to their `mhlo.memory_kind` signature attribute.
-        let zero_program = |memory| {
-            let mut builder = ProgramBuilder::new();
-            let output_type = test_vector_type(4).with_memory(memory);
-            let output =
-                builder.add_instruction(ZeroOperation::new(output_type), Vec::new(), Vec::new(), None).unwrap()[0];
-            builder
-                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
-                .unwrap()
-        };
-        assert_eq!(
-            unproject_plain_program(zero_program(Memory::Device))
-                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
-                .unwrap(),
-            indoc! {r#"
-            module {
-              func.func @main() -> tensor<4xf32> {
-                %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                return %0 : tensor<4xf32>
-              }
-            }
-        "#},
-        );
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let splat = [
+            "%cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>".to_string(),
+            "%0 = stablehlo.broadcast_in_dim <<UNKNOWN SSA VALUE>>, dims = [] : (tensor<f32>) -> tensor<4xf32>"
+                .to_string(),
+        ];
+
+        // A value in device memory is the splat itself.
+        let block = context.block_with_no_arguments();
+        let output = test_vector_type(4).lower_i64_splat_in_declared_memory(0, &mut block.as_ref(), location).unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output, operations.last().unwrap().result(0).unwrap().as_ref());
+        assert_eq!(operations.iter().map(ToString::to_string).collect::<Vec<_>>(), splat);
+
+        // A value in host memory is the splat annotated with its placement.
         for (memory, kind) in
             [(Memory::Host { pinned: true }, "pinned_host"), (Memory::Host { pinned: false }, "unpinned_host")]
         {
-            let expected = indoc! {r#"
-                module {
-                  func.func @main() -> (tensor<4xf32> {mhlo.memory_kind = "KIND"}) {
-                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                    %1 = stablehlo.custom_call @annotate_device_placement(%0) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "KIND"}} : (tensor<4xf32>) -> tensor<4xf32>
-                    return %1 : tensor<4xf32>
-                  }
-                }
-            "#}
-            .replace("KIND", kind);
+            let block = context.block_with_no_arguments();
+            let output = test_vector_type(4)
+                .with_memory(memory)
+                .lower_i64_splat_in_declared_memory(0, &mut block.as_ref(), location)
+                .unwrap();
+            let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            assert_eq!(output, operations.last().unwrap().result(0).unwrap().as_ref());
+            let annotation = format!(
+                "%0 = stablehlo.custom_call @annotate_device_placement(<<UNKNOWN SSA VALUE>>) {{backend_config = \"\", \
+                 has_side_effect = true, mhlo.frontend_attributes = {{_xla_buffer_placement = \"{kind}\"}}}} : \
+                 (tensor<4xf32>) -> tensor<4xf32>",
+            );
             assert_eq!(
-                unproject_plain_program(zero_program(memory))
-                    .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
-                    .unwrap(),
-                expected
+                operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                vec![splat[0].clone(), splat[1].clone(), annotation],
             );
         }
     }
@@ -853,7 +925,7 @@ mod tests {
             &context,
             location,
         );
-        assert_eq!(output.unwrap(), input);
+        assert_eq!(output, Ok(input));
         assert_eq!(block.operations().unwrap().count(), 0);
     }
 
@@ -943,97 +1015,6 @@ mod tests {
     }
 
     #[test]
-    fn test_data_type_lower() {
-        // Zero, Boolean, and unsigned one-bit values share the signless `i1` carrier, and tokens have no element type.
-        let context = MlirContext::new();
-        for (data_type, expected) in [
-            (DataType::Zero, "i1"),
-            (DataType::Boolean, "i1"),
-            (DataType::I4, "i4"),
-            (DataType::U1, "i1"),
-            (DataType::U8, "ui8"),
-            (DataType::BF16, "bf16"),
-            (DataType::F8E4M3FN, "f8E4M3FN"),
-            (DataType::C64, "complex<f32>"),
-        ] {
-            assert_eq!(data_type.lower(&context).unwrap().to_string(), expected);
-        }
-        assert!(matches!(
-            DataType::Token.lower(&context),
-            Err(Error::Lowering(LoweringError::UnsupportedDataType { data_type: DataType::Token, context }))
-                if context == "tensor element representation",
-        ));
-    }
-
-    #[test]
-    fn test_data_type_lower_f64_splat_attribute() {
-        // Boolean splats hold whether the value is nonzero, integer splats truncate it, and float splats round it to
-        // the nearest value of their element type.
-        let context = MlirContext::new();
-        let location = context.unknown_location();
-        let lower = |data_type: DataType, value: f64| {
-            let tensor_type = ArrayType::scalar(data_type).lower(&context, location).unwrap();
-            let attribute = data_type.lower_f64_splat_attribute(tensor_type, value, &context);
-            attribute.map(|attribute| attribute.to_string())
-        };
-        assert_eq!(lower(DataType::Boolean, 0.5).unwrap(), "dense<true> : tensor<i1>");
-        assert_eq!(lower(DataType::I32, -2.75).unwrap(), "dense<-2> : tensor<i32>");
-        assert_eq!(lower(DataType::F16, 0.1).unwrap(), "dense<9.997550e-02> : tensor<f16>");
-        assert_eq!(lower(DataType::Zero, 0.0).unwrap(), "dense<false> : tensor<i1>");
-
-        // Zero admits only a zero value, and complex values have no real splat.
-        for (data_type, value) in [(DataType::Zero, 1.0), (DataType::C64, 1.0)] {
-            assert!(matches!(
-                lower(data_type, value),
-                Err(Error::Lowering(LoweringError::UnsupportedDataType { data_type: actual, context }))
-                    if actual == data_type && context == "floating-point splat constant",
-            ));
-        }
-    }
-
-    #[test]
-    fn test_data_type_lower_i64_splat_attribute() {
-        // Integer splats hold the exact value, which a conversion to `f64` would round.
-        let context = MlirContext::new();
-        let location = context.unknown_location();
-        let lower = |data_type: DataType, value: i64| {
-            let tensor_type = ArrayType::scalar(data_type).lower(&context, location).unwrap();
-            data_type.lower_i64_splat_attribute(tensor_type, value, &context).unwrap().to_string()
-        };
-        assert_eq!(lower(DataType::I64, i64::MAX), "dense<9223372036854775807> : tensor<i64>");
-        assert_eq!(lower(DataType::F32, 3), "dense<3.000000e+00> : tensor<f32>");
-    }
-
-    #[test]
-    fn test_data_type_lower_i64_splat_attribute_with_unsigned_types() {
-        // Unsigned splats use the physical carrier of their element type, so `U1` keeps only the lowest bit, and the
-        // `f64` splat truncates its value to the same integer.
-        let context = MlirContext::new();
-        let location = context.unknown_location();
-        for data_type in [DataType::U1, DataType::U8] {
-            let tensor_type = ArrayType::scalar(data_type).lower(&context, location).unwrap();
-            for value in [0, 1, 2, 3] {
-                let expected = match data_type {
-                    DataType::U1 => format!("dense<{}> : tensor<i1>", value & 1 != 0),
-                    DataType::U8 => format!("dense<{value}> : tensor<ui8>"),
-                    _ => unreachable!(),
-                };
-                assert_eq!(
-                    data_type.lower_i64_splat_attribute(tensor_type, value, &context).unwrap().to_string(),
-                    expected,
-                );
-                assert_eq!(
-                    data_type
-                        .lower_f64_splat_attribute(tensor_type, value as f64 + 0.75, &context)
-                        .unwrap()
-                        .to_string(),
-                    expected,
-                );
-            }
-        }
-    }
-
-    #[test]
     fn test_type_lower() {
         // Dimensions lower to scalar `i64` tensors, and references must be resolved before lowering.
         let context = MlirContext::new();
@@ -1048,5 +1029,35 @@ mod tests {
             Err(Error::Lowering(LoweringError::UnresolvedReference { construct }))
                 if construct == reference_type.to_string(),
         ));
+    }
+
+    #[test]
+    fn test_dimension_extent_to_i64() {
+        assert_eq!(dimension_extent_to_i64(0), Ok(0));
+        let maximum = i64::MAX as usize;
+        assert_eq!(dimension_extent_to_i64(maximum), Ok(maximum as i64));
+        let Some(extent) = maximum.checked_add(1) else { return };
+        let error = dimension_extent_to_i64(extent).unwrap_err();
+        let Error::Core(core_error) = error else { unreachable!() };
+        let CoreError::Type(error) = *core_error else { unreachable!() };
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::ExtentExceedsBackendWidth { value: extent, maximum }),
+        );
+    }
+
+    #[test]
+    fn test_dimension_extent_to_i32() {
+        assert_eq!(dimension_extent_to_i32(0), Ok(0));
+        let maximum = i32::MAX as usize;
+        assert_eq!(dimension_extent_to_i32(maximum), Ok(i32::MAX));
+        let extent = maximum + 1;
+        let error = dimension_extent_to_i32(extent).unwrap_err();
+        let Error::Core(core_error) = error else { unreachable!() };
+        let CoreError::Type(error) = *core_error else { unreachable!() };
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::ExtentExceedsBackendWidth { value: extent, maximum }),
+        );
     }
 }

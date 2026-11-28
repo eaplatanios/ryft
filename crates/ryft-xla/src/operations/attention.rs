@@ -20,11 +20,10 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::lowering::types::{ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
-use crate::{ArrayTypeExtension, Error, LoweringError, Type};
+use crate::{ArrayTypeExtension, ArrayTypeLoweringExtension, Error, LoweringError, PhysicalStoragePadding, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -929,9 +928,8 @@ fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
             };
             let limit = if score_type.data_type() == DataType::F16 { 65_504.0 } else { 3.389_531_389_251_535_5e38 };
             let scalar_type = ArrayType::scalar(working_data_type);
-            let scalar_tensor_type = scalar_type.lower(context, location)?;
-            let lower = lower_f64_constant_splat(-limit, &scalar_type, scalar_tensor_type, block, context, location)?;
-            let upper = lower_f64_constant_splat(limit, &scalar_type, scalar_tensor_type, block, context, location)?;
+            let lower = scalar_type.lower_f64_splat(-limit, block, location)?;
+            let upper = scalar_type.lower_f64_splat(limit, block, location)?;
             let saturated = block.append_operation(stable_hlo::clamp(lower, bias, upper, location)?)?;
             let saturated = saturated.result(0).unwrap().as_ref();
             let finite = block.append_operation(stable_hlo::is_finite(bias, location)?)?;
@@ -954,13 +952,12 @@ fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
                 context,
                 location,
             )?;
-            let tensor_type = score_type.lower(context, location)?;
-            let zero = lower_f64_constant_splat(0.0, score_type, tensor_type, block, context, location)?;
+            let zero = score_type.lower_f64_splat(0.0, block, location)?;
             // These are the pinned JAX/cuDNN wrapper's deliberately conservative finite mask sentinels. They avoid
             // a cuDNN subtraction bug that can surface when two values sit at the element type's extreme finite
             // magnitude.
             let masked_value = if score_type.data_type() == DataType::F16 { -32_768.0 } else { -2_199_023_255_552.0 };
-            let masked = lower_f64_constant_splat(masked_value, score_type, tensor_type, block, context, location)?;
+            let masked = score_type.lower_f64_splat(masked_value, block, location)?;
             let selected = block.append_operation(stable_hlo::select(mask, zero, masked, location)?)?;
             Ok::<_, Error>(selected.result(0).unwrap().as_ref())
         })

@@ -69,14 +69,13 @@ pub use kernels::{
 };
 pub use lowering::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, DimensionExtension, EntryShardingOverride,
-    LogicalMeshExtension, LowerableOperation, Lowerer, LoweringError, MemberLowerableOperation,
-    MemoryLoweringExtension, MlirProgram, MlirProgramBoundaryMapping, MlirProgramBoundaryMappingInputDimension,
-    MlirProgramBoundaryMappingOutputDimension, NamedCompositionKey, OpenDimensions, PhysicalStoragePadding,
-    ProgramLoweringExtension, ProgramLoweringOperation, ProgramLoweringOptions, RaggedDotLoweringStrategy,
-    SHARDY_MESH_SYMBOL_NAME, ShardingExtension, TypeLoweringExtension, UnreducedKindExtension, ValueRefExtension,
-    dimension_extent_to_i32, dimension_extent_to_i64, lower_constant_output, lower_explicit_shape,
-    lower_f64_constant_splat, lower_projected_operation, lower_static_index_constants, lower_u64_scalar_constant,
-    lower_unplaced_constant_output,
+    InstructionLowerer, LogicalMeshExtension, LowerableOperation, Lowerer, LoweringError, LoweringRule,
+    MemberLowerableOperation, MemoryLoweringExtension, MlirProgram, MlirProgramBoundaryMapping,
+    MlirProgramBoundaryMappingInputDimension, MlirProgramBoundaryMappingOutputDimension, NamedCompositionKey,
+    OpenDimensions, PhysicalStoragePadding, ProgramLoweringExtension, ProgramLoweringOperation, ProgramLoweringOptions,
+    RaggedDotLoweringStrategy, SHARDY_MESH_SYMBOL_NAME, ShardingExtension, TypeLoweringExtension,
+    UnreducedKindExtension, ValueRefExtension, dimension_extent_to_i32, dimension_extent_to_i64, lower_i64_vector,
+    lower_index_constant, lower_projected_operation, lower_u64_scalar_constant,
 };
 pub use operations::{
     Operation, PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE, ensure_print_handler_registered, with_captured_prints,

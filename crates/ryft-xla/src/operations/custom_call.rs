@@ -13,10 +13,7 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::{
-    ArrayTypeLoweringExtension, EffectTokens, MemoryLoweringExtension, current_or_new_token,
-    lower_unplaced_constant_output,
-};
+use crate::lowering::{ArrayTypeLoweringExtension, EffectTokens, MemoryLoweringExtension, current_or_new_token};
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{
     CustomCallOperationExtension, Error, LowerableOperation, Lowerer, LoweringError, MemberLowerableOperation,
@@ -176,14 +173,7 @@ impl MemberLowerableOperation<Type> for CustomCallOperation {
                             return Ok(physical_inputs[alias.input_index()]);
                         }
                         let value = i64::from(r#type.data_type() == DataType::F8E8M0FNU);
-                        Ok(lower_unplaced_constant_output(
-                            std::slice::from_ref(r#type),
-                            value,
-                            &mut false_block,
-                            context,
-                            location,
-                        )?
-                        .remove(0))
+                        r#type.lower_i64_splat(value, &mut false_block, location)
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
                 if let Some(token) = entry_token {

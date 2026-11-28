@@ -56,7 +56,7 @@ impl LowerableOperation for ShardMapOperation {
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-        let (effect_tokens, _, _, _, lowering_context) = lowerer.split_effect_tokens();
+        let (effect_tokens, _, _, lowering_context) = lowerer.split_effect_tokens();
         lower_manual_computation(
             &mut block,
             input_values,
@@ -242,7 +242,6 @@ where
         let mut body_outputs = program.lower_inline(
             &[],
             &body_inputs,
-            None,
             &body_lowering_context,
             &mut body_effect_tokens,
             body_block_ref,

@@ -4,24 +4,21 @@ use ryft_core::{
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Type as MlirType,
-    Value as MlirValue, ValueRef,
+    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Size as MlirSize,
+    Type as MlirType, Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::EffectTokens;
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::sharding::OpenDimensions;
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, dimension_extent_to_i32, dimension_extent_to_i64, lower_explicit_reshape_shape,
-    lower_static_index_constants,
-};
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE, ASSERT_RESHAPE_KIND,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
 use crate::{
-    ArrayTypeExtension, DimensionExtension, Error, LowerableOperation, Lowerer, LoweringError,
-    ProgramLoweringOperation, Type, ValueRefExtension,
+    ArrayTypeExtension, ArrayTypeLoweringExtension, DimensionExtension, Error, LowerableOperation, Lowerer,
+    LoweringError, ProgramLoweringOperation, Type, ValueRefExtension, dimension_extent_to_i32, dimension_extent_to_i64,
+    lower_i64_vector, lower_index_constant,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -58,7 +55,7 @@ impl LowerableOperation for DynamicReshapeOperation {
         let context = lowerer.context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
-        let (effect_tokens, _, _, _, lowering_context) = lowerer.split_effect_tokens();
+        let (effect_tokens, _, _, lowering_context) = lowerer.split_effect_tokens();
         let Some((input, output_extents)) = input_values.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
@@ -110,7 +107,7 @@ impl LowerableOperation for DynamicReshapeOperation {
             let mut input_extents = Vec::with_capacity(input_type.rank());
             for (axis, dimension) in input_type.shape().dimensions().iter().enumerate() {
                 let extent = match dimension {
-                    Dimension::Static(extent) => lower_static_index_constants(&[*extent], block, context, location)?[0],
+                    Dimension::Static(extent) => lower_index_constant(*extent, block, location)?,
                     Dimension::Dynamic(_) => input.widen_dimension_to_i64(axis, block, location)?,
                 };
                 input_extents.push(extent);
@@ -132,7 +129,6 @@ impl LowerableOperation for DynamicReshapeOperation {
             let reshape = block.append_operation(stable_hlo::reshape(input, output_shape.as_slice(), location)?)?;
             reshape.result(0).unwrap().as_ref()
         } else {
-            let shape = lower_explicit_reshape_shape(output_extents, block, context, location)?;
             let output_bounds = output_type
                 .shape()
                 .dimensions()
@@ -145,6 +141,7 @@ impl LowerableOperation for DynamicReshapeOperation {
             for bound in output_bounds.iter().flatten() {
                 dimension_extent_to_i32(*bound)?;
             }
+            let shape = lower_reshape_shape(output_extents, block, location)?;
             let reshape =
                 block.append_operation(stable_hlo::dynamic_reshape(input, shape, &output_bounds, location)?)?;
             let result = reshape.result(0).unwrap().as_ref();
@@ -217,9 +214,7 @@ impl ReshapeOperationLoweringExtension for ReshapeOperation {
                 let mut extents = Vec::with_capacity(output_types[0].rank());
                 for dimension in output_types[0].shape().dimensions() {
                     extents.push(match dimension {
-                        Dimension::Static(extent) => {
-                            lower_static_index_constants(&[*extent], block, context, location)?[0]
-                        }
+                        Dimension::Static(extent) => lower_index_constant(*extent, block, location)?,
                         Dimension::Dynamic(_) => {
                             let axis = input_axes.next().ok_or_else(|| {
                                 Error::Lowering(LoweringError::UnsupportedOperation {
@@ -235,7 +230,6 @@ impl ReshapeOperationLoweringExtension for ReshapeOperation {
                         }
                     });
                 }
-                let shape = lower_explicit_reshape_shape(&extents, block, context, location)?;
                 let output_bounds = output_types[0]
                     .shape()
                     .dimensions()
@@ -248,6 +242,7 @@ impl ReshapeOperationLoweringExtension for ReshapeOperation {
                 for bound in output_bounds.iter().flatten() {
                     dimension_extent_to_i32(*bound)?;
                 }
+                let shape = lower_reshape_shape(&extents, block, location)?;
                 let reshape =
                     block.append_operation(stable_hlo::dynamic_reshape(input, shape, &output_bounds, location)?)?;
                 let result = reshape.result(0).unwrap().as_ref();
@@ -277,6 +272,21 @@ impl ReshapeOperationLoweringExtension for ReshapeOperation {
     }
 }
 
+/// Packs scalar `i64` extents in axis order and narrows the vector to the `i32` shape required by XLA's
+/// dynamic reshape importer. The caller checks that the output bounds fit in `i32`.
+fn lower_reshape_shape<'b, 'c: 'b, 't: 'c>(
+    extents: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let shape = lower_i64_vector(extents, block, location)?;
+    let context = block.context();
+    let shape_type =
+        context.tensor_type(context.signless_integer_type(32), &[MlirSize::Static(extents.len())], None, location)?;
+    let shape = block.append_operation(stable_hlo::convert(shape, shape_type, location)?)?;
+    Ok(shape.result(0)?.as_ref())
+}
+
 /// Checks equality of the input and output logical element counts without overflowing device-side arithmetic.
 fn lower_reshape_element_count_assertion<'b, 'c: 'b, 't: 'c>(
     input_extents: &[ValueRef<'b, 'c, 't>],
@@ -289,9 +299,9 @@ fn lower_reshape_element_count_assertion<'b, 'c: 'b, 't: 'c>(
     let observed = input_extents.iter().chain(output_extents).copied().collect::<Vec<_>>();
     let seed = match observed.first() {
         Some(value) => *value,
-        None => lower_static_index_constants(&[1], block, context, location)?[0],
+        None => lower_index_constant(1, block, location)?,
     };
-    let predicate = lower_deliberately_false_assertion_predicate(seed, block, context, location)?;
+    let predicate = lower_deliberately_false_assertion_predicate(seed, block, location)?;
     let input_rank = input_extents.len().to_string();
     let backend_configuration = context.dictionary_attribute(&[
         context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute("reshape")),
@@ -471,16 +481,15 @@ mod tests {
                     %c = stablehlo.constant dense<1> : tensor<i64>
                     %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
                     %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
-                    %3 = stablehlo.convert %c : (tensor<i64>) -> tensor<i32>
-                    %4 = stablehlo.reshape %3 : (tensor<i32>) -> tensor<1xi32>
-                    %5 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
-                    %6 = stablehlo.reshape %5 : (tensor<i32>) -> tensor<1xi32>
-                    %7 = stablehlo.concatenate %4, %6, dim = 0 : (tensor<1xi32>, tensor<1xi32>) -> tensor<2xi32>
-                    %8 = stablehlo.dynamic_reshape %0, %7 : (tensor<?xf64, #stablehlo.bounds<4>>, tensor<2xi32>) -> tensor<?x?xf64, #stablehlo.bounds<1, 4>>
-                    %cast = tensor.cast %8 : tensor<?x?xf64, #stablehlo.bounds<1, 4>> to tensor<1x?xf64, #stablehlo.bounds<?, 4>>
-                    %9 = stablehlo.get_dimension_size %cast, dim = 1 : (tensor<1x?xf64, #stablehlo.bounds<?, 4>>) -> tensor<i32>
-                    %10 = stablehlo.convert %9 : (tensor<i32>) -> tensor<i64>
-                    return %cast, %10 : tensor<1x?xf64, #stablehlo.bounds<?, 4>>, tensor<i64>
+                    %3 = stablehlo.reshape %c : (tensor<i64>) -> tensor<1xi64>
+                    %4 = stablehlo.reshape %2 : (tensor<i64>) -> tensor<1xi64>
+                    %5 = stablehlo.concatenate %3, %4, dim = 0 : (tensor<1xi64>, tensor<1xi64>) -> tensor<2xi64>
+                    %6 = stablehlo.convert %5 : (tensor<2xi64>) -> tensor<2xi32>
+                    %7 = stablehlo.dynamic_reshape %0, %6 : (tensor<?xf64, #stablehlo.bounds<4>>, tensor<2xi32>) -> tensor<?x?xf64, #stablehlo.bounds<1, 4>>
+                    %cast = tensor.cast %7 : tensor<?x?xf64, #stablehlo.bounds<1, 4>> to tensor<1x?xf64, #stablehlo.bounds<?, 4>>
+                    %8 = stablehlo.get_dimension_size %cast, dim = 1 : (tensor<1x?xf64, #stablehlo.bounds<?, 4>>) -> tensor<i32>
+                    %9 = stablehlo.convert %8 : (tensor<i32>) -> tensor<i64>
+                    return %cast, %9 : tensor<1x?xf64, #stablehlo.bounds<?, 4>>, tensor<i64>
                   }
                 }
             "#},
@@ -510,18 +519,16 @@ mod tests {
                     %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
                     %c = stablehlo.constant dense<1> : tensor<i64>
                     %c_0 = stablehlo.constant dense<3> : tensor<i64>
-                    %3 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
-                    %4 = stablehlo.reshape %3 : (tensor<i32>) -> tensor<1xi32>
-                    %5 = stablehlo.convert %c : (tensor<i64>) -> tensor<i32>
-                    %6 = stablehlo.reshape %5 : (tensor<i32>) -> tensor<1xi32>
-                    %7 = stablehlo.convert %c_0 : (tensor<i64>) -> tensor<i32>
-                    %8 = stablehlo.reshape %7 : (tensor<i32>) -> tensor<1xi32>
-                    %9 = stablehlo.concatenate %4, %6, %8, dim = 0 : (tensor<1xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<3xi32>
-                    %10 = stablehlo.dynamic_reshape %0, %9 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>, tensor<3xi32>) -> tensor<?x?x?xf64, #stablehlo.bounds<4, 1, 3>>
-                    %cast = tensor.cast %10 : tensor<?x?x?xf64, #stablehlo.bounds<4, 1, 3>> to tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>>
-                    %11 = stablehlo.get_dimension_size %cast, dim = 0 : (tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>>) -> tensor<i32>
-                    %12 = stablehlo.convert %11 : (tensor<i32>) -> tensor<i64>
-                    return %cast, %12 : tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>>, tensor<i64>
+                    %3 = stablehlo.reshape %2 : (tensor<i64>) -> tensor<1xi64>
+                    %4 = stablehlo.reshape %c : (tensor<i64>) -> tensor<1xi64>
+                    %5 = stablehlo.reshape %c_0 : (tensor<i64>) -> tensor<1xi64>
+                    %6 = stablehlo.concatenate %3, %4, %5, dim = 0 : (tensor<1xi64>, tensor<1xi64>, tensor<1xi64>) -> tensor<3xi64>
+                    %7 = stablehlo.convert %6 : (tensor<3xi64>) -> tensor<3xi32>
+                    %8 = stablehlo.dynamic_reshape %0, %7 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>, tensor<3xi32>) -> tensor<?x?x?xf64, #stablehlo.bounds<4, 1, 3>>
+                    %cast = tensor.cast %8 : tensor<?x?x?xf64, #stablehlo.bounds<4, 1, 3>> to tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>>
+                    %9 = stablehlo.get_dimension_size %cast, dim = 0 : (tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>>) -> tensor<i32>
+                    %10 = stablehlo.convert %9 : (tensor<i32>) -> tensor<i64>
+                    return %cast, %10 : tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>>, tensor<i64>
                   }
                 }
             "#},
@@ -556,16 +563,15 @@ mod tests {
                     %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?x2x3xf64, #stablehlo.bounds<4, ?, ?>>) -> tensor<i32>
                     %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
                     %c = stablehlo.constant dense<6> : tensor<i64>
-                    %3 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
-                    %4 = stablehlo.reshape %3 : (tensor<i32>) -> tensor<1xi32>
-                    %5 = stablehlo.convert %c : (tensor<i64>) -> tensor<i32>
-                    %6 = stablehlo.reshape %5 : (tensor<i32>) -> tensor<1xi32>
-                    %7 = stablehlo.concatenate %4, %6, dim = 0 : (tensor<1xi32>, tensor<1xi32>) -> tensor<2xi32>
-                    %8 = stablehlo.dynamic_reshape %0, %7 : (tensor<?x2x3xf64, #stablehlo.bounds<4, ?, ?>>, tensor<2xi32>) -> tensor<?x?xf64, #stablehlo.bounds<4, 6>>
-                    %cast = tensor.cast %8 : tensor<?x?xf64, #stablehlo.bounds<4, 6>> to tensor<?x6xf64, #stablehlo.bounds<4, ?>>
-                    %9 = stablehlo.get_dimension_size %cast, dim = 0 : (tensor<?x6xf64, #stablehlo.bounds<4, ?>>) -> tensor<i32>
-                    %10 = stablehlo.convert %9 : (tensor<i32>) -> tensor<i64>
-                    return %cast, %10 : tensor<?x6xf64, #stablehlo.bounds<4, ?>>, tensor<i64>
+                    %3 = stablehlo.reshape %2 : (tensor<i64>) -> tensor<1xi64>
+                    %4 = stablehlo.reshape %c : (tensor<i64>) -> tensor<1xi64>
+                    %5 = stablehlo.concatenate %3, %4, dim = 0 : (tensor<1xi64>, tensor<1xi64>) -> tensor<2xi64>
+                    %6 = stablehlo.convert %5 : (tensor<2xi64>) -> tensor<2xi32>
+                    %7 = stablehlo.dynamic_reshape %0, %6 : (tensor<?x2x3xf64, #stablehlo.bounds<4, ?, ?>>, tensor<2xi32>) -> tensor<?x?xf64, #stablehlo.bounds<4, 6>>
+                    %cast = tensor.cast %7 : tensor<?x?xf64, #stablehlo.bounds<4, 6>> to tensor<?x6xf64, #stablehlo.bounds<4, ?>>
+                    %8 = stablehlo.get_dimension_size %cast, dim = 0 : (tensor<?x6xf64, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %9 = stablehlo.convert %8 : (tensor<i32>) -> tensor<i64>
+                    return %cast, %9 : tensor<?x6xf64, #stablehlo.bounds<4, ?>>, tensor<i64>
                   }
                 }
             "#},
@@ -631,8 +637,8 @@ mod tests {
                     %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 1 : (tensor<1x4xf64>, tensor<i32>) -> tensor<1x?xf64, #stablehlo.bounds<?, 4>>
                     %1 = stablehlo.get_dimension_size %0, dim = 1 : (tensor<1x?xf64, #stablehlo.bounds<?, 4>>) -> tensor<i32>
                     %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
-                    %3 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
-                    %4 = stablehlo.reshape %3 : (tensor<i32>) -> tensor<1xi32>
+                    %3 = stablehlo.reshape %2 : (tensor<i64>) -> tensor<1xi64>
+                    %4 = stablehlo.convert %3 : (tensor<1xi64>) -> tensor<1xi32>
                     %5 = stablehlo.dynamic_reshape %0, %4 : (tensor<1x?xf64, #stablehlo.bounds<?, 4>>, tensor<1xi32>) -> tensor<?xf64, #stablehlo.bounds<4>>
                     %6 = stablehlo.get_dimension_size %5, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
                     %7 = stablehlo.convert %6 : (tensor<i32>) -> tensor<i64>
@@ -664,16 +670,15 @@ mod tests {
                     %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>>) -> tensor<i32>
                     %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
                     %c = stablehlo.constant dense<3> : tensor<i64>
-                    %3 = stablehlo.convert %2 : (tensor<i64>) -> tensor<i32>
-                    %4 = stablehlo.reshape %3 : (tensor<i32>) -> tensor<1xi32>
-                    %5 = stablehlo.convert %c : (tensor<i64>) -> tensor<i32>
-                    %6 = stablehlo.reshape %5 : (tensor<i32>) -> tensor<1xi32>
-                    %7 = stablehlo.concatenate %4, %6, dim = 0 : (tensor<1xi32>, tensor<1xi32>) -> tensor<2xi32>
-                    %8 = stablehlo.dynamic_reshape %0, %7 : (tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>>, tensor<2xi32>) -> tensor<?x?xf64, #stablehlo.bounds<4, 3>>
-                    %cast = tensor.cast %8 : tensor<?x?xf64, #stablehlo.bounds<4, 3>> to tensor<?x3xf64, #stablehlo.bounds<4, ?>>
-                    %9 = stablehlo.get_dimension_size %cast, dim = 0 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>) -> tensor<i32>
-                    %10 = stablehlo.convert %9 : (tensor<i32>) -> tensor<i64>
-                    return %cast, %10 : tensor<?x3xf64, #stablehlo.bounds<4, ?>>, tensor<i64>
+                    %3 = stablehlo.reshape %2 : (tensor<i64>) -> tensor<1xi64>
+                    %4 = stablehlo.reshape %c : (tensor<i64>) -> tensor<1xi64>
+                    %5 = stablehlo.concatenate %3, %4, dim = 0 : (tensor<1xi64>, tensor<1xi64>) -> tensor<2xi64>
+                    %6 = stablehlo.convert %5 : (tensor<2xi64>) -> tensor<2xi32>
+                    %7 = stablehlo.dynamic_reshape %0, %6 : (tensor<?x1x3xf64, #stablehlo.bounds<4, ?, ?>>, tensor<2xi32>) -> tensor<?x?xf64, #stablehlo.bounds<4, 3>>
+                    %cast = tensor.cast %7 : tensor<?x?xf64, #stablehlo.bounds<4, 3>> to tensor<?x3xf64, #stablehlo.bounds<4, ?>>
+                    %8 = stablehlo.get_dimension_size %cast, dim = 0 : (tensor<?x3xf64, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %9 = stablehlo.convert %8 : (tensor<i32>) -> tensor<i64>
+                    return %cast, %9 : tensor<?x3xf64, #stablehlo.bounds<4, ?>>, tensor<i64>
                   }
                 }
             "#},
@@ -725,18 +730,16 @@ mod tests {
                     %c_0 = stablehlo.constant dense<1> : tensor<i64>
                     %2 = stablehlo.get_dimension_size %1, dim = 1 : (tensor<3x?xf64, #stablehlo.bounds<?, 4>>) -> tensor<i32>
                     %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
-                    %4 = stablehlo.convert %c : (tensor<i64>) -> tensor<i32>
-                    %5 = stablehlo.reshape %4 : (tensor<i32>) -> tensor<1xi32>
-                    %6 = stablehlo.convert %c_0 : (tensor<i64>) -> tensor<i32>
-                    %7 = stablehlo.reshape %6 : (tensor<i32>) -> tensor<1xi32>
-                    %8 = stablehlo.convert %3 : (tensor<i64>) -> tensor<i32>
-                    %9 = stablehlo.reshape %8 : (tensor<i32>) -> tensor<1xi32>
-                    %10 = stablehlo.concatenate %5, %7, %9, dim = 0 : (tensor<1xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<3xi32>
-                    %11 = stablehlo.dynamic_reshape %1, %10 : (tensor<3x?xf64, #stablehlo.bounds<?, 4>>, tensor<3xi32>) -> tensor<?x?x?xf64, #stablehlo.bounds<3, 1, 4>>
-                    %cast = tensor.cast %11 : tensor<?x?x?xf64, #stablehlo.bounds<3, 1, 4>> to tensor<3x1x?xf64, #stablehlo.bounds<?, ?, 4>>
-                    %12 = stablehlo.get_dimension_size %cast, dim = 2 : (tensor<3x1x?xf64, #stablehlo.bounds<?, ?, 4>>) -> tensor<i32>
-                    %13 = stablehlo.convert %12 : (tensor<i32>) -> tensor<i64>
-                    return %cast, %13 : tensor<3x1x?xf64, #stablehlo.bounds<?, ?, 4>>, tensor<i64>
+                    %4 = stablehlo.reshape %c : (tensor<i64>) -> tensor<1xi64>
+                    %5 = stablehlo.reshape %c_0 : (tensor<i64>) -> tensor<1xi64>
+                    %6 = stablehlo.reshape %3 : (tensor<i64>) -> tensor<1xi64>
+                    %7 = stablehlo.concatenate %4, %5, %6, dim = 0 : (tensor<1xi64>, tensor<1xi64>, tensor<1xi64>) -> tensor<3xi64>
+                    %8 = stablehlo.convert %7 : (tensor<3xi64>) -> tensor<3xi32>
+                    %9 = stablehlo.dynamic_reshape %1, %8 : (tensor<3x?xf64, #stablehlo.bounds<?, 4>>, tensor<3xi32>) -> tensor<?x?x?xf64, #stablehlo.bounds<3, 1, 4>>
+                    %cast = tensor.cast %9 : tensor<?x?x?xf64, #stablehlo.bounds<3, 1, 4>> to tensor<3x1x?xf64, #stablehlo.bounds<?, ?, 4>>
+                    %10 = stablehlo.get_dimension_size %cast, dim = 2 : (tensor<3x1x?xf64, #stablehlo.bounds<?, ?, 4>>) -> tensor<i32>
+                    %11 = stablehlo.convert %10 : (tensor<i32>) -> tensor<i64>
+                    return %cast, %11 : tensor<3x1x?xf64, #stablehlo.bounds<?, ?, 4>>, tensor<i64>
                   }
                 }
             "#},
@@ -783,16 +786,15 @@ mod tests {
                     %c = stablehlo.constant dense<3> : tensor<i64>
                     %2 = stablehlo.get_dimension_size %1, dim = 1 : (tensor<3x?x1xf64, #stablehlo.bounds<?, 4, ?>>) -> tensor<i32>
                     %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
-                    %4 = stablehlo.convert %c : (tensor<i64>) -> tensor<i32>
-                    %5 = stablehlo.reshape %4 : (tensor<i32>) -> tensor<1xi32>
-                    %6 = stablehlo.convert %3 : (tensor<i64>) -> tensor<i32>
-                    %7 = stablehlo.reshape %6 : (tensor<i32>) -> tensor<1xi32>
-                    %8 = stablehlo.concatenate %5, %7, dim = 0 : (tensor<1xi32>, tensor<1xi32>) -> tensor<2xi32>
-                    %9 = stablehlo.dynamic_reshape %1, %8 : (tensor<3x?x1xf64, #stablehlo.bounds<?, 4, ?>>, tensor<2xi32>) -> tensor<?x?xf64, #stablehlo.bounds<3, 4>>
-                    %cast = tensor.cast %9 : tensor<?x?xf64, #stablehlo.bounds<3, 4>> to tensor<3x?xf64, #stablehlo.bounds<?, 4>>
-                    %10 = stablehlo.get_dimension_size %cast, dim = 1 : (tensor<3x?xf64, #stablehlo.bounds<?, 4>>) -> tensor<i32>
-                    %11 = stablehlo.convert %10 : (tensor<i32>) -> tensor<i64>
-                    return %cast, %11 : tensor<3x?xf64, #stablehlo.bounds<?, 4>>, tensor<i64>
+                    %4 = stablehlo.reshape %c : (tensor<i64>) -> tensor<1xi64>
+                    %5 = stablehlo.reshape %3 : (tensor<i64>) -> tensor<1xi64>
+                    %6 = stablehlo.concatenate %4, %5, dim = 0 : (tensor<1xi64>, tensor<1xi64>) -> tensor<2xi64>
+                    %7 = stablehlo.convert %6 : (tensor<2xi64>) -> tensor<2xi32>
+                    %8 = stablehlo.dynamic_reshape %1, %7 : (tensor<3x?x1xf64, #stablehlo.bounds<?, 4, ?>>, tensor<2xi32>) -> tensor<?x?xf64, #stablehlo.bounds<3, 4>>
+                    %cast = tensor.cast %8 : tensor<?x?xf64, #stablehlo.bounds<3, 4>> to tensor<3x?xf64, #stablehlo.bounds<?, 4>>
+                    %9 = stablehlo.get_dimension_size %cast, dim = 1 : (tensor<3x?xf64, #stablehlo.bounds<?, 4>>) -> tensor<i32>
+                    %10 = stablehlo.convert %9 : (tensor<i32>) -> tensor<i64>
+                    return %cast, %10 : tensor<3x?xf64, #stablehlo.bounds<?, 4>>, tensor<i64>
                   }
                 }
             "#},
@@ -830,20 +832,18 @@ mod tests {
                     %c = stablehlo.constant dense<1> : tensor<i64>
                     %4 = stablehlo.get_dimension_size %1, dim = 1 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>) -> tensor<i32>
                     %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
-                    %6 = stablehlo.convert %3 : (tensor<i64>) -> tensor<i32>
-                    %7 = stablehlo.reshape %6 : (tensor<i32>) -> tensor<1xi32>
-                    %8 = stablehlo.convert %c : (tensor<i64>) -> tensor<i32>
-                    %9 = stablehlo.reshape %8 : (tensor<i32>) -> tensor<1xi32>
-                    %10 = stablehlo.convert %5 : (tensor<i64>) -> tensor<i32>
-                    %11 = stablehlo.reshape %10 : (tensor<i32>) -> tensor<1xi32>
-                    %12 = stablehlo.concatenate %7, %9, %11, dim = 0 : (tensor<1xi32>, tensor<1xi32>, tensor<1xi32>) -> tensor<3xi32>
-                    %13 = stablehlo.dynamic_reshape %1, %12 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>, tensor<3xi32>) -> tensor<?x?x?xf64, #stablehlo.bounds<4, 1, 4>>
-                    %cast = tensor.cast %13 : tensor<?x?x?xf64, #stablehlo.bounds<4, 1, 4>> to tensor<?x1x?xf64, #stablehlo.bounds<4, ?, 4>>
-                    %14 = stablehlo.get_dimension_size %cast, dim = 0 : (tensor<?x1x?xf64, #stablehlo.bounds<4, ?, 4>>) -> tensor<i32>
+                    %6 = stablehlo.reshape %3 : (tensor<i64>) -> tensor<1xi64>
+                    %7 = stablehlo.reshape %c : (tensor<i64>) -> tensor<1xi64>
+                    %8 = stablehlo.reshape %5 : (tensor<i64>) -> tensor<1xi64>
+                    %9 = stablehlo.concatenate %6, %7, %8, dim = 0 : (tensor<1xi64>, tensor<1xi64>, tensor<1xi64>) -> tensor<3xi64>
+                    %10 = stablehlo.convert %9 : (tensor<3xi64>) -> tensor<3xi32>
+                    %11 = stablehlo.dynamic_reshape %1, %10 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>, tensor<3xi32>) -> tensor<?x?x?xf64, #stablehlo.bounds<4, 1, 4>>
+                    %cast = tensor.cast %11 : tensor<?x?x?xf64, #stablehlo.bounds<4, 1, 4>> to tensor<?x1x?xf64, #stablehlo.bounds<4, ?, 4>>
+                    %12 = stablehlo.get_dimension_size %cast, dim = 0 : (tensor<?x1x?xf64, #stablehlo.bounds<4, ?, 4>>) -> tensor<i32>
+                    %13 = stablehlo.convert %12 : (tensor<i32>) -> tensor<i64>
+                    %14 = stablehlo.get_dimension_size %cast, dim = 2 : (tensor<?x1x?xf64, #stablehlo.bounds<4, ?, 4>>) -> tensor<i32>
                     %15 = stablehlo.convert %14 : (tensor<i32>) -> tensor<i64>
-                    %16 = stablehlo.get_dimension_size %cast, dim = 2 : (tensor<?x1x?xf64, #stablehlo.bounds<4, ?, 4>>) -> tensor<i32>
-                    %17 = stablehlo.convert %16 : (tensor<i32>) -> tensor<i64>
-                    return %cast, %15, %17 : tensor<?x1x?xf64, #stablehlo.bounds<4, ?, 4>>, tensor<i64>, tensor<i64>
+                    return %cast, %13, %15 : tensor<?x1x?xf64, #stablehlo.bounds<4, ?, 4>>, tensor<i64>, tensor<i64>
                   }
                 }
             "#},
@@ -1387,16 +1387,15 @@ mod tests {
                     %c_3 = stablehlo.constant dense<0> : tensor<i64>
                     %9 = stablehlo.compare LT, %c_2, %c_3, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
                     %10 = stablehlo.custom_call @ryft.assert(%9, %c_2, %8, %c, %1, %6) {api_version = 4 : i32, backend_config = {actor = "reshape", detail = "2", kind = "reshape"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, tensor<i64>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
-                    %11 = stablehlo.convert %c : (tensor<i64>) -> tensor<i32>
-                    %12 = stablehlo.reshape %11 : (tensor<i32>) -> tensor<1xi32>
-                    %13 = stablehlo.convert %1 : (tensor<i64>) -> tensor<i32>
-                    %14 = stablehlo.reshape %13 : (tensor<i32>) -> tensor<1xi32>
-                    %15 = stablehlo.concatenate %12, %14, dim = 0 : (tensor<1xi32>, tensor<1xi32>) -> tensor<2xi32>
-                    %16 = stablehlo.dynamic_reshape %0, %15 : (tensor<2x?xf64, #stablehlo.bounds<?, 4>>, tensor<2xi32>) -> tensor<?x?xf64, #stablehlo.bounds<2, 4>>
-                    %cast = tensor.cast %16 : tensor<?x?xf64, #stablehlo.bounds<2, 4>> to tensor<2x?xf64, #stablehlo.bounds<?, 4>>
-                    %17 = stablehlo.get_dimension_size %0, dim = 1 : (tensor<2x?xf64, #stablehlo.bounds<?, 4>>) -> tensor<i32>
-                    %18 = stablehlo.convert %17 : (tensor<i32>) -> tensor<i64>
-                    return %0, %18 : tensor<2x?xf64, #stablehlo.bounds<?, 4>>, tensor<i64>
+                    %11 = stablehlo.reshape %c : (tensor<i64>) -> tensor<1xi64>
+                    %12 = stablehlo.reshape %1 : (tensor<i64>) -> tensor<1xi64>
+                    %13 = stablehlo.concatenate %11, %12, dim = 0 : (tensor<1xi64>, tensor<1xi64>) -> tensor<2xi64>
+                    %14 = stablehlo.convert %13 : (tensor<2xi64>) -> tensor<2xi32>
+                    %15 = stablehlo.dynamic_reshape %0, %14 : (tensor<2x?xf64, #stablehlo.bounds<?, 4>>, tensor<2xi32>) -> tensor<?x?xf64, #stablehlo.bounds<2, 4>>
+                    %cast = tensor.cast %15 : tensor<?x?xf64, #stablehlo.bounds<2, 4>> to tensor<2x?xf64, #stablehlo.bounds<?, 4>>
+                    %16 = stablehlo.get_dimension_size %0, dim = 1 : (tensor<2x?xf64, #stablehlo.bounds<?, 4>>) -> tensor<i32>
+                    %17 = stablehlo.convert %16 : (tensor<i32>) -> tensor<i64>
+                    return %0, %17 : tensor<2x?xf64, #stablehlo.bounds<?, 4>>, tensor<i64>
                   }
                 }
             "#}

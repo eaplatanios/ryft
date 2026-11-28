@@ -10,15 +10,12 @@ use ryft_mlir::{
 };
 
 use crate::lowering::sharding::OpenDimensions;
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_explicit_shape, lower_static_index_constants,
-    lower_unplaced_constant_output,
-};
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::operations::reductions::build_reduce_body_region;
 use crate::{
-    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, ValueRefExtension,
+    ArrayTypeExtension, ArrayTypeLoweringExtension, Error, LowerableOperation, Lowerer, LoweringError,
+    PhysicalStoragePadding, ProgramLoweringOperation, ValueRefExtension, lower_i64_vector, lower_index_constant,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -130,7 +127,7 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
                         block,
                         location,
                     )?,
-                    None => lower_static_index_constants(&[1], block, context, location)?[0],
+                    None => lower_index_constant(1, block, location)?,
                 };
 
                 // The bound is never negative on a nonempty axis, so it does not wrap when converted to an unsigned
@@ -150,11 +147,11 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
                     else {
                         unreachable!()
                     };
-                    sentinels.push(lower_static_index_constants(&[capacity], block, context, location)?[0]);
+                    sentinels.push(lower_index_constant(capacity, block, location)?);
                 }
             }
             let bound_type = ArrayType::new_static(index_data_type, [upper_bounds.len()]);
-            let upper_bounds = lower_explicit_shape(&upper_bounds, block, context, location)?;
+            let upper_bounds = lower_i64_vector(&upper_bounds, block, location)?;
             let upper_bounds = block
                 .append_operation(stable_hlo::convert(upper_bounds, bound_type.lower(context, location)?, location)?)?
                 .result(0)
@@ -169,8 +166,7 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
                 context,
                 location,
             )?;
-            let zero =
-                lower_unplaced_constant_output(&[ArrayType::scalar(index_data_type)], 0, block, context, location)?[0];
+            let zero = ArrayType::scalar(index_data_type).lower_i64_splat(0, block, location)?;
             let zero = lower_index_broadcast(zero, &indices_type, shape_source, &[], block, context, location)?;
             if self.mode() == ScatterMode::Clip {
                 indices =
@@ -186,13 +182,7 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
                     ComparisonDirection::LessThanOrEqual.lower_comparison(indices, upper_bounds, block, location)?;
                 let mask =
                     block.append_operation(stable_hlo::and(lower, upper, location)?)?.result(0).unwrap().as_ref();
-                let initial = lower_unplaced_constant_output(
-                    &[ArrayType::scalar(DataType::Boolean)],
-                    1,
-                    block,
-                    context,
-                    location,
-                )?[0];
+                let initial = ArrayType::scalar(DataType::Boolean).lower_i64_splat(1, block, location)?;
                 let body = build_reduce_body_region(
                     ReductionKind::All,
                     DataType::Boolean,
@@ -220,7 +210,7 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
                     context,
                     location,
                 )?;
-                let sentinels = lower_explicit_shape(&sentinels, block, context, location)?;
+                let sentinels = lower_i64_vector(&sentinels, block, location)?;
                 let sentinels = block
                     .append_operation(stable_hlo::convert(sentinels, bound_type.lower(context, location)?, location)?)?
                     .result(0)

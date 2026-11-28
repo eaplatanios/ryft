@@ -1,19 +1,22 @@
+use std::any::{Any, TypeId};
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-use ryft_core::{ArrayType, CompositeKey, FlatProgram, LogicalMesh, Provenance, ShardMapBoundary, Sharding};
+use ryft_core::{ArrayType, CompositeKey, LogicalMesh, Provenance, RegionId, ShardMapBoundary, Sharding};
+use ryft_mlir::dialects::func;
 use ryft_mlir::{AttributeRef, BlockRef, Context as MlirContext, Location, LocationRef, ValueRef};
 
 use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
-use crate::lowering::{LoweringError, RaggedDotLoweringStrategy};
-use crate::{Error, RetainedArray, RuntimeRequirement, Session, normalize_runtime_requirements};
+use crate::lowering::{LoweringError, LoweringRule, LoweringRules, RaggedDotLoweringStrategy};
+use crate::{Error, RetainedArray, RuntimeRequirement, normalize_runtime_requirements};
 
 /// Context for lowering a program in the current scope of its MLIR module. Each instruction lowerer holds
 /// a clone of this handle, sharing the module resources and the current scope's bindings through one [`Rc`].
 /// [`enter_manual_region`](Self::enter_manual_region) derives a context for the body of an `sdy.manual_computation`.
 /// Its manual axes and reachable session constants belong to that scope. The child inherits the module's target and
-/// lowering policy, looks up the same named compositions, and continues to allocate channels and record module
+/// lowering policy, requests the same private functions, and continues to allocate channels and record module
 /// requirements alongside the enclosing context.
 #[derive(Clone)]
 pub(crate) struct ProgramLoweringContext {
@@ -30,9 +33,10 @@ impl ProgramLoweringContext {
             state: Rc::new(ProgramLoweringContextState {
                 target_platform: None,
                 ragged_dot_lowering_strategy: RaggedDotLoweringStrategy::default(),
+                lowering_rules: LoweringRules::default(),
                 module: Rc::new(ModuleResources {
                     next_channel_id: Cell::new(1),
-                    named_compositions: RefCell::default(),
+                    functions: RefCell::default(),
                     mesh: OnceCell::new(),
                     has_provenance: Cell::new(false),
                     requires_assertion_handler: Cell::new(false),
@@ -40,6 +44,7 @@ impl ProgramLoweringContext {
                 }),
                 manual_regions: Vec::new(),
                 bound_manual_axes: Vec::new(),
+                shares_functions: true,
                 session_constant_indices: Rc::default(),
             }),
         }
@@ -56,6 +61,21 @@ impl ProgramLoweringContext {
     #[inline]
     pub(crate) fn with_ragged_dot_lowering_strategy(mut self, strategy: RaggedDotLoweringStrategy) -> Self {
         Rc::make_mut(&mut self.state).ragged_dot_lowering_strategy = strategy;
+        self
+    }
+
+    /// Returns this context carrying the [`LoweringRule`]s of the module.
+    #[inline]
+    pub(crate) fn with_lowering_rules(mut self, lowering_rules: LoweringRules) -> Self {
+        Rc::make_mut(&mut self.state).lowering_rules = lowering_rules;
+        self
+    }
+
+    /// Returns this context for a scope that inlines its calls.
+    /// Refer to [`Self::shared_function`] for more information.
+    #[inline]
+    pub(crate) fn without_shared_functions(mut self) -> Self {
+        Rc::make_mut(&mut self.state).shares_functions = false;
         self
     }
 
@@ -88,12 +108,19 @@ impl ProgramLoweringContext {
         self.state.ragged_dot_lowering_strategy
     }
 
-    /// Returns the decomposition at position `index` among those that lowering has requested for this module so far,
-    /// in the order of their first requests, or [`None`] when fewer were requested. The module emits them after its
-    /// other functions, and it asks by position because lowering one decomposition can request another.
+    /// Returns the rule that lowers the instructions of the operation named `operation_name` in this module, in
+    /// place of the lowering of their operation family, if the module has one.
     #[inline]
-    pub(super) fn named_composition(&self, index: usize) -> Option<NamedCompositionFunction> {
-        self.state.module.named_compositions.borrow().functions().nth(index).cloned()
+    pub(crate) fn lowering_rule(&self, operation_name: &str) -> Option<&Rc<dyn LoweringRule>> {
+        self.state.lowering_rules.get(operation_name)
+    }
+
+    /// Returns the private function at position `index` among those that this module holds so far, in the order in
+    /// which they were registered, or [`None`] when it holds fewer. The module emits them in that order, and it asks
+    /// by position because lowering one function can request another.
+    #[inline]
+    pub(crate) fn function(&self, index: usize) -> Option<PrivateFunction> {
+        self.state.module.functions.borrow().functions.get(index).cloned()
     }
 
     /// Returns the mesh that lowering has recorded for this module so far, which is the mesh that the module declares,
@@ -154,22 +181,61 @@ impl ProgramLoweringContext {
             .map_or(&[], |start| &captured_values[start..])
     }
 
-    /// Returns the symbol of the private function of this module that holds the decomposition of the named
-    /// composition `key`, and records that the module needs that function. The first request for a key traces
-    /// `program`, which must not lower anything itself, and every later request shares its function. Whatever lowers
-    /// a named composition requests its decomposition here, so the module holds a decomposition exactly when something
-    /// that lowering emitted refers to it, rather than when an analysis of the program predicts that.
+    /// Returns the private function that this module holds for `key`, and registers it when the module holds none yet,
+    /// so that everything that requests a function with an equal key shares one function. Keys are compared within
+    /// their own type and within the target platform of this context. The first request for a key calls `body`, which
+    /// returns what the function computes and must not lower anything itself, and every later request returns the same
+    /// function without calling it. The symbol of the function is `name`, with a numeric suffix when the module already
+    /// holds a function of that name.
+    ///
+    /// Whatever emits a reference to a private function (e.g., a `func.call`, or the decomposition of a
+    /// `stablehlo.composite`) requests it here, so that the module holds a function exactly when something that
+    /// lowering emitted or planned refers to it.
     ///
     /// # Errors
     ///
-    /// Returns the error of `program` when the decomposition cannot be traced.
-    pub(crate) fn require_named_composition<F: FnOnce() -> Result<FlatProgram<Session>, Error>>(
-        &self,
-        key: NamedCompositionKey,
-        program: F,
-    ) -> Result<Rc<str>, Error> {
-        let mut named_compositions = self.state.module.named_compositions.borrow_mut();
-        Ok(named_compositions.require(key, program)?.symbol().into())
+    /// Returns the error of `body` when it fails, in which case nothing is registered for `key`.
+    pub(crate) fn require_function<K, F>(&self, key: K, name: &str, body: F) -> Result<PrivateFunction, Error>
+    where
+        K: Eq + Hash + 'static,
+        F: FnOnce() -> Result<PrivateFunctionBody, Error>,
+    {
+        if let Some(function) = self.registered_function(&key) {
+            return Ok(function);
+        }
+
+        // The registry is not borrowed while `body` runs, so that tracing the body can use this context.
+        let body = body()?;
+        let mut functions = self.state.module.functions.borrow_mut();
+        Ok(functions.register(self.state.target_platform.clone(), Box::new(key), name, body))
+    }
+
+    /// Makes requests for `alias` return the private function that this module holds for `key`, so that a caller that
+    /// knows a function by a cheaper key (e.g., by the identity and boundary of a named composite call rather than by
+    /// its body) finds it without computing `key`. Nothing happens when the module holds no function for `key`.
+    pub(crate) fn alias_function<A: Eq + Hash + 'static, K: Eq + Hash + 'static>(&self, alias: A, key: &K) {
+        let mut functions = self.state.module.functions.borrow_mut();
+        let indices = functions.indices.entry(self.state.target_platform.clone()).or_default();
+        if let Some(&index) = indices.get(key as &dyn ErasedKey) {
+            indices.insert(Box::new(alias), index);
+        }
+    }
+
+    /// Returns the private function that this module holds for `key`, for a caller that calls the function when the
+    /// module holds one and inlines what it computes otherwise (e.g., a `call`, whose callee is shared only when the
+    /// module plans a function for it). Returns [`None`] in a scope that inlines its calls (i.e., one for which
+    /// [`Self::without_shared_functions`] was called), which includes the bodies of manual regions, because a
+    /// private function is lowered outside any manual region.
+    #[inline]
+    pub(crate) fn shared_function<K: Eq + Hash + 'static>(&self, key: &K) -> Option<PrivateFunction> {
+        self.state.shares_functions.then(|| self.registered_function(key)).flatten()
+    }
+
+    /// Returns the private function that this module holds for `key` on the target platform of this context.
+    fn registered_function<K: Eq + Hash + 'static>(&self, key: &K) -> Option<PrivateFunction> {
+        let functions = self.state.module.functions.borrow();
+        let index = *functions.indices.get(&self.state.target_platform)?.get(key as &dyn ErasedKey)?;
+        Some(functions.functions[index].clone())
     }
 
     /// Records `mesh` as the mesh that this module declares, which everything that lowering emits over a mesh (i.e.,
@@ -224,7 +290,7 @@ impl ProgramLoweringContext {
     }
 
     /// Derives a child context whose innermost manual region binds the axes of `boundary`. The body is isolated from
-    /// above, so its operations cannot use the enclosing scope's session constant bindings.
+    /// above, so its operations cannot use the enclosing scope's session constant bindings, and it inlines its calls.
     pub(crate) fn enter_manual_region(&self, boundary: ShardMapBoundary) -> Self {
         let mut child = self.clone();
         let state = Rc::make_mut(&mut child.state);
@@ -234,6 +300,7 @@ impl ProgramLoweringContext {
             }
         }
         state.manual_regions.push(Rc::new(boundary));
+        state.shares_functions = false;
         state.session_constant_indices = Rc::default();
         child
     }
@@ -355,6 +422,10 @@ struct ProgramLoweringContextState {
     /// Backend representation used to lower ragged dots in this module.
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
 
+    /// Rules that lower the instructions of some operations in this module, in place of the lowering of their
+    /// operation family.
+    lowering_rules: LoweringRules,
+
     /// Resources of the module that every scope of the program shares.
     module: Rc<ModuleResources>,
 
@@ -363,6 +434,10 @@ struct ProgramLoweringContextState {
 
     /// Axes bound by any enclosing manual region, excluded from shard-local placement constraints.
     bound_manual_axes: Vec<String>,
+
+    /// Whether calls in this scope may call the private functions that the module plans for their callees. Calls in
+    /// a scope that clears this are inlined.
+    shares_functions: bool,
 
     /// Position of each retained array within the session constant suffix of `captured_values`. The suffix holds hidden
     /// entry inputs followed by bufferless placeholders for arrays that the program only passes to callees that never
@@ -378,9 +453,8 @@ struct ModuleResources {
     /// Next unused collective channel ID in this module.
     next_channel_id: Cell<usize>,
 
-    /// Private decompositions of the named StableHLO composites that the emitted operations of every nested lowering
-    /// scope refer to, which the module emits.
-    named_compositions: RefCell<NamedCompositionFunctionMap>,
+    /// Private functions that the emitted operations of every nested lowering scope refer to, which the module emits.
+    functions: RefCell<PrivateFunctionRegistry>,
 
     /// First mesh recorded for a sharding in this module. Subsequent shardings must use the same topology.
     mesh: OnceCell<LogicalMesh>,
@@ -398,13 +472,13 @@ struct ModuleResources {
     runtime_requirements: RefCell<Vec<RuntimeRequirement>>,
 }
 
-/// Identity of one generated decomposition of a named composition at a concrete typed boundary.
-/// The lowering of an operation requests the private function that holds such a decomposition through
-/// [`Lowerer::require_named_composition`](crate::Lowerer::require_named_composition), and requests
-/// with equal keys share one function.
+/// Identity of one generated decomposition of a named composition at a concrete typed boundary. The lowering of an
+/// operation can request the private function that holds such a decomposition with this key (refer to
+/// [`Lowerer::require_function`](crate::Lowerer::require_function)), and requests with equal keys share one
+/// function.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NamedCompositionKey {
-    /// Semantic identity of the composition, whose name also names the emitted private function.
+    /// Semantic identity of the composition.
     composite: CompositeKey,
 
     /// Logical input types of the composition boundary.
@@ -422,72 +496,149 @@ impl NamedCompositionKey {
     }
 }
 
-/// Private decomposition function emitted for one [`NamedCompositionKey`].
-#[derive(Clone)]
-pub(super) struct NamedCompositionFunction {
-    /// Module-unique decomposition symbol.
-    symbol: Rc<str>,
+/// Module-owned registry of the private functions that lowering requests. The registry is independent of what requests
+/// a function and of the operation family of its body, and the module emits the functions that were registered. Refer
+/// to [`ProgramLoweringContext::require_function`] for more information.
+#[derive(Default)]
+struct PrivateFunctionRegistry {
+    /// Position in [`Self::functions`] of the function of each key, for each target platform. A module that is lowered
+    /// for several platforms lowers a function once for each platform that requests it, because the platform can change
+    /// what the function lowers to.
+    indices: HashMap<Option<Rc<str>>, HashMap<Box<dyn ErasedKey>, usize>>,
 
-    /// Canonical typed decomposition program.
-    program: Rc<FlatProgram<Session>>,
+    /// Functions in the stable order in which they were registered, which is the order in which the module emits them,
+    /// so that the layout of the module is deterministic.
+    functions: Vec<PrivateFunction>,
+
+    /// Number of functions that were registered under each name, which makes their symbols unique.
+    name_counts: HashMap<String, usize>,
 }
 
-impl NamedCompositionFunction {
-    /// Returns the module-unique decomposition symbol.
+impl PrivateFunctionRegistry {
+    /// Registers a function that computes `body` for `key` on `target_platform` and returns it. Its symbol is `name`,
+    /// suffixed with the number of functions that were registered under that name before it, if any.
+    fn register(
+        &mut self,
+        target_platform: Option<Rc<str>>,
+        key: Box<dyn ErasedKey>,
+        name: &str,
+        body: PrivateFunctionBody,
+    ) -> PrivateFunction {
+        let count = self.name_counts.entry(name.to_string()).or_default();
+        let symbol = match *count {
+            0 => name.to_string(),
+            count => format!("{name}_{count}"),
+        };
+        *count += 1;
+        let function = PrivateFunction { symbol: symbol.into(), body };
+        self.indices.entry(target_platform).or_default().insert(key, self.functions.len());
+        self.functions.push(function.clone());
+        function
+    }
+}
+
+/// Private function that a module holds, which [`ProgramLoweringContext::require_function`] registers.
+#[derive(Clone)]
+pub(crate) struct PrivateFunction {
+    /// Module-unique symbol of the function.
+    symbol: Rc<str>,
+
+    /// What the function computes.
+    body: PrivateFunctionBody,
+}
+
+impl PrivateFunction {
+    /// Returns the module-unique symbol of the function.
     #[inline]
-    pub(super) fn symbol(&self) -> &str {
+    pub(crate) fn symbol(&self) -> &Rc<str> {
         &self.symbol
     }
 
-    /// Returns the canonical typed decomposition program.
+    /// Returns what the function computes.
     #[inline]
-    pub(super) fn program(&self) -> &FlatProgram<Session> {
-        &self.program
+    pub(super) fn body(&self) -> &PrivateFunctionBody {
+        &self.body
     }
 }
 
-/// Module-owned registry of canonical named compositions and their private decomposition functions.
-/// The lowering of an operation requests the function of the composition that it emits (refer to
-/// [`ProgramLoweringContext::require_named_composition`]), and the module emits the functions that were requested,
-/// so that a module holds a decomposition exactly when something that lowering emitted refers to it.
-#[derive(Default)]
-struct NamedCompositionFunctionMap {
-    /// Functions indexed by semantic operation and typed boundary.
-    functions: HashMap<NamedCompositionKey, NamedCompositionFunction>,
+/// What a [`PrivateFunction`] computes.
+#[derive(Clone)]
+pub(crate) enum PrivateFunctionBody {
+    /// Region of the program that the module is lowered from, whose inputs and outputs are those of the function.
+    /// The module resolves the region when it emits the function, so the registry does not depend on the operation
+    /// family of that program.
+    Region {
+        /// Region that the function computes.
+        region: RegionId,
 
-    /// Keys in the stable order of their first occurrence, used for deterministic function emission.
-    order: Vec<NamedCompositionKey>,
+        /// Number of leading inputs of the region that are its lifted captures, which the captured constants of the
+        /// region refer to (i.e., the capture count of the `call`s that call the function).
+        capture_count: usize,
+    },
+
+    /// Program that was built for this function, whose inputs and outputs are those of the function.
+    /// It has no captures.
+    Program(Rc<dyn PrivateFunctionProgram>),
 }
 
-impl NamedCompositionFunctionMap {
-    /// Returns the functions in the stable order of the first occurrence of their keys, which is the order in which
-    /// a module emits them, so that the layout of the module is deterministic.
+/// Program that a module can emit as the body of a [`PrivateFunction`], whatever its operation family is.
+pub(crate) trait PrivateFunctionProgram {
+    /// Returns the private `func.func` named `symbol` whose body is the lowering of this program in `lowering_context`.
+    /// The function takes the inputs of this program, followed by one input for each session constant that the program
+    /// reads.
+    fn lower_private_function<'c, 't: 'c>(
+        &self,
+        symbol: &str,
+        lowering_context: &ProgramLoweringContext,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<func::DetachedFuncOperation<'c, 't>, Error>;
+}
+
+/// Key of a [`PrivateFunction`] of any type that can key a hash map, which the registry compares and hashes without
+/// knowing that type. Keys of different types are never equal.
+trait ErasedKey: Any {
+    /// Returns this key as [`Any`], for comparing it with a key of a known type.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Returns whether `other` has the type of this key and is equal to it.
+    fn erased_eq(&self, other: &dyn ErasedKey) -> bool;
+
+    /// Feeds the type of this key and then the key itself into `state`.
+    fn erased_hash(&self, state: &mut dyn Hasher);
+}
+
+impl<K: Eq + Hash + 'static> ErasedKey for K {
     #[inline]
-    fn functions(&self) -> impl Iterator<Item = &NamedCompositionFunction> {
-        self.order.iter().map(|key| &self.functions[key])
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
-    /// Returns the private function that holds the decomposition of `key`, after tracing `program` and adding the
-    /// function when `key` has none yet, so that every request for the complete semantic key shares one function.
-    /// The registry is independent of the operation family that produced `key` and `program`, and closed backend
-    /// operation enums only decide when to call this seam. A key whose composite name is already taken by another
-    /// key receives a symbol suffixed with the number of earlier keys of that name.
-    fn require<F: FnOnce() -> Result<FlatProgram<Session>, Error>>(
-        &mut self,
-        key: NamedCompositionKey,
-        program: F,
-    ) -> Result<&NamedCompositionFunction, Error> {
-        if !self.functions.contains_key(&key) {
-            let name = key.composite.name();
-            let symbol = match self.order.iter().filter(|existing| existing.composite.name() == name).count() {
-                0 => name.to_string(),
-                count => format!("{name}_{count}"),
-            };
-            let function = NamedCompositionFunction { symbol: symbol.into(), program: Rc::new(program()?) };
-            self.functions.insert(key.clone(), function);
-            self.order.push(key.clone());
-        }
-        Ok(&self.functions[&key])
+    #[inline]
+    fn erased_eq(&self, other: &dyn ErasedKey) -> bool {
+        other.as_any().downcast_ref::<K>().is_some_and(|other| self == other)
+    }
+
+    #[inline]
+    fn erased_hash(&self, mut state: &mut dyn Hasher) {
+        TypeId::of::<K>().hash(&mut state);
+        self.hash(&mut state);
+    }
+}
+
+impl PartialEq for dyn ErasedKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.erased_eq(other)
+    }
+}
+
+impl Eq for dyn ErasedKey {}
+
+impl Hash for dyn ErasedKey {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.erased_hash(state);
     }
 }
 
@@ -497,13 +648,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        CompositeAttribute, DataType, Dimension, DomainTracingContext, MeshAxis, MeshAxisType, ParallelReduce,
-        ProgramError, ProvenanceScope, ReductionKind, Shape, ShardMapOptions, ShardingDimension, shard_map,
+        DataType, Dimension, DomainTracingContext, MeshAxis, MeshAxisType, ParallelReduce, ProgramError,
+        ProvenanceScope, ReductionKind, Shape, ShardMapOptions, ShardingDimension, shard_map,
     };
     use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue};
 
     use crate::lowering::sharding::tests::{test_input_type, test_mesh};
-    use crate::lowering::tests::test_matrix_type;
+    use crate::lowering::tests::{DefaultLoweringRule, test_matrix_type};
     use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::sessions::tests::{domain_mesh, f32_scalar};
     use crate::tests::cpu_client;
@@ -520,7 +671,7 @@ mod tests {
         let lowering_context = ProgramLoweringContext::new();
         assert_eq!(lowering_context.target_platform(), None);
         assert_eq!(lowering_context.ragged_dot_lowering_strategy(), RaggedDotLoweringStrategy::Decomposition);
-        assert!(lowering_context.named_composition(0).is_none());
+        assert!(lowering_context.function(0).is_none());
         assert_eq!(lowering_context.mesh(), None);
         assert!(!lowering_context.has_provenance());
         assert!(!lowering_context.requires_assertion_handler());
@@ -548,6 +699,19 @@ mod tests {
             lowering_context.clone().with_ragged_dot_lowering_strategy(RaggedDotLoweringStrategy::Instruction);
         assert_eq!(instruction_context.ragged_dot_lowering_strategy(), RaggedDotLoweringStrategy::Instruction);
         assert_eq!(lowering_context.ragged_dot_lowering_strategy(), RaggedDotLoweringStrategy::Decomposition);
+    }
+
+    #[test]
+    fn test_program_lowering_context_with_lowering_rules() {
+        // The rules belong to the module, so the body of a manual region has them as well.
+        let lowering_context = ProgramLoweringContext::new();
+        assert!(lowering_context.lowering_rule("add").is_none());
+        let rules = LoweringRules::default().with_rule("add".to_string(), Rc::new(DefaultLoweringRule));
+        let lowering_context = lowering_context.with_lowering_rules(rules);
+        assert!(lowering_context.lowering_rule("add").is_some());
+        assert!(lowering_context.lowering_rule("mul").is_none());
+        let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
+        assert!(lowering_context.enter_manual_region(boundary).lowering_rule("add").is_some());
     }
 
     #[test]
@@ -581,43 +745,76 @@ mod tests {
     }
 
     #[test]
-    fn test_program_lowering_context_require_named_composition() {
-        // The first request for a key traces its decomposition and names its function after the composite.
-        let boundary_type = ArrayType::scalar(DataType::F32);
-        let decomposition = || {
-            let input_types = vec![Type::from(boundary_type.clone())];
+    fn test_program_lowering_context_require_function() {
+        // The first request for a key registers its function, which is named as requested.
+        let body = || {
+            let input_types = vec![Type::from(ArrayType::scalar(DataType::F32))];
             let (_, program) = DomainTracingContext::<Session>::trace(|inputs: Vec<Tracer>| Ok(inputs), input_types)?;
-            Ok(program.into_simplified()?)
+            Ok(PrivateFunctionBody::Program(Rc::new(program.into_simplified()?)))
         };
-        let key = |name: &'static str| {
-            let boundary_types = vec![boundary_type.clone()];
-            NamedCompositionKey::new(CompositeKey::new(name, 1), boundary_types.clone(), boundary_types)
-        };
+        let symbol = |function: Result<PrivateFunction, Error>| function.map(|function| function.symbol().to_string());
         let lowering_context = ProgramLoweringContext::new();
-        assert!(lowering_context.named_composition(0).is_none());
-        assert_eq!(lowering_context.require_named_composition(key("first"), decomposition).unwrap().as_ref(), "first");
+        assert!(lowering_context.function(0).is_none());
+        assert_eq!(symbol(lowering_context.require_function("first", "f", body)), Ok("f".to_string()));
 
-        // Every lowering scope of a program records into the same module, including the body of a manual region, and a
-        // decomposition that was already requested is not traced again.
+        // Every lowering scope of a program registers into the same module, including the body of a manual region, and
+        // the body of a function that is already registered is not requested again. Another key that asks for a name
+        // that is taken receives a suffixed symbol.
         let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
         let region_context = lowering_context.enter_manual_region(boundary);
-        assert_eq!(region_context.require_named_composition(key("second"), decomposition).unwrap().as_ref(), "second");
-        assert_eq!(
-            region_context.require_named_composition(key("first"), || unreachable!()).unwrap().as_ref(),
-            "first"
-        );
+        assert_eq!(symbol(region_context.require_function("second", "f", body)), Ok("f_1".to_string()));
+        assert_eq!(symbol(region_context.require_function("first", "g", || unreachable!())), Ok("f".to_string()));
         let symbols = (0..3)
-            .map(|index| lowering_context.named_composition(index).map(|function| function.symbol().to_string()))
+            .map(|index| lowering_context.function(index).map(|function| function.symbol().to_string()))
             .collect::<Vec<_>>();
-        assert_eq!(symbols, vec![Some("first".to_string()), Some("second".to_string()), None]);
+        assert_eq!(symbols, vec![Some("f".to_string()), Some("f_1".to_string()), None]);
 
-        // A decomposition that cannot be traced is not recorded.
-        let error = ProgramError::MalformedProgram("no decomposition".to_string());
+        // Keys of different types never share a function, even when they hold equal values.
+        assert_eq!(symbol(lowering_context.require_function(1_u8, "h", body)), Ok("h".to_string()));
+        assert_eq!(symbol(lowering_context.require_function(1_u16, "h", body)), Ok("h_1".to_string()));
+
+        // Keys are compared within the target platform of the requesting context.
+        let other_platform = lowering_context.clone().with_target_platform(Some("cuda"));
+        assert_eq!(symbol(other_platform.require_function("first", "f", body)), Ok("f_2".to_string()));
+
+        // A function whose body cannot be built is not registered.
+        let error = ProgramError::MalformedProgram("no body".to_string());
         assert_eq!(
-            lowering_context.require_named_composition(key("third"), || Err(error.clone().into())),
+            symbol(lowering_context.require_function("third", "f", || Err(error.clone().into()))),
             Err(Error::from(error)),
         );
-        assert!(lowering_context.named_composition(2).is_none());
+        assert!(lowering_context.function(5).is_none());
+    }
+
+    #[test]
+    fn test_program_lowering_context_alias_function() {
+        let lowering_context = ProgramLoweringContext::new();
+        let body = || Ok(PrivateFunctionBody::Region { region: RegionId::new(0), capture_count: 0 });
+        lowering_context.require_function("key", "f", body).unwrap();
+
+        // Requests for an alias return the function of the key that it was given for.
+        lowering_context.alias_function(7_usize, &"key");
+        let aliased = lowering_context.shared_function(&7_usize).unwrap();
+        assert_eq!(aliased.symbol().as_ref(), "f");
+        assert!(lowering_context.function(1).is_none());
+
+        // An alias for a key without a function finds nothing.
+        lowering_context.alias_function(8_usize, &"missing");
+        assert!(lowering_context.shared_function(&8_usize).is_none());
+    }
+
+    #[test]
+    fn test_program_lowering_context_shared_function() {
+        let lowering_context = ProgramLoweringContext::new();
+        assert!(lowering_context.shared_function(&"key").is_none());
+        let body = || Ok(PrivateFunctionBody::Region { region: RegionId::new(0), capture_count: 0 });
+        lowering_context.require_function("key", "f", body).unwrap();
+        assert_eq!(lowering_context.shared_function(&"key").unwrap().symbol().as_ref(), "f");
+
+        // A scope that inlines its calls finds no shared function, which includes the body of a manual region.
+        assert!(lowering_context.clone().without_shared_functions().shared_function(&"key").is_none());
+        let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
+        assert!(lowering_context.enter_manual_region(boundary).shared_function(&"key").is_none());
     }
 
     #[test]
@@ -994,64 +1191,5 @@ mod tests {
         let fused = Provenance::fused([scope("left", Provenance::unknown()), scope("right", Provenance::unknown())]);
         let location = lowering_context.lower_provenance(&context, &fused, base);
         assert_eq!(location.to_string(), "loc(fused[\"left\", \"right\"])");
-    }
-
-    #[test]
-    fn test_named_composition_function_map_require() {
-        // Registration consumes a semantic key and an ordinary typed program, not a Ryft operation enum variant.
-        // Consequently a downstream lowerer can use the same sharing seam after performing its own family conversion.
-        let boundary_type = ArrayType::scalar(DataType::F32);
-        let (_, program) = DomainTracingContext::<Session>::trace(
-            |inputs: Vec<Tracer>| Ok(inputs),
-            vec![Type::from(boundary_type.clone())],
-        )
-        .unwrap();
-        let program = program.into_simplified().unwrap();
-        let key = NamedCompositionKey {
-            composite: CompositeKey::new("downstream.example", 1)
-                .with_attribute("enabled", CompositeAttribute::Boolean(true)),
-            input_types: vec![boundary_type.clone()],
-            output_types: vec![boundary_type],
-        };
-        let trace_count = Cell::new(0);
-        let mut registry = NamedCompositionFunctionMap::default();
-        for _ in 0..2 {
-            let function = registry
-                .require(key.clone(), || {
-                    trace_count.set(trace_count.get() + 1);
-                    Ok(program.clone())
-                })
-                .unwrap();
-            assert_eq!(function.symbol(), "downstream.example");
-        }
-
-        assert_eq!(trace_count.get(), 1);
-        assert_eq!(registry.functions.len(), 1);
-        assert_eq!(registry.order.len(), 1);
-    }
-
-    #[test]
-    fn test_named_composition_function_map_require_suffixes_shared_names() {
-        // Keys that share a composite name but differ in their boundary types receive distinct symbols, suffixed with
-        // the number of earlier keys of that name.
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![4.into()]));
-        let composite = CompositeKey::new("downstream.example", 1);
-        let mut registry = NamedCompositionFunctionMap::default();
-        for boundary_type in [scalar_type.clone(), vector_type.clone(), scalar_type.clone()] {
-            let (_, program) = DomainTracingContext::<Session>::trace(
-                |inputs: Vec<Tracer>| Ok(inputs),
-                vec![Type::from(boundary_type.clone())],
-            )
-            .unwrap();
-            let key = NamedCompositionKey::new(composite.clone(), vec![boundary_type.clone()], vec![boundary_type]);
-            registry.require(key, || Ok(program.into_simplified().unwrap())).unwrap();
-        }
-
-        assert_eq!(
-            registry.functions().map(NamedCompositionFunction::symbol).collect::<Vec<_>>(),
-            vec!["downstream.example", "downstream.example_1"],
-        );
-        assert_eq!(registry.order[1].input_types, vec![vector_type]);
     }
 }

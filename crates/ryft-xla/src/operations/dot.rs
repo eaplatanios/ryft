@@ -11,14 +11,11 @@ use ryft_mlir::{
     Region, Type as MlirType, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, DataTypeLoweringExtension, PhysicalStoragePadding, lower_u64_scalar_constant,
-    lower_unplaced_constant_output,
-};
+use crate::lowering::types::{ArrayTypeLoweringExtension, DataTypeLoweringExtension, PhysicalStoragePadding};
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::{
     ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation,
-    RaggedDotLoweringStrategy,
+    RaggedDotLoweringStrategy, lower_u64_scalar_constant,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -413,8 +410,8 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
         return Ok((wide_group_sizes, wide_group_sizes));
     }
 
-    let zero = lower_u64_scalar_constant(0, block, context, location)?;
-    let extent = lower_u64_scalar_constant(physical_ragged_extent, block, context, location)?;
+    let zero = lower_u64_scalar_constant(0, block, location)?;
+    let extent = lower_u64_scalar_constant(physical_ragged_extent, block, location)?;
     // StableHLO may reassociate a reduction, so cap every leaf first to ensure every reducer operand is at most the
     // physical extent and the saturating reducer remains associative.
     let capped_group_sizes = block.append_operation(stable_hlo::clamp(zero, wide_group_sizes, extent, location)?)?;
@@ -425,7 +422,7 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
     let mut reducer_block = reducer_region.append_block(reducer_block)?;
     let left = reducer_block.argument(0)?.as_ref();
     let right = reducer_block.argument(1)?.as_ref();
-    let reducer_extent = lower_u64_scalar_constant(physical_ragged_extent, &mut reducer_block, context, location)?;
+    let reducer_extent = lower_u64_scalar_constant(physical_ragged_extent, &mut reducer_block, location)?;
     let remaining = reducer_block.append_operation(stable_hlo::subtract(reducer_extent, left, location)?)?;
     let remaining = remaining.result(0).unwrap().as_ref();
     let increment = reducer_block.append_operation(stable_hlo::minimum(right, remaining, location)?)?;
@@ -549,11 +546,7 @@ fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
         location,
     )?;
     let zero = if intermediate_type.static_shape().is_some() {
-        let zero =
-            lower_unplaced_constant_output(&[ArrayType::scalar(input_type.data_type())], 0, block, context, location)?
-                [0];
-        let zero = block.append_operation(stable_hlo::broadcast(zero, intermediate_tensor_type, &[], location)?)?;
-        zero.result(0).unwrap().as_ref()
+        intermediate_type.lower_i64_splat(0, block, location)?
     } else {
         let false_mask = block.append_operation(stable_hlo::xor(mask, mask, location)?)?;
         let false_mask = false_mask.result(0).unwrap().as_ref();

@@ -11,13 +11,11 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_f64_constant_splat, lower_unplaced_constant_output,
-};
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::{
-    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, ValueRefExtension,
+    ArrayTypeExtension, ArrayTypeLoweringExtension, DataTypeLoweringExtension, Error, LowerableOperation, Lowerer,
+    LoweringError, ProgramLoweringOperation, ValueRefExtension,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -33,14 +31,13 @@ pub(crate) fn lower_product_combiner_to_mlir<'b, 'c: 'b, 't: 'c>(
     right: ValueRef<'b, 'c, 't>,
     element_type: DataType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let product = block.append_operation(stable_hlo::multiply(left, right, location)?)?.result(0).unwrap().as_ref();
     if !element_type.is_complex() {
         return Ok(product);
     }
-    let one = lower_unplaced_constant_output(&[ArrayType::scalar(element_type)], 1, block, context, location)?[0];
+    let one = ArrayType::scalar(element_type).lower_i64_splat(1, block, location)?;
     let mut identity_masks = Vec::with_capacity(2);
     for operand in [left, right] {
         let mask = block.append_operation(stable_hlo::compare(
@@ -96,9 +93,7 @@ pub(crate) fn build_reduce_body_region<'c, 't>(
         ReductionKind::Sum | ReductionKind::Mean => {
             block_ref.append_operation(stable_hlo::add(left, right, location)?)?.result(0).unwrap().as_ref()
         }
-        ReductionKind::Product => {
-            lower_product_combiner_to_mlir(left, right, element_type, &mut block_ref, context, location)?
-        }
+        ReductionKind::Product => lower_product_combiner_to_mlir(left, right, element_type, &mut block_ref, location)?,
         ReductionKind::Max | ReductionKind::Min => lower_extremum_to_mlir(
             kind == ReductionKind::Max,
             element_type,
@@ -245,21 +240,8 @@ impl ReductionKindLoweringExtension for ReductionKind {
                 }
             }
         }
-        let output_tensor_type = output_array_type.lower(context, location)?;
         let count = if element_type.is_integer() { count.max(1) } else { count };
-        let divisor = if element_type.is_complex() {
-            let part_type = output_array_type.clone().with_data_type(if element_type == DataType::C64 {
-                DataType::F32
-            } else {
-                DataType::F64
-            });
-            let part_tensor_type = part_type.lower(context, location)?;
-            let real = lower_f64_constant_splat(count as f64, &part_type, part_tensor_type, block, context, location)?;
-            let imaginary = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
-            block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0).unwrap().as_ref()
-        } else {
-            lower_f64_constant_splat(count as f64, output_array_type, output_tensor_type, block, context, location)?
-        };
+        let divisor = output_array_type.lower_f64_splat(count as f64, block, location)?;
         let mean = block.append_operation(stable_hlo::divide(reduced, divisor, location)?)?;
         Ok(mean.result(0).unwrap().as_ref())
     }
@@ -291,14 +273,10 @@ pub(crate) fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
         };
         let part_data_type = if element_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
         let part_type = ArrayType::scalar(part_data_type);
-        let part_tensor_type = part_type.lower(context, location)?;
-        let real_value = lower_f64_constant_splat(real, &part_type, part_tensor_type, block, context, location)?;
+        let real_value = part_type.lower_f64_splat(real, block, location)?;
         // Products use `1 + 0i`, while lexicographic extrema need both components at the same bound.
-        let imaginary_value = if kind == ReductionKind::Product {
-            lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?
-        } else {
-            real_value
-        };
+        let imaginary_value =
+            if kind == ReductionKind::Product { part_type.lower_f64_splat(0.0, block, location)? } else { real_value };
         let complex = block.append_operation(stable_hlo::complex(real_value, imaginary_value, location)?)?;
         return Ok(complex.result(0).unwrap().as_ref());
     }
@@ -518,8 +496,7 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     let maximum = ReductionKind::Max.lower(axes, maximum_input, &shift_type, form, block, context, location)?;
     let finite = block.append_operation(stable_hlo::is_finite(maximum, location)?)?;
     let finite = finite.result(0).unwrap().as_ref();
-    let shift_tensor_type = shift_type.lower(context, location)?;
-    let zero = lower_f64_constant_splat(0.0, &shift_type, shift_tensor_type, block, context, location)?;
+    let zero = shift_type.lower_f64_splat(0.0, block, location)?;
     let shift = block.append_operation(stable_hlo::select(finite, maximum, zero, location)?)?;
     let shift = shift.result(0).unwrap().as_ref();
     let shift = match element_type.is_complex() {
@@ -865,9 +842,7 @@ fn lower_index_reduction_to_mlir<'b, 'c: 'b, 't: 'c>(
     let identity_kind = if maximize { ReductionKind::Max } else { ReductionKind::Min };
     let value_identity = build_reduction_identity_constant(identity_kind, value_data_type, block, context, location)?;
     let scalar_index_type = ArrayType::scalar(index_data_type);
-    let scalar_index_tensor_type = scalar_index_type.lower(context, location)?;
-    let index_identity =
-        lower_f64_constant_splat(0.0, &scalar_index_type, scalar_index_tensor_type, block, context, location)?;
+    let index_identity = scalar_index_type.lower_i64_splat(0, block, location)?;
     let body = build_index_reduction_body_region(maximize, value_data_type, index_data_type, context, location)?;
     let reduced = block.append_operation(stable_hlo::reduce(
         &[value, indices],

@@ -9,15 +9,14 @@ use ryft_mlir::{
 };
 
 use crate::lowering::EffectTokens;
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_to_i32, dimension_extent_to_i64,
-    lower_constant_output, lower_static_index_constants,
-};
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_CONCATENATE_KIND, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
+use crate::{
+    ArrayTypeExtension, ArrayTypeLoweringExtension, Error, LowerableOperation, Lowerer, PhysicalStoragePadding,
+    ProgramLoweringOperation, Type, dimension_extent_to_i32, dimension_extent_to_i64, lower_index_constant,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -66,7 +65,7 @@ impl LowerableOperation for ConcatenateOperation<Type> {
             for (input, r#type) in array_inputs.iter().zip(array_input_types) {
                 let r#type = <&ArrayType>::try_from(r#type)?;
                 let extent = match r#type.shape().dimensions()[self.axis()] {
-                    Dimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
+                    Dimension::Static(extent) => lower_index_constant(extent, block, location)?,
                     Dimension::Dynamic(_) => {
                         let extent =
                             block.append_operation(stable_hlo::get_dimension_size(*input, self.axis(), location)?)?;
@@ -134,13 +133,8 @@ impl LowerableOperation for ConcatenateOperation<Type> {
             if high_padding[self.axis()] != 0 {
                 // Padding is outside the logical extent, so choose a representable value even for the float format
                 // that only has exponent bits, which has no zero encoding.
-                let padding = lower_constant_output(
-                    &[ArrayType::scalar(output_type.data_type())],
-                    padding_value,
-                    block,
-                    context,
-                    location,
-                )?[0];
+                let padding =
+                    ArrayType::scalar(output_type.data_type()).lower_i64_splat(padding_value, block, location)?;
                 let resized = block.append_operation(stable_hlo::pad(
                     result,
                     padding,
@@ -200,7 +194,7 @@ fn lower_concatenate_extent_assertion<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
-    let predicate = lower_deliberately_false_assertion_predicate(actual, block, context, location)?;
+    let predicate = lower_deliberately_false_assertion_predicate(actual, block, location)?;
     let axis = axis.to_string();
     let backend_configuration = context.dictionary_attribute(&[
         context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute("concatenate")),

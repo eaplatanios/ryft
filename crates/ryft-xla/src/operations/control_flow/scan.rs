@@ -19,8 +19,6 @@
 //! types of the scan, and outputs whose types place them over explicit mesh axes are constrained to that placement.
 //! Reference state is discharged before lowering.
 
-use std::rc::Rc;
-
 use ryft_core::{
     ArrayType, ComparisonDirection, DataType, Dimension, EagerContext, EffectClasses, FlatProgram, Operation,
     ProgramError, SCAN_OPERATION_NAME, ScanOperation, Shape, TypedProgram,
@@ -34,10 +32,7 @@ use ryft_mlir::{
 use crate::lowering::EffectTokens;
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::programs::ProgramInlineLoweringExtension;
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, TypeLoweringExtension, lower_constant_output, lower_static_index_constants,
-};
-use crate::operations::call::CallFunctionMap;
+use crate::lowering::types::{ArrayTypeLoweringExtension, TypeLoweringExtension};
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::control_flow::{
     append_loop_effect_tokens, lower_explicit_sharding_constraints, lower_refined_region_input,
@@ -46,7 +41,7 @@ use crate::operations::control_flow::{
 };
 use crate::{
     ArrayError, Constant, DimensionExtension, Error, LowerableOperation, Lowerer, LoweringError,
-    ProgramLoweringOperation, Type,
+    ProgramLoweringOperation, Type, lower_index_constant,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -99,8 +94,7 @@ impl LowerableOperation for ScanOperation<Type> {
         self.validate_region_count(lowerer.regions().len())?;
         let (context, location) = (lowerer.context(), lowerer.location());
         let block = &mut lowerer.block();
-        let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
-            lowerer.split_effect_tokens();
+        let (effect_tokens, regions, captured_values, lowering_context) = lowerer.split_effect_tokens();
         let body = &regions[0];
         let (carry_count, length) = (self.carry_count(), self.iteration_count());
         let body_input_types = body.input_types();
@@ -190,7 +184,6 @@ impl LowerableOperation for ScanOperation<Type> {
             context,
             location,
             captured_values,
-            nested_functions,
             lowering_context,
         };
 
@@ -238,7 +231,7 @@ impl LowerableOperation for ScanOperation<Type> {
                 effect_tokens,
             )?
         } else {
-            let mut state_values = vec![lower_static_index_constants(&[0], block, context, location)?[0]];
+            let mut state_values = vec![lower_index_constant(0, block, location)?];
             state_values.extend(carries);
             // An exact runtime length (e.g., that of an eager dimension value) refines the stacked inputs of a scan of
             // dynamic length to static leading extents, while the loop state stacks them over the declared length, so
@@ -343,7 +336,6 @@ struct ScanLoopInputs<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> {
     captured_values: &'o [ValueRef<'b, 'c, 't>],
 
     /// Nested functions that `call` operations in the body lower against.
-    nested_functions: Option<&'o Rc<CallFunctionMap<O>>>,
 
     /// Program lowering context of the enclosing function.
     lowering_context: &'o ProgramLoweringContext,
@@ -373,8 +365,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> ScanLoopInputs<'o, 'b,
             };
             physical_dimensions[0] = Dimension::Static(physical_length);
             let physical_type = stack_type.clone().with_shape(Shape::new(physical_dimensions));
-            let accumulator =
-                lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
+            let accumulator = physical_type.lower_i64_splat_in_declared_memory(0, block, location)?;
             let ScanLoopLength::Dynamic(runtime_length) = self.length else {
                 accumulators.push(accumulator);
                 continue;
@@ -407,10 +398,10 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> ScanLoopInputs<'o, 'b,
         block: &mut BlockRef<'b, 'c, 't>,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let zero_index = lower_static_index_constants(&[0], block, self.context, self.location)?[0];
+        let zero_index = lower_index_constant(0, block, self.location)?;
         for iteration in first_iteration..length {
             let index = if self.reverse { length - 1 - iteration } else { iteration };
-            let index_value = lower_static_index_constants(&[index], block, self.context, self.location)?[0];
+            let index_value = lower_index_constant(index, block, self.location)?;
             (carries, stacked_output_accumulators) = self.lower_iteration(
                 index_value,
                 zero_index,
@@ -456,9 +447,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> ScanLoopInputs<'o, 'b,
         let block_arguments = state_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
         let length_value = |block: &mut BlockRef<'b, 'c, 't>| -> Result<ValueRef<'b, 'c, 't>, Error> {
             match self.length {
-                ScanLoopLength::Static(length) => {
-                    Ok(lower_static_index_constants(&[length], block, context, location)?[0])
-                }
+                ScanLoopLength::Static(length) => lower_index_constant(length, block, location),
                 ScanLoopLength::Dynamic(length) => Ok(length),
             }
         };
@@ -476,8 +465,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> ScanLoopInputs<'o, 'b,
             let counter_limit = if unroll == 1 {
                 length_value
             } else {
-                let offset =
-                    lower_static_index_constants(&[unroll - 1], &mut condition_block_ref, context, location)?[0];
+                let offset = lower_index_constant(unroll - 1, &mut condition_block_ref, location)?;
                 let subtraction =
                     condition_block_ref.append_operation(stable_hlo::subtract(length_value, offset, location)?)?;
                 subtraction.result(0).unwrap().as_ref()
@@ -504,12 +492,12 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> ScanLoopInputs<'o, 'b,
             });
             let entry_effect_tokens = body_effect_tokens;
             let counter = arguments[0];
-            let zero_index = lower_static_index_constants(&[0], &mut body_block_ref, context, location)?[0];
+            let zero_index = lower_index_constant(0, &mut body_block_ref, location)?;
             // When the visit order is reversed, logical iteration `i` reads iteration `length - 1 - i`. A reversed scan
             // of length zero never runs its body, so the saturated limit constant is inert.
             let reverse_limit = if self.reverse {
                 let length_value = length_value(&mut body_block_ref)?;
-                let one = lower_static_index_constants(&[1], &mut body_block_ref, context, location)?[0];
+                let one = lower_index_constant(1, &mut body_block_ref, location)?;
                 let limit = body_block_ref.append_operation(stable_hlo::subtract(length_value, one, location)?)?;
                 Some(limit.result(0).unwrap().as_ref())
             } else {
@@ -525,7 +513,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> ScanLoopInputs<'o, 'b,
                 let iteration = if copy == 0 {
                     counter
                 } else {
-                    let offset = lower_static_index_constants(&[copy], &mut body_block_ref, context, location)?[0];
+                    let offset = lower_index_constant(copy, &mut body_block_ref, location)?;
                     let addition = body_block_ref.append_operation(stable_hlo::add(counter, offset, location)?)?;
                     addition.result(0).unwrap().as_ref()
                 };
@@ -551,7 +539,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> ScanLoopInputs<'o, 'b,
 
             // Assemble the next state, which advances the counter by the unroll factor, threads the new carries, passes
             // the input stacks through unchanged, and threads the updated accumulators and effect tokens.
-            let step = lower_static_index_constants(&[unroll], &mut body_block_ref, context, location)?[0];
+            let step = lower_index_constant(unroll, &mut body_block_ref, location)?;
             let next_counter = body_block_ref.append_operation(stable_hlo::add(counter, step, location)?)?;
             let mut next_state = vec![next_counter.result(0).unwrap().as_ref()];
             next_state.extend(carries);
@@ -617,7 +605,6 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> ScanLoopInputs<'o, 'b,
         let mut body_outputs = self.body.lower_inline(
             self.captured_values,
             iteration_inputs.as_slice(),
-            self.nested_functions,
             self.lowering_context,
             effect_tokens,
             *block,
@@ -1051,7 +1038,6 @@ mod tests {
                 context: &context,
                 location,
                 captured_values: &[],
-                nested_functions: None,
                 lowering_context: &lowering_context,
             };
             let state_values = (0..3).map(|index| block.as_ref().argument(index).unwrap().as_ref()).collect();

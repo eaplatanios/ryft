@@ -1,6 +1,6 @@
 use ryft_core::{
     ArrayType, ComparisonDirection, ConstantOperation, DataType, Dimension, DimensionAddOperation,
-    DimensionDivOperation, DimensionError, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
+    DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
     DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation, DimensionSizeOperation,
     DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue, EffectClass,
     MAX_DIMENSION_EXTENT, Operation, ProgramError, SaturatingSubOperation,
@@ -11,7 +11,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::EffectTokens;
-use crate::lowering::types::{ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_static_index_constants};
+use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::lowering::values::DimensionValueLoweringExtension;
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_ADD_KIND, ASSERT_BOUNDS_KIND, ASSERT_DETAIL_ATTRIBUTE, ASSERT_DIV_KIND,
@@ -19,7 +19,9 @@ use crate::operations::assertions::{
     ASSERT_RIGHT_ATTRIBUTE, ASSERT_SUB_KIND, lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
-use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
+use crate::{
+    Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type, ValueRefExtension, lower_index_constant,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -32,7 +34,6 @@ impl LowerableOperation for DimensionSizeOperation {
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = output_types;
-        let context = lowerer.context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
         let [input] = input_values else {
@@ -42,25 +43,11 @@ impl LowerableOperation for DimensionSizeOperation {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_types.len() }.into());
         };
         let input_type = <&ArrayType>::try_from(input_type)?;
-        match input_type.shape().dimensions()[self.axis()] {
-            Dimension::Static(extent) => {
-                let output_type = ArrayType::scalar(DataType::I64).lower(context, location)?;
-                let extent = i64::try_from(extent).map_err(|_| DimensionError::ExtentExceedsBackendWidth {
-                    value: extent,
-                    maximum: i64::MAX as usize,
-                })?;
-                let elements = DataType::I64.lower_i64_splat_attribute(output_type, extent, context)?;
-                let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-                Ok(vec![constant.result(0).unwrap().as_ref()])
-            }
-            Dimension::Dynamic(_) => {
-                let size = block.append_operation(stable_hlo::get_dimension_size(*input, self.axis(), location)?)?;
-                let size = size.result(0).unwrap().as_ref();
-                let output_type = ArrayType::scalar(DataType::I64).lower(context, location)?;
-                let converted = block.append_operation(stable_hlo::convert(size, output_type, location)?)?;
-                Ok(vec![converted.result(0).unwrap().as_ref()])
-            }
-        }
+        let extent = match input_type.shape().dimensions()[self.axis()] {
+            Dimension::Static(extent) => lower_index_constant(extent, block, location)?,
+            Dimension::Dynamic(_) => input.widen_dimension_to_i64(self.axis(), block, location)?,
+        };
+        Ok(vec![extent])
     }
 }
 
@@ -84,13 +71,13 @@ impl LowerableOperation for DimensionFromScalarOperation {
         let converted = block.append_operation(stable_hlo::convert(*input, i64_type, location)?)?;
         let converted = converted.result(0).unwrap().as_ref();
         let bounds = self.output_type().bounds();
-        let lower = lower_static_index_constants(&[bounds.lower()], block, context, location)?[0];
+        let lower = lower_index_constant(bounds.lower(), block, location)?;
         let at_least_lower =
             ComparisonDirection::GreaterThanOrEqual.lower_comparison(converted, lower, block, location)?;
         // Do not encode an exclusive upper bound, one past the maximum, in the signed runtime extent representation.
         let predicate = match bounds.upper().filter(|upper| *upper <= MAX_DIMENSION_EXTENT) {
             Some(upper) => {
-                let upper = lower_static_index_constants(&[upper], block, context, location)?[0];
+                let upper = lower_index_constant(upper, block, location)?;
                 let below_upper = ComparisonDirection::LessThan.lower_comparison(converted, upper, block, location)?;
                 block
                     .append_operation(stable_hlo::and(at_least_lower, below_upper, location)?)?
@@ -148,7 +135,7 @@ impl LowerableOperation for ConstantOperation<DimensionValue> {
         if !input_values.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
         }
-        Ok(vec![self.value().lower(&mut lowerer.block(), lowerer.context(), lowerer.location())?])
+        Ok(vec![self.value().lower(&mut lowerer.block(), lowerer.location())?])
     }
 }
 
@@ -329,26 +316,23 @@ impl DimensionOperationLoweringExtension for DimensionOperation<DimensionValue> 
         // A runtime assertion and the arithmetic operation do not have a StableHLO data dependency.
         // Select a valid divisor for the data operation so speculative or reordered execution cannot
         // evaluate division by zero before the host callback reports the original inputs.
-        let safe_right = if requires_runtime_assertion
-            && matches!(self, DimensionOperation::Div(_) | DimensionOperation::Rem(_))
-        {
-            let constants = lower_static_index_constants(&[0, 1], block, context, location)?;
-            let positive = ComparisonDirection::GreaterThan.lower_comparison(*right, constants[0], block, location)?;
-            let selected = block.append_operation(stable_hlo::select(positive, *right, constants[1], location)?)?;
-            selected.result(0).unwrap().as_ref()
-        } else {
-            *right
-        };
+        let safe_right =
+            if requires_runtime_assertion && matches!(self, DimensionOperation::Div(_) | DimensionOperation::Rem(_)) {
+                let zero = lower_index_constant(0, block, location)?;
+                let one = lower_index_constant(1, block, location)?;
+                let positive = ComparisonDirection::GreaterThan.lower_comparison(*right, zero, block, location)?;
+                let selected = block.append_operation(stable_hlo::select(positive, *right, one, location)?)?;
+                selected.result(0).unwrap().as_ref()
+            } else {
+                *right
+            };
         let result = match self {
             DimensionOperation::Add(_) => block.append_operation(stable_hlo::add(*left, *right, location)?)?,
             DimensionOperation::Sub(_) => block.append_operation(stable_hlo::subtract(*left, *right, location)?)?,
             DimensionOperation::SaturatingSub(_) => {
                 let difference = block.append_operation(stable_hlo::subtract(*left, *right, location)?)?;
                 let difference = difference.result(0).unwrap().as_ref();
-                let tensor_type = ArrayType::scalar(DataType::I64).lower(context, location)?;
-                let elements = DataType::I64.lower_i64_splat_attribute(tensor_type, 0i64, context)?;
-                let zero = block.append_operation(stable_hlo::constant(elements, location)?)?;
-                let zero = zero.result(0).unwrap().as_ref();
+                let zero = lower_index_constant(0, block, location)?;
                 block.append_operation(stable_hlo::maximum(difference, zero, location)?)?
             }
             DimensionOperation::Mul(_) => block.append_operation(stable_hlo::multiply(*left, *right, location)?)?,
@@ -373,9 +357,9 @@ impl DimensionOperationLoweringExtension for DimensionOperation<DimensionValue> 
                     | DimensionOperation::Mul(_)
                     | DimensionOperation::Pow(_)
             ) {
-            let constants = lower_static_index_constants(&[0], block, context, location)?;
+            let zero = lower_index_constant(0, block, location)?;
             let raw = result.result(0).unwrap().as_ref();
-            block.append_operation(stable_hlo::maximum(raw, constants[0], location)?)?
+            block.append_operation(stable_hlo::maximum(raw, zero, location)?)?
         } else {
             result
         };
@@ -403,7 +387,7 @@ impl DimensionOperationLoweringExtension for DimensionOperation<DimensionValue> 
             DimensionOperation::Rem(_) => ASSERT_REM_KIND,
             _ => return Ok(()),
         };
-        let predicate = lower_deliberately_false_assertion_predicate(left, block, context, location)?;
+        let predicate = lower_deliberately_false_assertion_predicate(left, block, location)?;
         let left_name = left_type.dimension().to_string();
         let right_name = right_type.dimension().to_string();
         let backend_config = context.dictionary_attribute(&[

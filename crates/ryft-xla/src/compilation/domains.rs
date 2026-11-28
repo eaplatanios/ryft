@@ -3383,8 +3383,8 @@ mod tests {
                     %9 = stablehlo.compare LT, %8, %c_0, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
                     %10 = stablehlo.after_all  : !stablehlo.token
                     %11 = stablehlo.custom_call @ryft.assert(%9, %8, %3, %10) {api_version = 4 : i32, backend_config = {actor = "reshape", detail = "1", kind = "reshape"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
-                    %12 = stablehlo.convert %3 : (tensor<i64>) -> tensor<i32>
-                    %13 = stablehlo.reshape %12 : (tensor<i32>) -> tensor<1xi32>
+                    %12 = stablehlo.reshape %3 : (tensor<i64>) -> tensor<1xi64>
+                    %13 = stablehlo.convert %12 : (tensor<1xi64>) -> tensor<1xi32>
                     %14 = stablehlo.dynamic_reshape %6, %13 : (tensor<?xf32, #stablehlo.bounds<8>>, tensor<1xi32>) -> tensor<?xf32, #stablehlo.bounds<8>>
                     %15 = stablehlo.get_dimension_size %14, dim = 0 : (tensor<?xf32, #stablehlo.bounds<8>>) -> tensor<i32>
                     %16 = stablehlo.convert %15 : (tensor<i32>) -> tensor<i64>

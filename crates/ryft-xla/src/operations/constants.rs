@@ -12,7 +12,7 @@ use ryft_mlir::{
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::values::ArrayLiteralLoweringExtension;
-use crate::lowering::{ArrayTypeLoweringExtension, MemoryLoweringExtension, lower_constant_output};
+use crate::lowering::{ArrayTypeLoweringExtension, MemoryLoweringExtension};
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{
     ArrayTypeExtension, DimensionExtension, Error, LowerableOperation, Lowerer, LoweringError,
@@ -298,11 +298,12 @@ impl LowerableOperation for ZeroOperation<ArrayType> {
         if !input_values.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
         }
-        let result =
-            lower_constant_output(output_types, 0, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+        check_count!("output", output_types, 1, ProgramError);
+        let output_type = &output_types[0];
+        let result = output_type.lower_i64_splat_in_declared_memory(0, &mut lowerer.block(), lowerer.location())?;
         lower_constructor_sharding_constraint(
-            result,
-            output_types.first(),
+            vec![result],
+            Some(output_type),
             lowerer.lowering_context(),
             &mut lowerer.block(),
             lowerer.location(),
@@ -322,11 +323,12 @@ impl LowerableOperation for OneOperation<ArrayType> {
         if !input_values.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
         }
-        let result =
-            lower_constant_output(output_types, 1, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+        check_count!("output", output_types, 1, ProgramError);
+        let output_type = &output_types[0];
+        let result = output_type.lower_i64_splat_in_declared_memory(1, &mut lowerer.block(), lowerer.location())?;
         lower_constructor_sharding_constraint(
-            result,
-            output_types.first(),
+            vec![result],
+            Some(output_type),
             lowerer.lowering_context(),
             &mut lowerer.block(),
             lowerer.location(),
@@ -505,7 +507,7 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
     }
     let output_type = &output_types[0];
     let result = if output_type.static_shape().is_some() {
-        lower_constant_output(output_types, integer_value, block, context, location)?
+        vec![output_type.lower_i64_splat_in_declared_memory(integer_value, block, location)?]
     } else {
         // Allocation uses the declared bounds, while logical sizes come from the exemplar, including zero extents.
         let mut dimensions = Vec::new();
@@ -653,8 +655,7 @@ fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let (output_type, physical_type) = dynamic_constructor_types(name, input_values.len(), output_types)?;
-    let result =
-        lower_constant_output(std::slice::from_ref(&physical_type), integer_value, block, context, location)?.remove(0);
+    let result = physical_type.lower_i64_splat_in_declared_memory(integer_value, block, location)?;
     refine_dynamic_constructor_result(result, input_values, &output_type, physical_type, block, context, location)
 }
 
@@ -677,7 +678,6 @@ mod tests {
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, test_vector_type, unproject_plain_program,
     };
-    use crate::lowering::types::lower_f64_constant_splat;
     use crate::operations::Operation;
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::sessions::tests::read_first_shard;
@@ -693,8 +693,7 @@ mod tests {
         let array_type = ArrayType::new_static(DataType::F32, [2, 3]);
         let module = context.module(location).unwrap();
         let mut block = module.body().unwrap();
-        let tensor_type = array_type.lower(&context, location).unwrap();
-        let input = lower_f64_constant_splat(1.0, &array_type, tensor_type, &mut block, &context, location).unwrap();
+        let input = array_type.lower_f64_splat(1.0, &mut block, location).unwrap();
 
         // A type without a layout leaves its value unconstrained.
         assert_eq!(array_type.lower_layout_constraint(input, &mut block, location).unwrap(), input);

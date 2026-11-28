@@ -9,17 +9,14 @@ use ryft_mlir::{
 };
 
 use crate::lowering::EffectTokens;
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_to_i32, lower_constant_output,
-    lower_static_index_constants, lower_unplaced_constant_output,
-};
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_KIND_ATTRIBUTE,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
 use crate::{
-    ArrayError, ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type,
-    ValueRefExtension,
+    ArrayError, ArrayTypeExtension, ArrayTypeLoweringExtension, Error, LowerableOperation, Lowerer, LoweringError,
+    PhysicalStoragePadding, ProgramLoweringOperation, Type, ValueRefExtension, dimension_extent_to_i32,
+    lower_index_constant,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -111,12 +108,11 @@ impl LowerableOperation for UpdateSliceOperation {
         let _ = input_types;
         check_count!("input", input_values, 2, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let index_values = lower_static_index_constants(
-            self.start_indices(),
-            &mut lowerer.block(),
-            lowerer.context(),
-            lowerer.location(),
-        )?;
+        let index_values = self
+            .start_indices()
+            .iter()
+            .map(|index| lower_index_constant(*index, &mut lowerer.block(), lowerer.location()))
+            .collect::<Result<Vec<_>, _>>()?;
         let result = lowerer.block().append_operation(stable_hlo::dynamic_update_slice(
             input_values[0],
             input_values[1],
@@ -243,24 +239,23 @@ impl LowerableOperation for DynamicSliceOperation<Type> {
             // Normalize once and reuse the same origin for validation and extraction.
             let zero_start = DimensionType::new("start", DimensionBounds::new(0, Some(1)).unwrap());
             let start_type = if self.bounds() == DynamicSliceBounds::Clamp {
-                let constants = lower_static_index_constants(&[0, 1, self.strides()[axis]], block, context, location)?;
+                let zero = lower_index_constant(0, block, location)?;
+                let one = lower_index_constant(1, block, location)?;
+                let stride = lower_index_constant(self.strides()[axis], block, location)?;
                 let difference = block
-                    .append_operation(stable_hlo::subtract(sizes[axis], constants[1], location)?)?
+                    .append_operation(stable_hlo::subtract(sizes[axis], one, location)?)?
                     .result(0)
                     .unwrap()
                     .as_ref();
                 let steps = block
-                    .append_operation(stable_hlo::maximum(difference, constants[0], location)?)?
+                    .append_operation(stable_hlo::maximum(difference, zero, location)?)?
                     .result(0)
                     .unwrap()
                     .as_ref();
-                let steps = block
-                    .append_operation(stable_hlo::multiply(steps, constants[2], location)?)?
-                    .result(0)
-                    .unwrap()
-                    .as_ref();
+                let steps =
+                    block.append_operation(stable_hlo::multiply(steps, stride, location)?)?.result(0).unwrap().as_ref();
                 let occupied = block
-                    .append_operation(stable_hlo::minimum(sizes[axis], constants[1], location)?)?
+                    .append_operation(stable_hlo::minimum(sizes[axis], one, location)?)?
                     .result(0)
                     .unwrap()
                     .as_ref();
@@ -273,14 +268,14 @@ impl LowerableOperation for DynamicSliceOperation<Type> {
                     .unwrap()
                     .as_ref();
                 let maximum_start = block
-                    .append_operation(stable_hlo::maximum(maximum_start, constants[0], location)?)?
+                    .append_operation(stable_hlo::maximum(maximum_start, zero, location)?)?
                     .result(0)
                     .unwrap()
                     .as_ref();
                 if matches!(start_types[axis], Type::Array(_)) {
                     // Unlike dimension starts, array starts can be negative, which clamping raises to zero.
                     starts[axis] = block
-                        .append_operation(stable_hlo::maximum(starts[axis], constants[0], location)?)?
+                        .append_operation(stable_hlo::maximum(starts[axis], zero, location)?)?
                         .result(0)
                         .unwrap()
                         .as_ref();
@@ -331,13 +326,7 @@ impl LowerableOperation for DynamicSliceOperation<Type> {
             context,
             location,
         )?;
-        let padding = lower_constant_output(
-            &[ArrayType::scalar(input_type.data_type())],
-            padding_value,
-            block,
-            context,
-            location,
-        )?[0];
+        let padding = ArrayType::scalar(input_type.data_type()).lower_i64_splat(padding_value, block, location)?;
         let high_padding = physical_spans.iter().map(|span| *span as i64).collect::<Vec<_>>();
         let padded = block
             .append_operation(stable_hlo::pad(
@@ -509,15 +498,8 @@ fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
             .enumerate()
             .map(|(axis, (start, start_type))| {
                 let scalar_type = ArrayType::scalar(start_type.data_type());
-                let zero =
-                    lower_unplaced_constant_output(std::slice::from_ref(&scalar_type), 0, block, context, location)?[0];
-                let extent = lower_unplaced_constant_output(
-                    &[scalar_type],
-                    static_shape[axis] as i64,
-                    block,
-                    context,
-                    location,
-                )?[0];
+                let zero = scalar_type.lower_i64_splat(0, block, location)?;
+                let extent = scalar_type.lower_i64_splat(static_shape[axis] as i64, block, location)?;
                 let negative = block
                     .append_operation(stable_hlo::compare(
                         *start,
@@ -558,7 +540,7 @@ fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
                 start = block.append_operation(stable_hlo::negate(start, location)?)?.result(0).unwrap().as_ref();
             }
             let extent = input.widen_dimension_to_i64(axis, block, location)?;
-            let zero = lower_unplaced_constant_output(&[scalar_type], 0, block, context, location)?[0];
+            let zero = scalar_type.lower_i64_splat(0, block, location)?;
             if wraps(start_type) {
                 // The start is a signed i64 here, like the extent: `select(start < 0, start + extent, start)`.
                 let negative = block
@@ -580,7 +562,7 @@ fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
                     .unwrap()
                     .as_ref();
             }
-            let size = lower_static_index_constants(&[*size], block, context, location)?[0];
+            let size = lower_index_constant(*size, block, location)?;
             let maximum =
                 block.append_operation(stable_hlo::subtract(extent, size, location)?)?.result(0).unwrap().as_ref();
             let maximum = block
@@ -625,7 +607,7 @@ fn lower_dynamic_slice_assertion<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
-    let predicate = lower_deliberately_false_assertion_predicate(start, block, context, location)?;
+    let predicate = lower_deliberately_false_assertion_predicate(start, block, location)?;
     let detail = format!("{axis}:{stride}");
     let backend_configuration = context.dictionary_attribute(&[
         context.named_attribute(
@@ -679,7 +661,7 @@ fn lower_array_start<'b, 'c: 'b, 't: 'c>(
         .result(0)
         .unwrap()
         .as_ref();
-    let maximum = lower_unplaced_constant_output(&[unsigned_scalar_type], i64::MAX, block, context, location)?[0];
+    let maximum = unsigned_scalar_type.lower_i64_splat(i64::MAX, block, location)?;
     let start = block.append_operation(stable_hlo::minimum(start, maximum, location)?)?.result(0).unwrap().as_ref();
     Ok(block
         .append_operation(stable_hlo::convert(start, signed_type, location)?)?

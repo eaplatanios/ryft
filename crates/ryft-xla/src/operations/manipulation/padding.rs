@@ -333,7 +333,7 @@ impl PadOperationAssertionLoweringExtension for PadOperation<Type> {
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<(), Error> {
-        let predicate = lower_deliberately_false_assertion_predicate(output, block, context, location)?;
+        let predicate = lower_deliberately_false_assertion_predicate(output, block, location)?;
         let detail = format!(
             "{axis}:{}:{}:{}",
             self.edge_padding_low()[axis],
@@ -375,10 +375,11 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, test_vector_type, unproject_plain_program};
-    use crate::lowering::types::lower_static_index_constants;
     use crate::operations::Operation;
     use crate::tests::{execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
-    use crate::{ArrayConstant, Constant, ProgramLoweringExtension, ProgramLoweringOptions, ToPjrt};
+    use crate::{
+        ArrayConstant, Constant, ProgramLoweringExtension, ProgramLoweringOptions, ToPjrt, lower_index_constant,
+    };
 
     use super::*;
 
@@ -832,8 +833,7 @@ mod tests {
         let input = block.argument(0).unwrap().as_ref();
         let padding_value = block.argument(1).unwrap().as_ref();
 
-        let output_extent =
-            lower_static_index_constants(&[6], &mut block.as_ref(), &context, location.as_ref()).unwrap()[0];
+        let output_extent = lower_index_constant(6, &mut block.as_ref(), location).unwrap();
         let results = PadOperation::<ArrayType>::new(vec![1], vec![2], vec![1])
             .unwrap()
             .lower_to_mlir(

@@ -10,17 +10,14 @@ use ryft_mlir::{
 };
 
 use crate::lowering::sharding::OpenDimensions;
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat, lower_unplaced_constant_output,
-};
 use crate::operations::assertions::{lower_dependency_barrier, lower_type_relationship_checks};
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::operations::control_flow::{lower_refined_region_input, lower_refined_region_outputs};
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
 use crate::{
-    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type,
-    ValueRefExtension,
+    ArrayTypeExtension, ArrayTypeLoweringExtension, Error, LowerableOperation, Lowerer, LoweringError,
+    PhysicalStoragePadding, ProgramLoweringOperation, Type, ValueRefExtension,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -121,20 +118,8 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
                     DataType::U2 => (0, 3),
                     _ => (0, 15),
                 };
-                let minimum = lower_unplaced_constant_output(
-                    std::slice::from_ref(&carrier_type),
-                    minimum,
-                    &mut lowerer.block(),
-                    lowerer.context(),
-                    lowerer.location(),
-                )?[0];
-                let maximum = lower_unplaced_constant_output(
-                    std::slice::from_ref(&carrier_type),
-                    maximum,
-                    &mut lowerer.block(),
-                    lowerer.context(),
-                    lowerer.location(),
-                )?[0];
+                let minimum = carrier_type.lower_i64_splat(minimum, &mut lowerer.block(), lowerer.location())?;
+                let maximum = carrier_type.lower_i64_splat(maximum, &mut lowerer.block(), lowerer.location())?;
                 let clamped = lowerer.block().append_operation(stable_hlo::clamp(
                     minimum,
                     converted,
@@ -143,17 +128,15 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
                 )?)?;
                 converted = clamped.result(0).unwrap().as_ref();
             }
-            let mask = lower_unplaced_constant_output(
-                &[carrier_type],
+            let mask = carrier_type.lower_i64_splat(
                 match output_data_type {
                     DataType::I1 | DataType::U1 => 1,
                     DataType::I2 | DataType::U2 => 3,
                     _ => 15,
                 },
                 &mut lowerer.block(),
-                lowerer.context(),
                 lowerer.location(),
-            )?[0];
+            )?;
             let masked = lowerer.block().append_operation(stable_hlo::and(converted, mask, lowerer.location())?)?;
             input = masked.result(0).unwrap().as_ref();
         }
@@ -186,22 +169,8 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
                 DataType::F6E2M3FN => 7.5,
                 _ => 28.0,
             };
-            let minimum = lower_f64_constant_splat(
-                -maximum,
-                &float_type,
-                float_tensor_type,
-                &mut lowerer.block(),
-                lowerer.context(),
-                lowerer.location(),
-            )?;
-            let maximum = lower_f64_constant_splat(
-                maximum,
-                &float_type,
-                float_tensor_type,
-                &mut lowerer.block(),
-                lowerer.context(),
-                lowerer.location(),
-            )?;
+            let minimum = float_type.lower_f64_splat(-maximum, &mut lowerer.block(), lowerer.location())?;
+            let maximum = float_type.lower_f64_splat(maximum, &mut lowerer.block(), lowerer.location())?;
             let is_nan = lowerer.block().append_operation(stable_hlo::compare(
                 input,
                 input,
@@ -585,7 +554,7 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
     )?)?;
     let mut increased = increased.result(0).unwrap().as_ref();
     if input_type.data_type().is_signed() || input_type.data_type().is_floating_point() {
-        let zero = lower_unplaced_constant_output(std::slice::from_ref(input_type), 0, block, context, location)?[0];
+        let zero = input_type.lower_i64_splat(0, block, location)?;
         let negative = block.append_operation(stable_hlo::compare(
             input,
             zero,
@@ -612,7 +581,7 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
     let bits =
         block.append_operation(stable_hlo::bitcast_convert(float, bits_type.lower(context, location)?, location)?)?;
     let bits = bits.result(0).unwrap().as_ref();
-    let one = lower_unplaced_constant_output(&[bits_type], 1, block, context, location)?[0];
+    let one = bits_type.lower_i64_splat(1, block, location)?;
     let previous = block.append_operation(stable_hlo::subtract(bits, one, location)?)?;
     let truncated =
         block.append_operation(stable_hlo::select(increased, previous.result(0).unwrap().as_ref(), bits, location)?)?;
@@ -628,33 +597,18 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
         let wide_tensor_type = wide_type.lower(context, location)?;
         let source_bits = block.append_operation(stable_hlo::bitcast_convert(input, wide_tensor_type, location)?)?;
         let source_bits = source_bits.result(0).unwrap().as_ref();
-        let magnitude_mask =
-            lower_unplaced_constant_output(std::slice::from_ref(&wide_type), i64::MAX, block, context, location)?[0];
-        let exponent_shift =
-            lower_unplaced_constant_output(std::slice::from_ref(&wide_type), 52, block, context, location)?[0];
+        let magnitude_mask = wide_type.lower_i64_splat(i64::MAX, block, location)?;
+        let exponent_shift = wide_type.lower_i64_splat(52, block, location)?;
         // The smallest normal f32 has f64 biased exponent 1023 - 126 = 897. Its subnormal unit is 2^-149,
         // so an f64 significand at biased exponent `e` needs a right shift of 1023 + 52 - 149 - e = 926 - e.
-        let smallest_normal_exponent =
-            lower_unplaced_constant_output(std::slice::from_ref(&wide_type), 897, block, context, location)?[0];
-        let shift_offset =
-            lower_unplaced_constant_output(std::slice::from_ref(&wide_type), 926, block, context, location)?[0];
-        let mantissa_mask = lower_unplaced_constant_output(
-            std::slice::from_ref(&wide_type),
-            (1i64 << 52) - 1,
-            block,
-            context,
-            location,
-        )?[0];
-        let implicit_bit =
-            lower_unplaced_constant_output(std::slice::from_ref(&wide_type), 1i64 << 52, block, context, location)?[0];
-        let wide_one =
-            lower_unplaced_constant_output(std::slice::from_ref(&wide_type), 1, block, context, location)?[0];
-        let wide_zero =
-            lower_unplaced_constant_output(std::slice::from_ref(&wide_type), 0, block, context, location)?[0];
-        let sign_shift =
-            lower_unplaced_constant_output(std::slice::from_ref(&wide_type), 32, block, context, location)?[0];
-        let sign_mask =
-            lower_unplaced_constant_output(std::slice::from_ref(&wide_type), 1i64 << 31, block, context, location)?[0];
+        let smallest_normal_exponent = wide_type.lower_i64_splat(897, block, location)?;
+        let shift_offset = wide_type.lower_i64_splat(926, block, location)?;
+        let mantissa_mask = wide_type.lower_i64_splat((1i64 << 52) - 1, block, location)?;
+        let implicit_bit = wide_type.lower_i64_splat(1i64 << 52, block, location)?;
+        let wide_one = wide_type.lower_i64_splat(1, block, location)?;
+        let wide_zero = wide_type.lower_i64_splat(0, block, location)?;
+        let sign_shift = wide_type.lower_i64_splat(32, block, location)?;
+        let sign_mask = wide_type.lower_i64_splat(1i64 << 31, block, location)?;
         let magnitude = block.append_operation(stable_hlo::and(source_bits, magnitude_mask, location)?)?;
         let magnitude = magnitude.result(0).unwrap().as_ref();
         let exponent = block.append_operation(stable_hlo::shift_right_logical(magnitude, exponent_shift, location)?)?;
@@ -790,13 +744,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         )?)?;
         let offsets =
             block.append_operation(stable_hlo::iota(expanded_tensor_type, output_type.rank() - 1, location)?)?;
-        let width = lower_unplaced_constant_output(
-            std::slice::from_ref(&expanded_type),
-            group_width,
-            block,
-            context,
-            location,
-        )?[0];
+        let width = expanded_type.lower_i64_splat(group_width, block, location)?;
         let offsets =
             block.append_operation(stable_hlo::multiply(offsets.result(0).unwrap().as_ref(), width, location)?)?;
         let shifted = block.append_operation(stable_hlo::shift_right_logical(
@@ -804,8 +752,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             offsets.result(0).unwrap().as_ref(),
             location,
         )?)?;
-        let mask =
-            lower_unplaced_constant_output(&[expanded_type], (1 << group_width) - 1, block, context, location)?[0];
+        let mask = expanded_type.lower_i64_splat((1 << group_width) - 1, block, location)?;
         let groups = block.append_operation(stable_hlo::and(shifted.result(0).unwrap().as_ref(), mask, location)?)?;
         let result = block.append_operation(stable_hlo::convert(
             groups.result(0).unwrap().as_ref(),
@@ -818,16 +765,10 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         let groups_type = physical_input_type.clone().with_data_type(DataType::U8);
         let groups_tensor_type = groups_type.lower(context, location)?;
         let groups = block.append_operation(stable_hlo::convert(physical_input, groups_tensor_type, location)?)?;
-        let mask = lower_unplaced_constant_output(
-            std::slice::from_ref(&groups_type),
-            (1 << group_width) - 1,
-            block,
-            context,
-            location,
-        )?[0];
+        let mask = groups_type.lower_i64_splat((1 << group_width) - 1, block, location)?;
         let groups = block.append_operation(stable_hlo::and(groups.result(0).unwrap().as_ref(), mask, location)?)?;
         let offsets = block.append_operation(stable_hlo::iota(groups_tensor_type, input_type.rank() - 1, location)?)?;
-        let width = lower_unplaced_constant_output(&[groups_type], group_width, block, context, location)?[0];
+        let width = groups_type.lower_i64_splat(group_width, block, location)?;
         let offsets =
             block.append_operation(stable_hlo::multiply(offsets.result(0).unwrap().as_ref(), width, location)?)?;
         let shifted = block.append_operation(stable_hlo::shift_left(
@@ -883,7 +824,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             offsets.result(0).unwrap().as_ref(),
             location,
         )?)?;
-        let one = lower_unplaced_constant_output(std::slice::from_ref(&expanded_type), 1, block, context, location)?[0];
+        let one = expanded_type.lower_i64_splat(1, block, location)?;
         let bits = block.append_operation(stable_hlo::and(shifted.result(0).unwrap().as_ref(), one, location)?)?;
         let bits = block.append_operation(stable_hlo::convert(
             bits.result(0).unwrap().as_ref(),
@@ -969,35 +910,15 @@ fn lower_fp6_to_bits<'b, 'c: 'b, 't: 'c>(
     let float = float.result(0).unwrap().as_ref();
     let bits = block.append_operation(stable_hlo::bitcast_convert(float, integer_tensor_type, location)?)?;
     let bits = bits.result(0).unwrap().as_ref();
-    let sign_shift =
-        lower_unplaced_constant_output(std::slice::from_ref(&integer_type), 26, block, context, location)?[0];
-    let sign_mask =
-        lower_unplaced_constant_output(std::slice::from_ref(&integer_type), 32, block, context, location)?[0];
-    let exponent_shift =
-        lower_unplaced_constant_output(std::slice::from_ref(&integer_type), 23, block, context, location)?[0];
-    let exponent_mask =
-        lower_unplaced_constant_output(std::slice::from_ref(&integer_type), 255, block, context, location)?[0];
-    let mantissa_shift = lower_unplaced_constant_output(
-        std::slice::from_ref(&integer_type),
-        23 - mantissa_bits,
-        block,
-        context,
-        location,
-    )?[0];
-    let mantissa_mask = lower_unplaced_constant_output(
-        std::slice::from_ref(&integer_type),
-        (1 << mantissa_bits) - 1,
-        block,
-        context,
-        location,
-    )?[0];
-    let bias_offset =
-        lower_unplaced_constant_output(std::slice::from_ref(&integer_type), 127 - bias, block, context, location)?[0];
-    let smallest_normal_exponent =
-        lower_unplaced_constant_output(std::slice::from_ref(&integer_type), 128 - bias, block, context, location)?[0];
-    let encoding_shift =
-        lower_unplaced_constant_output(std::slice::from_ref(&integer_type), mantissa_bits, block, context, location)?
-            [0];
+    let sign_shift = integer_type.lower_i64_splat(26, block, location)?;
+    let sign_mask = integer_type.lower_i64_splat(32, block, location)?;
+    let exponent_shift = integer_type.lower_i64_splat(23, block, location)?;
+    let exponent_mask = integer_type.lower_i64_splat(255, block, location)?;
+    let mantissa_shift = integer_type.lower_i64_splat(23 - mantissa_bits, block, location)?;
+    let mantissa_mask = integer_type.lower_i64_splat((1 << mantissa_bits) - 1, block, location)?;
+    let bias_offset = integer_type.lower_i64_splat(127 - bias, block, location)?;
+    let smallest_normal_exponent = integer_type.lower_i64_splat(128 - bias, block, location)?;
+    let encoding_shift = integer_type.lower_i64_splat(mantissa_bits, block, location)?;
     let sign = block.append_operation(stable_hlo::shift_right_logical(bits, sign_shift, location)?)?;
     let sign = sign.result(0).unwrap().as_ref();
     let sign = block.append_operation(stable_hlo::and(sign, sign_mask, location)?)?;
@@ -1016,14 +937,7 @@ fn lower_fp6_to_bits<'b, 'c: 'b, 't: 'c>(
     let biased = biased.result(0).unwrap().as_ref();
     let normal = block.append_operation(stable_hlo::or(biased, mantissa, location)?)?;
     let normal = normal.result(0).unwrap().as_ref();
-    let scale = lower_f64_constant_splat(
-        2.0f64.powi((bias + mantissa_bits - 1) as i32),
-        &float_type,
-        float_tensor_type,
-        block,
-        context,
-        location,
-    )?;
+    let scale = float_type.lower_f64_splat(2.0f64.powi((bias + mantissa_bits - 1) as i32), block, location)?;
     let magnitude = block.append_operation(stable_hlo::abs(float, location)?)?;
     let magnitude = magnitude.result(0).unwrap().as_ref();
     let scaled = block.append_operation(stable_hlo::multiply(magnitude, scale, location)?)?;
@@ -1066,39 +980,15 @@ fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
     let float_tensor_type = float_type.lower(context, location)?;
     let bits = block.append_operation(stable_hlo::convert(input, integer_tensor_type, location)?)?;
     let bits = bits.result(0).unwrap().as_ref();
-    let sign_mask =
-        lower_unplaced_constant_output(std::slice::from_ref(&integer_type), 32, block, context, location)?[0];
-    let sign_shift =
-        lower_unplaced_constant_output(std::slice::from_ref(&integer_type), 26, block, context, location)?[0];
-    let encoding_shift =
-        lower_unplaced_constant_output(std::slice::from_ref(&integer_type), mantissa_bits, block, context, location)?
-            [0];
-    let exponent_mask = lower_unplaced_constant_output(
-        std::slice::from_ref(&integer_type),
-        (1 << (5 - mantissa_bits)) - 1,
-        block,
-        context,
-        location,
-    )?[0];
-    let mantissa_mask = lower_unplaced_constant_output(
-        std::slice::from_ref(&integer_type),
-        (1 << mantissa_bits) - 1,
-        block,
-        context,
-        location,
-    )?[0];
-    let bias_offset =
-        lower_unplaced_constant_output(std::slice::from_ref(&integer_type), 127 - bias, block, context, location)?[0];
-    let exponent_shift =
-        lower_unplaced_constant_output(std::slice::from_ref(&integer_type), 23, block, context, location)?[0];
-    let mantissa_shift = lower_unplaced_constant_output(
-        std::slice::from_ref(&integer_type),
-        23 - mantissa_bits,
-        block,
-        context,
-        location,
-    )?[0];
-    let zero = lower_unplaced_constant_output(std::slice::from_ref(&integer_type), 0, block, context, location)?[0];
+    let sign_mask = integer_type.lower_i64_splat(32, block, location)?;
+    let sign_shift = integer_type.lower_i64_splat(26, block, location)?;
+    let encoding_shift = integer_type.lower_i64_splat(mantissa_bits, block, location)?;
+    let exponent_mask = integer_type.lower_i64_splat((1 << (5 - mantissa_bits)) - 1, block, location)?;
+    let mantissa_mask = integer_type.lower_i64_splat((1 << mantissa_bits) - 1, block, location)?;
+    let bias_offset = integer_type.lower_i64_splat(127 - bias, block, location)?;
+    let exponent_shift = integer_type.lower_i64_splat(23, block, location)?;
+    let mantissa_shift = integer_type.lower_i64_splat(23 - mantissa_bits, block, location)?;
+    let zero = integer_type.lower_i64_splat(0, block, location)?;
     let sign = block.append_operation(stable_hlo::and(bits, sign_mask, location)?)?;
     let sign = sign.result(0).unwrap().as_ref();
     let sign = block.append_operation(stable_hlo::shift_left(sign, sign_shift, location)?)?;
@@ -1117,14 +1007,7 @@ fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
     let normal_mantissa = normal_mantissa.result(0).unwrap().as_ref();
     let normal = block.append_operation(stable_hlo::or(biased, normal_mantissa, location)?)?;
     let normal = normal.result(0).unwrap().as_ref();
-    let scale = lower_f64_constant_splat(
-        2.0f64.powi((1 - bias - mantissa_bits) as i32),
-        &float_type,
-        float_tensor_type,
-        block,
-        context,
-        location,
-    )?;
+    let scale = float_type.lower_f64_splat(2.0f64.powi((1 - bias - mantissa_bits) as i32), block, location)?;
     let subnormal = block.append_operation(stable_hlo::convert(mantissa, float_tensor_type, location)?)?;
     let subnormal = subnormal.result(0).unwrap().as_ref();
     let subnormal = block.append_operation(stable_hlo::multiply(subnormal, scale, location)?)?;

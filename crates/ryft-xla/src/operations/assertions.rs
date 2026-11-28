@@ -19,14 +19,14 @@ use ryft_pjrt::extensions::ffi::{
 };
 use ryft_pjrt::{Client, Error as PjrtError};
 
-use crate::lowering::types::{ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_static_index_constants};
+use crate::lowering::types::{ArrayTypeLoweringExtension, PhysicalStoragePadding};
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::manipulation::conversions::TypeCastLoweringExtension;
 use crate::sessions::effects::EffectCallbackGuard;
 use crate::{
     Error, ExecutionError, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, RuntimeExtension,
-    RuntimeProvider, RuntimeRequirement, Type, ValueRefExtension,
+    RuntimeProvider, RuntimeRequirement, Type, ValueRefExtension, lower_index_constant,
 };
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
@@ -176,10 +176,9 @@ pub(crate) fn lower_assertion_custom_call<'b, 'c: 'b, 't: 'c>(
 pub(crate) fn lower_deliberately_false_assertion_predicate<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let zero = lower_static_index_constants(&[0], block, context, location)?[0];
+    let zero = lower_index_constant(0, block, location)?;
     ComparisonDirection::LessThan.lower_comparison(value, zero, block, location)
 }
 
@@ -222,7 +221,7 @@ pub(crate) fn lower_output_extent_validation<'b, 'c: 'b, 't: 'c>(
             continue;
         }
         checked.push((value, extent));
-        let expected = lower_static_index_constants(&[extent], block, context, location)?.remove(0);
+        let expected = lower_index_constant(extent, block, location)?;
         let predicate = ComparisonDirection::Equal.lower_comparison(value, expected, block, location)?;
         lower_assert_to_custom_call(
             name,
@@ -418,7 +417,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
                             }
                             static_checks.push((*expected, actual, (value, Some(axis))));
                             let runtime = value.widen_dimension_to_i64(axis, block, location)?;
-                            let expected = lower_static_index_constants(&[*expected], block, context, location)?[0];
+                            let expected = lower_index_constant(*expected, block, location)?;
                             let message = format!("input dimension `{actual}` must have the declared extent {site}");
                             lower_check(expected, runtime, message, effect_tokens, block)?;
                         }
@@ -439,7 +438,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
                             continue;
                         }
                         static_checks.push((expected, actual.dimension(), (value, None)));
-                        let expected = lower_static_index_constants(&[expected], block, context, location)?[0];
+                        let expected = lower_index_constant(expected, block, location)?;
                         let message =
                             format!("input dimension `{}` must have the declared extent {site}", actual.dimension());
                         lower_check(expected, value, message, effect_tokens, block)?;
@@ -486,7 +485,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
         }
         let lower_extent = |extent: &Result<usize, (ValueRef<'b, 'c, 't>, Option<usize>)>,
                             block: &mut BlockRef<'b, 'c, 't>| match extent {
-            Ok(extent) => Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0)),
+            Ok(extent) => lower_index_constant(*extent, block, location),
             Err((value, None)) => Ok::<_, Error>(*value),
             Err((value, Some(axis))) => value.widen_dimension_to_i64(*axis, block, location),
         };

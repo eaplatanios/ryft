@@ -77,8 +77,7 @@ impl LowerableOperation for ParallelBroadcastOperation {
             return program.lower_inline(
                 &[],
                 input_values,
-                None,
-                &lowering_context,
+                &lowering_context.clone().without_shared_functions(),
                 lowerer.effect_tokens_mut(),
                 block,
                 location,

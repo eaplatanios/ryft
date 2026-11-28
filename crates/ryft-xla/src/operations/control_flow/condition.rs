@@ -67,8 +67,7 @@ impl LowerableOperation for ConditionOperation<Type> {
         lowerer.validate_pending_reductions_across_regions(self.name(), input_types, output_types)?;
         self.validate_region_count(lowerer.regions().len())?;
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-        let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
-            lowerer.split_effect_tokens();
+        let (effect_tokens, regions, captured_values, lowering_context) = lowerer.split_effect_tokens();
         let (true_branch, false_branch) = (&regions[0], &regions[1]);
         let branch_input_types = true_branch.input_types();
         let expected = branch_input_types.len() + 1;
@@ -118,7 +117,6 @@ impl LowerableOperation for ConditionOperation<Type> {
                 context,
                 location,
                 captured_values,
-                nested_functions,
                 lowering_context,
                 entry_effect_tokens,
                 threaded_effects,

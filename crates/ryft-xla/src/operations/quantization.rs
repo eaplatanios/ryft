@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
@@ -13,14 +14,17 @@ use ryft_mlir::{
 };
 
 use crate::lowering::NamedCompositionKey;
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, DataTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat,
-};
+use crate::lowering::contexts::PrivateFunctionBody;
+use crate::lowering::types::{ArrayTypeLoweringExtension, DataTypeLoweringExtension, PhysicalStoragePadding};
 use crate::operations::call::lower_shared_function_call;
 use crate::operations::composites::named_composition_input_types;
 use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Session, Tracer, Type};
 
 // TODO(eaplatanios): Review this module.
+
+/// Name of the StableHLO composite that a scaled dot lowers to, which also names the private function that holds its
+/// decomposition.
+const SCALED_DOT_COMPOSITION_NAME: &str = "xla.scaled_dot";
 
 /// Traces the canonical scaled dot decomposition for one validated operation boundary.
 pub(crate) fn trace_scaled_dot_composition(
@@ -75,7 +79,7 @@ pub(crate) fn scaled_dot_composition_key(
 ) -> Result<NamedCompositionKey, Error> {
     let dimensions = operation.dimensions();
     Ok(NamedCompositionKey::new(
-        CompositeKey::new("xla.scaled_dot", 0)
+        CompositeKey::new(SCALED_DOT_COMPOSITION_NAME, 0)
             .with_attribute(
                 "dimension_numbers",
                 vec![
@@ -135,8 +139,11 @@ impl LowerableOperation for ScaledDotOperation {
             scaled_dot_composition_types(self, input_types, output_types, lowering_context.target_platform())?.unwrap();
         // The module emits the decomposition as a private function because this call requests it here.
         let key = scaled_dot_composition_key(self, &composition_input_types, &composition_output_types)?;
-        let symbol = lowering_context
-            .require_named_composition(key, || trace_scaled_dot_composition(self, &composition_input_types))?;
+        let function = lowering_context.require_function(key, SCALED_DOT_COMPOSITION_NAME, || {
+            let program = trace_scaled_dot_composition(self, &composition_input_types)?;
+            Ok(PrivateFunctionBody::Program(Rc::new(program)))
+        })?;
+        let symbol = function.symbol();
         if lowering_context.target_platform() == Some("cuda") && !uses_physical_boundary {
             let output_types = output_types.iter().cloned().map(Type::from).collect::<Vec<_>>();
             return lower_shared_function_call(symbol.as_ref(), &output_types, input_values, block, context, location);
@@ -172,8 +179,7 @@ impl LowerableOperation for ScaledDotOperation {
             let dummy_type =
                 scaled_dot_dummy_scale_type(&composition_input_types[element_index], contracting_dimensions);
             let physical_type = dummy_type.physical_bound_type()?;
-            let physical_tensor_type = physical_type.lower(context, location)?;
-            let dummy = lower_f64_constant_splat(1.0, &physical_type, physical_tensor_type, block, context, location)?;
+            let dummy = physical_type.lower_f64_splat(1.0, block, location)?;
             if uses_physical_boundary {
                 composite_values.push(dummy);
             } else {
@@ -208,7 +214,7 @@ impl LowerableOperation for ScaledDotOperation {
             .map(|r#type| r#type.lower(context, location).map(|r#type| r#type.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         let composite = block.append_operation(stable_hlo::composite(
-            "xla.scaled_dot",
+            SCALED_DOT_COMPOSITION_NAME,
             0,
             Some(&attributes),
             composite_values.as_slice(),

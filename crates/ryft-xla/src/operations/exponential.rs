@@ -8,14 +8,13 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, lower_explicit_shape, lower_f64_constant_splat, lower_static_index_constants,
-    lower_unplaced_constant_output,
-};
 use crate::operations::complex::lower_select_principal_phase_to_mlir;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_inputs};
-use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, ValueRefExtension};
+use crate::{
+    ArrayTypeLoweringExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, ValueRefExtension,
+    lower_i64_vector, lower_index_constant,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -97,7 +96,6 @@ impl LowerableOperation for Ln1pOperation<ArrayType> {
                 input_values[0],
                 &output_types[0],
                 &mut lowerer.block(),
-                lowerer.context(),
                 lowerer.location(),
             )?]);
         }
@@ -335,8 +333,7 @@ pub(crate) fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
             output_type
                 .clone()
                 .with_data_type(if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 });
-        let part_tensor_type = part_type.lower(context, location)?;
-        let zero = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
+        let zero = part_type.lower_f64_splat(0.0, block, location)?;
         let larger_real = block.append_operation(stable_hlo::real(larger, location)?)?.result(0).unwrap().as_ref();
         let larger_imaginary = block.append_operation(stable_hlo::imag(larger, location)?)?.result(0).unwrap().as_ref();
         let cosine = block
@@ -374,7 +371,7 @@ pub(crate) fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
             .result(0)
             .unwrap()
             .as_ref();
-        let correction = lower_complex_ln_1p_to_mlir(ratio, output_type, block, context, location)?;
+        let correction = lower_complex_ln_1p_to_mlir(ratio, output_type, block, location)?;
         let correction_real =
             block.append_operation(stable_hlo::real(correction, location)?)?.result(0).unwrap().as_ref();
         let correction_imaginary =
@@ -393,7 +390,7 @@ pub(crate) fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
             .result(0)
             .unwrap()
             .as_ref();
-        let one = lower_unplaced_constant_output(std::slice::from_ref(output_type), 1, block, context, location)?[0];
+        let one = output_type.lower_i64_splat(1, block, location)?;
         let unit = block.append_operation(stable_hlo::add(ratio, one, location)?)?.result(0).unwrap().as_ref();
         let unit = block.append_operation(stable_hlo::multiply(rotation, unit, location)?)?.result(0).unwrap().as_ref();
         let unit_real = block.append_operation(stable_hlo::real(unit, location)?)?.result(0).unwrap().as_ref();
@@ -403,15 +400,7 @@ pub(crate) fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
             .result(0)
             .unwrap()
             .as_ref();
-        let imaginary = lower_select_principal_phase_to_mlir(
-            imaginary,
-            reduced,
-            &part_type,
-            part_tensor_type,
-            block,
-            context,
-            location,
-        )?;
+        let imaginary = lower_select_principal_phase_to_mlir(imaginary, reduced, &part_type, block, location)?;
         return Ok(block
             .append_operation(stable_hlo::complex(real, imaginary, location)?)?
             .result(0)
@@ -466,32 +455,23 @@ fn lower_exponential_constant_like<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let output_tensor_type = output_type.lower(context, location)?;
     if output_type.static_shape().is_some() {
-        return lower_f64_constant_splat(factor, output_type, output_tensor_type, block, context, location);
+        return output_type.lower_f64_splat(factor, block, location);
     }
+    let output_tensor_type = output_type.lower(context, location)?;
     let scalar_type = ArrayType::scalar(output_type.data_type());
-    let scalar = lower_f64_constant_splat(
-        factor,
-        &scalar_type,
-        scalar_type.lower(context, location)?,
-        block,
-        context,
-        location,
-    )?;
+    let scalar = scalar_type.lower_f64_splat(factor, block, location)?;
     let dimensions = output_type
         .shape()
         .dimensions()
         .iter()
         .enumerate()
         .map(|(axis, dimension)| match dimension {
-            Dimension::Static(extent) => {
-                Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0))
-            }
+            Dimension::Static(extent) => lower_index_constant(*extent, block, location),
             Dimension::Dynamic(_) => input.widen_dimension_to_i64(axis, block, location),
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    let shape = lower_explicit_shape(&dimensions, block, context, location)?;
+    let shape = lower_i64_vector(&dimensions, block, location)?;
     let broadcast = block
         .append_operation(stable_hlo::dynamic_broadcast(scalar, shape, &[], None, None, location)?)?
         .result(0)
@@ -588,7 +568,6 @@ fn lower_complex_ln_1p_to_mlir<'b, 'c: 'b, 't: 'c>(
     input: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let part_type = output_type.clone().with_data_type(if output_type.data_type() == DataType::C64 {
@@ -596,11 +575,10 @@ fn lower_complex_ln_1p_to_mlir<'b, 'c: 'b, 't: 'c>(
     } else {
         DataType::F64
     });
-    let part_tensor_type = part_type.lower(context, location)?;
-    let one = lower_f64_constant_splat(1.0, &part_type, part_tensor_type, block, context, location)?;
-    let two = lower_f64_constant_splat(2.0, &part_type, part_tensor_type, block, context, location)?;
-    let half = lower_f64_constant_splat(0.5, &part_type, part_tensor_type, block, context, location)?;
-    let nan = lower_f64_constant_splat(f64::NAN, &part_type, part_tensor_type, block, context, location)?;
+    let one = part_type.lower_f64_splat(1.0, block, location)?;
+    let two = part_type.lower_f64_splat(2.0, block, location)?;
+    let half = part_type.lower_f64_splat(0.5, block, location)?;
+    let nan = part_type.lower_f64_splat(f64::NAN, block, location)?;
     let real = block.append_operation(stable_hlo::real(input, location)?)?.result(0).unwrap().as_ref();
     let imaginary = block.append_operation(stable_hlo::imag(input, location)?)?.result(0).unwrap().as_ref();
     let shifted_real = block.append_operation(stable_hlo::add(one, real, location)?)?.result(0).unwrap().as_ref();

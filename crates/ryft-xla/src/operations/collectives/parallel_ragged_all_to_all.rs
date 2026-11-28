@@ -11,15 +11,13 @@ use ryft_mlir::{
 };
 
 use crate::lowering::contexts::ProgramLoweringContext;
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_constant_output, lower_u64_scalar_constant,
-};
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::operations::collectives::axis_index::AxisIndexOperationLoweringExtension;
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
 use crate::{
-    ArrayTypeExtension, Error, LowerableOperation, Lowerer, MemberLowerableOperation, ProgramLoweringOperation, Type,
+    ArrayTypeExtension, ArrayTypeLoweringExtension, DataTypeLoweringExtension, Error, LowerableOperation, Lowerer,
+    MemberLowerableOperation, ProgramLoweringOperation, Type, lower_u64_scalar_constant,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -348,7 +346,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
                 let row_extent = u64::try_from(row_extent).map_err(|_| overflow())?;
                 let items = block.append_operation(stable_hlo::iota(item_metadata_tensor_type, 0, location)?)?;
                 let items = items.result(0).unwrap().as_ref();
-                let row_extent = lower_u64_scalar_constant(row_extent, block, context, location)?;
+                let row_extent = lower_u64_scalar_constant(row_extent, block, location)?;
                 let row_extent = block.append_operation(stable_hlo::broadcast(
                     row_extent,
                     item_metadata_tensor_type,
@@ -428,11 +426,10 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
         expanded_dimensions[0] = Dimension::Static(expanded_extent);
         let expanded_output_type = input_types[1].clone().with_shape(Shape::new(expanded_dimensions));
         let expanded_output = if expanded_output_type.static_shape().is_some() {
-            lower_constant_output(std::slice::from_ref(&expanded_output_type), 0, block, context, location)?.remove(0)
+            expanded_output_type.lower_i64_splat_in_declared_memory(0, block, location)?
         } else {
             let physical_type = expanded_output_type.physical_bound_type()?;
-            let zero =
-                lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
+            let zero = physical_type.lower_i64_splat_in_declared_memory(0, block, location)?;
             let dimension_sources =
                 (0..expanded_output_type.rank()).map(|axis| (input_values[1], axis)).collect::<Vec<_>>();
             expanded_output_type.restore_dynamic_dimensions(
@@ -466,7 +463,6 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
                 )
             })?,
             block,
-            context,
             location,
         )?;
         let transfer_count = block.append_operation(stable_hlo::broadcast(

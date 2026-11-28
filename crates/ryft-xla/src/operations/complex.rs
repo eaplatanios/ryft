@@ -1,13 +1,9 @@
 use ryft_core::{ArrayType, ComplexOperation, ConjugateOperation, DataType, ImaginaryOperation, RealOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::Accuracy;
-use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, TensorTypeRef,
-    Value as MlirValue, ValueRef,
-};
+use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat};
-use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
+use crate::{ArrayTypeLoweringExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
@@ -91,7 +87,6 @@ pub(crate) fn lower_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let part_type = output_type.clone().with_data_type(if output_type.data_type() == DataType::C64 {
@@ -99,7 +94,6 @@ pub(crate) fn lower_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
     } else {
         DataType::F64
     });
-    let part_tensor_type = part_type.lower(context, location)?;
     let real = block.append_operation(stable_hlo::real(value, location)?)?.result(0).unwrap().as_ref();
     let imaginary = block.append_operation(stable_hlo::imag(value, location)?)?.result(0).unwrap().as_ref();
     let sine = block
@@ -113,15 +107,7 @@ pub(crate) fn lower_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
         .unwrap()
         .as_ref();
     let reduced = block.append_operation(stable_hlo::atan2(sine, cosine, location)?)?.result(0).unwrap().as_ref();
-    let imaginary = lower_select_principal_phase_to_mlir(
-        imaginary,
-        reduced,
-        &part_type,
-        part_tensor_type,
-        block,
-        context,
-        location,
-    )?;
+    let imaginary = lower_select_principal_phase_to_mlir(imaginary, reduced, &part_type, block, location)?;
     Ok(block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0).unwrap().as_ref())
 }
 
@@ -131,12 +117,10 @@ pub(crate) fn lower_select_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
     phase: ValueRef<'b, 'c, 't>,
     reduced: ValueRef<'b, 'c, 't>,
     part_type: &ArrayType,
-    part_tensor_type: TensorTypeRef<'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let pi = lower_f64_constant_splat(std::f64::consts::PI, part_type, part_tensor_type, block, context, location)?;
+    let pi = part_type.lower_f64_splat(std::f64::consts::PI, block, location)?;
     let negative_pi = block.append_operation(stable_hlo::negate(pi, location)?)?.result(0).unwrap().as_ref();
     let above_lower = block
         .append_operation(stable_hlo::compare(

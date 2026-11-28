@@ -5,8 +5,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat};
-use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
+use crate::{ArrayTypeLoweringExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
@@ -106,8 +105,8 @@ impl SortOperationLoweringExtension for SortOperation {
             if !data_type.is_complex() {
                 if data_type.is_floating_point() && self.ordering() == SortOrdering::Canonical {
                     components.push((
-                        lower_canonical_sort_key(left_key, data_type, &mut comparator_block, context, location)?,
-                        lower_canonical_sort_key(right_key, data_type, &mut comparator_block, context, location)?,
+                        lower_canonical_sort_key(left_key, data_type, &mut comparator_block, location)?,
+                        lower_canonical_sort_key(right_key, data_type, &mut comparator_block, location)?,
                         comparison_type,
                     ));
                 } else {
@@ -126,8 +125,8 @@ impl SortOperationLoweringExtension for SortOperation {
                 (left_imaginary.result(0).unwrap().as_ref(), right_imaginary.result(0).unwrap().as_ref()),
             ] {
                 components.push((
-                    lower_canonical_sort_key(left_part, part_data_type, &mut comparator_block, context, location)?,
-                    lower_canonical_sort_key(right_part, part_data_type, &mut comparator_block, context, location)?,
+                    lower_canonical_sort_key(left_part, part_data_type, &mut comparator_block, location)?,
+                    lower_canonical_sort_key(right_part, part_data_type, &mut comparator_block, location)?,
                     comparison_type,
                 ));
             }
@@ -181,7 +180,6 @@ fn lower_canonical_sort_key<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     data_type: DataType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let (has_negative_zero, has_multiple_nan_encodings) = match data_type {
@@ -190,10 +188,9 @@ fn lower_canonical_sort_key<'b, 'c: 'b, 't: 'c>(
         _ => (true, true),
     };
     let scalar_type = ArrayType::scalar(data_type);
-    let scalar_tensor_type = scalar_type.lower(context, location)?;
     let mut canonical = value;
     if has_negative_zero {
-        let zero = lower_f64_constant_splat(0.0, &scalar_type, scalar_tensor_type, block, context, location)?;
+        let zero = scalar_type.lower_f64_splat(0.0, block, location)?;
         let is_zero = block.append_operation(stable_hlo::compare(
             value,
             zero,
@@ -210,7 +207,7 @@ fn lower_canonical_sort_key<'b, 'c: 'b, 't: 'c>(
         canonical = selected.result(0).unwrap().as_ref();
     }
     if has_multiple_nan_encodings {
-        let nan = lower_f64_constant_splat(f64::NAN, &scalar_type, scalar_tensor_type, block, context, location)?;
+        let nan = scalar_type.lower_f64_splat(f64::NAN, block, location)?;
         let is_nan = block.append_operation(stable_hlo::compare(
             value,
             value,

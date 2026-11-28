@@ -11,7 +11,7 @@
 //!     a call that names devices, or for the replicas of a bounded dynamic program while an override splits a value,
 //!     fails with an exact error (refer to `validate_placements`), as JAX rejects a nested `jit` with an incompatible
 //!     device assignment. Lowering emits each callee inline or, when it occurs more than once, as a call of one shared
-//!     private `func.func` (refer to `collect_call_functions`).
+//!     private `func.func` (refer to `plan_call_functions`).
 //!   - Eager dispatch and eager interpretation take one placement decision for each application (refer to
 //!     `CallEagerExtension::eager_decision`), which admits the inputs as an execution does (their client, their
 //!     committed devices, and their reduction state), selects the devices of the call, moves captures and uncommitted
@@ -27,7 +27,6 @@
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
@@ -45,12 +44,12 @@ use ryft_mlir::{
 use crate::compilation::domains::{commits_public_outputs, relocated_input_type};
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::EffectTokens;
-use crate::lowering::contexts::{PrivateFunction, PrivateFunctionBody, ProgramLoweringContext};
+use crate::lowering::contexts::{PrivateFunctionBody, ProgramLoweringContext};
 use crate::lowering::programs::{
-    CallTraversal, ProgramInlineLoweringExtension, RegionLoweringExtension, RegionPlacementRequestsExtension,
-    UnreadLiftedCaptures,
+    CallTraversal, ProgramInlineLoweringExtension, ProgramSessionConstants, RegionLoweringExtension,
+    RegionPlacementRequestsExtension, UnreadLiftedCaptures,
 };
-use crate::lowering::types::{TypeLoweringExtension, lower_unplaced_constant_output};
+use crate::lowering::types::{ArrayTypeLoweringExtension, TypeLoweringExtension};
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::TypeCastLoweringExtension;
 use crate::operations::sharding::constrain_sharding::lower_declared_sharding_constraint;
@@ -90,6 +89,18 @@ pub(crate) struct CallProgramKey {
     /// placement, or a derived input boundary) must distinguish callees, including what the rendering of a call does
     /// not show (refer to [`CallOperation`]).
     calls: Vec<CallOperation<Type>>,
+
+    /// Number of leading inputs of the callee that are its lifted captures, which its captured constants refer to by
+    /// position, or zero when the callee has no captured constant. The rendering shows the position of a captured
+    /// constant, and this count states which inputs those positions name. Calls that lift different numbers of
+    /// captures therefore still share the function of a callee that reads none of them through a captured constant.
+    capture_count: usize,
+
+    /// For each session constant of the callee, in the order of its regions and of their atoms, the position of the
+    /// first constant that refers to the same array. The rendering shows only the type of a session constant, and a
+    /// shared function receives the arrays as inputs (refer to [`lower_shared_call`]), so callees that read different
+    /// arrays share a function as long as they repeat their arrays in the same pattern.
+    session_constants: Vec<usize>,
 }
 
 /// Plans the shared private functions of the `call`s of `program`, which is the program that a module is lowered from,
@@ -98,7 +109,7 @@ pub(crate) struct CallProgramKey {
 /// body that no backend implementation replaces on the target platform and that occurs at least twice.
 /// Single-occurrence callees are left to inline, so modules without repeated calls lower without private functions.
 /// At each `call` lowering site, a callee whose function is registered is emitted as a `func.call` of that function
-/// instead of being inlined (refer to [`shared_call_function`]).
+/// instead of being inlined (refer to [`lower_shared_call`]).
 ///
 /// A function that named composite calls reach is named after the name and version of the first such definition (e.g.,
 /// `ryft.example.v1`, with a numeric suffix for other specializations), even when a `call` also reaches it, and the
@@ -121,33 +132,34 @@ where
     let target_platform = lowering_context.target_platform();
     let mut counts = HashMap::new();
     let mut order: Vec<CallProgramKey> = Vec::new();
-    let mut memo: HashMap<RegionId, Option<CallProgramKey>> = HashMap::new();
+    let mut memo: HashMap<(RegionId, usize), Option<CallProgramKey>> = HashMap::new();
     let mut named = HashMap::new();
     let mut names = HashMap::new();
     count_calls(program, target_platform, &mut counts, &mut order, &mut memo, &mut named, &mut names)?;
 
+    let mut function_count = 0;
     let mut boundaries = HashMap::<CallProgramKey, (Vec<Type>, Vec<Type>)>::new();
     for key in order {
         let (count, region, program) = counts.remove(&key).unwrap();
         // Effectful callees always inline (even when repeated) so their effectful instructions chain onto the
         // caller's effect token in program order, which a shared token-free function could not preserve. That
-        // includes the entry guards that lowering synthesizes for the callee's nested control flow. Callees that
-        // reference session constants also inline, because only the entry function receives their hidden arguments
-        // and binds the arrays that are only passed on to calls that never read them.
-        if count < 2
-            || !lowered_effect_classes(&program)?.is_empty()
-            || program.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter).any(|region| {
-                region.atoms().iter().any(|atom| matches!(atom.as_constant(), Some(Constant::Session(_))))
-            })
-        {
+        // includes the entry guards that lowering synthesizes for the callee's nested control flow.
+        if count < 2 || !lowered_effect_classes(&program)?.is_empty() {
             continue;
         }
         let name = match names.get(&key) {
             Some(name) => Cow::Borrowed(name.as_str()),
-            None => Cow::Owned(format!("callee_{}", boundaries.len())),
+            None => Cow::Owned(format!("callee_{}", function_count)),
         };
-        lowering_context.require_function(key.clone(), &name, || Ok(PrivateFunctionBody::Region(region)))?;
-        boundaries.insert(key, (program.input_types().into_owned(), program.output_types().into_owned()));
+        let body = PrivateFunctionBody::Region { region, capture_count: key.capture_count };
+        lowering_context.require_function(key.clone(), &name, || Ok(body))?;
+        function_count += 1;
+
+        // A function that receives session constants is found by the body of each of its calls, which states the
+        // arrays that the call passes, and never by a key and boundary alone.
+        if key.session_constants.is_empty() {
+            boundaries.insert(key, (program.input_types().into_owned(), program.output_types().into_owned()));
+        }
     }
     for (named_key, key) in named {
         let Some((key, (input_types, output_types))) =
@@ -162,14 +174,49 @@ where
     Ok(())
 }
 
-/// Returns the shared private function that the module of `lowering_context` holds for calls of `callee`, if it plans
-/// one for the identity of `callee` (refer to [`plan_call_functions`]) and the scope of `lowering_context` does not
-/// inline its calls.
-pub(crate) fn shared_call_function<O: ProgramLoweringOperation>(
+/// Lowers a call of `callee`, whose first `capture_count` inputs are its lifted captures, to a `func.call` of the
+/// shared private function that the module of `lowering_context` holds for it, and returns the results of that call.
+/// Returns [`None`] without emitting anything when the module plans no function for the identity of `callee` (refer
+/// to [`plan_call_functions`]), when the scope of `lowering_context` inlines its calls, or when `input_values` are
+/// not the inputs of `callee`.
+///
+/// The function takes the inputs of `callee` followed by the session constants that `callee` reads, so the call
+/// passes `input_values` followed by the values that the calling scope, whose captured values are
+/// `caller_captured_values`, binds for those constants.
+///
+/// # Errors
+///
+/// Returns [`LoweringError::UnboundSessionConstant`] when the calling scope binds no value for a session constant
+/// that `callee` reads.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_shared_call<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     callee: &FlatProgram<EagerContext<Constant, O>>,
+    capture_count: usize,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    caller_captured_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
     lowering_context: &ProgramLoweringContext,
-) -> Option<PrivateFunction> {
-    lowering_context.shared_function(&call_program_key(callee)?)
+) -> Result<Option<Vec<ValueRef<'b, 'c, 't>>>, Error> {
+    // The `call` operation's type inference already pins its inputs to the callee input types, so a matching arity
+    // is the only guard needed before emitting the symbol call. Anything else inlines.
+    if input_values.len() != callee.input_count() {
+        return Ok(None);
+    }
+    let function = call_program_key(callee, capture_count).and_then(|key| lowering_context.shared_function(&key));
+    let Some(function) = function else {
+        return Ok(None);
+    };
+    let target_platform = lowering_context.target_platform();
+    let regions = callee.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter);
+    let session_constants = ProgramSessionConstants::from_regions(regions, target_platform);
+    let mut arguments = input_values.to_vec();
+    for constant in session_constants.inputs() {
+        arguments.push(lowering_context.lower_session_constant(constant, caller_captured_values)?);
+    }
+    let output_types = callee.output_types();
+    lower_shared_function_call(function.symbol(), &output_types, &arguments, block, context, location).map(Some)
 }
 
 /// Calls the shared private `func.func` named `symbol` with the provided operands, which must match its inputs, and
@@ -725,9 +772,7 @@ impl LowerableOperation for CallOperation<Type> {
             .map(|(index, (&value, ty))| {
                 let Type::Array(actual) = ty else { return Ok(value) };
                 if unread.as_deref().is_some_and(|unread| unread.get(index).copied().unwrap_or(false)) {
-                    let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-                    let types = std::slice::from_ref(actual);
-                    return Ok(lower_unplaced_constant_output(types, 0, &mut block, context, location)?[0]);
+                    return actual.lower_i64_splat(0, &mut lowerer.block(), lowerer.location());
                 }
                 let callee = lowerer.regions()[0].entry_region_ref();
                 let declared = &callee.interface().input_types()[index];
@@ -805,7 +850,7 @@ impl LowerableOperation for CallOperation<Type> {
 /// across definitions with equal keys under different named axes, or in different operation families).
 /// [`plan_call_functions`] enforces it by registering no function under a key and boundary whose calls carry
 /// different bodies, so those calls look up their shared function by their own body (refer to
-/// [`shared_call_function`]).
+/// [`lower_shared_call`]).
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct NamedFunctionKey {
     /// Semantic identity of the calls.
@@ -857,20 +902,20 @@ struct NamedRegionCall {
 
 /// Returns whether `program` may be deduplicated by structural identity.
 ///
-/// A program is eligible only when the canonical rendering captures the full semantics needed to safely share a private
-/// function. Although immediate constant payloads are rendered, a [`CaptureReference`](ryft_core::CaptureReference)
-/// identifies a slot and type rather than the runtime value in the surrounding capture table, so programs with
-/// constants remain ineligible. `shard_map` also remains outside this deduplication path because its lowering owns a
+/// A program is eligible only when its [`CallProgramKey`] captures the full semantics needed to safely share a private
+/// function. That holds for programs with constants. The payloads of immediate constants are rendered. A
+/// [`CaptureReference`](ryft_core::CaptureReference) renders its position among the lifted captures of the callee,
+/// which are leading inputs of the shared function. A session constant is an input of the shared function as well
+/// (refer to [`lower_shared_call`]). `shard_map` remains outside this deduplication path because its lowering owns a
 /// separate outlined boundary.
 fn supports_structural_deduplication<O: ProgramLoweringOperation>(
     program: &FlatProgram<EagerContext<Constant, O>>,
 ) -> bool {
     program.regions().iter().all(|region| {
-        region.atoms().iter().all(|atom| !atom.is_constant())
-            && region
-                .instructions()
-                .iter()
-                .all(|instruction| instruction.operation().projected_payload::<ShardMapOperation>().is_none())
+        region
+            .instructions()
+            .iter()
+            .all(|instruction| instruction.operation().projected_payload::<ShardMapOperation>().is_none())
     })
 }
 
@@ -882,37 +927,44 @@ fn supports_structural_deduplication_of_region<O: ProgramLoweringOperation>(
         if !visited.insert(region.id()) {
             return true;
         }
-        region.atoms().iter().all(|atom| !atom.is_constant())
-            && region.instructions().iter().all(|instruction| {
-                instruction.operation().projected_payload::<ShardMapOperation>().is_none()
-                    && instruction
-                        .regions()
-                        .iter()
-                        .copied()
-                        .all(|nested| RegionRef::new(region.arena(), nested).is_ok_and(|nested| walk(nested, visited)))
-            })
+        region.instructions().iter().all(|instruction| {
+            instruction.operation().projected_payload::<ShardMapOperation>().is_none()
+                && instruction
+                    .regions()
+                    .iter()
+                    .copied()
+                    .all(|nested| RegionRef::new(region.arena(), nested).is_ok_and(|nested| walk(nested, visited)))
+        })
     }
 
     walk(region, &mut HashSet::new())
 }
 
-/// Computes the deduplication key for a flat callee program, or [`None`] for programs that are not eligible for
-/// structural deduplication (refer to [`supports_structural_deduplication`]) and therefore always inline. The key is
-/// generic over the program's constant universe so that lookups from the value-generic lowering path type-check,
-/// although the map itself is only ever populated from the staged [`Constant`]-keyed pipeline.
+/// Computes the deduplication key for a flat callee program whose first `capture_count` inputs are its lifted
+/// captures, or [`None`] for programs that are not eligible for structural deduplication (refer to
+/// [`supports_structural_deduplication`]) and therefore always inline.
 fn call_program_key<O: ProgramLoweringOperation>(
     program: &FlatProgram<EagerContext<Constant, O>>,
+    capture_count: usize,
 ) -> Option<CallProgramKey> {
-    supports_structural_deduplication(program).then(|| structural_key(program))
+    supports_structural_deduplication(program).then(|| structural_key(program, capture_count))
 }
 
-/// Computes the deduplication key for a borrowed callee region, materializing only after borrowed eligibility checks.
-fn call_region_key<O: ProgramLoweringOperation>(region: RegionRef<'_, Constant, O>) -> Option<CallProgramKey> {
-    supports_structural_deduplication_of_region(region).then(|| structural_key(&region.to_program()))
+/// Computes the deduplication key for a borrowed callee region whose first `capture_count` inputs are its lifted
+/// captures, materializing only after borrowed eligibility checks.
+fn call_region_key<O: ProgramLoweringOperation>(
+    region: RegionRef<'_, Constant, O>,
+    capture_count: usize,
+) -> Option<CallProgramKey> {
+    supports_structural_deduplication_of_region(region).then(|| structural_key(&region.to_program(), capture_count))
 }
 
-/// Returns the deduplication key of `program`, an eligible callee (refer to [`CallProgramKey`]).
-fn structural_key<O: ProgramLoweringOperation>(program: &FlatProgram<EagerContext<Constant, O>>) -> CallProgramKey {
+/// Returns the deduplication key of `program`, an eligible callee whose first `capture_count` inputs are its lifted
+/// captures (refer to [`CallProgramKey`]).
+fn structural_key<O: ProgramLoweringOperation>(
+    program: &FlatProgram<EagerContext<Constant, O>>,
+    capture_count: usize,
+) -> CallProgramKey {
     fn walk<O: ProgramLoweringOperation>(
         region: RegionRef<'_, Constant, O>,
         visited: &mut HashSet<RegionId>,
@@ -935,11 +987,30 @@ fn structural_key<O: ProgramLoweringOperation>(program: &FlatProgram<EagerContex
 
     let mut calls = Vec::new();
     walk(program.entry_region_ref(), &mut HashSet::new(), &mut calls);
+
+    let mut has_captured_constants = false;
+    let mut first_positions = HashMap::new();
+    let mut session_constants = Vec::new();
+    for region in program.regions() {
+        for atom in region.atoms() {
+            match atom.as_constant() {
+                Some(Constant::Captured(_)) => has_captured_constants = true,
+                Some(Constant::Session(constant)) => {
+                    let position = session_constants.len();
+                    session_constants.push(*first_positions.entry(constant.identity_key()).or_insert(position));
+                }
+                _ => {}
+            }
+        }
+    }
+
     CallProgramKey {
         rendered: program.to_string(),
         input_types: program.input_types().into_owned(),
         output_types: program.output_types().into_owned(),
         calls,
+        capture_count: if has_captured_constants { capture_count } else { 0 },
+        session_constants,
     }
 }
 
@@ -963,7 +1034,7 @@ fn count_calls<Input, Output, O: ProgramLoweringOperation>(
     target_platform: Option<&str>,
     counts: &mut HashMap<CallProgramKey, (usize, RegionId, FlatProgram<EagerContext<Constant, O>>)>,
     order: &mut Vec<CallProgramKey>,
-    memo: &mut HashMap<RegionId, Option<CallProgramKey>>,
+    memo: &mut HashMap<(RegionId, usize), Option<CallProgramKey>>,
     named: &mut HashMap<NamedFunctionKey, Option<CallProgramKey>>,
     names: &mut HashMap<CallProgramKey, String>,
 ) -> Result<(), Error>
@@ -978,7 +1049,7 @@ where
         target_platform: Option<&str>,
         counts: &mut HashMap<CallProgramKey, (usize, RegionId, FlatProgram<EagerContext<Constant, O>>)>,
         order: &mut Vec<CallProgramKey>,
-        memo: &mut HashMap<RegionId, Option<CallProgramKey>>,
+        memo: &mut HashMap<(RegionId, usize), Option<CallProgramKey>>,
         named_calls: &mut NamedRegionCalls,
         visited: &mut HashSet<RegionId>,
     ) -> Result<(), Error>
@@ -1051,15 +1122,16 @@ where
                 });
                 continue;
             }
-            if instruction.operation().projected_payload::<CallOperation<Type>>().is_some() {
+            if let Some(call) = instruction.operation().projected_payload::<CallOperation<Type>>() {
                 let Some(&callee_region) = instruction.regions().first() else {
                     continue;
                 };
+                let capture_count = call.capture_count();
                 let key = memo
-                    .entry(callee_region)
+                    .entry((callee_region, capture_count))
                     .or_insert_with(|| {
                         let callee = program.region_ref(callee_region).unwrap();
-                        call_region_key(callee)
+                        call_region_key(callee, capture_count)
                     })
                     .clone();
                 let Some(key) = key else {
@@ -1082,9 +1154,10 @@ where
     for call in named_calls.calls {
         let named_key =
             NamedFunctionKey { key: call.composite, input_types: call.input_types, output_types: call.output_types };
+        // The body of a named composite call has no captures (refer to the lowering of `CompositeOperation`).
         let key = memo
-            .entry(call.region)
-            .or_insert_with(|| call_region_key(program.region_ref(call.region).unwrap()))
+            .entry((call.region, 0))
+            .or_insert_with(|| call_region_key(program.region_ref(call.region).unwrap(), 0))
             .clone();
         // A body that structural deduplication cannot key (e.g., one with constants) has no shared function, and it
         // marks its key and boundary as conflicting, so that its calls never resolve to another body's function.
@@ -1157,20 +1230,17 @@ impl<O: ProgramLoweringOperation> CallProgramLoweringExtension<O> for FlatProgra
         // Only pure callees are ever deduplicated (`plan_call_functions` skips effectful programs), so the shared
         // function path below never interacts with the caller's effect tokens. Effectful callees always take the inline
         // path, which threads the caller's per-class tokens through the callee body in program order.
-        if let Some(function) = shared_call_function(self, lowering_context) {
-            // The `call` operation's type inference already pins its inputs to the callee input types, so a
-            // matching arity is the only guard needed before emitting the symbol call. Anything else inlines.
-            if input_values.len() == self.input_count() {
-                let output_types = self.output_types();
-                return lower_shared_function_call(
-                    function.symbol(),
-                    &output_types,
-                    input_values,
-                    block,
-                    context,
-                    location,
-                );
-            }
+        if let Some(outputs) = lower_shared_call(
+            self,
+            capture_count,
+            input_values,
+            caller_captured_values,
+            block,
+            context,
+            location,
+            lowering_context,
+        )? {
+            return Ok(outputs);
         }
         if input_values.len() < capture_count {
             // The provided inputs cover the leading captures, so the first capture without a value is the next one.
@@ -1179,14 +1249,7 @@ impl<O: ProgramLoweringOperation> CallProgramLoweringExtension<O> for FlatProgra
         // The callee binds its own leading inputs as captures and inherits the caller's session constant bindings.
         let mut captured_values = input_values[..capture_count].to_vec();
         captured_values.extend_from_slice(lowering_context.session_constant_values(caller_captured_values));
-        self.lower_inline(
-            captured_values.as_slice(),
-            input_values,
-            lowering_context,
-            effect_tokens,
-            *block,
-            location,
-        )
+        self.lower_inline(captured_values.as_slice(), input_values, lowering_context, effect_tokens, *block, location)
     }
 }
 
@@ -1244,12 +1307,12 @@ mod tests {
         test_vector_type, unproject_plain_program,
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
-    use crate::sessions::tests::{domain_mesh, read_first_shard, read_sharded_f32_array, two_device_mesh};
+    use crate::sessions::tests::{domain_mesh, f32_scalar, read_first_shard, read_sharded_f32_array, two_device_mesh};
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         Array, CompileTracer, CompiledFunction, Constant, CustomCallOperationExtension, Error, FromPjrt, Options,
-        ProgramLoweringExtension, ProgramLoweringOptions, RuntimeRequirement, StagedFunction, ToPjrt, Type, Value,
-        compile, compile_with_options, stage,
+        ProgramLoweringExtension, ProgramLoweringOptions, RetainedArray, RuntimeRequirement, StagedFunction, ToPjrt,
+        Type, Value, compile, compile_with_options, stage,
     };
 
     use super::*;
@@ -1378,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_call_functions() {
+    fn test_plan_call_functions() {
         let callee = add_self_callee(test_vector_type(4));
         let module = lower_call_sum_module(vec![callee.clone(), callee]);
 
@@ -1403,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_call_functions_shares_structurally_identical_programs() {
+    fn test_plan_call_functions_shares_structurally_identical_programs() {
         // Two distinct programs (i.e., separate `Arc`s) with identical structure must still deduplicate into the same
         // single shared function as the pointer-identical case above. This is the shape produced when a transform
         // such as `grad` linearizes each of several identical blocks into its own staged program.
@@ -1430,7 +1493,143 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_call_functions_distinguishes_callees_whose_calls_differ() {
+    fn test_plan_call_functions_shares_callees_with_constants() {
+        // An immediate constant is part of the rendering of its callee, and a captured constant names a leading input
+        // of its callee, so a repeated callee that reads either is shared like any other.
+        let vector_type = test_vector_type(4);
+        let callee = {
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+            builder.add_input(vector_type.clone().into());
+            let input = builder.add_input(vector_type.clone().into());
+            let capture =
+                builder.add_constant(Constant::Captured(CaptureReference::new(0, vector_type.clone().into())));
+            builder.add_constant(Constant::Boolean(true));
+            let output =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture], None).unwrap()[0];
+            let callee =
+                builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder]);
+            Arc::new(callee.unwrap())
+        };
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+        let capture = builder.add_input(vector_type.clone().into());
+        let mut value = builder.add_input(vector_type.into());
+        for _ in 0..2 {
+            let region = builder.intern_callee(&callee, None).unwrap();
+            let call = Operation::Call(CallOperation::new(1));
+            value = builder.add_instruction(call, vec![region], vec![capture, value], None).unwrap()[0];
+        }
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func private @callee_0(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.add %arg1, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = call @callee_0(%arg0, %arg1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+                    %1 = call @callee_0(%arg0, %0) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+                    return %1 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_plan_call_functions_passes_session_constants_to_shared_functions() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let [first, second] = [1.0, 2.0].map(|value| RetainedArray::new(&f32_scalar(&session, &mesh, value)));
+        let scalar_type = Type::Array(first.r#type().into_owned());
+        let options = ProgramLoweringOptions::new().without_pruning().without_boundary_shardings();
+        let add_constants = |constants: &[&RetainedArray]| {
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+            let mut value = builder.add_input(scalar_type.clone());
+            for constant in constants {
+                let constant = builder.add_constant(Constant::Session((*constant).clone()));
+                value =
+                    builder.add_instruction(AddOperation::new(), Vec::new(), vec![value, constant], None).unwrap()[0];
+            }
+            let callee =
+                builder.build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder], vec![Placeholder]);
+            Arc::new(callee.unwrap())
+        };
+        let chain = |callees: &[&Arc<FlatProgram<Session>>]| {
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+            let mut value = builder.add_input(scalar_type.clone());
+            for callee in callees {
+                value = add_call(&mut builder, callee, vec![value]);
+            }
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        // Structurally identical callees that read different arrays share one function, which receives the array of
+        // each call as its last input. The entry function receives both arrays as hidden inputs and passes them on.
+        let program = chain(&[&add_constants(&[&first]), &add_constants(&[&second])]);
+        assert_eq!(
+            program.to_rendered_mlir("main", &options).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func private @callee_0(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
+                    %0 = stablehlo.add %arg0, %arg1 : tensor<f32>
+                    return %0 : tensor<f32>
+                  }
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<f32>, %arg2: tensor<f32>) -> tensor<f32> {
+                    %0 = call @callee_0(%arg2, %arg1) : (tensor<f32>, tensor<f32>) -> tensor<f32>
+                    %1 = call @callee_0(%0, %arg0) : (tensor<f32>, tensor<f32>) -> tensor<f32>
+                    return %1 : tensor<f32>
+                  }
+                }
+            "#},
+        );
+
+        // A shared function receives the arrays that the functions which it calls read, and passes them on.
+        let inner = add_constants(&[&first]);
+        let outer = Arc::new(chain(&[&inner, &inner]));
+        assert_eq!(
+            chain(&[&outer, &outer]).to_rendered_mlir("main", &options).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func private @callee_0(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
+                    %0 = stablehlo.add %arg0, %arg1 : tensor<f32>
+                    return %0 : tensor<f32>
+                  }
+                  func.func private @callee_1(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
+                    %0 = call @callee_0(%arg0, %arg1) : (tensor<f32>, tensor<f32>) -> tensor<f32>
+                    %1 = call @callee_0(%0, %arg1) : (tensor<f32>, tensor<f32>) -> tensor<f32>
+                    return %1 : tensor<f32>
+                  }
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
+                    %0 = call @callee_1(%arg1, %arg0) : (tensor<f32>, tensor<f32>) -> tensor<f32>
+                    %1 = call @callee_1(%0, %arg0) : (tensor<f32>, tensor<f32>) -> tensor<f32>
+                    return %1 : tensor<f32>
+                  }
+                }
+            "#},
+        );
+
+        // Callees share a function only when they repeat their arrays in the same pattern, because a function has
+        // one input for each distinct array.
+        let function_count = |program: &FlatProgram<Session>| {
+            let lowering_context = ProgramLoweringContext::new();
+            plan_call_functions(program, &lowering_context).unwrap();
+            (0..).take_while(|index| lowering_context.function(*index).is_some()).count()
+        };
+        let (repeated, distinct) = (add_constants(&[&first, &first]), add_constants(&[&first, &second]));
+        assert_eq!(function_count(&chain(&[&repeated, &add_constants(&[&second, &second])])), 1);
+        assert_eq!(function_count(&chain(&[&distinct, &add_constants(&[&second, &first])])), 1);
+        assert_eq!(function_count(&chain(&[&repeated, &distinct])), 0);
+    }
+
+    #[test]
+    fn test_plan_call_functions_distinguishes_callees_whose_calls_differ() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1485,8 +1684,11 @@ mod tests {
             derived(vec![None]),
             derived(vec![Some(sharded)]),
         ];
-        let function_count =
-            |program: &FlatProgram<Session>| collect_call_functions(program, None).unwrap().functions().count();
+        let function_count = |program: &FlatProgram<Session>| {
+            let lowering_context = ProgramLoweringContext::new();
+            plan_call_functions(program, &lowering_context).unwrap();
+            (0..).take_while(|index| lowering_context.function(*index).is_some()).count()
+        };
         assert_eq!(function_count(&program(&base, &base)), 2);
         for variant in &variants {
             assert_eq!(function_count(&program(&base, variant)), 1, "{variant:?}");
@@ -1527,7 +1729,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_call_functions_inlines_single_calls() {
+    fn test_plan_call_functions_inlines_single_calls() {
         // A single-occurrence callee stays below the dedup threshold and inlines, so no shared function is emitted
         // and the callee body appears directly in `@main`.
         let module = lower_call_sum_module(vec![add_self_callee(test_vector_type(4))]);
@@ -1546,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_call_functions_excludes_dormant_regions() {
+    fn test_plan_call_functions_excludes_dormant_regions() {
         let array_type = test_vector_type(4);
         let callee = |identifier| {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
@@ -1668,7 +1870,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_call_functions_skips_shard_map_bodies() {
+    fn test_plan_call_functions_skips_shard_map_bodies() {
         // `count_calls` intentionally skips `shard_map` bodies, so a callee that occurs twice inside a `shard_map`
         // body never gets a shared `func.func private @callee_*` and both occurrences inline into the
         // `sdy.manual_computation` region.
@@ -1707,7 +1909,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_call_functions_shares_programs_with_nested_bodies() {
+    fn test_plan_call_functions_shares_programs_with_nested_bodies() {
         /// Builds the flat callee `f(p, x) = if p { -x } else { x }`, whose body contains a `condition` instruction.
         /// Its nested branch bodies render contextually into the callee's canonical program text, so separately
         /// constructed copies of this callee remain eligible for structural `call` deduplication.
@@ -1732,7 +1934,7 @@ mod tests {
         // With nested computations attached as regions, a callee's `condition` bodies render contextually inside its
         // canonical rendering, so two structurally identical but separately constructed callees share one structural
         // identity and merge into a single emitted function, exactly like the body-free callees of
-        // `test_collect_call_functions_shares_structurally_identical_programs`.
+        // `test_plan_call_functions_shares_structurally_identical_programs`.
         let first = condition_callee();
         let second = condition_callee();
         let vector_type = test_vector_type(4);
@@ -1787,7 +1989,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_call_functions_inlines_effectful_callees() {
+    fn test_plan_call_functions_inlines_effectful_callees() {
         // A repeated `call` callee that prints is excluded from function deduplication and inlines at every
         // call site, so both inlined prints chain onto the caller's ordered I/O token in program order, which a shared
         // token-free `func.func` could not preserve.
@@ -1824,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_call_functions_inlines_callees_with_synthesized_guards() {
+    fn test_plan_call_functions_inlines_callees_with_synthesized_guards() {
         // The repeated callee is pure in the source program, but its inner conditional's mixed entry (a symbolic
         // `dimension<m>` and an exact `f64[2]` entering `[dimension<n>, f64[n]]`) gains an entry guard during lowering.
         // A shared token-free function could not order that guard, so the callee inlines at both call sites, and the
@@ -1940,7 +2142,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_call_functions_inlines_callees_with_extent_validations() {
+    fn test_plan_call_functions_inlines_callees_with_extent_validations() {
         // The repeated callee is pure in the source program, but its `zero[n, n]` constructor consumes a symbolic
         // `dimension<n>` and an exact `dimension<2>`, so type inference refines it to `f64[2, 2]` and lowering
         // validates that `n = 2` at runtime. A shared token-free function could not order those validations, so the

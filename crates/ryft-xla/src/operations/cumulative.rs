@@ -8,14 +8,13 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat, lower_unplaced_constant_output};
 use crate::operations::complex::lower_principal_phase_to_mlir;
 use crate::operations::exponential::lower_log_add_exp_to_mlir;
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::{
     build_reduce_body_region, build_reduction_identity_constant, lower_product_combiner_to_mlir,
 };
-use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
+use crate::{ArrayTypeLoweringExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
@@ -223,7 +222,7 @@ impl CumulativeKindLoweringExtension for CumulativeKind {
             return Ok(result.result(0).unwrap().as_ref());
         }
         match self == CumulativeKind::LogSumExp && element_type.is_complex() {
-            true => lower_principal_phase_to_mlir(result, output_array_type, block, context, location),
+            true => lower_principal_phase_to_mlir(result, output_array_type, block, location),
             false => Ok(result),
         }
     }
@@ -243,11 +242,7 @@ fn build_cumulative_initial_value<'b, 'c: 'b, 't: 'c>(
         CumulativeKind::Sum => {
             build_reduction_identity_constant(ReductionKind::Sum, element_type, block, context, location)
         }
-        // A scalar `one` reaches the same real and complex constant synthesis that the `one` primitive lowers through,
-        // which the reduction identities do not cover because no reduction kind multiplies.
-        CumulativeKind::Product => {
-            Ok(lower_unplaced_constant_output(&[ArrayType::scalar(element_type)], 1, block, context, location)?[0])
-        }
+        CumulativeKind::Product => ArrayType::scalar(element_type).lower_i64_splat(1, block, location),
         CumulativeKind::Max => {
             build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)
         }
@@ -257,13 +252,7 @@ fn build_cumulative_initial_value<'b, 'c: 'b, 't: 'c>(
         // Complex types pair negative infinity with a zero imaginary component, whose exponential is exactly zero,
         // rather than using their lowest value, whose imaginary component is infinite too.
         CumulativeKind::LogSumExp if element_type.is_complex() => {
-            let part_type =
-                ArrayType::scalar(if element_type == DataType::C64 { DataType::F32 } else { DataType::F64 });
-            let part_tensor_type = part_type.lower(context, location)?;
-            let real =
-                lower_f64_constant_splat(f64::NEG_INFINITY, &part_type, part_tensor_type, block, context, location)?;
-            let imaginary = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
-            Ok(block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0).unwrap().as_ref())
+            ArrayType::scalar(element_type).lower_f64_splat(f64::NEG_INFINITY, block, location)
         }
         // Real formats with infinity use negative infinity, while the supported formats without infinities use their
         // lowest value, which remains an identity after each rounded pairwise combination regardless of prefix length.
@@ -354,15 +343,7 @@ fn build_cumulative_body_region<'c, 't>(
             )?;
             let part_type =
                 ArrayType::scalar(if element_type == DataType::C64 { DataType::F32 } else { DataType::F64 });
-            let part_tensor_type = part_type.lower(context, location)?;
-            let negative_infinity = lower_f64_constant_splat(
-                f64::NEG_INFINITY,
-                &part_type,
-                part_tensor_type,
-                &mut block_ref,
-                context,
-                location,
-            )?;
+            let negative_infinity = part_type.lower_f64_splat(f64::NEG_INFINITY, &mut block_ref, location)?;
             let mut negative_infinity_masks = Vec::with_capacity(2);
             for operand in [left, right] {
                 let real =
@@ -398,7 +379,7 @@ fn build_cumulative_body_region<'c, 't>(
             context,
             location,
         )?,
-        _ => lower_product_combiner_to_mlir(left, right, element_type, &mut block_ref, context, location)?,
+        _ => lower_product_combiner_to_mlir(left, right, element_type, &mut block_ref, location)?,
     };
     let body_value = if carrier_type.is_some() {
         let bits = block_ref.append_operation(stable_hlo::bitcast_convert(body_value, argument_type, location)?)?;

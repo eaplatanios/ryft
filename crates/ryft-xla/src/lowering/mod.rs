@@ -23,10 +23,28 @@
 //! implements [`MemberLowerableOperation`] instead, which lowers it with the types of the family. The remaining
 //! public functions of this module lower types, constants, and dynamic dimensions, for use in such implementations.
 //!
+//! # Private Functions
+//!
+//! A module holds the private functions that its lowering refers to, in the order in which they were requested. The
+//! lowering of an operation requests one with [`Lowerer::require_function`], under any key that can key a hash map, and
+//! every request with an equal key shares one function (e.g., the decomposition of a `stablehlo.composite`). A `call`
+//! whose callee occurs more than once lowers to a `func.call` of such a function as well, including a callee with
+//! constants. The arrays that a shared callee imports are inputs of its function, so callees that differ only in the
+//! arrays that they import share one function.
+//!
 //! # Options
 //!
 //! [`RaggedDotLoweringStrategy`] selects how a compilation lowers ragged dots.
+//! [`ProgramLoweringOptions::with_lowering_rule`] replaces the lowering of the instructions of one operation with a
+//! [`LoweringRule`], which sees each instruction through an [`InstructionLowerer`] and therefore applies to every
+//! operation family of the module. [`ProgramLoweringOptions::with_target_platforms`] lowers one module for several
+//! platforms. Its entry function takes a platform index as its last input and calls the body of the platform that the
+//! index selects, and [platforms](MlirProgram::platforms) on which the program lowers alike share one body.
 
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::hash::Hash;
 use std::rc::Rc;
 
 use ryft_core::{
@@ -39,11 +57,10 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::contexts::ProgramLoweringContext;
+use crate::lowering::contexts::{PrivateFunctionBody, ProgramLoweringContext};
 use crate::lowering::programs::ProgramInlineLoweringExtension;
-use crate::operations::call::CallFunctionMap;
 use crate::operations::composites::NamedCompositeImplementation;
-use crate::{Constant, Error, Operation, RuntimeRequirement, Session, Type};
+use crate::{Constant, Error, Operation, RuntimeRequirement, Type};
 
 pub mod contexts;
 pub mod programs;
@@ -61,11 +78,11 @@ pub use sharding::{
 };
 pub use types::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, MemoryLoweringExtension, PhysicalStoragePadding,
-    TypeLoweringExtension, dimension_extent_to_i32, dimension_extent_to_i64, lower_constant_output,
-    lower_explicit_shape, lower_f64_constant_splat, lower_static_index_constants, lower_u64_scalar_constant,
-    lower_unplaced_constant_output,
+    TypeLoweringExtension, dimension_extent_to_i32, dimension_extent_to_i64,
 };
-pub use values::{DimensionExtension, ValueRefExtension};
+pub use values::{
+    DimensionExtension, ValueRefExtension, lower_i64_vector, lower_index_constant, lower_u64_scalar_constant,
+};
 
 /// Represents errors produced while validating a program for XLA lowering, constructing its StableHLO
 /// representation, or verifying the result.
@@ -244,10 +261,6 @@ pub struct Lowerer<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type> = Operation
     /// Attached regions of the instruction currently being lowered, materialized as flat programs in region-slot order.
     regions: Vec<FlatProgram<EagerContext<Constant, O>>>,
 
-    /// Shared private functions emitted for deduplicated `call` callees, consulted at `call` lowering sites.
-    /// Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
-    nested_functions: Option<Rc<CallFunctionMap<O>>>,
-
     /// Hidden capture inputs of the function currently being lowered, in capture-table order.
     captured_values: Vec<ValueRef<'b, 'c, 't>>,
 
@@ -271,7 +284,6 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
             context,
             location,
             regions: Vec::new(),
-            nested_functions: None,
             captured_values: Vec::new(),
             effect_tokens: EffectTokens::default(),
             lowering_context,
@@ -281,12 +293,6 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     /// Attaches the materialized attached regions of the instruction currently being lowered.
     pub(crate) fn with_regions(mut self, regions: Vec<FlatProgram<EagerContext<Constant, O>>>) -> Self {
         self.regions = regions;
-        self
-    }
-
-    /// Attaches the shared deduplicated `call` functions consulted while lowering.
-    pub(crate) fn with_nested_functions(mut self, nested_functions: Option<Rc<CallFunctionMap<O>>>) -> Self {
-        self.nested_functions = nested_functions;
         self
     }
 
@@ -300,13 +306,6 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     pub(crate) fn with_effect_tokens(mut self, effect_tokens: EffectTokens<'b, 'c, 't>) -> Self {
         self.effect_tokens = effect_tokens;
         self
-    }
-
-    /// Returns the shared private functions emitted for deduplicated `call` callees, consulted at `call`
-    /// lowering sites. Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
-    #[inline]
-    pub(crate) fn nested_functions(&self) -> Option<&Rc<CallFunctionMap<O>>> {
-        self.nested_functions.as_ref()
     }
 
     /// Returns the current per-class effect tokens of the lowering scope this lowerer emits into.
@@ -328,7 +327,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     }
 
     /// Returns the effect tokens of the lowering scope mutably, together with the attached regions, the captured
-    /// values, the shared `call` functions, and the program lowering context of this lowerer, in that order.
+    /// values, and the program lowering context of this lowerer, in that order.
     /// Lowering helpers thread the tokens while they read the rest of that state, which the separate accessors cannot
     /// provide, because the mutable borrow of [`Self::effect_tokens_mut`] covers the whole lowerer.
     #[allow(clippy::type_complexity)]
@@ -338,16 +337,9 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
         &mut EffectTokens<'b, 'c, 't>,
         &[FlatProgram<EagerContext<Constant, O>>],
         &[ValueRef<'b, 'c, 't>],
-        Option<&Rc<CallFunctionMap<O>>>,
         &ProgramLoweringContext,
     ) {
-        (
-            &mut self.effect_tokens,
-            &self.regions,
-            &self.captured_values,
-            self.nested_functions.as_ref(),
-            &self.lowering_context,
-        )
+        (&mut self.effect_tokens, &self.regions, &self.captured_values, &self.lowering_context)
     }
 
     /// Returns the block that receives the StableHLO operations of the instruction being lowered. [`BlockRef`] is a
@@ -398,29 +390,32 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
         self.lowering_context.require_mesh(mesh)
     }
 
-    /// Returns the symbol of the private function of the module that holds the decomposition of the named
-    /// composition `key`, and declares that this emitted operation refers to that function (e.g., as the
-    /// decomposition of a `stablehlo.composite` that it emits, or as the callee of a `func.call`).
+    /// Returns the symbol of the private function that the module holds for `key`, and declares that this emitted
+    /// operation refers to that function (e.g., as the decomposition of a `stablehlo.composite` that it emits, or as
+    /// the callee of a `func.call`).
     ///
     /// A module holds one such function for each key, which every nested lowering scope shares, and it holds the
-    /// function only when an emitted operation requests it here. The first request for a key calls `program`, which
-    /// returns the decomposition as a program whose inputs and outputs are those of the boundary of `key`, and every
-    /// later request returns the same symbol without calling it. The symbol is the name of the composite of `key`,
-    /// with a numeric suffix when another key of the module has that name already.
+    /// function only when an emitted operation requests it here. Keys of any type that can key a hash map are
+    /// accepted (e.g., a [`NamedCompositionKey`]), and keys of different types never share a function. The first
+    /// request for a key calls `program`, which returns what the function computes as a program whose inputs and
+    /// outputs are those of the function, over any operation family that lowers, and every later request returns the
+    /// same symbol without calling it. The symbol is `name`, with a numeric suffix when the module already holds a
+    /// function of that name.
     ///
-    /// The decomposition is lowered outside any manual region, into a function without an effect token or hidden
-    /// inputs. It must therefore have no effects when it is lowered and import no array, which this function does
-    /// not check.
+    /// The program is lowered outside any manual region, into a function without an effect token or hidden inputs.
+    /// It must therefore have no effects when it is lowered and import no array, which this function does not check.
     ///
     /// # Errors
     ///
-    /// Returns the error of `program` when it fails, in which case nothing is recorded for `key`.
-    pub fn require_named_composition<F: FnOnce() -> Result<FlatProgram<Session>, Error>>(
-        &mut self,
-        key: NamedCompositionKey,
-        program: F,
-    ) -> Result<Rc<str>, Error> {
-        self.lowering_context.require_named_composition(key, program)
+    /// Returns the error of `program` when it fails, in which case nothing is registered for `key`.
+    pub fn require_function<K, P, F>(&mut self, key: K, name: &str, program: F) -> Result<Rc<str>, Error>
+    where
+        K: Eq + Hash + 'static,
+        P: ProgramLoweringOperation + 'static,
+        F: FnOnce() -> Result<FlatProgram<EagerContext<Constant, P>>, Error>,
+    {
+        let body = || Ok(PrivateFunctionBody::Program(Rc::new(program()?)));
+        Ok(Rc::clone(self.lowering_context.require_function(key, name, body)?.symbol()))
     }
 
     /// Returns the StableHLO tensor type that represents values of `array_type`.
@@ -488,12 +483,215 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
         region.lower_inline(
             self.captured_values.as_slice(),
             input_values,
-            self.nested_functions.as_ref(),
             &self.lowering_context,
             &mut self.effect_tokens,
             self.block,
             self.location,
         )
+    }
+}
+
+/// Lowering state of one instruction of a program of any operation family, which a [`LoweringRule`] receives. It
+/// exposes what the [`Lowerer`] of the instruction exposes, together with the operation and the boundary of the
+/// instruction, without naming the operation family, so that one rule applies to every program of a module.
+pub trait InstructionLowerer<'b, 'c: 'b, 't: 'c> {
+    /// Returns the name of the operation of the instruction.
+    fn operation_name(&self) -> &'static str;
+
+    /// Returns the payload of the operation of the instruction whose [`TypeId`] is `payload`, if the operation
+    /// holds one (refer to [`OperationPayloadProjection::project_payload`]). Rules usually call `payload` on this
+    /// trait object instead, which returns the payload with its type.
+    fn project_payload(&self, payload: TypeId) -> Option<&dyn Any>;
+
+    /// Returns the lowered MLIR values of the instruction inputs, one per input.
+    fn input_values(&self) -> &[ValueRef<'b, 'c, 't>];
+
+    /// Returns the declared types of the instruction inputs, in input order.
+    fn input_types(&self) -> &[Type];
+
+    /// Returns the declared types of the instruction outputs, in output order.
+    fn output_types(&self) -> &[Type];
+
+    /// Returns the block that receives the operations of the instruction (refer to [`Lowerer::block`]).
+    fn block(&self) -> BlockRef<'b, 'c, 't>;
+
+    /// Returns the MLIR context that owns the block and the operations emitted into it.
+    fn context(&self) -> &'c MlirContext<'t>;
+
+    /// Returns the location of the emitted operations, which carries the provenance of the instruction.
+    fn location(&self) -> LocationRef<'c, 't>;
+
+    /// Declares a runtime contract required by an emitted operation (refer to [`Lowerer::require_runtime`]).
+    fn require_runtime(&mut self, requirement: RuntimeRequirement) -> Result<(), Error>;
+
+    /// Declares `mesh` as the mesh that an emitted operation refers to (refer to [`Lowerer::require_mesh`]).
+    fn require_mesh(&mut self, mesh: &LogicalMesh) -> Result<(), Error>;
+
+    /// Returns the current token of the `effect_class` chain of the enclosing lowering scope (refer to
+    /// [`Lowerer::effect_token`]).
+    fn effect_token(&mut self, effect_class: EffectClass) -> Result<ValueRef<'b, 'c, 't>, Error>;
+
+    /// Records `token` as the current token of the `effect_class` chain of the enclosing lowering scope (refer to
+    /// [`Lowerer::set_effect_token`]).
+    fn set_effect_token(&mut self, effect_class: EffectClass, token: ValueRef<'b, 'c, 't>);
+
+    /// Lowers the attached region at `index` inline into the block of the instruction (refer to
+    /// [`Lowerer::lower_region_inline`]).
+    fn lower_region_inline(
+        &mut self,
+        index: usize,
+        input_values: &[ValueRef<'b, 'c, 't>],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+
+    /// Lowers the instruction as its operation family lowers it (refer to [`LowerableOperation::lower`]), without
+    /// consulting the rule again, and returns one MLIR value per output. A rule calls this for the instructions that
+    /// it leaves alone, or to wrap the operations that the family emits.
+    fn lower_default(&mut self) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl<'b, 'c: 'b, 't: 'c> dyn InstructionLowerer<'b, 'c, 't> + '_ {
+    /// Returns the payload of type `P` of the operation of the instruction, if the operation holds one directly or
+    /// through a projected member variant, and [`None`] otherwise.
+    #[inline]
+    pub fn payload<P: 'static>(&self) -> Option<&P> {
+        self.project_payload(TypeId::of::<P>()).and_then(|payload| payload.downcast_ref::<P>())
+    }
+}
+
+/// Lowering of the instructions of one operation that replaces the lowering of their operation family for one
+/// module (refer to [`ProgramLoweringOptions::with_lowering_rule`]). A rule sees an instruction through an
+/// [`InstructionLowerer`], so it applies to the instructions of every program that the module lowers, whatever
+/// their operation family is, including the bodies of the private functions of the module.
+pub trait LoweringRule {
+    /// Lowers `instruction` to one or more StableHLO operations emitted into its block, and returns one MLIR value
+    /// per output.
+    fn lower<'b, 'c: 'b, 't: 'c>(
+        &self,
+        instruction: &mut dyn InstructionLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+/// [`LoweringRule`]s of one module, by the name of the operation whose instructions they lower.
+#[derive(Clone, Default)]
+pub(crate) struct LoweringRules(Rc<HashMap<String, Rc<dyn LoweringRule>>>);
+
+impl LoweringRules {
+    /// Returns these rules with `rule` lowering the instructions of the operation named `operation_name`, in place
+    /// of any rule that they held for that operation.
+    pub(crate) fn with_rule(mut self, operation_name: String, rule: Rc<dyn LoweringRule>) -> Self {
+        Rc::make_mut(&mut self.0).insert(operation_name, rule);
+        self
+    }
+
+    /// Returns the rule that lowers the instructions of the operation named `operation_name`, if any.
+    #[inline]
+    pub(crate) fn get(&self, operation_name: &str) -> Option<&Rc<dyn LoweringRule>> {
+        if self.0.is_empty() { None } else { self.0.get(operation_name) }
+    }
+}
+
+impl Debug for LoweringRules {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut operation_names = self.0.keys().collect::<Vec<_>>();
+        operation_names.sort();
+        formatter.debug_set().entries(operation_names).finish()
+    }
+}
+
+/// [`InstructionLowerer`] of an instruction of the operation family `O`, which pairs the [`Lowerer`] of the
+/// instruction with its operation and its boundary.
+pub(crate) struct FamilyInstructionLowerer<'l, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> {
+    /// Operation of the instruction.
+    pub(crate) operation: &'l O,
+
+    /// Lowering state of the instruction.
+    pub(crate) lowerer: &'l mut Lowerer<'b, 'c, 't, O>,
+
+    /// Lowered MLIR values of the instruction inputs.
+    pub(crate) input_values: &'l [ValueRef<'b, 'c, 't>],
+
+    /// Declared types of the instruction inputs.
+    pub(crate) input_types: &'l [Type],
+
+    /// Declared types of the instruction outputs.
+    pub(crate) output_types: &'l [Type],
+}
+
+impl<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> InstructionLowerer<'b, 'c, 't>
+    for FamilyInstructionLowerer<'_, 'b, 'c, 't, O>
+{
+    #[inline]
+    fn operation_name(&self) -> &'static str {
+        self.operation.name()
+    }
+
+    #[inline]
+    fn project_payload(&self, payload: TypeId) -> Option<&dyn Any> {
+        self.operation.project_payload(payload)
+    }
+
+    #[inline]
+    fn input_values(&self) -> &[ValueRef<'b, 'c, 't>] {
+        self.input_values
+    }
+
+    #[inline]
+    fn input_types(&self) -> &[Type] {
+        self.input_types
+    }
+
+    #[inline]
+    fn output_types(&self) -> &[Type] {
+        self.output_types
+    }
+
+    #[inline]
+    fn block(&self) -> BlockRef<'b, 'c, 't> {
+        self.lowerer.block()
+    }
+
+    #[inline]
+    fn context(&self) -> &'c MlirContext<'t> {
+        self.lowerer.context()
+    }
+
+    #[inline]
+    fn location(&self) -> LocationRef<'c, 't> {
+        self.lowerer.location()
+    }
+
+    #[inline]
+    fn require_runtime(&mut self, requirement: RuntimeRequirement) -> Result<(), Error> {
+        self.lowerer.require_runtime(requirement)
+    }
+
+    #[inline]
+    fn require_mesh(&mut self, mesh: &LogicalMesh) -> Result<(), Error> {
+        self.lowerer.require_mesh(mesh)
+    }
+
+    #[inline]
+    fn effect_token(&mut self, effect_class: EffectClass) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        self.lowerer.effect_token(effect_class)
+    }
+
+    #[inline]
+    fn set_effect_token(&mut self, effect_class: EffectClass, token: ValueRef<'b, 'c, 't>) {
+        self.lowerer.set_effect_token(effect_class, token);
+    }
+
+    #[inline]
+    fn lower_region_inline(
+        &mut self,
+        index: usize,
+        input_values: &[ValueRef<'b, 'c, 't>],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        self.lowerer.lower_region_inline(index, input_values)
+    }
+
+    #[inline]
+    fn lower_default(&mut self) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        self.operation.lower(self.lowerer, self.input_values, self.input_types, self.output_types)
     }
 }
 
@@ -1038,6 +1236,18 @@ pub(crate) mod tests {
     }
 
     /// Stages one `call` to `callee`, which is interned as a shared callee root region, over `inputs` in `builder`.
+    /// [`LoweringRule`] that lowers every instruction as its operation family lowers it.
+    pub(crate) struct DefaultLoweringRule;
+
+    impl LoweringRule for DefaultLoweringRule {
+        fn lower<'b, 'c: 'b, 't: 'c>(
+            &self,
+            instruction: &mut dyn InstructionLowerer<'b, 'c, 't>,
+        ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+            instruction.lower_default()
+        }
+    }
+
     pub(crate) fn add_call(
         builder: &mut CoreProgramBuilder<Constant, Operation>,
         callee: &Arc<FlatProgram<Session>>,

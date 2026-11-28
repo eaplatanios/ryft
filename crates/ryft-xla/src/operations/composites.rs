@@ -12,7 +12,7 @@ use ryft_mlir::{Block as _, Operation as _, Value as _};
 
 use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::operations::attention::{AttentionConfigurationLoweringExtension, select_attention_implementation};
-use crate::operations::call::lower_shared_function_call;
+use crate::operations::call::{NamedFunctionKey, lower_shared_call, lower_shared_function_call};
 use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
@@ -186,35 +186,28 @@ where
             {
                 return backend.lower(lowerer, input_values, &input_types, &output_types);
             }
-            let function = lowerer
-                .nested_functions()
-                .as_ref()
-                .and_then(|functions| functions.named(key, &input_types, &output_types));
-            if let Some(function) = function {
-                return lower_shared_function_call(
-                    function.symbol(),
-                    function.output_types(),
-                    input_values,
-                    &mut lowerer.block(),
-                    lowerer.context(),
-                    lowerer.location(),
-                );
+            // Calls whose key and boundary are shared by calls with another body have no function under that key and
+            // boundary, so they find their shared function by their own body instead, as `NamedFunctionKey` explains.
+            let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+            let named_key = NamedFunctionKey::new(key.clone(), input_types.clone(), output_types.clone());
+            if let Some(function) = lowerer.lowering_context().shared_function(&named_key) {
+                let symbol = function.symbol();
+                return lower_shared_function_call(symbol, &output_types, input_values, &mut block, context, location);
             }
-
-            // Calls whose key and boundary are shared by calls with another body are not indexed, so they find their
-            // shared function by their own body instead, as `CallFunctionMap::named` explains.
-            let function = lowerer.nested_functions().zip(lowerer.regions().first()).and_then(|(functions, primal)| {
-                functions.get(primal).filter(|function| function.input_types().len() == input_values.len())
-            });
-            if let Some(function) = function {
-                return lower_shared_function_call(
-                    function.symbol(),
-                    function.output_types(),
+            let (_, regions, captured_values, lowering_context) = lowerer.split_effect_tokens();
+            if let Some(primal) = regions.first()
+                && let Some(outputs) = lower_shared_call(
+                    primal,
+                    0,
                     input_values,
-                    &mut lowerer.block(),
-                    lowerer.context(),
-                    lowerer.location(),
-                );
+                    captured_values,
+                    &mut block,
+                    context,
+                    location,
+                    lowering_context,
+                )?
+            {
+                return Ok(outputs);
             }
         }
 
@@ -240,12 +233,10 @@ where
         // region because attached rules are dormant and retained rules are callbacks. Regions traced as nested programs
         // (i.e., those of `while`, `scan`, `condition`, and `linear_call`) share the enclosing capture scope.
         let (block, location) = (lowerer.block(), lowerer.location());
-        let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
-            lowerer.split_effect_tokens();
+        let (effect_tokens, regions, captured_values, lowering_context) = lowerer.split_effect_tokens();
         regions[0].lower_inline(
             lowering_context.session_constant_values(captured_values),
             input_values,
-            nested_functions,
             lowering_context,
             effect_tokens,
             block,
@@ -971,12 +962,12 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_operation_lower_named_composite_separates_bodies_that_cannot_be_shared() {
-        // Two definitions share one key and boundary, and the body of the first holds a constant, which structural
-        // deduplication cannot key. Its calls must inline their own body instead of calling the second body's function.
-        let first = named_rules_with_version("ryft.tests.xla_named_unshareable", 1);
-        let second = named_rules_with_version("ryft.tests.xla_named_unshareable", 1);
-        let unshareable = {
+    fn test_composite_operation_lower_named_composite_shares_bodies_with_constants() {
+        // Two definitions share one key and boundary, and the body of the first holds a constant. Each body is shared
+        // as a function of its own, and each call calls the function of its own body.
+        let first = named_rules_with_version("ryft.tests.xla_named_constant", 1);
+        let second = named_rules_with_version("ryft.tests.xla_named_constant", 1);
+        let with_constant = {
             let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(test_vector_type(4).into());
             builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
@@ -986,7 +977,7 @@ mod tests {
         let doubled = doubled_body();
         let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let input = builder.add_input(test_vector_type(4).into());
-        let outputs = [(&first, &unshareable), (&second, &doubled), (&first, &unshareable), (&second, &doubled)]
+        let outputs = [(&first, &with_constant), (&second, &doubled), (&first, &with_constant), (&second, &doubled)]
             .into_iter()
             .map(|(rules, body)| {
                 let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
@@ -1001,15 +992,19 @@ mod tests {
             lower_named_calls(&program, None).unwrap(),
             indoc! {r#"
                 module {
-                  func.func private @ryft.tests.xla_named_unshareable.v1(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                  func.func private @ryft.tests.xla_named_constant.v1(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.multiply %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                  func.func private @ryft.tests.xla_named_constant.v1_1(%arg0: tensor<4xf32>) -> tensor<4xf32> {
                     %0 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
                     return %0 : tensor<4xf32>
                   }
                   func.func @main(%arg0: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) {
-                    %0 = stablehlo.multiply %arg0, %arg0 : tensor<4xf32>
-                    %1 = call @ryft.tests.xla_named_unshareable.v1(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
-                    %2 = stablehlo.multiply %arg0, %arg0 : tensor<4xf32>
-                    %3 = call @ryft.tests.xla_named_unshareable.v1(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
+                    %0 = call @ryft.tests.xla_named_constant.v1(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
+                    %1 = call @ryft.tests.xla_named_constant.v1_1(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
+                    %2 = call @ryft.tests.xla_named_constant.v1(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
+                    %3 = call @ryft.tests.xla_named_constant.v1_1(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
                     return %0, %1, %2, %3 : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>, tensor<4xf32>
                   }
                 }

@@ -75,8 +75,7 @@ impl LowerableOperation for RematerializeOperation<Type> {
         let _ = (input_types, output_types);
         let mut block = lowerer.block();
         let location = lowerer.location();
-        let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
-            lowerer.split_effect_tokens();
+        let (effect_tokens, regions, captured_values, lowering_context) = lowerer.split_effect_tokens();
         let [body] = regions else {
             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                 operation: self.name().to_string(),
@@ -116,7 +115,6 @@ impl LowerableOperation for RematerializeOperation<Type> {
         body.lower_inline(
             lowering_context.session_constant_values(captured_values),
             &inputs,
-            nested_functions,
             lowering_context,
             effect_tokens,
             block,

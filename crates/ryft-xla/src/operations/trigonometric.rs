@@ -1,11 +1,10 @@
 use ryft_core::{ArrayType, Atan2Operation, CosOperation, DataType, SinOperation, TanOperation, TanhOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::Accuracy;
-use ryft_mlir::{Block, Context as MlirContext, Location, Operation as MlirOperation, Value as MlirValue, ValueRef};
+use ryft_mlir::{Block, Location, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat};
 use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_inputs};
-use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
+use crate::{ArrayTypeLoweringExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
@@ -24,7 +23,6 @@ impl LowerableOperation for SinOperation<ArrayType> {
                 &output_types[0],
                 true,
                 &mut lowerer.block(),
-                lowerer.context(),
                 lowerer.location(),
             )?]);
         }
@@ -52,7 +50,6 @@ impl LowerableOperation for CosOperation<ArrayType> {
                 &output_types[0],
                 false,
                 &mut lowerer.block(),
-                lowerer.context(),
                 lowerer.location(),
             )?]);
         }
@@ -134,14 +131,12 @@ impl LowerableOperation for TanhOperation<ArrayType> {
 ///   - `output_type`: Inferred complex output type, used to construct real constants of the same shape.
 ///   - `sine`: Whether to lower sine rather than cosine.
 ///   - `block`: Destination block for the StableHLO decomposition.
-///   - `context`: MLIR context that owns all emitted types and attributes.
 ///   - `location`: Source location attached to emitted operations.
 fn lower_complex_sine_or_cosine<'b, 'c: 'b, 't: 'c, B, L>(
     input: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
     sine: bool,
     block: &mut B,
-    context: &'c MlirContext<'t>,
     location: L,
 ) -> Result<ValueRef<'b, 'c, 't>, Error>
 where
@@ -154,9 +149,8 @@ where
         _ => unreachable!(),
     };
     let part_type = ArrayType::new(part_data_type, output_type.shape().clone());
-    let part_tensor_type = part_type.lower(context, location)?;
-    let zero = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
-    let two = lower_f64_constant_splat(2.0, &part_type, part_tensor_type, block, context, location)?;
+    let zero = part_type.lower_f64_splat(0.0, block, location)?;
+    let two = part_type.lower_f64_splat(2.0, block, location)?;
 
     let real = block.append_operation(stable_hlo::real(input, location)?)?;
     let real = real.result(0).unwrap().as_ref();
@@ -205,11 +199,10 @@ where
     // components finite even when `exp(abs(imaginary))`, or the hyperbolic factor itself, would overflow. Above
     // magnitude twenty, dropping the decaying exponential changes the factor by less than one `f64` ulp.
     let magnitude = block.append_operation(stable_hlo::abs(imaginary, location)?)?.result(0).unwrap().as_ref();
-    let half = lower_f64_constant_splat(0.5, &part_type, part_tensor_type, block, context, location)?;
-    let threshold = lower_f64_constant_splat(20.0, &part_type, part_tensor_type, block, context, location)?;
-    let infinity = lower_f64_constant_splat(f64::INFINITY, &part_type, part_tensor_type, block, context, location)?;
-    let log_two =
-        lower_f64_constant_splat(std::f64::consts::LN_2, &part_type, part_tensor_type, block, context, location)?;
+    let half = part_type.lower_f64_splat(0.5, block, location)?;
+    let threshold = part_type.lower_f64_splat(20.0, block, location)?;
+    let infinity = part_type.lower_f64_splat(f64::INFINITY, block, location)?;
+    let log_two = part_type.lower_f64_splat(std::f64::consts::LN_2, block, location)?;
     let large = block
         .append_operation(stable_hlo::compare(
             magnitude,

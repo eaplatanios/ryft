@@ -1,5 +1,3 @@
-use std::rc::Rc;
-
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, CONDITION_OPERATION_NAME, ConditionOperation, CustomCallOperation, DataType, Dimension, EagerContext,
@@ -16,10 +14,9 @@ use ryft_mlir::{
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::programs::{CallTraversal, ProgramInlineLoweringExtension, RegionLoweringExtension};
 use crate::lowering::sharding::OpenDimensions;
-use crate::lowering::types::{ArrayTypeLoweringExtension, dimension_extent_to_i64, lower_unplaced_constant_output};
+use crate::lowering::types::{ArrayTypeLoweringExtension, dimension_extent_to_i32, dimension_extent_to_i64};
 use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::assertions::{lower_guard, validates_output_extents};
-use crate::operations::call::CallFunctionMap;
 use crate::{ArrayTypeExtension, Constant, Error, Lowerer, LoweringError, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
@@ -246,16 +243,13 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     for (axis, dimensions) in dimension_pairs.enumerate() {
         runtime_sizes.push(match dimensions {
             (Dimension::Static(_), _) => None,
-            (Dimension::Dynamic(_), Dimension::Static(extent)) => Some(
-                lower_unplaced_constant_output(
-                    &[ArrayType::scalar(DataType::I32)],
-                    dimension_extent_to_i64(*extent)?,
+            (Dimension::Dynamic(_), Dimension::Static(extent)) => {
+                Some(ArrayType::scalar(DataType::I32).lower_i64_splat(
+                    i64::from(dimension_extent_to_i32(*extent)?),
                     block,
-                    context,
                     location,
-                )?
-                .remove(0),
-            ),
+                )?)
+            }
             (Dimension::Dynamic(_), Dimension::Dynamic(_)) => {
                 let size = block.append_operation(stable_hlo::get_dimension_size(value, axis, location)?)?;
                 Some(size.result(0).unwrap().as_ref())
@@ -278,9 +272,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
             Ok(dimension_extent_to_i64(bound.value().unwrap())? - dimension_extent_to_i64(extent.value().unwrap())?)
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    let padding_value =
-        lower_unplaced_constant_output(&[ArrayType::scalar(declared_type.data_type())], 0, block, context, location)?
-            .remove(0);
+    let padding_value = ArrayType::scalar(declared_type.data_type()).lower_i64_splat(0, block, location)?;
     let padded = block.append_operation(stable_hlo::pad(
         physical_value,
         padding_value,
@@ -405,7 +397,6 @@ pub(crate) trait ControlFlowRegionLoweringExtension<O: ProgramLoweringOperation>
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
         captured_values: &[ValueRef<'b, 'c, 't>],
-        nested_functions: Option<&Rc<CallFunctionMap<O>>>,
         lowering_context: &ProgramLoweringContext,
         entry_effect_tokens: EffectTokens<'b, 'c, 't>,
         threaded_effects: EffectClasses,
@@ -421,7 +412,6 @@ impl<O: ProgramLoweringOperation> ControlFlowRegionLoweringExtension<O> for Flat
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
         captured_values: &[ValueRef<'b, 'c, 't>],
-        nested_functions: Option<&Rc<CallFunctionMap<O>>>,
         lowering_context: &ProgramLoweringContext,
         entry_effect_tokens: EffectTokens<'b, 'c, 't>,
         threaded_effects: EffectClasses,
@@ -434,7 +424,6 @@ impl<O: ProgramLoweringOperation> ControlFlowRegionLoweringExtension<O> for Flat
             let mut outputs = self.lower_inline(
                 captured_values,
                 input_values,
-                nested_functions,
                 lowering_context,
                 &mut region_effect_tokens,
                 block_ref,
@@ -582,7 +571,7 @@ mod tests {
     use ryft_pjrt::{Client, Program as PjrtProgram};
 
     use crate::lowering::tests::{dynamic_dimension, test_vector_type};
-    use crate::lowering::types::{TypeLoweringExtension, lower_f64_constant_splat};
+    use crate::lowering::types::TypeLoweringExtension;
     use crate::operations::Operation;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
@@ -938,13 +927,8 @@ mod tests {
         let module = context.module(location).unwrap();
         let mut block = module.body().unwrap();
         let predicate_type = ArrayType::scalar(DataType::Boolean);
-        let predicate_tensor_type = predicate_type.lower(&context, location).unwrap();
-        let predicate =
-            lower_f64_constant_splat(1.0, &predicate_type, predicate_tensor_type, &mut block, &context, location)
-                .unwrap();
-        let input_tensor_type = scalar_type.lower(&context, location).unwrap();
-        let input =
-            lower_f64_constant_splat(2.0, &scalar_type, input_tensor_type, &mut block, &context, location).unwrap();
+        let predicate = predicate_type.lower_f64_splat(1.0, &mut block, location).unwrap();
+        let input = scalar_type.lower_f64_splat(2.0, &mut block, location).unwrap();
 
         // The regions are rendered inside a conditional, because the program reads its input from the enclosing scope.
         let lower = || {
@@ -955,7 +939,6 @@ mod tests {
                     &context,
                     location,
                     &[],
-                    None,
                     &ProgramLoweringContext::new(),
                     EffectTokens::default(),
                     EffectClasses::NONE,
@@ -1006,7 +989,6 @@ mod tests {
                 &context,
                 location,
                 &[],
-                None,
                 &ProgramLoweringContext::new(),
                 EffectTokens::default(),
                 threaded_effects,

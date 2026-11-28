@@ -8,9 +8,11 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::{ArrayTypeLoweringExtension, MemoryLoweringExtension, lower_f64_constant_splat};
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
+use crate::{
+    ArrayTypeLoweringExtension, Error, LowerableOperation, Lowerer, LoweringError, MemoryLoweringExtension,
+    ProgramLoweringOperation, Type,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -121,22 +123,13 @@ impl LowerableOperation for DropoutOperation {
             Some(state) => (RandomAlgorithm::from_state_type(&input_types[1])?, *state),
             None => {
                 let state_type = RandomAlgorithm::ThreeFry.state_type();
-                let state_tensor_type = state_type.lower(context, location)?;
-                let state = lower_f64_constant_splat(0.0, &state_type, state_tensor_type, block, context, location)?;
+                let state = state_type.lower_i64_splat(0, block, location)?;
                 (RandomAlgorithm::ThreeFry, state)
             }
         };
         let mask_type = self.mask_type(input_type)?;
         let generated = algorithm.lower_unplaced_bit_generator(&mask_type, &[state], block, context, location)?;
-        let mask_tensor_type = mask_type.lower(context, location)?;
-        let threshold = lower_f64_constant_splat(
-            f64::from(self.drop_threshold()),
-            &mask_type,
-            mask_tensor_type,
-            block,
-            context,
-            location,
-        )?;
+        let threshold = mask_type.lower_i64_splat(i64::from(self.drop_threshold()), block, location)?;
         let keep = block
             .append_operation(stable_hlo::compare(
                 generated[1],
@@ -148,7 +141,6 @@ impl LowerableOperation for DropoutOperation {
             .result(0)
             .unwrap()
             .as_ref();
-        let input_tensor_type = input_type.lower(context, location)?;
         let keep = if mask_type.shape() == input_type.shape() {
             keep
         } else {
@@ -162,33 +154,8 @@ impl LowerableOperation for DropoutOperation {
                 .as_ref()
         };
 
-        // Complex scales and zeros combine real parts with one shared zero imaginary part.
-        let part_data_type = match input_type.data_type() {
-            DataType::C64 => Some(DataType::F32),
-            DataType::C128 => Some(DataType::F64),
-            _ => None,
-        };
-        let (scale, zero) = match part_data_type {
-            None => (
-                lower_f64_constant_splat(self.scale(), input_type, input_tensor_type, block, context, location)?,
-                lower_f64_constant_splat(0.0, input_type, input_tensor_type, block, context, location)?,
-            ),
-            Some(part_data_type) => {
-                let part_type = input_type.clone().with_data_type(part_data_type).with_layout(None);
-                let part_tensor_type = part_type.lower(context, location)?;
-                let part_zero = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
-                let part_scale =
-                    lower_f64_constant_splat(self.scale(), &part_type, part_tensor_type, block, context, location)?;
-                let mut complex = |real: ValueRef<'b, 'c, 't>| -> Result<ValueRef<'b, 'c, 't>, Error> {
-                    Ok(block
-                        .append_operation(stable_hlo::complex(real, part_zero, location)?)?
-                        .result(0)
-                        .unwrap()
-                        .as_ref())
-                };
-                (complex(part_scale)?, complex(part_zero)?)
-            }
-        };
+        let scale = input_type.lower_f64_splat(self.scale(), block, location)?;
+        let zero = input_type.lower_f64_splat(0.0, block, location)?;
         // A rate of one drops every element, after drawing the words that advance the state as for any other rate.
         if self.drops_everything() {
             return Ok(std::iter::once(zero).chain(input_values.get(1).map(|_| generated[0])).collect());
@@ -880,13 +847,15 @@ mod tests {
                     %c_0 = stablehlo.constant dense<2147483648> : tensor<ui32>
                     %1 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<ui32>) -> tensor<4xui32>
                     %2 = stablehlo.compare GE, %output, %1, UNSIGNED : (tensor<4xui32>, tensor<4xui32>) -> tensor<4xi1>
-                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %3 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                    %cst_1 = stablehlo.constant dense<2.000000e+00> : tensor<f32>
-                    %4 = stablehlo.broadcast_in_dim %cst_1, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                    %5 = stablehlo.complex %4, %3 : tensor<4xcomplex<f32>>
-                    %6 = stablehlo.complex %3, %3 : tensor<4xcomplex<f32>>
-                    %7 = stablehlo.multiply %arg0, %5 : tensor<4xcomplex<f32>>
+                    %cst = stablehlo.constant dense<2.000000e+00> : tensor<f32>
+                    %cst_1 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %3 = stablehlo.complex %cst, %cst_1 : tensor<complex<f32>>
+                    %4 = stablehlo.broadcast_in_dim %3, dims = [] : (tensor<complex<f32>>) -> tensor<4xcomplex<f32>>
+                    %cst_2 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %cst_3 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %5 = stablehlo.complex %cst_2, %cst_3 : tensor<complex<f32>>
+                    %6 = stablehlo.broadcast_in_dim %5, dims = [] : (tensor<complex<f32>>) -> tensor<4xcomplex<f32>>
+                    %7 = stablehlo.multiply %arg0, %4 : tensor<4xcomplex<f32>>
                     %8 = stablehlo.select %2, %7, %6 : tensor<4xi1>, tensor<4xcomplex<f32>>
                     return %8 : tensor<4xcomplex<f32>>
                   }
