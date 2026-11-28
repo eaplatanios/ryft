@@ -3,10 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use ryft_core::{FlatProgram, LogicalMesh, Provenance, ShardMapBoundary, Sharding};
-use ryft_mlir::{
-    AttributeRef, BlockRef, Context as MlirContext, Location, LocationRef, Module, Operation as MlirOperation,
-    OperationPrintingFlags, ValueRef,
-};
+use ryft_mlir::{AttributeRef, BlockRef, Context as MlirContext, Location, LocationRef, ValueRef};
 
 use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::lowering::{LoweringError, RaggedDotLoweringStrategy};
@@ -103,6 +100,12 @@ impl ProgramLoweringContext {
     #[inline]
     pub(super) fn mesh(&self) -> Option<LogicalMesh> {
         self.state.mesh.get().cloned()
+    }
+
+    /// Returns whether any scope lowered instruction provenance into an MLIR location.
+    #[inline]
+    pub(super) fn has_provenance(&self) -> bool {
+        self.state.has_provenance.get()
     }
 
     /// Returns whether this module requires the runtime assertion handler.
@@ -283,17 +286,14 @@ impl ProgramLoweringContext {
             })
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Lowers one instruction's [`Provenance`] onto MLIR locations above the provided base location and records
-    /// module-wide whether any instruction-specific location was constructed. Unknown provenance uses the base
-    /// location unchanged, each scope level becomes one
-    /// [`NameLoc`](https://mlir.llvm.org/docs/Dialects/Builtin/#nameloc) above its lowered origin, and fused
-    /// provenance becomes one metadata-free
+    /// module-wide whether any instruction-specific location was constructed. Unknown provenance uses the base location
+    /// unchanged, each scope level becomes one [`NameLoc`](https://mlir.llvm.org/docs/Dialects/Builtin/#nameloc) above
+    /// its lowered origin, and fused provenance becomes one metadata-free
     /// [`FusedLoc`](https://mlir.llvm.org/docs/Dialects/Builtin/#fusedloc) over its recursively lowered origins. An
     /// existing file/line base location is thereby preserved as the innermost child of the named scopes rather than
     /// being replaced.
-    pub(crate) fn instruction_location<'c, 't: 'c>(
+    pub(super) fn lower_provenance<'c, 't: 'c>(
         &self,
         context: &'c MlirContext<'t>,
         provenance: &Provenance,
@@ -319,32 +319,10 @@ impl ProgramLoweringContext {
         if provenance.is_unknown() {
             return base;
         }
-        self.state.has_provenance.set(true);
-        lower(context, provenance, base)
-    }
 
-    /// Renders `module` as StableHLO text, including instruction locations when lowering recorded provenance.
-    /// The text is also part of the compilation cache key. Modules without provenance keep the plain rendering.
-    /// Modules with provenance use the parsable debug form and retain all element and resource attributes so that
-    /// a cached artifact carries the locations and constants of the program that produced it. Programs that differ
-    /// only in provenance can therefore have separate cache entries. Sharing those entries would require an explicit
-    /// option to strip provenance from the module before computing its key.
-    pub(super) fn render_module(&self, module: &Module<'_, '_>) -> Result<String, Error> {
-        if !self.state.has_provenance.get() {
-            return Ok(module.to_string());
-        }
-        module
-            .as_operation()?
-            .to_string_with_flags(OperationPrintingFlags {
-                elements_attribute_size_threshold: None,
-                resource_string_size_threshold: None,
-                enable_debug_information: true,
-                pretty_print_debug_information: false,
-                ..OperationPrintingFlags::default()
-            })
-            .map_err(|error| {
-                ryft_mlir::Error::internal(format!("serialized module is not valid UTF-8: {error}")).into()
-            })
+        self.state.has_provenance.set(true);
+
+        lower(context, provenance, base)
     }
 }
 
@@ -589,8 +567,8 @@ mod tests {
         assert!(root.requires_assertion_handler());
         let context = MlirContext::new();
         let provenance = Provenance::scope(ProvenanceScope::new("nested"), Provenance::unknown());
-        inner.instruction_location(&context, &provenance, context.unknown_location().as_ref());
-        assert!(sibling.state.has_provenance.get());
+        inner.lower_provenance(&context, &provenance, context.unknown_location().as_ref());
+        assert!(sibling.has_provenance());
     }
 
     #[test]

@@ -13,9 +13,9 @@ use ryft_core::{
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
-    Attribute, Block, BlockRef, Context as MlirContext, DetachedBlock, Location, LocationRef,
-    Operation as MlirOperation, Region, SymbolVisibility, Type as MlirType, TypeAndAttributes, Value as MlirValue,
-    ValueRef, WalkOrder, WalkResult,
+    Attribute, Block, BlockRef, Context as MlirContext, DetachedBlock, Error as MlirError, Location, LocationRef,
+    Operation as MlirOperation, OperationPrintingFlags, Region, SymbolVisibility, Type as MlirType, TypeAndAttributes,
+    Value as MlirValue, ValueRef, WalkOrder, WalkResult,
 };
 
 use crate::arrays::host::ReductionChange;
@@ -911,7 +911,25 @@ where
 
         let runtime_requirements = normalize_runtime_requirements(runtime_requirements)?.into();
 
-        Ok(MlirProgram::new(lowering_context.render_module(&module)?, boundary_mapping, runtime_requirements, mesh))
+        // The StableHLO text is part of the compilation cache key. Use plain text for modules without provenance.
+        // Otherwise, include parsable locations and complete constants so the cached artifact retains both.
+        // Programs that differ only in provenance can therefore have distinct cache entries.
+        let stable_hlo = if lowering_context.has_provenance() {
+            module
+                .as_operation()?
+                .to_string_with_flags(OperationPrintingFlags {
+                    elements_attribute_size_threshold: None,
+                    resource_string_size_threshold: None,
+                    enable_debug_information: true,
+                    pretty_print_debug_information: false,
+                    ..OperationPrintingFlags::default()
+                })
+                .map_err(|error| MlirError::internal(format!("serialized module is not valid UTF-8: {error}")))?
+        } else {
+            module.to_string()
+        };
+
+        Ok(MlirProgram::new(stable_hlo, boundary_mapping, runtime_requirements, mesh))
     }
 }
 
@@ -2570,7 +2588,7 @@ where
                 let (input_types, output_types) = region.instruction_boundary_types(instruction);
 
                 // All operations emitted for this instruction inherit its provenance on top of the ambient location.
-                let location = lowering_context.instruction_location(context, instruction.provenance(), location);
+                let location = lowering_context.lower_provenance(context, instruction.provenance(), location);
                 let operation = instruction.operation();
 
                 // A named composite with a backend implementation or a shared function needs no copy of its body.
