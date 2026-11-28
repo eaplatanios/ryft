@@ -48,12 +48,13 @@ use crate::lowering::EffectTokens;
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::programs::{
     CallTraversal, ProgramInlineLoweringExtension, RegionLoweringExtension, RegionPlacementRequestsExtension,
+    UnreadLiftedCaptures,
 };
 use crate::lowering::types::{TypeLoweringExtension, lower_unplaced_constant_output};
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::TypeCastLoweringExtension;
 use crate::operations::sharding::constrain_sharding::lower_declared_sharding_constraint;
-use crate::operations::{Operation, unread_lifted_captures};
+use crate::operations::{Operation, cached_unread_lifted_captures};
 use crate::{
     Array, Constant, Error, ExecutionError, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation,
     Session, Type, Value,
@@ -485,7 +486,7 @@ impl CallEagerExtension for CallOperation<Type> {
         let callee_requests = || RegionPlacementRequests::for_lowering(callee, Some(target_platform));
         let unread_captures = match self.capture_count() {
             0 => None,
-            capture_count => unread_lifted_captures(callee, capture_count, Some(target_platform)),
+            capture_count => cached_unread_lifted_captures(callee, capture_count, Some(target_platform)),
         };
         let unread = unread_captures.as_deref();
         let read_arrays = inputs.iter().enumerate().map(|(index, input)| read_array(unread, index, input));
@@ -828,13 +829,13 @@ impl LowerableOperation for CallOperation<Type> {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         self.validate_region_count(lowerer.regions().len())?;
         // A capture that the callee never reads receives a bufferless value, just like an unread entry argument.
-        // Both capture analysis and session constant partitioning use the same family decision about those inputs.
+        // Both capture analysis and session constant partitioning use the same decision about those inputs.
         let unread = match self.capture_count() {
             0 => None,
-            capture_count => O::unread_captures(
-                lowerer.regions()[0].entry_region_ref(),
+            capture_count => lowerer.regions()[0].entry_region_ref().unread_lifted_captures(
                 capture_count,
                 lowerer.lowering_context().target_platform(),
+                &mut UnreadLiftedCaptures::new(),
             ),
         };
         let input_values = input_values

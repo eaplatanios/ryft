@@ -3,9 +3,8 @@ use ryft_core::{ArrayType, CompareOperation, ComparisonDirection, DataType, Prog
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::lowering::types::lower_signed_one_bit_to_mlir;
 use crate::operations::normalize_binary_elementwise_inputs;
-use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
+use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type, ValueRefExtension};
 
 // TODO(eaplatanios): Review this module.
 
@@ -69,8 +68,7 @@ impl LowerableOperation for CompareOperation<ArrayType> {
         let mut inputs = [input_values[0], input_values[1]];
         for (input, input_type) in inputs.iter_mut().zip(input_types) {
             if input_type.data_type() == DataType::I1 {
-                *input =
-                    lower_signed_one_bit_to_mlir(*input, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+                *input = input.widen_i1_to_i8(&mut lowerer.block(), lowerer.location())?;
             }
         }
         if operand_type.data_type() == DataType::I1 {

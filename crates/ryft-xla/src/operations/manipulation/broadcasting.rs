@@ -9,12 +9,15 @@ use ryft_mlir::{Block, Operation as MlirOperation, Type as MlirType, Value as Ml
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_i64, lower_explicit_shape,
-    lower_runtime_dimension_size_i64, lower_static_index_constants,
+    lower_static_index_constants,
 };
 use crate::operations::constants::{
     ArrayTypeLayoutConstraintLoweringExtension, dynamic_constructor_types, refine_dynamic_constructor_result,
 };
-use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
+use crate::{
+    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type,
+    ValueRefExtension,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -62,7 +65,7 @@ impl LowerableOperation for BroadcastOperation {
                     } else {
                         let input_axis =
                             self.output_axes().iter().position(|output_axis| *output_axis == axis).unwrap();
-                        lower_runtime_dimension_size_i64(input, input_axis, block, context, location)
+                        input.widen_dimension_to_i64(input_axis, block, location)
                     }
                 })
                 .collect::<Result<Vec<_>, Error>>()?;

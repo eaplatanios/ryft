@@ -152,6 +152,7 @@ impl LowerableOperation for IdentityOperation {
 #[derive(Clone, Debug, ryft_macros::Operation)]
 #[ryft(crate = "ryft_core", type(Type), constant(Constant))]
 enum ExtendedOperation {
+    #[ryft(family)]
     Xla(Box<Operation>),
     Twice(TwiceOperation),
     Square(SquareOperation),

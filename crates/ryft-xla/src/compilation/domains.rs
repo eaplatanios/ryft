@@ -33,12 +33,12 @@ use crate::compilation::programs::{
 use crate::execution::{ExecutionPlan, validate_capture_reduction};
 use crate::lowering::programs::{
     CallTraversal, OutputShardingSource, ProgramLoweringAnalysisExtension, ProgramLoweringExtension,
-    ProgramLoweringOptions, ProgramSessionConstants, RegionLoweringExtension, entry_output_shardings,
-    entry_outputs_with_compiler_chosen_placement,
+    ProgramLoweringOptions, ProgramSessionConstants, RegionLoweringExtension, UnreadLiftedCaptures,
+    entry_output_shardings, entry_outputs_with_compiler_chosen_placement,
 };
 use crate::{
-    Array, Constant, Error, ExecutionError, LowerableOperation, LoweringError, OpShardingExtension, Operation,
-    RetainedArray, Session, Type, Value,
+    Array, Constant, Error, ExecutionError, LoweringError, OpShardingExtension, Operation, RetainedArray, Session,
+    Type, Value,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -162,7 +162,7 @@ impl Session {
         // decision (refer to `used_captures`).
         let target_platform = Some(self.target()?.platform_name());
         let entry = staged.source_program().program().entry_region_ref();
-        let is_read = entry.used_captures(capture_count, false, target_platform);
+        let is_read = entry.used_captures(capture_count, false, target_platform, &mut UnreadLiftedCaptures::new());
         let capture_placements = staged
             .source_program()
             .captures()
@@ -472,7 +472,7 @@ impl Session {
                                 .any(|(_, identity)| data_derived_dimensions.contains(identity))
                         });
                     if consumes_data_derived_extent {
-                        instruction.operation().validate_data_derived_dimensions()?;
+                        instruction.operation().validate_data_derived_dimension_support()?;
                     }
                 }
             }

@@ -7,14 +7,14 @@ use ryft_mlir::{
 
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_explicit_shape, lower_runtime_dimension_size_i64,
-    lower_static_index_constants, lower_unplaced_constant_output,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_explicit_shape, lower_static_index_constants,
+    lower_unplaced_constant_output,
 };
 use crate::lowering::values::ArrayLiteralLoweringExtension;
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::build_reduce_body_region;
-use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
+use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, ValueRefExtension};
 
 // TODO(eaplatanios): Review this module.
 
@@ -153,9 +153,7 @@ impl GatherOperationLoweringExtension for GatherOperation {
         for &axis in dimensions.start_index_map() {
             let extent = match input_types[0].shape().dimensions()[axis] {
                 Dimension::Static(extent) => lower_static_index_constants(&[extent], block, context, location)?[0],
-                Dimension::Dynamic(_) => {
-                    lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?
-                }
+                Dimension::Dynamic(_) => input_values[0].widen_dimension_to_i64(axis, block, location)?,
             };
             let window = lower_static_index_constants(&[self.slice_sizes()[axis]], block, context, location)?[0];
             upper_bounds.push(

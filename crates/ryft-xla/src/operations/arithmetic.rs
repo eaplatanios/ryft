@@ -6,9 +6,9 @@ use ryft_core::{
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, Operation as MlirOperation, TensorTypeRef, Type as MlirType, Value as MlirValue, ValueRef};
 
-use crate::lowering::types::{ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_signed_one_bit_to_mlir};
+use crate::lowering::types::{ArrayTypeLoweringExtension, DataTypeLoweringExtension};
 use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_inputs};
-use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
+use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, ValueRefExtension};
 
 // TODO(eaplatanios): Review this module.
 
@@ -283,7 +283,7 @@ fn normalize_arithmetic_inputs<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     let mut inputs = [input_values[0], input_values[1]];
     for (input, input_type) in inputs.iter_mut().zip(input_types) {
         if input_type.data_type() == DataType::I1 {
-            *input = lower_signed_one_bit_to_mlir(*input, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+            *input = input.widen_i1_to_i8(&mut lowerer.block(), lowerer.location())?;
         }
     }
     let output_type = match output_types[0].data_type() {

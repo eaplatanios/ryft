@@ -62,7 +62,7 @@ pub use configurations::{
 };
 pub use operations::{
     COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeConversion, CompositeJvpRule,
-    CompositeOperation, CompositeTransposeOperation,
+    CompositeOperation, CompositeTransposeOperation, NamedCompositeOperation,
 };
 pub use rules::{
     CompositeAttribute, CompositeBody, CompositeKey, CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration,

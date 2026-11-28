@@ -24,7 +24,7 @@ use crate::lowering::EffectTokens;
 use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, PhysicalStoragePadding, TypeLoweringExtension, lower_explicit_shape,
-    lower_runtime_dimension_size_i64, lower_static_index_constants,
+    lower_static_index_constants,
 };
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::control_flow::{
@@ -34,7 +34,9 @@ use crate::operations::control_flow::{
 };
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
-use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
+use crate::{
+    ArrayTypeExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type, ValueRefExtension,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -349,15 +351,7 @@ impl LowerableOperation for WhileOperation<Type> {
                                 )?
                             } else {
                                 let extents = (0..state_type.rank())
-                                    .map(|axis| {
-                                        lower_runtime_dimension_size_i64(
-                                            *carried,
-                                            axis,
-                                            &mut body_block_ref,
-                                            context,
-                                            location,
-                                        )
-                                    })
+                                    .map(|axis| carried.widen_dimension_to_i64(axis, &mut body_block_ref, location))
                                     .collect::<Result<Vec<_>, _>>()?;
                                 let shape = lower_explicit_shape(&extents, &mut body_block_ref, context, location)?;
                                 let broadcast = body_block_ref.append_operation(stable_hlo::dynamic_broadcast(

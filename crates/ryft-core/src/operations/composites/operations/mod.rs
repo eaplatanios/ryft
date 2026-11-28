@@ -3,6 +3,7 @@ use std::hash::Hash;
 use crate::batching::BatchAxis;
 use crate::contexts::StagingContext;
 use crate::differentiation::{DifferentiableType, DifferentiationError};
+use crate::operations::composites::rules::definitions::CompositeKey;
 use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
 use crate::operations::composites::rules::{
     CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleForwardSpecializationKey,
@@ -26,6 +27,22 @@ pub enum CompositeConversion<A, R> {
 
     /// Converted call or carrier whose rules are retained, with the source that the conversion mapped.
     Retained(R),
+}
+
+/// Operations that may be calls of a [`NamedComposite`](crate::NamedComposite), which code that only sees an operation
+/// family uses to recognize such calls (e.g., a backend that shares one function among the calls of a named composite,
+/// or that replaces them with an implementation of its own). [`CompositeOperation`] implements it, and an operation
+/// family answers for whichever member it holds.
+///
+/// `#[derive(Operation)]` implements this trait for every family. The generated implementation delegates to the
+/// payloads of the variants that are marked with `#[ryft(composite)]` (i.e., the variants that hold composite calls)
+/// and of the variants that are marked with `#[ryft(family)]` (i.e., the variants that hold a nested family), and it
+/// reports no key for every other variant. A family must therefore mark every variant whose payload is a composite
+/// call, and every projected member variant whose payload is a family that holds such calls.
+pub trait NamedCompositeOperation {
+    /// Returns the semantic identity of this operation if it is a call of a named composite whose primal region is
+    /// still the body of its definition, and [`None`] otherwise.
+    fn composite_key(&self) -> Option<&CompositeKey>;
 }
 
 /// Returns the batching record of the [`CompositeTransposeOperation`] that reverse mode differentiation stages for

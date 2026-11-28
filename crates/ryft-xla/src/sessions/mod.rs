@@ -111,11 +111,11 @@ use ryft_core::{
     DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue, DiskCache, Domain,
     DomainTracer, EagerContext, EffectClass, EmptyRegionDriver, FlatProgram, ImportingContext, InputRegionProvenance,
     InterpretableOperation, LogicalMesh, MeshAxis, MeshAxisType, MeshContext, NamedAxes, NamedAxis,
-    NestedTracingContext, Operation as CoreOperation, OperationProvider, Placeholder, Placement, ProcessIndex,
-    ProgramBuilder, ProgramError, Provenance, ProvenanceScope, Region, RegionDriver, RegionKey,
-    RegionPlacementRequests, RegionRole, RequestedPlacement, Sharding, SpecializationCache, SpecializationCacheEntry,
-    SpecializationCacheStatistics, TracingContext, Transform, TransformArtifact, Type as CoreType, TypeError, Typed,
-    TypedProgram, ValueProjection, Zero, ZeroOperation, decode_logical_bytes,
+    NamedCompositeOperation, NestedTracingContext, Operation as CoreOperation, OperationProvider, Placeholder,
+    Placement, ProcessIndex, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, Region, RegionDriver,
+    RegionKey, RegionPlacementRequests, RegionRole, RequestedPlacement, Sharding, SpecializationCache,
+    SpecializationCacheEntry, SpecializationCacheStatistics, TracingContext, Transform, TransformArtifact,
+    Type as CoreType, TypeError, Typed, TypedProgram, ValueProjection, Zero, ZeroOperation, decode_logical_bytes,
 };
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Client, ClientOptions, Error as PjrtError, MemoryStatistics, Plugin};
@@ -138,7 +138,7 @@ use crate::sessions::runtimes::RuntimeRegistry;
 use crate::sessions::synchronization::{SessionWorkTracker, WorkReservation};
 use crate::{
     Array, ArrayError, ArrayShard, ArrayStatistics, Constant, Dimension, DistributedRuntime, Error, FromPjrt,
-    LiveArray, LowerableOperation, Operation, Options, ProgramLoweringOperation, RetainedArray, Type, Value,
+    LiveArray, Operation, Options, ProgramLoweringOperation, RetainedArray, Type, Value,
 };
 
 pub mod effects;

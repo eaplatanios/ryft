@@ -30,10 +30,10 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
 ///
 /// Every variant of the enum must wrap exactly one operation payload, which may be stored directly or boxed, and
 /// the enum then behaves like whichever payload it holds. The macro always generates the `Display`, `Operation`,
-/// `InterpretableOperation`, and `OperationPayloadProjection` implementations, one `OperationProjection`
-/// implementation per projected member variant, and the owned `From<Payload>` and borrowed `TryFrom<&Enum>` payload
-/// conversions. Unless a variant stores a native `GuardOperation`, it also generates an `OperationProvider`
-/// implementation that rejects guard requests, and when a variant declares `#[ryft(collective)]` or
+/// `NamedCompositeOperation`, `InterpretableOperation`, and `OperationPayloadProjection`, implementations, one
+/// `OperationProjection` implementation per projected member variant, and the owned `From<Payload>` and borrowed
+/// `TryFrom<&Enum>` payload conversions. Unless a variant stores a native `GuardOperation`, it also generates an
+/// `OperationProvider` implementation that rejects guard requests, and when a variant declares `#[ryft(collective)]` or
 /// `#[ryft(lockstep)]`, it generates a `CollectiveOperation` or `LockstepOperation` implementation that delegates to
 /// the payloads of the variants that declare it and reports no rule for every other variant. The payload-delegating
 /// `PartialEq`, `Eq`, and `Hash` implementations, as well as the reference discharge, partial evaluation, batching,
@@ -54,6 +54,7 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
 /// #[ryft(mixed(U [, structural]))]          // The instruction crosses member universes, and `U` may be defaulted.
 /// #[ryft(family)]                           // The payload is a nested operation family of the same type.
 /// #[ryft(collective)]                       // `CollectiveOperation` delegates to the payload of the variant.
+/// #[ryft(composite)]                        // `NamedCompositeOperation` delegates to the payload of the variant.
 /// #[ryft(lockstep)]                         // `LockstepOperation` delegates to the payload of the variant.
 /// #[ryft(skip_from)]                        // Skips only the owned `From<Payload>` conversion of the variant.
 /// ```

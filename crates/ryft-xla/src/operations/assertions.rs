@@ -19,16 +19,14 @@ use ryft_pjrt::extensions::ffi::{
 };
 use ryft_pjrt::{Client, Error as PjrtError};
 
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_runtime_dimension_size_i64, lower_static_index_constants,
-};
+use crate::lowering::types::{ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_static_index_constants};
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::manipulation::conversions::TypeCastLoweringExtension;
 use crate::sessions::effects::EffectCallbackGuard;
 use crate::{
     Error, ExecutionError, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, RuntimeExtension,
-    RuntimeProvider, RuntimeRequirement, Type,
+    RuntimeProvider, RuntimeRequirement, Type, ValueRefExtension,
 };
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
@@ -419,7 +417,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
                                 continue;
                             }
                             static_checks.push((*expected, actual, (value, Some(axis))));
-                            let runtime = lower_runtime_dimension_size_i64(value, axis, block, context, location)?;
+                            let runtime = value.widen_dimension_to_i64(axis, block, location)?;
                             let expected = lower_static_index_constants(&[*expected], block, context, location)?[0];
                             let message = format!("input dimension `{actual}` must have the declared extent {site}");
                             lower_check(expected, runtime, message, effect_tokens, block)?;
@@ -490,7 +488,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
                             block: &mut BlockRef<'b, 'c, 't>| match extent {
             Ok(extent) => Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0)),
             Err((value, None)) => Ok::<_, Error>(*value),
-            Err((value, Some(axis))) => lower_runtime_dimension_size_i64(*value, *axis, block, context, location),
+            Err((value, Some(axis))) => value.widen_dimension_to_i64(*axis, block, location),
         };
         let expected = lower_extent(first, block)?;
         let actual = lower_extent(extent, block)?;
@@ -792,7 +790,7 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
             context.string_attribute(rank.to_string().as_str()),
         ));
         for axis in 0..rank {
-            arguments.push(lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?);
+            arguments.push(input_values[0].widen_dimension_to_i64(axis, block, location)?);
         }
         // XLA custom calls require static physical carriers, and the separately captured logical extents exclude
         // padding.

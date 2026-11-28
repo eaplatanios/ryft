@@ -9,13 +9,13 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, lower_explicit_shape, lower_f64_constant_splat, lower_runtime_dimension_size_i64,
-    lower_static_index_constants, lower_unplaced_constant_output,
+    ArrayTypeLoweringExtension, lower_explicit_shape, lower_f64_constant_splat, lower_static_index_constants,
+    lower_unplaced_constant_output,
 };
 use crate::operations::complex::lower_select_principal_phase_to_mlir;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_inputs};
-use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
+use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, ValueRefExtension};
 
 // TODO(eaplatanios): Review this module.
 
@@ -488,7 +488,7 @@ fn lower_exponential_constant_like<'b, 'c: 'b, 't: 'c>(
             Dimension::Static(extent) => {
                 Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0))
             }
-            Dimension::Dynamic(_) => lower_runtime_dimension_size_i64(input, axis, block, context, location),
+            Dimension::Dynamic(_) => input.widen_dimension_to_i64(axis, block, location),
         })
         .collect::<Result<Vec<_>, Error>>()?;
     let shape = lower_explicit_shape(&dimensions, block, context, location)?;

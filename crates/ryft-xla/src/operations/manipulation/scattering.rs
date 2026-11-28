@@ -11,13 +11,15 @@ use ryft_mlir::{
 
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_explicit_shape, lower_runtime_dimension_size_i64,
-    lower_static_index_constants, lower_unplaced_constant_output,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_explicit_shape, lower_static_index_constants,
+    lower_unplaced_constant_output,
 };
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::operations::reductions::build_reduce_body_region;
-use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
+use crate::{
+    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, ValueRefExtension,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -121,13 +123,11 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
             let mut upper_bounds = Vec::new();
             let mut sentinels = Vec::new();
             for &axis in dimensions.scatter_dimensions_to_operand_dimensions() {
-                let extent = lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?;
+                let extent = input_values[0].widen_dimension_to_i64(axis, block, location)?;
                 let window = match window_axes.iter().position(|window_axis| *window_axis == axis) {
-                    Some(position) => lower_runtime_dimension_size_i64(
-                        input_values[2],
+                    Some(position) => input_values[2].widen_dimension_to_i64(
                         dimensions.update_window_dimensions()[position],
                         block,
-                        context,
                         location,
                     )?,
                     None => lower_static_index_constants(&[1], block, context, location)?[0],

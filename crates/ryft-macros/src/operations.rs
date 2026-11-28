@@ -22,6 +22,7 @@ const DISPATCH_ATTRIBUTE: Symbol = Symbol::new("dispatch");
 const PROJECTED_ATTRIBUTE: Symbol = Symbol::new("projected");
 const MIXED_ATTRIBUTE: Symbol = Symbol::new("mixed");
 const COLLECTIVE_ATTRIBUTE: Symbol = Symbol::new("collective");
+const COMPOSITE_ATTRIBUTE: Symbol = Symbol::new("composite");
 const LOCKSTEP_ATTRIBUTE: Symbol = Symbol::new("lockstep");
 const FAMILY_ATTRIBUTE: Symbol = Symbol::new("family");
 const SKIP_FROM_ATTRIBUTE: Symbol = Symbol::new("skip_from");
@@ -225,6 +226,7 @@ impl OperationCodeGenerator {
             self.variants.iter().filter_map(|variant| self.generate_operation_projection_impl(variant));
         let payload_projection = self.generate_payload_projection_impl();
         let collective = self.generate_collective_impl();
+        let named_composite = self.generate_named_composite_impl();
         let lockstep = self.generate_lockstep_impl();
         let guard_provider = self.generate_guard_provider_impl();
         let conversions = self
@@ -261,6 +263,8 @@ impl OperationCodeGenerator {
             #payload_projection
 
             #collective
+
+            #named_composite
 
             #lockstep
 
@@ -1507,6 +1511,43 @@ impl OperationCodeGenerator {
         })
     }
 
+    /// Generates the `NamedCompositeOperation` implementation, which delegates to the payloads of the variants that
+    /// declare `#[ryft(composite)]` or `#[ryft(family)]` and reports no composite key for every other variant. The
+    /// payload of such a variant either implements `NamedCompositeOperation` itself (i.e., it is a composite call) or
+    /// is a family that does, and it is bounded accordingly. Unlike the `CollectiveOperation` implementation, this one
+    /// is generated for every family, so that code that is generic over operation families can always ask, and a
+    /// nested family is delegated to without a marker, so that a family that wraps another one cannot forget to.
+    fn generate_named_composite_impl(&self) -> TokenStream {
+        let ryft = &self.ryft_crate;
+        let self_type = &self.self_type;
+        let mut generics = self.generics.clone();
+        let mut arms = Vec::new();
+        for variant in self.variants.iter().filter(|variant| variant.is_composite || variant.is_family) {
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            generics
+                .make_where_clause()
+                .predicates
+                .push(syn::parse_quote_spanned!(variant.span => #payload_type: #ryft::NamedCompositeOperation));
+            arms.push(variant.arm(quote!(<#payload_type as #ryft::NamedCompositeOperation>::composite_key(#receiver))));
+        }
+
+        let (impl_generics, _, where_clause) = generics.split_for_impl();
+        quote! {
+            #[automatically_derived]
+            impl #impl_generics #ryft::NamedCompositeOperation for #self_type #where_clause {
+                #[allow(unreachable_patterns)]
+                #[inline]
+                fn composite_key(&self) -> ::std::option::Option<&#ryft::CompositeKey> {
+                    match self {
+                        #(#arms)*
+                        _ => ::std::option::Option::None,
+                    }
+                }
+            }
+        }
+    }
+
     /// Generates the `LockstepOperation` implementation, which delegates to the payloads of the variants that declare
     /// `#[ryft(lockstep)]` and reports no lockstep rule for every other variant, or returns [`None`] when no variant
     /// declares it. The implementation is generic over the root operation family of the emulated program, and the
@@ -1989,7 +2030,7 @@ impl OperationParser {
     ///   - `generics`: [`syn::Generics`] of the enum, which are used to detect bare generic extension payloads.
     ///   - `variant`: [`syn::Variant`] from which to extract an [`OperationVariant`].
     fn extract_variant(&mut self, generics: &syn::Generics, variant: &syn::Variant) -> Option<OperationVariant> {
-        let (class, generate_from, is_collective, is_lockstep, is_family, partial_evaluation) =
+        let (class, generate_from, is_collective, is_composite, is_lockstep, is_family, partial_evaluation) =
             self.extract_variant_attributes(variant);
         let field = match &variant.fields {
             syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => &fields.unnamed[0],
@@ -2048,6 +2089,7 @@ impl OperationParser {
             is_generic_extension,
             generate_from,
             is_collective,
+            is_composite,
             is_lockstep,
             is_family,
             partial_evaluation,
@@ -2060,17 +2102,20 @@ impl OperationParser {
     /// suppresses only its generated `From<Payload>` implementation so that a handwritten normalizing conversion can be
     /// used instead. Its borrowed `TryFrom` projection is still generated. The collective marker is `true` when the
     /// variant declares `#[ryft(collective)]`, which makes the generated `CollectiveOperation` implementation delegate
-    /// to its payload, and the lockstep marker is `true` when it declares `#[ryft(lockstep)]`, which does the same for
-    /// the generated `LockstepOperation` implementation. The family marker is `true` when the variant declares
-    /// `#[ryft(family)]` (refer to [`OperationVariant::is_family`]), which only family-native variants may declare.
-    /// A projected variant may specify a custom parent-universe partial evaluation rule by path.
+    /// to its payload, the composite marker is `true` when it declares `#[ryft(composite)]`, which does the same for
+    /// the generated `NamedCompositeOperation` implementation, and the lockstep marker is `true` when it declares
+    /// `#[ryft(lockstep)]`, which does the same for the generated `LockstepOperation` implementation. The family marker
+    /// is `true` when the variant declares `#[ryft(family)]` (refer to [`OperationVariant::is_family`]), which only
+    /// family-native variants may declare. A projected variant may specify a custom parent-universe partial evaluation
+    /// rule by path.
     fn extract_variant_attributes(
         &mut self,
         variant: &syn::Variant,
-    ) -> (OperationVariantClass, bool, bool, bool, bool, Option<syn::Path>) {
+    ) -> (OperationVariantClass, bool, bool, bool, bool, bool, Option<syn::Path>) {
         let mut class = None::<OperationVariantClass>;
         let mut generate_from = true;
         let mut is_collective = false;
+        let mut is_composite = false;
         let mut is_lockstep = false;
         let mut is_family = false;
         let mut partial_evaluation = None;
@@ -2088,6 +2133,13 @@ impl OperationParser {
                 }
                 path if path == &COLLECTIVE_ATTRIBUTE => {
                     is_collective = true;
+                    Ok(())
+                }
+                path if path == &COMPOSITE_ATTRIBUTE && is_composite => {
+                    Err(meta.error("duplicate ryft operation variant attribute `composite`"))
+                }
+                path if path == &COMPOSITE_ATTRIBUTE => {
+                    is_composite = true;
                     Ok(())
                 }
                 path if path == &LOCKSTEP_ATTRIBUTE && is_lockstep => {
@@ -2135,7 +2187,7 @@ impl OperationParser {
                 )),
                 _ => Err(meta.error(format_args!(
                     "invalid operation variant `#[ryft(...)]` attribute `{}`; only `projected`, `mixed`, `family`, \
-                     `collective`, `lockstep`, `partial_evaluation`, and `skip_from` are supported here",
+                     `collective`, `composite`, `lockstep`, `partial_evaluation`, and `skip_from` are supported here",
                     meta.path.to_compact_string(),
                 ))),
             })
@@ -2158,6 +2210,7 @@ impl OperationParser {
             class.unwrap_or(OperationVariantClass::FamilyNative),
             generate_from,
             is_collective,
+            is_composite,
             is_lockstep,
             is_family,
             partial_evaluation,
@@ -2446,6 +2499,11 @@ struct OperationVariant {
     /// Boolean flag indicating whether the generated `CollectiveOperation` implementation delegates to the payload of
     /// this [`OperationVariant`], which is the case when the variant declares `#[ryft(collective)]`.
     is_collective: bool,
+
+    /// Boolean flag indicating whether the generated `NamedCompositeOperation` implementation delegates to the payload
+    /// of this [`OperationVariant`], which is the case when the variant declares `#[ryft(composite)]`. A variant that
+    /// declares `#[ryft(family)]` delegates as well, without this marker.
+    is_composite: bool,
 
     /// Boolean flag indicating whether the generated `LockstepOperation` implementation delegates to the payload of
     /// this [`OperationVariant`], which is the case when the variant declares `#[ryft(lockstep)]`.
@@ -3083,7 +3141,7 @@ mod tests {
         let variant: syn::Variant = syn::parse_quote!(Zero(ZeroOperation<DataType>));
         assert!(matches!(
             parser.extract_variant_attributes(&variant),
-            (OperationVariantClass::FamilyNative, true, false, false, false, None),
+            (OperationVariantClass::FamilyNative, true, false, false, false, false, None),
         ));
         let variant: syn::Variant = syn::parse_quote! {
             #[ryft(skip_from)]
@@ -3092,23 +3150,28 @@ mod tests {
         };
         assert!(matches!(
             parser.extract_variant_attributes(&variant),
-            (OperationVariantClass::MixedMember { structural: true, .. }, false, true, false, false, None),
+            (OperationVariantClass::MixedMember { structural: true, .. }, false, true, false, false, false, None),
         ));
         let variant: syn::Variant = syn::parse_quote!(#[ryft(lockstep)] While(WhileOperation<ArrayIrType>));
         assert!(matches!(
             parser.extract_variant_attributes(&variant),
-            (OperationVariantClass::FamilyNative, true, false, true, false, None),
+            (OperationVariantClass::FamilyNative, true, false, false, true, false, None),
         ));
         let variant: syn::Variant = syn::parse_quote!(#[ryft(family, collective)] Portable(ArrayIrOperation<Array>));
         assert!(matches!(
             parser.extract_variant_attributes(&variant),
-            (OperationVariantClass::FamilyNative, true, true, false, true, None),
+            (OperationVariantClass::FamilyNative, true, true, false, false, true, None),
+        ));
+        let variant: syn::Variant = syn::parse_quote!(#[ryft(composite)] Composite(CompositeOperation<V, Self>));
+        assert!(matches!(
+            parser.extract_variant_attributes(&variant),
+            (OperationVariantClass::FamilyNative, true, false, true, false, false, None),
         ));
         let variant: syn::Variant = syn::parse_quote! {
             #[ryft(projected(ArrayType), partial_evaluation = Rules::partially_evaluate)]
             Array(ArrayOperation<A>)
         };
-        let (_, _, _, _, _, rule) = parser.extract_variant_attributes(&variant);
+        let (_, _, _, _, _, _, rule) = parser.extract_variant_attributes(&variant);
         assert_eq!(rule, Some(syn::parse_quote!(Rules::partially_evaluate)));
         assert_eq!(errors(&parser), Vec::<String>::new());
 
@@ -3116,6 +3179,7 @@ mod tests {
         for (attribute, error) in [
             (quote!(#[ryft(skip_from, skip_from)]), "duplicate ryft operation variant attribute `skip_from`"),
             (quote!(#[ryft(collective, collective)]), "duplicate ryft operation variant attribute `collective`"),
+            (quote!(#[ryft(composite, composite)]), "duplicate ryft operation variant attribute `composite`"),
             (quote!(#[ryft(lockstep, lockstep)]), "duplicate ryft operation variant attribute `lockstep`"),
             (quote!(#[ryft(family, family)]), "duplicate ryft operation variant attribute `family`"),
             (quote!(#[ryft(partial_evaluation = rule)]), "`partial_evaluation` requires a projected member variant"),
@@ -3146,7 +3210,7 @@ mod tests {
             (
                 quote!(#[ryft(transpose = custom)]),
                 "invalid operation variant `#[ryft(...)]` attribute `transpose`; only `projected`, `mixed`, `family`, \
-                 `collective`, `lockstep`, `partial_evaluation`, and `skip_from` are supported here",
+                 `collective`, `composite`, `lockstep`, `partial_evaluation`, and `skip_from` are supported here",
             ),
         ] {
             let mut parser = OperationParser::new();
@@ -3320,6 +3384,7 @@ mod tests {
                 "Operation",
                 "InterpretableOperation",
                 "OperationPayloadProjection",
+                "NamedCompositeOperation",
                 "OperationProvider",
                 "From",
                 "TryFrom",
@@ -3350,6 +3415,7 @@ mod tests {
                 "TransposableOperation",
                 "OperationProjection",
                 "OperationPayloadProjection",
+                "NamedCompositeOperation",
                 "OperationProvider",
                 "From",
                 "TryFrom",
@@ -4499,6 +4565,73 @@ mod tests {
                             ::std::result::Result::Err(payload) => payload,
                         };
                         ::std::result::Result::Err(payload)
+                    }
+                }
+            }),
+        );
+    }
+
+    #[test]
+    fn test_operation_code_generator_generate_named_composite_impl() {
+        // Marked variants and nested families delegate to their payloads, stored directly or boxed, while every other
+        // variant reports no key.
+        let operation = code_generator(quote! {
+            #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
+            enum Operation<A: Value<Type = ArrayType>> {
+                #[ryft(projected(ArrayType))]
+                Array(ArrayOperation<A>),
+                #[ryft(composite)]
+                Composite(Box<CompositeOperation<ArrayIrValue<A>, Self>>),
+                #[ryft(family)]
+                Portable(ArrayIrOperation<A>),
+                Dot(DotOperation),
+            }
+        });
+        assert_eq!(
+            rendering(&operation.generate_named_composite_impl()),
+            rendering(&quote! {
+                #[automatically_derived]
+                impl<A: Value<Type = ArrayType>> ryft::NamedCompositeOperation for Operation<A>
+                where
+                    CompositeOperation<ArrayIrValue<A>, Operation<A>>: ryft::NamedCompositeOperation,
+                    ArrayIrOperation<A>: ryft::NamedCompositeOperation,
+                {
+                    #[allow(unreachable_patterns)]
+                    #[inline]
+                    fn composite_key(&self) -> ::std::option::Option<&ryft::CompositeKey> {
+                        match self {
+                            Self::Composite(operation) => {
+                                <CompositeOperation<ArrayIrValue<A>, Operation<A>> as ryft::NamedCompositeOperation>
+                                    ::composite_key(&**operation)
+                            },
+                            Self::Portable(operation) => {
+                                <ArrayIrOperation<A> as ryft::NamedCompositeOperation>::composite_key(operation)
+                            },
+                            _ => ::std::option::Option::None,
+                        }
+                    }
+                }
+            }),
+        );
+
+        // A family without such variants still implements the trait, so that every family can be asked.
+        let operation = code_generator(quote! {
+            #[ryft(type(ArrayType), constant(A))]
+            enum Operation<A: Value<Type = ArrayType>> {
+                Dot(DotOperation),
+            }
+        });
+        assert_eq!(
+            rendering(&operation.generate_named_composite_impl()),
+            rendering(&quote! {
+                #[automatically_derived]
+                impl<A: Value<Type = ArrayType>> ryft::NamedCompositeOperation for Operation<A> {
+                    #[allow(unreachable_patterns)]
+                    #[inline]
+                    fn composite_key(&self) -> ::std::option::Option<&ryft::CompositeKey> {
+                        match self {
+                            _ => ::std::option::Option::None,
+                        }
                     }
                 }
             }),

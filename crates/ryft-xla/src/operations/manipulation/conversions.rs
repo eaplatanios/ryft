@@ -11,15 +11,18 @@ use ryft_mlir::{
 
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat, lower_signed_one_bit_to_mlir,
-    lower_unplaced_constant_output, static_dimensions,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat, lower_unplaced_constant_output,
+    static_dimensions,
 };
 use crate::operations::assertions::{lower_dependency_barrier, lower_type_relationship_checks};
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::operations::control_flow::{lower_refined_region_input, lower_refined_region_outputs};
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
-use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
+use crate::{
+    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type,
+    ValueRefExtension,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -88,7 +91,7 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
             return Ok(vec![input]);
         }
         if input_data_type == DataType::I1 {
-            input = lower_signed_one_bit_to_mlir(input, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+            input = input.widen_i1_to_i8(&mut lowerer.block(), lowerer.location())?;
         }
         if matches!(
             output_data_type,

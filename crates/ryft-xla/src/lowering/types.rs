@@ -455,41 +455,6 @@ pub enum PhysicalStoragePadding<'b, 'c: 'b, 't: 'c> {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Widens a logical signed one-bit integer to `i8`, recovering `-1` from StableHLO's predicate carrier.
-pub fn lower_signed_one_bit_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
-    input: ValueRef<'b, 'c, 't>,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<ValueRef<'b, 'c, 't>, Error>
-where
-    B: Block<'b, 'c, 't>,
-    L: Copy + Location<'c, 't>,
-{
-    let input_type = input.r#type()?.cast::<TensorTypeRef>().unwrap();
-    let dimensions = input_type.dimensions().collect::<Vec<_>>();
-    let signed_type =
-        context.tensor_type(context.signless_integer_type(8), &dimensions, input_type.encoding()?, location)?;
-    let widened = block.append_operation(stable_hlo::convert(input, signed_type, location)?)?;
-    let signed = block.append_operation(stable_hlo::negate(widened.result(0)?.as_ref(), location)?)?;
-    Ok(signed.result(0)?.as_ref())
-}
-
-/// Reads one runtime tensor dimension and widens StableHLO's `i32` size result to Ryft's `i64` dimension ABI.
-pub fn lower_runtime_dimension_size_i64<'b, 'c: 'b, 't: 'c>(
-    input: ValueRef<'b, 'c, 't>,
-    axis: usize,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let size = block.append_operation(stable_hlo::get_dimension_size(input, axis, location)?)?;
-    let size = size.result(0)?.as_ref();
-    let i64_scalar = context.tensor_type(context.signless_integer_type(64), &[], None, location)?;
-    let size = block.append_operation(stable_hlo::convert(size, i64_scalar, location)?)?;
-    Ok(size.result(0)?.as_ref())
-}
-
 /// Converts one dimension extent to StableHLO's signed 64-bit shape representation.
 pub fn dimension_extent_i64(value: usize) -> Result<i64, Error> {
     i64::try_from(value)
@@ -734,8 +699,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ConvertElementTypeOperation, DimensionBounds, DimensionType, DimensionVariable, Error as CoreError,
-        Placeholder, ReferenceType, ZeroOperation,
+        DimensionBounds, DimensionType, DimensionVariable, Error as CoreError, Placeholder, ReferenceType,
+        ZeroOperation,
     };
 
     use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, test_vector_type, unproject_plain_program};
@@ -828,42 +793,6 @@ mod tests {
                 CoreError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 2 }),
             ),
         ));
-    }
-
-    #[test]
-    fn test_lower_signed_one_bit_to_mlir() {
-        let mut builder = ProgramBuilder::new();
-        let input =
-            builder.add_input(ArrayType::new(DataType::I1, Shape::new(vec![dynamic_dimension("size", Some(6))])));
-        let output = builder
-            .add_instruction(
-                ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, false),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        // Widening retains the physical bound as well as the runtime dimension before recovering the signed value.
-        let program = unproject_plain_program(program);
-        assert_eq!(
-            program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap(),
-            indoc! {r#"
-        module {
-          func.func @main(%arg0: tensor<5xi1>, %arg1: tensor<i32>) -> (tensor<?xf32, #stablehlo.bounds<5>>, tensor<i64>) {
-            %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<5xi1>, tensor<i32>) -> tensor<?xi1, #stablehlo.bounds<5>>
-            %1 = stablehlo.convert %0 : (tensor<?xi1, #stablehlo.bounds<5>>) -> tensor<?xi8, #stablehlo.bounds<5>>
-            %2 = stablehlo.negate %1 : tensor<?xi8, #stablehlo.bounds<5>>
-            %3 = stablehlo.convert %2 : (tensor<?xi8, #stablehlo.bounds<5>>) -> tensor<?xf32, #stablehlo.bounds<5>>
-            %4 = stablehlo.get_dimension_size %3, dim = 0 : (tensor<?xf32, #stablehlo.bounds<5>>) -> tensor<i32>
-            %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
-            return %3, %5 : tensor<?xf32, #stablehlo.bounds<5>>, tensor<i64>
-          }
-        }
-        "#},
-        );
     }
 
     #[test]

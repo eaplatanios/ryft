@@ -11,13 +11,16 @@ use ryft_mlir::{
 use crate::lowering::EffectTokens;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_i32, lower_constant_output,
-    lower_runtime_dimension_size_i64, lower_static_index_constants, lower_unplaced_constant_output, static_dimensions,
+    lower_static_index_constants, lower_unplaced_constant_output, static_dimensions,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_KIND_ATTRIBUTE,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
+use crate::{
+    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type,
+    ValueRefExtension,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -261,7 +264,7 @@ impl LowerableOperation for DynamicSliceOperation<Type> {
                     .as_ref();
                 let span =
                     block.append_operation(stable_hlo::add(steps, occupied, location)?)?.result(0).unwrap().as_ref();
-                let input_size = lower_runtime_dimension_size_i64(*input, axis, block, context, location)?;
+                let input_size = input.widen_dimension_to_i64(axis, block, location)?;
                 let maximum_start = block
                     .append_operation(stable_hlo::subtract(input_size, span, location)?)?
                     .result(0)
@@ -297,7 +300,7 @@ impl LowerableOperation for DynamicSliceOperation<Type> {
                 size_type,
             )?;
             if plan.needs_runtime_assertion {
-                let input_size = lower_runtime_dimension_size_i64(*input, axis, block, context, location)?;
+                let input_size = input.widen_dimension_to_i64(axis, block, location)?;
                 lower_dynamic_slice_assertion(
                     axis,
                     self.strides()[axis],
@@ -552,7 +555,7 @@ fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
             if start_type.data_type() == DataType::I1 {
                 start = block.append_operation(stable_hlo::negate(start, location)?)?.result(0).unwrap().as_ref();
             }
-            let extent = lower_runtime_dimension_size_i64(input, axis, block, context, location)?;
+            let extent = input.widen_dimension_to_i64(axis, block, location)?;
             let zero = lower_unplaced_constant_output(&[scalar_type], 0, block, context, location)?[0];
             if wraps(start_type) {
                 // The start is a signed i64 here, like the extent: `select(start < 0, start + extent, start)`.

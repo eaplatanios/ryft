@@ -14,12 +14,12 @@ use ryft_pjrt::extensions::ffi::{
 };
 use ryft_pjrt::{BufferType, Client, Error as PjrtError};
 
-use crate::lowering::types::{ArrayTypeLoweringExtension, lower_signed_one_bit_to_mlir};
+use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::sessions::effects::EffectCallbackGuard;
 use crate::{
     Error, ExecutionError, FromPjrt, LowerableOperation, Lowerer, ProgramLoweringOperation, RuntimeExtension,
-    RuntimeProvider, RuntimeRequirement,
+    RuntimeProvider, RuntimeRequirement, ValueRefExtension,
 };
 
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
@@ -273,7 +273,7 @@ fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
     }
     let backend_config = context.dictionary_attribute(&attributes);
     let value = if data_type == DataType::I1 {
-        lower_signed_one_bit_to_mlir(value, block, context, location)?
+        value.widen_i1_to_i8(block, location)?
     } else {
         // XLA can pack sub-byte elements, and the FFI buffer view does not describe that packing.
         let carrier = match data_type {

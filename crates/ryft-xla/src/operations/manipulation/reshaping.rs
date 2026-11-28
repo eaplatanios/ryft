@@ -13,14 +13,16 @@ use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, dimension_extent_i32, dimension_extent_i64, lower_explicit_reshape_shape,
-    lower_runtime_dimension_size_i64, lower_static_index_constants, stable_hlo_dynamic_dimension_bound,
-    static_dimensions,
+    lower_static_index_constants, stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE, ASSERT_RESHAPE_KIND,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
+use crate::{
+    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type,
+    ValueRefExtension,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -109,7 +111,7 @@ impl LowerableOperation for DynamicReshapeOperation {
             for (axis, dimension) in input_type.shape().dimensions().iter().enumerate() {
                 let extent = match dimension {
                     Dimension::Static(extent) => lower_static_index_constants(&[*extent], block, context, location)?[0],
-                    Dimension::Dynamic(_) => lower_runtime_dimension_size_i64(*input, axis, block, context, location)?,
+                    Dimension::Dynamic(_) => input.widen_dimension_to_i64(axis, block, location)?,
                 };
                 input_extents.push(extent);
             }
@@ -231,7 +233,7 @@ impl ReshapeOperationLoweringExtension for ReshapeOperation {
                                     ),
                                 })
                             })?;
-                            lower_runtime_dimension_size_i64(input, axis, block, context, location)?
+                            input.widen_dimension_to_i64(axis, block, location)?
                         }
                     });
                 }

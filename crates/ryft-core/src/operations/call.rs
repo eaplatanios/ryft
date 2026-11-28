@@ -3087,7 +3087,7 @@ impl RegionPlacementRequests {
     ) -> impl FnMut(RegionRef<'_, V, O>) -> bool + use<'o, V, O>
     where
         V: Value<Type = ArrayIrType>,
-        O: 'static + Operation<Type = ArrayIrType> + OperationPayloadProjection,
+        O: Operation<Type = ArrayIrType> + OperationPayloadProjection,
     {
         let mut analysis = DeviceNamingAnalysis::new(entry.arena().len(), omits_regions);
         move |region| analysis.names_devices(region)
@@ -3406,7 +3406,7 @@ struct DeviceNamingAnalysis<'o, V: Value<Type = ArrayIrType>, O: Operation<Type 
 impl<'o, V, O> DeviceNamingAnalysis<'o, V, O>
 where
     V: Value<Type = ArrayIrType>,
-    O: 'static + Operation<Type = ArrayIrType> + OperationPayloadProjection,
+    O: Operation<Type = ArrayIrType> + OperationPayloadProjection,
 {
     /// Creates an analysis of a program whose arena holds `region_count` regions, whose backend omits the regions of
     /// the instructions for which `omits_regions` returns `true`.

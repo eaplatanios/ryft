@@ -25,17 +25,14 @@
 //!
 //! # Options
 //!
-//! [`RaggedDotLoweringStrategy`] selects how a compilation lowers ragged dots, and an operation states through
-//! [`LowerableOperation::validate_data_derived_dimensions`] whether it can consume dimensions that are derived from
-//! runtime data.
+//! [`RaggedDotLoweringStrategy`] selects how a compilation lowers ragged dots.
 
 use std::rc::Rc;
-use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, CompositeKey, DataType, EagerContext, EffectClass, EffectClasses, FlatProgram, LogicalMesh,
-    Operation as CoreOperation, OperationPayloadProjection, Parameterized, Program, ProgramError, RegionRef,
-    ScanOperation, Sharding, ShardingDimension, Type as CoreType,
+    ArrayType, DataType, EagerContext, EffectClass, EffectClasses, FlatProgram, LogicalMesh, NamedCompositeOperation,
+    Operation as CoreOperation, OperationPayloadProjection, ProgramError, ScanOperation, Sharding, ShardingDimension,
+    Type as CoreType,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -45,6 +42,7 @@ use ryft_mlir::{
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::operations::call::CallFunctionMap;
+use crate::operations::composites::NamedCompositeImplementation;
 use crate::{Constant, Error, Operation, RuntimeRequirement, Session, Type};
 
 pub mod contexts;
@@ -64,10 +62,10 @@ pub use sharding::{
 pub use types::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, MemoryLoweringExtension, PhysicalStoragePadding,
     TypeLoweringExtension, dimension_extent_i32, dimension_extent_i64, lower_constant_output, lower_explicit_shape,
-    lower_f64_constant_splat, lower_runtime_dimension_size_i64, lower_signed_one_bit_to_mlir,
-    lower_static_index_constants, lower_u64_scalar_constant, lower_unplaced_constant_output,
+    lower_f64_constant_splat, lower_static_index_constants, lower_u64_scalar_constant, lower_unplaced_constant_output,
     stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
+pub use values::ValueRefExtension;
 
 /// Represents errors produced while validating a program for XLA lowering, constructing its StableHLO
 /// representation, or verifying the result.
@@ -155,91 +153,6 @@ pub trait LowerableOperation: CoreOperation {
         input_types: &[Self::Type],
         output_types: &[Self::Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
-
-    /// Returns the semantic identity of this operation if it is a call of a named composite (refer to
-    /// [`NamedComposite`](ryft_core::NamedComposite)), and [`None`] otherwise. Module-level lowering passes use it to
-    /// emit one shared function per specialization of a named composite body and to skip the bodies that a backend
-    /// implementation replaces. Families forward it to the variants that can hold such calls, and the calls of a family
-    /// that does not are lowered without sharing their bodies.
-    #[inline]
-    fn composite_key(&self) -> Option<&CompositeKey> {
-        None
-    }
-
-    /// Returns `true` if a backend implementation replaces the calls of the named composite `key` of this family at
-    /// the boundary with the provided types when they are lowered for `target_platform`. The lowering of such a call
-    /// emits none of its regions, so the module-level lowering passes skip them. It returns `false` unless a family
-    /// overrides it, in which case the body of every named composite call is lowered.
-    #[inline]
-    fn has_composite_implementation(
-        key: &CompositeKey,
-        input_types: &[Type],
-        output_types: &[Type],
-        target_platform: Option<&str>,
-    ) -> bool {
-        let _ = (key, input_types, output_types, target_platform);
-        false
-    }
-
-    /// Validates that this operation can consume a dimension that is derived from runtime data (i.e., one that
-    /// `dimension_from_scalar` produces, or that dimension arithmetic derives from such a dimension). A value with
-    /// such a dimension is bounded dynamic, so an operation can consume it only if its lowering keeps the physical
-    /// padding of that value unobservable. Compilation admits a program that derives dimensions from data only if
-    /// every operation that consumes one passes this validation. Families answer for each of their variants, and
-    /// [`Operation`] does so with exhaustive matches, so that adding an operation to it does not compile until it
-    /// is stated whether that operation passes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::UnsupportedOperation`], which names this operation and the reason, when this
-    /// operation cannot consume such a dimension. It returns that error unless a family overrides this function, so
-    /// that an operation whose padding behavior nobody has stated is rejected and never assumed to be safe.
-    #[inline]
-    fn validate_data_derived_dimensions(&self) -> Result<(), Error> {
-        Err(unsupported_data_derived_dimensions(
-            self.name(),
-            "its operation family does not state how it keeps the padding of data-derived dimensions unobservable",
-        ))
-    }
-
-    /// Returns `program`, a pruned program of this family, without the mesh that each of its `call`s records for the
-    /// devices that its callee names when that callee names none anymore once it is lowered for `target_platform`
-    /// (e.g., because pruning dropped the only request that named them). Lowering prepares every program that it
-    /// prunes with this function. It returns `program` as it is unless a family overrides it, in which case such a
-    /// call keeps its mesh.
-    #[inline]
-    fn without_stale_call_meshes<Input, Output>(
-        program: Program<Constant, Self, Input, Output>,
-        target_platform: Option<&str>,
-    ) -> Result<Program<Constant, Self, Input, Output>, ProgramError>
-    where
-        Self: CoreOperation<Type = Type> + Sized,
-        Input: Parameterized<Constant>,
-        Output: Parameterized<Constant>,
-    {
-        let _ = target_platform;
-        Ok(program)
-    }
-
-    /// Returns, for each input of `callee`, the callee of a `call` of this family whose first `capture_count`
-    /// inputs are its lifted captures, whether it is a capture that the callee never reads when it is lowered for
-    /// `target_platform`, or [`None`] when every input counts as read. The lowering of the call passes a value that
-    /// requires no buffer in place of such a capture, and the function that makes the call reads the input only
-    /// where the callee reads it. Only a family knows the regions of its callees, so this function is asked of the
-    /// family. It returns [`None`] unless a family overrides it, and [`Operation`] answers from the regions that its
-    /// lowering emits.
-    #[inline]
-    fn unread_captures(
-        callee: RegionRef<'_, Constant, Self>,
-        capture_count: usize,
-        target_platform: Option<&str>,
-    ) -> Option<Arc<[bool]>>
-    where
-        Self: CoreOperation<Type = Type>,
-    {
-        let _ = (callee, capture_count, target_platform);
-        None
-    }
 }
 
 /// Operations whose own type universe is a member universe of an enclosing operation family that lowers them at the
@@ -271,14 +184,21 @@ pub trait MemberLowerableOperation<T: CoreType>: CoreOperation {
 ///
 /// This is the bound on `O` in [`LowerableOperation::lower`]. The family lowers program instructions at [`Type`]
 /// and exposes its payloads through [`OperationPayloadProjection`] so that lowering passes can recognize operations
-/// inside the family, for example when deduplicating calls or deciding which regions to emit.
+/// inside the family, for example when deduplicating calls or deciding which regions to emit. Calls of named composites
+/// are recognized through [`NamedCompositeOperation`], because their payloads name the family that holds them.
 ///
 /// The blanket implementation covers every type that meets these bounds, including downstream operation families.
-pub trait ProgramLoweringOperation: LowerableOperation<Type = Type> + OperationPayloadProjection {
+/// A downstream family that holds another family in a variant (e.g., one that wraps [`Operation`]) must declare
+/// `#[ryft(family)]` on that variant, so that payload projection and [`NamedCompositeOperation`] reach the operations
+/// of the nested family. Lowering passes would otherwise not see its calls and named composites.
+pub trait ProgramLoweringOperation:
+    LowerableOperation<Type = Type> + OperationPayloadProjection + NamedCompositeOperation
+{
     /// Returns whether lowering skips the bodies of this operation's attached regions on `target_platform`.
     /// A scan with zero iterations omits its body on every platform, though lowering still reads the body interface
-    /// to type the results. A named composite omits its body when this family supplies a
-    /// [backend implementation](LowerableOperation::has_composite_implementation) for its key and boundary types.
+    /// to type the results. A call of a named composite omits its body when a backend implementation replaces it for
+    /// its key and boundary types (refer to `NamedCompositeImplementation::select`), which is the selection that the
+    /// lowering of the call makes as well.
     /// Only that lookup evaluates `boundary_types`, which returns the input types followed by the output types.
     /// Staged lowering and eager dispatch use this decision to skip captures and placements in omitted regions.
     fn omits_regions(
@@ -293,11 +213,14 @@ pub trait ProgramLoweringOperation: LowerableOperation<Type = Type> + OperationP
             return false;
         };
         let (input_types, output_types) = boundary_types();
-        Self::has_composite_implementation(key, &input_types, &output_types, target_platform)
+        NamedCompositeImplementation::select(key, &input_types, &output_types, target_platform).is_some()
     }
 }
 
-impl<O: LowerableOperation<Type = Type> + OperationPayloadProjection> ProgramLoweringOperation for O {}
+impl<O: LowerableOperation<Type = Type> + OperationPayloadProjection + NamedCompositeOperation> ProgramLoweringOperation
+    for O
+{
+}
 
 /// Per-instruction StableHLO lowering state passed to [`LowerableOperation::lower`] while lowering a program of the
 /// operation family `O`.
@@ -776,7 +699,7 @@ pub(crate) fn current_or_new_token<'b, 'c: 'b, 't: 'c>(
     Ok(created)
 }
 
-/// Returns the error with which [`LowerableOperation::validate_data_derived_dimensions`] rejects the operation named
+/// Returns the error with which `Operation::validate_data_derived_dimension_support` rejects the operation named
 /// `operation_name`, which cannot consume a dimension that is derived from runtime data because of `reason`.
 pub(crate) fn unsupported_data_derived_dimensions(operation_name: &str, reason: &str) -> Error {
     ProgramError::UnsupportedOperation {
@@ -826,9 +749,9 @@ pub(crate) mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayOperation, ArrayOperations, ArrayType, AtomId, CallOperation, CastOperation, DataType, Device, DeviceMesh,
-        Dimension, DimensionBounds, DimensionVariable, DomainTracingContext, ErasedOperation, Error as CoreError,
-        LinearCallOperation, LogicalMesh, MeshAxis, MeshAxisType, MulOperation, NegOperation,
+        ArrayOperation, ArrayOperations, ArrayType, AtomId, CallOperation, CastOperation, CompositeKey, DataType,
+        Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable, DomainTracingContext, ErasedOperation,
+        Error as CoreError, LinearCallOperation, LogicalMesh, MeshAxis, MeshAxisType, MulOperation, NegOperation,
         Operation as CoreOperation, OperationPayloadProjection, Parameterized, ParameterizedFamily, Placeholder,
         Program, ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedContext, ReduceOperation, ReductionKind,
         RegionInterface, Reshape, ScanOptions, Shape, ShardMap, ShardMapBoundary, ShardMapOperation, ShardMapOptions,
@@ -1419,6 +1342,12 @@ pub(crate) mod tests {
         }
     }
 
+    impl NamedCompositeOperation for BorrowingOperation<'_> {
+        fn composite_key(&self) -> Option<&CompositeKey> {
+            None
+        }
+    }
+
     impl LowerableOperation for BorrowingOperation<'_> {
         fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
             &self,
@@ -1493,8 +1422,9 @@ pub(crate) mod tests {
     #[test]
     fn test_lowerable_operation_family_admits_families_that_borrow() {
         // A family whose operations borrow their configuration is a family that lowering lowers, because what lowering
-        // must know of the calls of a family it asks of that family (refer to `LowerableOperation::unread_captures`)
-        // rather than recovering it from a program that lives for as long as the whole program does.
+        // must know of the calls of a family it derives from the regions at hand (refer to
+        // `RegionLoweringExtension::unread_lifted_captures`) rather than retaining it with a program that lives for
+        // as long as the whole process does.
         let r#type = ArrayType::new_static(DataType::F32, [3]);
         let positions = vec![1, 0];
         let mut builder = CoreProgramBuilder::<Constant, BorrowingOperation<'_>>::new();
@@ -1525,22 +1455,6 @@ pub(crate) mod tests {
                   }
                 }
             "},
-        );
-    }
-
-    #[test]
-    fn test_lowerable_operation_validate_data_derived_dimensions() {
-        // A family that does not state whether its operations keep the padding of data-derived dimensions
-        // unobservable is not assumed to be safe.
-        let operation = BorrowingOperation { positions: &[0] };
-        assert_eq!(
-            operation.validate_data_derived_dimensions(),
-            Err(Error::from(ProgramError::UnsupportedOperation {
-                message: "operation `borrowing` cannot consume data-derived dimensions during XLA lowering because \
-                          its operation family does not state how it keeps the padding of data-derived dimensions \
-                          unobservable"
-                    .to_string(),
-            })),
         );
     }
 

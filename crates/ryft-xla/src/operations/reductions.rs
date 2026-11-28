@@ -12,12 +12,13 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_f64_constant_splat, lower_signed_one_bit_to_mlir,
-    lower_unplaced_constant_output,
+    ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_f64_constant_splat, lower_unplaced_constant_output,
 };
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
-use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
+use crate::{
+    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, ValueRefExtension,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -839,7 +840,7 @@ fn lower_index_reduction_to_mlir<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let (value, value_data_type) = match input_type.data_type() {
-        DataType::I1 => (lower_signed_one_bit_to_mlir(input_value, block, context, location)?, DataType::I8),
+        DataType::I1 => (input_value.widen_i1_to_i8(block, location)?, DataType::I8),
         data_type if data_type.is_floating_point() && !matches!(data_type, DataType::F32 | DataType::F64) => {
             let working_type = (ArrayType::new(DataType::F32, input_type.shape().clone())).lower(context, location)?;
             let converted = block.append_operation(stable_hlo::convert(input_value, working_type, location)?)?;

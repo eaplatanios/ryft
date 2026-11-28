@@ -5,8 +5,8 @@ use ryft_core::{
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
-    Attribute, Block, Context as MlirContext, DenseElementsAttributeRef, Location, Operation as MlirOperation,
-    Value as MlirValue, ValueRef,
+    Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, Location, LocationRef,
+    Operation as MlirOperation, TensorTypeRef, Type as MlirType, Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::LoweringError;
@@ -15,6 +15,77 @@ use crate::lowering::types::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, MemoryLoweringExtension, dimension_extent_i64,
 };
 use crate::{ArrayConstant, Constant, Error};
+
+/// Extends MLIR [`ValueRef`]s with StableHLO operations used by the XLA lowering.
+pub trait ValueRefExtension<'b, 'c: 'b, 't: 'c> {
+    /// Widens a logical [`DataType::I1`] tensor to `i8`, interpreting bit `1` as `-1`. The result keeps the
+    /// input shape and encoding. The caller supplies the signed interpretation of StableHLO's `i1` carrier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidArgument`] if the input is not a ranked `i1` tensor. Propagates MLIR errors
+    /// from constructing and appending the widening operations.
+    fn widen_i1_to_i8<B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+        self,
+        block: &mut B,
+        location: L,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+
+    /// Reads the runtime size of tensor dimension `axis` and widens StableHLO's scalar `i32` result to Ryft's
+    /// scalar `i64` dimension representation.
+    ///
+    /// # Errors
+    ///
+    /// Propagates MLIR errors from constructing and appending the dimension read and conversion.
+    fn widen_dimension_to_i64(
+        self,
+        axis: usize,
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+}
+
+impl<'b, 'c: 'b, 't: 'c> ValueRefExtension<'b, 'c, 't> for ValueRef<'b, 'c, 't> {
+    fn widen_i1_to_i8<B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+        self,
+        block: &mut B,
+        location: L,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        let context = self.context();
+        let input_type = self.r#type()?;
+        let tensor_type = match input_type.cast::<TensorTypeRef>() {
+            Some(tensor_type) if tensor_type.element_type()? == context.signless_integer_type(1).as_ref() => {
+                tensor_type
+            }
+            _ => {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!("expected an `i1` tensor for signed widening to `i8`, got `{input_type}`"),
+                }
+                .into());
+            }
+        };
+        let dimensions = tensor_type.dimensions().collect::<Vec<_>>();
+        let signed_type =
+            context.tensor_type(context.signless_integer_type(8), &dimensions, tensor_type.encoding()?, location)?;
+        let widened = block.append_operation(stable_hlo::convert(self, signed_type, location)?)?;
+        let signed = block.append_operation(stable_hlo::negate(widened.result(0)?.as_ref(), location)?)?;
+        Ok(signed.result(0)?.as_ref())
+    }
+
+    fn widen_dimension_to_i64(
+        self,
+        axis: usize,
+        block: &mut BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        let context = self.context();
+        let size = block.append_operation(stable_hlo::get_dimension_size(self, axis, location)?)?;
+        let size = size.result(0)?.as_ref();
+        let i64_scalar = context.tensor_type(context.signless_integer_type(64), &[], None, location)?;
+        let size = block.append_operation(stable_hlo::convert(size, i64_scalar, location)?)?;
+        Ok(size.result(0)?.as_ref())
+    }
+}
 
 /// Provides lowering support for array literals to StableHLO. [`Self::lower_constant`] embeds the value's dense
 /// elements in a StableHLO constant (e.g., for a [`ConstantOperation`](ryft_core::ConstantOperation) carrying
@@ -221,16 +292,18 @@ impl Constant {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use ryft_core::{Complex, StridedLayout, i1, i2, i4, u1, u2, u4};
-    use ryft_mlir::Size as MlirSize;
+    use ryft_core::{Complex, ConvertElementTypeOperation, Placeholder, Shape, StridedLayout, i1, i2, i4, u1, u2, u4};
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
+    use ryft_mlir::dialects::func;
+    use ryft_mlir::{Region, Size as MlirSize};
 
-    use crate::lowering::tests::test_vector_type;
+    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, test_vector_type, unproject_plain_program};
     use crate::sessions::tests::{domain_mesh, f32_scalar};
     use crate::tests::{cpu_client, values_to_bytes};
-    use crate::{RetainedArray, Session, Type};
+    use crate::{ProgramLoweringExtension, ProgramLoweringOptions, RetainedArray, Session, Type};
 
     use super::*;
 
@@ -249,6 +322,102 @@ mod tests {
         let location = context.unknown_location();
         let tensor_type = literal.r#type().as_ref().lower(&context, location).unwrap();
         literal.lower_attribute(tensor_type, &context).unwrap().to_string()
+    }
+
+    #[test]
+    fn test_value_ref_widen_i1_to_i8() {
+        let mut builder = ProgramBuilder::new();
+        let input =
+            builder.add_input(ArrayType::new(DataType::I1, Shape::new(vec![dynamic_dimension("size", Some(6))])));
+        let output = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, false),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // Widening retains the physical bound as well as the runtime dimension before recovering the signed value.
+        let program = unproject_plain_program(program);
+        assert_eq!(
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap(),
+            indoc! {r#"
+        module {
+          func.func @main(%arg0: tensor<5xi1>, %arg1: tensor<i32>) -> (tensor<?xf32, #stablehlo.bounds<5>>, tensor<i64>) {
+            %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<5xi1>, tensor<i32>) -> tensor<?xi1, #stablehlo.bounds<5>>
+            %1 = stablehlo.convert %0 : (tensor<?xi1, #stablehlo.bounds<5>>) -> tensor<?xi8, #stablehlo.bounds<5>>
+            %2 = stablehlo.negate %1 : tensor<?xi8, #stablehlo.bounds<5>>
+            %3 = stablehlo.convert %2 : (tensor<?xi8, #stablehlo.bounds<5>>) -> tensor<?xf32, #stablehlo.bounds<5>>
+            %4 = stablehlo.get_dimension_size %3, dim = 0 : (tensor<?xf32, #stablehlo.bounds<5>>) -> tensor<i32>
+            %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
+            return %3, %5 : tensor<?xf32, #stablehlo.bounds<5>>, tensor<i64>
+          }
+        }
+        "#},
+        );
+    }
+
+    #[test]
+    fn test_value_ref_widen_i1_to_i8_rejects_other_types() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = ArrayType::scalar(DataType::F32).lower(&context, location).unwrap();
+        let integer_type = context.signless_integer_type(32);
+        for (input_type, name) in [(tensor_type.as_ref(), "tensor<f32>"), (integer_type.as_ref(), "i32")] {
+            let block = context.block(&[(input_type, location)]);
+            let input = block.argument(0).unwrap().as_ref();
+            assert_eq!(
+                input.widen_i1_to_i8(&mut block.as_ref(), location),
+                Err(ProgramError::InvalidArgument {
+                    message: format!("expected an `i1` tensor for signed widening to `i8`, got `{name}`"),
+                }
+                .into()),
+            );
+            assert!(block.operations().unwrap().next().is_none());
+        }
+    }
+
+    #[test]
+    fn test_value_ref_widen_dimension_to_i64() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let input_type = ArrayType::new_static(DataType::F32, [2, 3]).lower(&context, location).unwrap();
+        let output_type = ArrayType::scalar(DataType::I64).lower(&context, location).unwrap();
+        let block = context.block(&[(input_type, location)]);
+        let mut block_ref = block.as_ref();
+        let input = block.argument(0).unwrap().as_ref();
+        let size = input.widen_dimension_to_i64(1, &mut block_ref, location.as_ref()).unwrap();
+        block_ref.append_operation(func::r#return(&[size], location).unwrap()).unwrap();
+        let mut region = context.region();
+        region.append_block(block).unwrap();
+        let attributes = func::FuncAttributes {
+            arguments: vec![input_type.into()],
+            results: vec![output_type.into()],
+            ..Default::default()
+        };
+        let module = context.module(location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation(func::func("main", attributes, region, location).unwrap())
+            .unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x3xf32>) -> tensor<i64> {
+                    %0 = stablehlo.get_dimension_size %arg0, dim = 1 : (tensor<2x3xf32>) -> tensor<i32>
+                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    return %1 : tensor<i64>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]

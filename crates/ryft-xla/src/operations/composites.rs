@@ -168,11 +168,6 @@ where
     V::Type: Eq + Hash + DifferentiableType + Into<Type>,
     Self: Operation<Type = V::Type>,
 {
-    #[inline]
-    fn composite_key(&self) -> Option<&CompositeKey> {
-        self.key()
-    }
-
     fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
@@ -311,9 +306,9 @@ mod tests {
     use ryft_core::{
         AddOperation, BatchAxis, BatchingLevelExtent, Compare, ComparisonDirection, CompositeJvpRule,
         CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionValue, DomainTracer, Error as CoreError,
-        FlatProgram, LogicalMesh, MeshAxis, MeshAxisType, Mul, MulOperation, NamedComposite, PrintOperation, Program,
-        ProgramBuilder, ProjectedContext, Reduce, Shape, Sharding, ShardingDimension, Softmax, batch, composite,
-        differentiate_at, softmax,
+        FlatProgram, LogicalMesh, MeshAxis, MeshAxisType, Mul, MulOperation, NamedComposite, NamedCompositeOperation,
+        PrintOperation, Program, ProgramBuilder, ProjectedContext, Reduce, Shape, Sharding, ShardingDimension, Softmax,
+        batch, composite, differentiate_at, softmax,
     };
     use ryft_mlir::{Block, Context as MlirContext, Location};
 
@@ -891,6 +886,84 @@ mod tests {
                     %1 = call @ryft.tests.xla_named_square.v2(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
                     %2 = call @ryft.tests.xla_named_square.v2(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
                     return %0, %1, %2 : tensor<4xf32>, tensor<4xf32>, tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    /// Downstream operation family that holds the operations of this backend in a nested family.
+    #[derive(Clone, Debug, ryft_macros::Operation)]
+    #[ryft(crate = "ryft_core", type(Type), constant(Constant))]
+    enum WrappingOperation {
+        #[ryft(family)]
+        Xla(Box<Operation>),
+    }
+
+    impl LowerableOperation for WrappingOperation {
+        fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
+            &self,
+            lowerer: &mut Lowerer<'b, 'c, 't, O>,
+            input_values: &[ValueRef<'b, 'c, 't>],
+            input_types: &[Type],
+            output_types: &[Type],
+        ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+            crate::lower_operation_variants!(
+                self, WrappingOperation, lowerer, input_values, input_types, output_types;
+                Xla => boxed,
+            )
+        }
+    }
+
+    #[test]
+    fn test_composite_operation_lower_named_composite_through_a_wrapping_family() {
+        // A family that wraps this backend's family answers for the named composite calls that it holds, so the
+        // analysis of the program and the lowering of the call select the same implementation. On CUDA the call is
+        // replaced and its body is never visited, and elsewhere the call lowers its body.
+        let rules = named_rules_with_version("ryft.tests.xla_named_square", 1);
+        let wrap = |operation: Operation| WrappingOperation::Xla(Box::new(operation));
+        let body = {
+            let mut builder = ProgramBuilder::<Constant, WrappingOperation>::new();
+            let input = builder.add_input(test_vector_type(4).into());
+            let add = wrap(Operation::from(AddOperation::<ArrayType>::new()));
+            let output = builder.add_instruction(add, Vec::new(), vec![input, input], None).unwrap()[0];
+            Arc::new(
+                builder
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                    .unwrap(),
+            )
+        };
+        let mut builder = ProgramBuilder::<Constant, WrappingOperation>::new();
+        let input = builder.add_input(test_vector_type(4).into());
+        let call = wrap(Operation::Composite(CompositeOperation::new(rules.reference())));
+        assert_eq!(call.composite_key(), rules.reference().key());
+        let regions = vec![builder.intern_callee(&body, None).unwrap()];
+        let output = builder.add_instruction(call, regions, vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let lower = |target_platform: Option<&str>| {
+            let options = ProgramLoweringOptions::new().without_pruning().with_target_platform(target_platform);
+            program.to_rendered_mlir("main", &options).unwrap()
+        };
+        assert_eq!(
+            lower(Some("cuda")),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.multiply %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+        assert_eq!(
+            lower(None),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
                   }
                 }
             "#},

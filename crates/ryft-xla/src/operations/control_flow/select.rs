@@ -15,10 +15,12 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::types::{ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_signed_one_bit_to_mlir};
+use crate::lowering::types::{ArrayTypeLoweringExtension, PhysicalStoragePadding};
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::operations::normalize_elementwise_input;
-use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
+use crate::{
+    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, ValueRefExtension,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -102,7 +104,7 @@ where
         // StableHLO stores `I1` in a predicate carrier. Recover its signed value before promoting a branch, while
         // `I1` branches of an `I1` output keep their original carrier and the Boolean condition stays a predicate.
         if index != 0 && input_types[index].data_type() == DataType::I1 && output_type.data_type() != DataType::I1 {
-            inputs[index] = lower_signed_one_bit_to_mlir(inputs[index], block, context, location)?;
+            inputs[index] = inputs[index].widen_i1_to_i8(block, location)?;
         }
         let input_tensor_type = inputs[index].r#type()?.cast::<TensorTypeRef>();
         if multiple_dynamic_axes

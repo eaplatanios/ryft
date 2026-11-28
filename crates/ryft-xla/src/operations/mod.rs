@@ -7,7 +7,6 @@
 //! operations, and this module also provides the elementwise operand normalization and the result accuracy conversion
 //! that those lowerings share.
 
-use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -16,7 +15,7 @@ use ryft_core::{
     AbsOperation, Accuracy as CoreAccuracy, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array,
     ArrayIrOperation, ArrayOperation, ArrayReferenceTransform, ArrayType, AssertOperation, Atan2Operation,
     AxisIndexOperation, BroadcastLikeOperation, BroadcastOperation, CallOperation, CastOperation, CeilOperation,
-    ClampOperation, CompareOperation, ComplexOperation, CompositeConversion, CompositeKey, CompositeOperation,
+    ClampOperation, CompareOperation, ComplexOperation, CompositeConversion, CompositeOperation,
     CompositeTransposeOperation, ConcatenateOperation, ConditionOperation, ConjugateOperation, ConstantOperation,
     ConstrainShardingOperation, ConvertElementTypeOperation, CosOperation, CumulativeOperation, CustomCallOperation,
     Dimension, DimensionAddOperation, DimensionDivOperation, DimensionFromScalarOperation, DimensionMaxOperation,
@@ -24,22 +23,21 @@ use ryft_core::{
     DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
     DivOperation, DotOperation, DropoutOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
     DynamicSliceOperation, DynamicUpdateSliceOperation, ErfOperation, ExpM1Operation, ExpOperation, FillLikeOperation,
-    FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, Instruction, IotaLikeOperation, IotaOperation,
+    FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaLikeOperation, IotaOperation,
     LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogisticOperation,
     MaxOperation, MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
     Operation as CoreOperation, OperationProvider, OrOperation, PadOperation, ParallelAllGatherOperation,
     ParallelAllToAllOperation, ParallelBroadcastOperation, ParallelCastOperation, ParallelPermuteOperation,
     ParallelRaggedAllToAllOperation, ParallelReduceOperation, ParallelSumScatterOperation, ParallelVaryOperation,
-    Parameterized, PlaceOperation, PowOperation, PrintOperation, Program, ProgramError, RaggedDotOperation,
-    RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionKind, ReferenceAccessDescriptor,
-    ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation,
-    ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
-    Region as CoreRegion, RegionId, RegionPlacementRequests, RegionRef, RemOperation, RematerializeOperation,
-    ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation, RsqrtOperation,
-    SaturatingSubOperation, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation, ScatterReductionKind,
-    SelectOperation, ShardMapOperation, SignOperation, SinOperation, SliceOperation, SortDirection, SortOperation,
-    SqrtOperation, StopGradientOperation, SubOperation, TagOperation, TanOperation, TanhOperation,
-    TransferToMemoryOperation, Transform, TransformArtifact, TransposeOperation, UnavailableCustomRules,
+    PlaceOperation, PowOperation, PrintOperation, ProgramError, RaggedDotOperation, RealOperation, ReduceOperation,
+    ReducePrecisionOperation, ReductionKind, ReferenceAccessDescriptor, ReferenceAccessOperation,
+    ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+    ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Region as CoreRegion, RegionRef,
+    RemOperation, RematerializeOperation, ReshapeOperation, ReshardOperation, RngBitGeneratorOperation, RoundOperation,
+    RsqrtOperation, SaturatingSubOperation, ScaledDotOperation, ScanOperation, ScatterMode, ScatterOperation,
+    ScatterReductionKind, SelectOperation, ShardMapOperation, SignOperation, SinOperation, SliceOperation,
+    SortDirection, SortOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation, TanOperation,
+    TanhOperation, TransferToMemoryOperation, Transform, TransformArtifact, TransposeOperation, UnavailableCustomRules,
     UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_kernels::KernelReferenceOperation;
@@ -50,10 +48,9 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::programs::RegionLoweringExtension;
+use crate::lowering::programs::{RegionLoweringExtension, UnreadLiftedCaptures};
 use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::lowering::{unsupported_data_derived_dimensions, validate_local_output_placement};
-use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::{
     ArrayTypeExtension, Constant, Error, KernelOperation, LowerableOperation, Lowerer, LoweringError,
@@ -294,7 +291,7 @@ where
     /// regions that can contain XLA operations or retained rules registered in this family, which are traced lazily.
     /// Its retained rules can communicate along mesh axes that no instruction of the call names, which the call reports
     /// as hidden axes, so this variant delegates the collective metadata of the family to it.
-    #[ryft(collective, lockstep)]
+    #[ryft(collective, composite, lockstep)]
     Composite(CompositeOperation<Payload, Operation<Payload>>),
 
     /// Reverse mode carrier of a [`Composite`](Self::Composite) call, which transposition replaces with the call's
@@ -315,7 +312,7 @@ where
     /// member payload. Its derivative rules are specialized by the member definition and converted into this family as
     /// [`LiftedCustomRules`]. Conversions never produce such a call with attached rules, which follow their
     /// call into the [`Composite`](Self::Composite) variant instead.
-    #[ryft(collective, lockstep)]
+    #[ryft(collective, composite, lockstep)]
     LiftedComposite(
         CompositeOperation<
             Payload,
@@ -751,27 +748,19 @@ impl LowerableOperation for DimensionOperation<DimensionValue> {
     }
 }
 
-impl LowerableOperation for Operation {
-    #[inline]
-    fn composite_key(&self) -> Option<&CompositeKey> {
-        match self {
-            Self::Composite(operation) => operation.key(),
-            Self::LiftedComposite(operation) => operation.key(),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn has_composite_implementation(
-        key: &CompositeKey,
-        input_types: &[Type],
-        output_types: &[Type],
-        target_platform: Option<&str>,
-    ) -> bool {
-        NamedCompositeImplementation::select(key, input_types, output_types, target_platform).is_some()
-    }
-
-    fn validate_data_derived_dimensions(&self) -> Result<(), Error> {
+impl Operation {
+    /// Validates that this operation can consume a dimension that is derived from runtime data (i.e., one that
+    /// `dimension_from_scalar` produces, or that dimension arithmetic derives from such a dimension). A value with
+    /// such a dimension is bounded dynamic, so an operation can consume it only if its lowering keeps the physical
+    /// padding of that value unobservable. Compilation admits a program that derives dimensions from data only if
+    /// every operation that consumes one passes this validation. The matches are exhaustive, so that adding an
+    /// operation to this family does not compile until it is stated whether that operation passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::UnsupportedOperation`], which names this operation and the reason, when this
+    /// operation cannot consume such a dimension.
+    pub(crate) fn validate_data_derived_dimension_support(&self) -> Result<(), Error> {
         match self {
             Self::Array(operation) => validate_array_data_derived_dimensions(operation),
             Self::RngBitGenerator(_) => {
@@ -824,88 +813,9 @@ impl LowerableOperation for Operation {
         }
         .map_err(|reason| unsupported_data_derived_dimensions(self.name(), reason))
     }
+}
 
-    // TODO(eaplatanios): Review this.
-    #[inline]
-    fn without_stale_call_meshes<Input, Output>(
-        program: Program<Constant, Self, Input, Output>,
-        target_platform: Option<&str>,
-    ) -> Result<Program<Constant, Self, Input, Output>, ProgramError>
-    where
-        Input: Parameterized<Constant>,
-        Output: Parameterized<Constant>,
-    {
-        // A call records the devices that its callee names when the callee is staged, from its whole program, so a call
-        // whose outputs pruning dropped together with the only request that named them names no devices anymore, and it
-        // is lowered as a call that names none. Whether a callee names devices is derived once for each region of the
-        // pruned program (refer to `RegionPlacementRequests::names_devices_predicate`), so nested calls cost one pass
-        // over the program. Most programs have no call that records a mesh and pay one scan of their calls. The regions
-        // that lowering omits are those of `RegionPlacementRequestsExtension::for_lowering`.
-        let arena = program.entry_region_ref().arena();
-        let omitted: &dyn Fn(RegionRef<'_, Constant, Self>, &Instruction<Self>) -> bool = &|region, instruction| {
-            target_platform.is_some()
-                && instruction
-                    .operation()
-                    .omits_regions(target_platform, || region.instruction_boundary_types(instruction))
-        };
-        let mut names_devices = RegionPlacementRequests::names_devices_predicate(program.entry_region_ref(), omitted);
-        let mut stale = HashSet::new();
-        for (index, region) in program.regions().iter().enumerate() {
-            let region_ref = RegionRef::new(arena, RegionId::new(index)).unwrap();
-            for (position, instruction) in region.instructions().iter().enumerate() {
-                let Self::Call(call) = instruction.operation() else { continue };
-                if call.mesh().is_some()
-                    && let Ok(callee) = region_ref.with_id(instruction.regions()[0])
-                    && call.names_devices(|| names_devices(callee)).is_none()
-                {
-                    stale.insert((index, position));
-                }
-            }
-        }
-
-        if stale.is_empty() {
-            return Ok(program);
-        }
-
-        let regions = program
-            .regions()
-            .iter()
-            .enumerate()
-            .map(|(index, region)| {
-                let instructions = region
-                    .instructions()
-                    .iter()
-                    .enumerate()
-                    .map(|(position, instruction)| match instruction.operation() {
-                        Self::Call(call) if stale.contains(&(index, position)) => {
-                            let (_, inputs, outputs, regions, provenance) = instruction.clone().into_parts();
-                            Instruction::new(Self::Call(call.without_mesh()), inputs, outputs, regions)
-                                .with_provenance(provenance)
-                        }
-                        _ => instruction.clone(),
-                    })
-                    .collect();
-                CoreRegion::new(
-                    region.atoms().to_vec(),
-                    region.input_ids().to_vec(),
-                    region.output_ids().to_vec(),
-                    instructions,
-                )
-            })
-            .collect::<Vec<_>>();
-
-        Program::new(program.input_structure().clone(), program.output_structure().clone(), regions, program.entry())
-    }
-
-    #[inline]
-    fn unread_captures(
-        callee: RegionRef<'_, Constant, Self>,
-        capture_count: usize,
-        target_platform: Option<&str>,
-    ) -> Option<Arc<[bool]>> {
-        unread_lifted_captures(callee, capture_count, target_platform)
-    }
-
+impl LowerableOperation for Operation {
     fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
@@ -1161,8 +1071,8 @@ fn validate_array_data_derived_dimensions(
     }
 }
 
-/// [`Transform`] marker under which [`unread_lifted_captures`] retains its result with a callee, for the number of
-/// lifted captures and the target platform that its arguments name. The region-owned cache only retains owned
+/// [`Transform`] marker under which [`cached_unread_lifted_captures`] retains its result with a callee, for the number
+/// of lifted captures and the target platform that its arguments name. The region-owned cache only retains owned
 /// arguments, so the name of the platform is held as a [`String`].
 struct UnreadLiftedCapturesAnalysis;
 
@@ -1181,20 +1091,14 @@ impl Transform<CoreRegion<Constant, Operation>> for UnreadLiftedCapturesAnalysis
 /// nothing of such a capture, as an execution of the callee requires nothing of it. The flags depend on the callee,
 /// the number of its captures, and the platform alone, so they are derived once for each of them and retained with
 /// the callee, and repeated applications only look them up.
-pub(crate) fn unread_lifted_captures(
+pub(crate) fn cached_unread_lifted_captures(
     callee: RegionRef<'_, Constant, Operation>,
     capture_count: usize,
     target_platform: Option<&str>,
 ) -> Option<Arc<[bool]>> {
+    // The table of the analysis is local to this derivation, because the flags are retained with the callee itself.
     let derive = |callee: RegionRef<'_, Constant, Operation>| -> Result<_, Infallible> {
-        let is_read = callee.used_captures(capture_count, true, target_platform);
-        let input_types = callee.interface().input_types();
-        let mut unread = vec![false; input_types.len()];
-        for (index, is_read) in is_read.into_iter().enumerate() {
-            unread[index] = !is_read
-                && matches!(input_types.get(index), Some(Type::Array(r#type)) if r#type.static_shape().is_some());
-        }
-        let unread = unread.contains(&true).then(|| Arc::from(unread));
+        let unread = callee.unread_lifted_captures(capture_count, target_platform, &mut UnreadLiftedCaptures::new());
         Ok(TransformArtifact::new(Vec::new(), unread))
     };
     let arguments = (capture_count, target_platform.map(str::to_owned));
@@ -3149,13 +3053,13 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_validate_data_derived_dimensions() {
+    fn test_operation_validate_data_derived_dimension_support() {
         // An operation whose lowering keeps padding unobservable passes, and one that does not is rejected with an
         // error that names it and the reason. Every reference operation shares one collapsed match arm, so one
         // representative pins that arm.
-        assert_eq!(Operation::from(AddOperation::<ArrayType>::new()).validate_data_derived_dimensions(), Ok(()));
+        assert_eq!(Operation::from(AddOperation::<ArrayType>::new()).validate_data_derived_dimension_support(), Ok(()));
         assert_eq!(
-            Operation::ReferenceNew(ReferenceNewOperation::new()).validate_data_derived_dimensions(),
+            Operation::ReferenceNew(ReferenceNewOperation::new()).validate_data_derived_dimension_support(),
             Err(Error::from(ProgramError::UnsupportedOperation {
                 message: format!(
                     "operation `{REFERENCE_NEW_OPERATION_NAME}` cannot consume data-derived dimensions during XLA \

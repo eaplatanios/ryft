@@ -7,10 +7,11 @@ use std::sync::Arc;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, Atom, AtomId, BroadcastOperation, CallOperation, DataType, DeviceMesh, Dimension, EagerContext,
-    EffectClass, ExternalReferenceBinding, FlatProgram, Instruction, Layout, LogicalMesh, Memory, MeshAxisType,
-    Parameterized, PlaceOperation, PlacementRequest, Program, ProgramError, RegionId, RegionPlacementRequests,
-    RegionRef, RegionRole, RequestedPlacement, Shape, Sharding, ShardingDimension, StopGradientOperation, TagOperation,
-    TransferToMemoryOperation, Type as CoreType, Typed, TypedProgram, UnreducedKind, Value,
+    EffectClass, ErasedOperation, ExternalReferenceBinding, FlatProgram, Instruction, Layout, LogicalMesh, Memory,
+    MeshAxisType, Parameterized, PlaceOperation, PlacementRequest, Program, ProgramError, Region as CoreRegion,
+    RegionId, RegionPlacementRequests, RegionRef, RegionRole, RequestedPlacement, Shape, Sharding, ShardingDimension,
+    StopGradientOperation, TagOperation, TransferToMemoryOperation, Type as CoreType, Typed, TypedProgram,
+    UnreducedKind, Value,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -27,11 +28,11 @@ use crate::lowering::sharding::{
     LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension,
     validate_declared_pending_reduction, validate_partial_completion, validate_pending_reduction_change,
 };
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, TypeLoweringExtension, lower_runtime_dimension_size_i64, lower_unplaced_constant_output,
-};
+use crate::lowering::types::{ArrayTypeLoweringExtension, TypeLoweringExtension, lower_unplaced_constant_output};
+use crate::lowering::values::ValueRefExtension;
 use crate::lowering::{EffectTokens, Lowerer, LoweringError, ProgramLoweringOperation, RaggedDotLoweringStrategy};
 use crate::operations::call::{CallFunctionMap, collect_call_functions};
+use crate::operations::composites::NamedCompositeImplementation;
 use crate::{
     CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement, ToPjrt, Type,
     normalize_runtime_requirements,
@@ -1956,11 +1957,9 @@ impl ProgramBoundary {
         }
 
         for output_dimension in boundary_mapping.output_dimensions() {
-            executable_outputs.push(lower_runtime_dimension_size_i64(
-                logical_outputs[output_dimension.logical_output_index()],
+            executable_outputs.push(logical_outputs[output_dimension.logical_output_index()].widen_dimension_to_i64(
                 output_dimension.axis(),
                 &mut function_block_ref,
-                context,
                 location.as_ref(),
             )?);
         }
@@ -2028,7 +2027,8 @@ impl ProgramSessionConstants {
             }
 
             if has_session_constants {
-                region.visit_atom_reads(target_platform, |id, is_live| {
+                // The regions may belong to different programs, so each one is analyzed with a table of its own.
+                region.visit_atom_reads(target_platform, &mut UnreadLiftedCaptures::new(), |id, is_live| {
                     if let Some(Atom::Constant(Constant::Session(constant))) = region.atoms().get(id.index()) {
                         let usage = &mut constants[indices[&constant.identity_key()]].1;
                         if is_live {
@@ -2073,11 +2073,13 @@ pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
     /// [`RegionPlacementRequests::requests`] analyzes it, so that the validation of placements, the lowering itself,
     /// commitment, and the devices that a program names all see the same instructions. Whether a call still names
     /// devices is read for `target_platform`, so a callee that names devices only inside a body that lowering for
-    /// that platform replaces names none.
+    /// that platform replaces names none. A `call` whose callee names no devices anymore (e.g., because pruning dropped
+    /// the only request that named them) loses the mesh that it recorded for them.
     ///
     /// # Errors
     ///
-    /// Returns the errors of [`Program::into_pruned`] and [`Program::into_simplified`].
+    /// Returns the errors of [`Program::into_pruned`] and [`Program::into_simplified`], and
+    /// [`ProgramError::MalformedProgram`] when the family cannot hold a `call` that it holds without its mesh.
     fn pruned_for_lowering(&self, target_platform: Option<&str>) -> Result<Self, ProgramError>;
 
     /// Returns whether an instruction in a region that lowering emits declares ordered state. XLA cannot represent
@@ -2212,9 +2214,78 @@ where
 {
     type Operation = O;
 
-    #[inline]
+    // TODO(eaplatanios): Review this.
     fn pruned_for_lowering(&self, target_platform: Option<&str>) -> Result<Self, ProgramError> {
-        O::without_stale_call_meshes(self.clone().into_pruned()?.into_simplified()?, target_platform)
+        let program = self.clone().into_pruned()?.into_simplified()?;
+
+        // A call records the devices that its callee names when the callee is staged, from its whole program, so a call
+        // whose outputs pruning dropped together with the only request that named them names no devices anymore, and it
+        // is lowered as a call that names none. Whether a callee names devices is derived once for each region of the
+        // pruned program (refer to `RegionPlacementRequests::names_devices_predicate`), so nested calls cost one pass
+        // over the program. Most programs have no call that records a mesh and pay one scan of their calls. The regions
+        // that lowering omits are those of `RegionPlacementRequestsExtension::for_lowering`.
+        let arena = program.entry_region_ref().arena();
+        let omitted: &dyn Fn(RegionRef<'_, Constant, O>, &Instruction<O>) -> bool = &|region, instruction| {
+            target_platform.is_some()
+                && instruction
+                    .operation()
+                    .omits_regions(target_platform, || region.instruction_boundary_types(instruction))
+        };
+        let mut names_devices = RegionPlacementRequests::names_devices_predicate(program.entry_region_ref(), omitted);
+        let mut stale = HashSet::new();
+        for (index, region) in program.regions().iter().enumerate() {
+            let region_ref = RegionRef::new(arena, RegionId::new(index)).unwrap();
+            for (position, instruction) in region.instructions().iter().enumerate() {
+                let Some(call) = instruction.operation().projected_payload::<CallOperation<Type>>() else { continue };
+                if call.mesh().is_some()
+                    && let Ok(callee) = region_ref.with_id(instruction.regions()[0])
+                    && call.names_devices(|| names_devices(callee)).is_none()
+                {
+                    stale.insert((index, position));
+                }
+            }
+        }
+
+        if stale.is_empty() {
+            return Ok(program);
+        }
+
+        let regions = program
+            .regions()
+            .iter()
+            .enumerate()
+            .map(|(index, region)| {
+                let instructions = region
+                    .instructions()
+                    .iter()
+                    .enumerate()
+                    .map(|(position, instruction)| {
+                        let call = instruction.operation().projected_payload::<CallOperation<Type>>();
+                        let Some(call) = call.filter(|_| stale.contains(&(index, position))) else {
+                            return Ok(instruction.clone());
+                        };
+                        // The family holds this call, so it can hold the same call without its mesh.
+                        let operation =
+                            O::from_payload(ErasedOperation::new(call.without_mesh())).map_err(|payload| {
+                                ProgramError::MalformedProgram(format!(
+                                    "the operation family of the program cannot hold the `{}` that it holds a call of",
+                                    payload.type_name(),
+                                ))
+                            })?;
+                        let (_, inputs, outputs, regions, provenance) = instruction.clone().into_parts();
+                        Ok(Instruction::new(operation, inputs, outputs, regions).with_provenance(provenance))
+                    })
+                    .collect::<Result<Vec<_>, ProgramError>>()?;
+                Ok(CoreRegion::new(
+                    region.atoms().to_vec(),
+                    region.input_ids().to_vec(),
+                    region.output_ids().to_vec(),
+                    instructions,
+                ))
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+
+        Program::new(program.input_structure().clone(), program.output_structure().clone(), regions, program.entry())
     }
 
     #[inline]
@@ -2422,7 +2493,12 @@ where
     ) -> Vec<bool> {
         let lifted = self.input_count() + session_constant_count == logical_input_types.len();
         let source_capture_count = capture_count.saturating_sub(session_constant_count);
-        let used_captures = self.entry_region_ref().used_captures(source_capture_count, lifted, target_platform);
+        let used_captures = self.entry_region_ref().used_captures(
+            source_capture_count,
+            lifted,
+            target_platform,
+            &mut UnreadLiftedCaptures::new(),
+        );
         logical_input_types
             .iter()
             .enumerate()
@@ -2671,7 +2747,7 @@ where
 
                 // A named composite with a backend implementation or a shared function needs no copy of its body.
                 let regions = if operation.composite_key().is_some_and(|key| {
-                    O::has_composite_implementation(key, &input_types, &output_types, target_platform)
+                    NamedCompositeImplementation::select(key, &input_types, &output_types, target_platform).is_some()
                         || nested_functions
                             .is_some_and(|functions| functions.named(key, &input_types, &output_types).is_some())
                 }) {
@@ -3109,6 +3185,11 @@ where
     }
 }
 
+/// Unread lifted captures of the callees that one capture analysis has visited, by the region of each callee and the
+/// number of its captures. One analysis covers the regions of one program for one target platform, so a table must not
+/// be shared between programs or platforms.
+pub(crate) type UnreadLiftedCaptures = HashMap<(RegionId, usize), Option<Arc<[bool]>>>;
+
 /// Analyzes instruction boundaries, emitted computations, and capture use in an XLA program region.
 pub(crate) trait RegionLoweringExtension<O: ProgramLoweringOperation>: Sized {
     /// Returns the input and output types of an instruction in this region, in operand and result order.
@@ -3126,13 +3207,38 @@ pub(crate) trait RegionLoweringExtension<O: ProgramLoweringOperation>: Sized {
     /// indices. At each call, [`Self::visit_atom_reads`] checks the forwarded operands against the callee's unread
     /// captures. Compilation and lowering use these flags so that a capture read only inside an omitted body, such
     /// as a zero-length scan, can be skipped at the executable boundary.
-    fn used_captures(self, capture_count: usize, lifted: bool, target_platform: Option<&str>) -> Vec<bool>;
+    fn used_captures(
+        self,
+        capture_count: usize,
+        lifted: bool,
+        target_platform: Option<&str>,
+        unread_lifted_captures: &mut UnreadLiftedCaptures,
+    ) -> Vec<bool>;
 
-    /// Visits each instruction input and each output of this region, passing its atom ID and whether the read
-    /// is live. Outputs are always live. When a call forwards a lifted capture that the operation family marks
-    /// [`unread`](super::LowerableOperation::unread_captures) on `target_platform`, its operand is dead and lowering
-    /// supplies a bufferless value. Capture analysis and session constant partitioning use this same decision.
-    fn visit_atom_reads<F: FnMut(AtomId, bool)>(self, target_platform: Option<&str>, visit: F);
+    /// Returns, for each input of this region, the callee of a `call` whose first `capture_count` inputs are its lifted
+    /// captures, whether it is a capture that an executable of the callee has no physical input for (i.e., an array of
+    /// a static shape that no region which lowering emits for `target_platform` reads), or [`None`] when the callee has
+    /// no such capture. The lowering of the call passes a value that requires no buffer in place of such a capture, and
+    /// the function that makes the call reads the input only where the callee reads it. The answer is derived from
+    /// [`Self::used_captures`], which asks the same question of the callees of nested calls, so it is retained in
+    /// `unread_lifted_captures` and each callee is analyzed once per analysis.
+    fn unread_lifted_captures(
+        self,
+        capture_count: usize,
+        target_platform: Option<&str>,
+        unread_lifted_captures: &mut UnreadLiftedCaptures,
+    ) -> Option<Arc<[bool]>>;
+
+    /// Visits each instruction input and each output of this region, passing its atom ID and whether the read is live.
+    /// Outputs are always live. When a call forwards a lifted capture that its callee never reads on `target_platform`,
+    /// its input is dead and lowering supplies a bufferless value. Capture analysis and session constant partitioning
+    /// use this same decision.
+    fn visit_atom_reads<F: FnMut(AtomId, bool)>(
+        self,
+        target_platform: Option<&str>,
+        unread_lifted_captures: &mut UnreadLiftedCaptures,
+        visit: F,
+    );
 }
 
 impl<O: ProgramLoweringOperation> RegionLoweringExtension<O> for RegionRef<'_, Constant, O> {
@@ -3174,7 +3280,13 @@ impl<O: ProgramLoweringOperation> RegionLoweringExtension<O> for RegionRef<'_, C
         })
     }
 
-    fn used_captures(self, capture_count: usize, lifted: bool, target_platform: Option<&str>) -> Vec<bool> {
+    fn used_captures(
+        self,
+        capture_count: usize,
+        lifted: bool,
+        target_platform: Option<&str>,
+        unread_lifted_captures: &mut UnreadLiftedCaptures,
+    ) -> Vec<bool> {
         let mut is_read = vec![false; capture_count];
         for region in self.emitted_regions(target_platform, CallTraversal::Skip) {
             let mut lifted_captures = HashMap::new();
@@ -3183,7 +3295,7 @@ impl<O: ProgramLoweringOperation> RegionLoweringExtension<O> for RegionRef<'_, C
                 lifted_captures.extend(inputs.enumerate().map(|(index, id)| (*id, index)));
             }
 
-            region.visit_atom_reads(target_platform, |id, is_live| {
+            region.visit_atom_reads(target_platform, unread_lifted_captures, |id, is_live| {
                 if !is_live {
                     return;
                 }
@@ -3201,7 +3313,37 @@ impl<O: ProgramLoweringOperation> RegionLoweringExtension<O> for RegionRef<'_, C
         is_read
     }
 
-    fn visit_atom_reads<F: FnMut(AtomId, bool)>(self, target_platform: Option<&str>, mut visit: F) {
+    fn unread_lifted_captures(
+        self,
+        capture_count: usize,
+        target_platform: Option<&str>,
+        unread_lifted_captures: &mut UnreadLiftedCaptures,
+    ) -> Option<Arc<[bool]>> {
+        let key = (self.id(), capture_count);
+        if let Some(unread) = unread_lifted_captures.get(&key) {
+            return unread.clone();
+        }
+
+        // Only an array of a static shape can go without a buffer, so every other unread capture counts as read.
+        let is_read = self.used_captures(capture_count, true, target_platform, unread_lifted_captures);
+        let input_types = self.interface().input_types();
+        let mut unread = vec![false; input_types.len()];
+        for (index, is_read) in is_read.into_iter().enumerate() {
+            unread[index] = !is_read
+                && matches!(input_types.get(index), Some(Type::Array(r#type)) if r#type.static_shape().is_some());
+        }
+
+        let unread = unread.contains(&true).then(|| Arc::from(unread));
+        unread_lifted_captures.insert(key, unread.clone());
+        unread
+    }
+
+    fn visit_atom_reads<F: FnMut(AtomId, bool)>(
+        self,
+        target_platform: Option<&str>,
+        unread_lifted_captures: &mut UnreadLiftedCaptures,
+        mut visit: F,
+    ) {
         for instruction in self.instructions() {
             let unread = instruction
                 .operation()
@@ -3209,7 +3351,7 @@ impl<O: ProgramLoweringOperation> RegionLoweringExtension<O> for RegionRef<'_, C
                 .filter(|call| call.capture_count() != 0)
                 .and_then(|call| {
                     let callee = self.with_id(*instruction.regions().first()?).ok()?;
-                    O::unread_captures(callee, call.capture_count(), target_platform)
+                    callee.unread_lifted_captures(call.capture_count(), target_platform, unread_lifted_captures)
                 });
 
             for (index, id) in instruction.inputs().iter().enumerate() {
@@ -7032,7 +7174,10 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        assert_eq!(program.entry_region_ref().used_captures(3, false, None), vec![true, false, false]);
+        assert_eq!(
+            program.entry_region_ref().used_captures(3, false, None, &mut UnreadLiftedCaptures::new()),
+            vec![true, false, false]
+        );
 
         // Only lifted captures are the leading entry inputs.
         let mut builder = ProgramBuilder::<Constant, Operation>::new();
@@ -7041,8 +7186,14 @@ mod tests {
         let program = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![first], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        assert_eq!(program.entry_region_ref().used_captures(2, true, None), vec![true, false]);
-        assert_eq!(program.entry_region_ref().used_captures(2, false, None), vec![false, false]);
+        assert_eq!(
+            program.entry_region_ref().used_captures(2, true, None, &mut UnreadLiftedCaptures::new()),
+            vec![true, false]
+        );
+        assert_eq!(
+            program.entry_region_ref().used_captures(2, false, None, &mut UnreadLiftedCaptures::new()),
+            vec![false, false]
+        );
 
         // A capture that only the body of a scan reads is read only when the scan admits an iteration, because
         // lowering otherwise emits nothing of that body.
@@ -7066,10 +7217,40 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            program.entry_region_ref().used_captures(1, false, None)
+            program.entry_region_ref().used_captures(1, false, None, &mut UnreadLiftedCaptures::new())
         };
         assert_eq!(used_captures(0), vec![false]);
         assert_eq!(used_captures(1), vec![true]);
+    }
+
+    #[test]
+    fn test_region_ref_unread_lifted_captures() {
+        // The callee receives three lifted captures and reads only the second of them together with its fourth input,
+        // so an executable of it has no physical input for the other two.
+        let vector_type = test_vector_type(4);
+        let callee = {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let inputs = (0..4).map(|_| builder.add_input(vector_type.clone().into())).collect::<Vec<_>>();
+            let output =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![inputs[1], inputs[3]], None).unwrap()[0];
+            Arc::new(
+                builder
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
+                    .unwrap(),
+            )
+        };
+        let region = callee.entry_region_ref();
+        let mut table = UnreadLiftedCaptures::new();
+        let unread = region.unread_lifted_captures(3, None, &mut table);
+        assert_eq!(unread.as_deref(), Some([true, false, true, false].as_slice()));
+
+        // The answer is retained by the region and the number of captures, and it is the one returned again.
+        assert_eq!(table.get(&(region.id(), 3)), Some(&unread));
+        assert_eq!(region.unread_lifted_captures(3, None, &mut table), unread);
+
+        // A callee that reads every capture has none to report.
+        assert_eq!(region.unread_lifted_captures(0, None, &mut table), None);
+        assert_eq!(table.len(), 2);
     }
 
     #[test]
@@ -7077,7 +7258,9 @@ mod tests {
         let vector_type = test_vector_type(4);
         let visits = |program: &FlatProgram<Session>| {
             let mut visits = Vec::new();
-            program.entry_region_ref().visit_atom_reads(None, |id, is_live| visits.push((id, is_live)));
+            program
+                .entry_region_ref()
+                .visit_atom_reads(None, &mut UnreadLiftedCaptures::new(), |id, is_live| visits.push((id, is_live)));
             visits
         };
 

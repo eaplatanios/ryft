@@ -23,7 +23,9 @@ use crate::operations::collectives::{CollectiveAxes, CollectiveOperation, Hidden
 use crate::operations::composites::operations::composite_transpose::{
     CompositeTransposeOperation, CompositeTransposeRules,
 };
-use crate::operations::composites::operations::{CompositeConversion, transpose_carrier_batching};
+use crate::operations::composites::operations::{
+    CompositeConversion, NamedCompositeOperation, transpose_carrier_batching,
+};
 use crate::operations::composites::rules::definitions::CompositeKey;
 use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
 use crate::operations::composites::rules::{
@@ -931,6 +933,15 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
                 })
             }
         }
+    }
+}
+
+impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> NamedCompositeOperation
+    for CompositeOperation<V, O, S>
+{
+    #[inline]
+    fn composite_key(&self) -> Option<&CompositeKey> {
+        self.key()
     }
 }
 

@@ -10,12 +10,14 @@ use ryft_mlir::{
 };
 
 use crate::lowering::EffectTokens;
-use crate::lowering::types::{ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_runtime_dimension_size_i64};
+use crate::lowering::types::{ArrayTypeLoweringExtension, PhysicalStoragePadding};
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE, ASSERT_PAD_KIND,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
+use crate::{
+    ArrayTypeExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type, ValueRefExtension,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -63,7 +65,7 @@ impl LowerableOperation for PadOperation<Type> {
         }
         if self.effects().classes().contains(EffectClass::OrderedAssertion) {
             for axis in 0..output_type.rank() {
-                let input_extent = lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?;
+                let input_extent = input_values[0].widen_dimension_to_i64(axis, block, location)?;
                 self.lower_extent_assertion(
                     axis,
                     input_extent,
@@ -266,7 +268,7 @@ impl<T: CoreType> PadOperationLoweringExtension for PadOperation<T> {
             let extent = match output_extents {
                 Some(extents) => extents[axis],
                 // Homogeneous padding retains a dynamic axis only when its size is unchanged.
-                None => lower_runtime_dimension_size_i64(input_values[0], axis, &mut block, context, location)?,
+                None => input_values[0].widen_dimension_to_i64(axis, &mut block, location)?,
             };
             let extent = block
                 .append_operation(stable_hlo::convert(
