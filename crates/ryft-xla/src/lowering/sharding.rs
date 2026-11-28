@@ -331,25 +331,27 @@ const ELEMENTWISE_OPERATIONS: &[&str] = &[
     "stablehlo.xor",
 ];
 
-// TODO(eaplatanios): Review this.
-/// Returns the dimension shardings that the `sdy.sharding_constraint` that produces `value` declares, including along
-/// auto mesh axes, which no type records, or [`None`] when `value` is not the result of such a constraint or the
+/// Returns the dimension shardings that the `sdy.sharding_constraint` that produces `value` declares, including
+/// along auto mesh axes, which no type records, or [`None`] when `value` is not the result of such a constraint or the
 /// constraint partitions a dimension along a part of an axis. An empty dimension is replicated when it is closed and
 /// unconstrained when it is open. This is what the program states about the placement of a value along auto mesh axes
-/// (e.g., the constraint that [`ProgramLoweringContext::lower_pending_reduction_constraint`] emits for an input
-/// that enters with a pending reduction, or for the result of an earlier instruction), so it is read from the program
-/// rather than reconstructed.
+/// (e.g., the constraint that [`ProgramLoweringContext::lower_pending_reduction_constraint`] emits for an input that
+/// enters with a pending reduction, or for the result of an earlier instruction), so it is read from the program rather
+/// than reconstructed.
 fn constrained_dimensions(value: ValueRef<'_, '_, '_>) -> Result<Option<Rc<[ShardingDimension]>>, Error> {
     let Some(result) = value.cast::<OperationResultRef>() else {
         return Ok(None);
     };
+
     let operation = result.operation()?;
     if operation.name().as_str() != Ok("sdy.sharding_constraint") {
         return Ok(None);
     }
+
     let Some(constraint) = (unsafe { operation.cast::<shardy::ShardingConstraintOperationRef>() }) else {
         return Ok(None);
     };
+
     let sharding = shardy::ShardingConstraintOperation::sharding(&constraint)?;
     let mut dimensions = Vec::new();
     for dimension in sharding.dim_shardings() {
@@ -358,10 +360,12 @@ fn constrained_dimensions(value: ValueRef<'_, '_, '_>) -> Result<Option<Rc<[Shar
             if axis.sub_axis_info()?.is_some() {
                 return Ok(None);
             }
+
             let name = axis.name();
             let name = name.as_str().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
             axes.push(name.to_string());
         }
+
         dimensions.push(if !axes.is_empty() {
             ShardingDimension::Sharded(axes)
         } else if dimension.is_closed() {
@@ -370,16 +374,16 @@ fn constrained_dimensions(value: ValueRef<'_, '_, '_>) -> Result<Option<Rc<[Shar
             ShardingDimension::Unconstrained
         });
     }
+
     Ok(Some(dimensions.into()))
 }
 
-// TODO(eaplatanios): Review this.
 /// Returns `dimensions`, dimension shardings over `mesh` that the program states for a value (e.g., with
 /// [`constrained_dimensions`]), if they agree with `stated`, the closed dimension shardings of the type of that value
-/// (refer to [`Sharding::dimensions_with_unconstrained_replicated`]), along every mesh axis that is
-/// not an auto axis, which is all that a type records, and `stated` otherwise. A value whose type tracks a placement is
-/// placed as its type says along those axes, so the program can only add the placement along auto mesh axes, which its
-/// type cannot record.
+/// (refer to [`Sharding::dimensions_with_unconstrained_replicated`]), along every mesh axis that is not an auto axis,
+/// which is all that a type records, and `stated` otherwise. A value whose type tracks a placement is placed as its
+/// type says along those axes, so the program can only add the placement along auto mesh axes, which its type cannot
+/// record.
 fn dimensions_along_auto_axes(
     dimensions: Option<Rc<[ShardingDimension]>>,
     stated: Rc<[ShardingDimension]>,
@@ -396,6 +400,7 @@ fn dimensions_along_auto_axes(
         }
         ShardingDimension::Replicated | ShardingDimension::Unconstrained => ShardingDimension::Replicated,
     };
+
     match dimensions {
         Some(dimensions)
             if dimensions.len() == stated.len()
