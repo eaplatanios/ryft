@@ -219,7 +219,7 @@ impl LowerableOperation for ConstantOperation<Array> {
         check_count!("output", output_types, 1, ProgramError);
         let constant_value =
             self.value()
-                .lower_constant_value(&[], &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+                .lower_constant(&[], &mut lowerer.block(), lowerer.context(), lowerer.location())?;
         Ok(vec![constant_value])
     }
 }
@@ -241,7 +241,7 @@ impl LowerableOperation for FillLikeOperation<ArrayType> {
         let physical_tensor_type = lowerer.lower_tensor_type(&physical_type)?;
         let value =
             self.value()
-                .lower_constant_value(&[], &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+                .lower_constant(&[], &mut lowerer.block(), lowerer.context(), lowerer.location())?;
         let result = lowerer.block().append_operation(stable_hlo::broadcast(
             value,
             physical_tensor_type,

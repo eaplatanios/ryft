@@ -21,7 +21,7 @@ use ryft_mlir::{
 use crate::arrays::host::ReductionChange;
 use crate::devices::MemoryExtension;
 use crate::lowering::emissions::{
-    collect_session_constants, omits_regions, partition_session_constants, unread_entry_inputs,
+    collect_session_constants, lowers_without_regions, omits_regions, partition_session_constants, unread_entry_inputs,
 };
 use crate::lowering::modules::{
     contains_unresolved_references, contains_unresolved_state, normalize_function_name, remove_shardy_operations,
@@ -31,14 +31,16 @@ use crate::lowering::reductions::{
     ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
     validate_pending_reduction_change,
 };
-use crate::lowering::regions::lower_instruction;
 use crate::lowering::sharding::{LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension};
 use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, TypeLoweringExtension, lower_runtime_dimension_size_i64,
     lower_unplaced_constant_output, validate_boundary_memory,
 };
-use crate::lowering::{EffectTokens, LowerableOperationFamily, LoweringError, RaggedDotLoweringStrategy};
+use crate::lowering::{
+    EffectTokens, LowerableOperationFamily, Lowerer, LoweringError, RaggedDotLoweringStrategy,
+    lower_instruction_operation,
+};
 use crate::operations::call::{CallFunctionMap, collect_call_functions};
 use crate::{
     CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement, Type,
@@ -1467,8 +1469,7 @@ impl ProgramBoundary {
                         let output_sharding = &output_shardings[logical_output_index];
                         let shares_buffers = match same_sharding {
                             true => output_type == input_type && output_sharding == input_sharding,
-                            // TODO(eaplatanios): Can we avoid the use of a label here? I don't like this kind of control flow.
-                            false => 'shards: {
+                            false => {
                                 // Every device must hold shards of the same type of the input and of the output,
                                 // although the two shardings may differ (e.g., when the output completes a pending sum
                                 // of the input along a mesh axis, or splits a dimension along another axis of the same
@@ -1476,11 +1477,9 @@ impl ProgramBoundary {
                                 // That is the case when both shardings are on the same mesh, the types are identical
                                 // apart from their shardings (i.e., in data type, shape, layout, and memory), and both
                                 // shardings split each dimension into shards of the same static extent.
-                                let (Some(input_sharding), Some(output_sharding), Some(shape)) =
-                                    (input_sharding.as_ref(), output_sharding.as_ref(), input_type.static_shape())
-                                else {
-                                    break 'shards false;
-                                };
+                                let input_sharding = input_sharding.as_ref()?;
+                                let output_sharding = output_sharding.as_ref()?;
+                                let shape = input_type.static_shape()?;
 
                                 // The extent of the shards of each dimension, or `None` when a dimension is
                                 // unconstrained, names an axis that the mesh does not have, or is not split evenly.
@@ -2346,7 +2345,8 @@ pub(crate) trait ProgramInlineLoweringExtension {
     /// location from `location` and its provenance. Calls may use private functions registered in `nested_functions`.
     ///
     /// Ordered effects consume and update the caller's `effect_tokens` in program order. The caller continues from
-    /// the final token of each chain after the body returns.
+    /// the final token of each chain after the body returns. An instruction that uses the assertion token marks the
+    /// module as requiring the runtime assertion handler.
     ///
     /// # Errors
     ///
@@ -2373,7 +2373,6 @@ where
 {
     type Operation = O;
 
-    #[inline]
     fn lower_inline<'b, 'c: 'b, 't: 'c>(
         &self,
         captured_values: &[ValueRef<'b, 'c, 't>],
@@ -2391,17 +2390,52 @@ where
             input_values.to_vec(),
             |_, value| value.lower(captured_values, lowering_context, &mut constant_block, context, location),
             |instruction, inputs| {
-                lower_instruction(
-                    region,
-                    instruction,
-                    captured_values,
-                    inputs,
+                let input_types = instruction
+                    .inputs()
+                    .iter()
+                    .map(|input| region.atoms()[input.index()].r#type().into_owned())
+                    .collect::<Vec<_>>();
+                let output_types = instruction
+                    .outputs()
+                    .iter()
+                    .map(|output| region.atoms()[output.index()].r#type().into_owned())
+                    .collect::<Vec<_>>();
+
+                // All operations emitted for this instruction inherit its provenance on top of the ambient location.
+                let location = lowering_context.instruction_location(context, instruction.provenance(), location);
+                let operation = instruction.operation();
+                let regions = if lowers_without_regions(
+                    operation,
+                    &input_types,
+                    &output_types,
                     nested_functions,
-                    lowering_context,
-                    effect_tokens,
-                    block,
-                    location,
-                )
+                    lowering_context.target_platform(),
+                ) {
+                    Vec::new()
+                } else {
+                    instruction
+                        .regions()
+                        .iter()
+                        .map(|attached| RegionRef::new(region.arena(), *attached).map(RegionRef::to_program))
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+
+                let mut lowerer = Lowerer::new(block, context, location, lowering_context.clone())
+                    .with_regions(regions)
+                    .with_nested_functions(nested_functions.cloned())
+                    .with_captured_values(captured_values)
+                    .with_effect_tokens(*effect_tokens);
+
+                let outputs =
+                    lower_instruction_operation(operation, &mut lowerer, inputs, &input_types, &output_types)?;
+
+                if lowerer.effect_tokens.ordered_assertion.is_some() {
+                    lowering_context.record_assertion();
+                }
+
+                *effect_tokens = lowerer.effect_tokens;
+
+                Ok(outputs)
             },
         )
     }

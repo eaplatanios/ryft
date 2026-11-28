@@ -172,8 +172,6 @@ pub(crate) mod modules;
 pub(crate) mod programs;
 /// Lowering and validation of pending reductions.
 pub(crate) mod reductions;
-/// Lowering of instructions while replaying a borrowed program region.
-mod regions;
 /// Lowering of logical meshes, shardings, and sharding constraints to Shardy.
 pub(crate) mod sharding;
 /// Program lowering context for nested regions and their enclosing module.

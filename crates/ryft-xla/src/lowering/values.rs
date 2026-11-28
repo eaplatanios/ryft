@@ -1,7 +1,3 @@
-//! Lowering of the values of programs (i.e., their constants) to StableHLO values. A value is either materialized
-//! as a literal (refer to [`MlirLowerableValue`]) or forwarded from a hidden input of the function that it is lowered
-//! in (refer to [`Constant::lower`]).
-
 use std::borrow::Cow;
 
 use ryft_core::{
@@ -20,17 +16,17 @@ use crate::lowering::types::{
 };
 use crate::{ArrayConstant, Constant, Error};
 
-// TODO(eaplatanios): Review this module.
-
 /// Value type that lowering can materialize as a StableHLO dense constant or bind to a captured input (e.g., the
 /// values of [`ArrayOperation`](ryft_core::ArrayOperation) constants).
 pub(crate) trait MlirLowerableValue: 'static + Value<Type = ArrayType> {
-    /// Builds a dense-elements attribute containing this value.
+    /// Builds a [`DenseElementsAttributeRef`] that contains this value.
     fn to_dense_elements_attribute<'c, 't>(
         &self,
         tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
         context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, Error>;
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Lowers this concrete value to a StableHLO constant operation and applies its declared memory placement.
     fn lower_literal<'b, 'c: 'b, 't: 'c, B, L>(
@@ -53,7 +49,7 @@ pub(crate) trait MlirLowerableValue: 'static + Value<Type = ArrayType> {
 
     /// Lowers this program constant inside a function body.
     #[inline]
-    fn lower_constant_value<'b, 'c: 'b, 't: 'c, B, L>(
+    fn lower_constant<'b, 'c: 'b, 't: 'c, B, L>(
         &self,
         captured_values: &[ValueRef<'b, 'c, 't>],
         block: &mut B,
@@ -91,7 +87,7 @@ impl MlirLowerableValue for ArrayConstant {
         }
     }
 
-    fn lower_constant_value<'b, 'c: 'b, 't: 'c, B, L>(
+    fn lower_constant<'b, 'c: 'b, 't: 'c, B, L>(
         &self,
         captured_values: &[ValueRef<'b, 'c, 't>],
         block: &mut B,
@@ -188,27 +184,6 @@ impl MlirLowerableValue for Array {
     }
 }
 
-/// Lowering of a [`CaptureReference`] to StableHLO.
-trait CaptureReferenceLoweringExtension {
-    /// Lowers this captured constant reference by forwarding its runtime value among `captured_values`.
-    fn lower<'b, 'c: 'b, 't: 'c>(
-        &self,
-        captured_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
-}
-
-impl<T: CoreType> CaptureReferenceLoweringExtension for CaptureReference<T> {
-    fn lower<'b, 'c: 'b, 't: 'c>(
-        &self,
-        captured_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-        captured_values
-            .get(self.index())
-            .copied()
-            .ok_or(Error::Lowering(LoweringError::MissingCapturedConstant { index: self.index() }))
-    }
-}
-
 /// Lowering of a [`DimensionValue`] to StableHLO.
 pub(crate) trait DimensionValueLoweringExtension {
     /// Lowers one first-class dimension extent to the scalar `i64` [`stablehlo.constant`](stable_hlo::constant) that
@@ -242,6 +217,27 @@ impl DimensionValueLoweringExtension for DimensionValue {
         let elements = DataType::I64.lower_constant_elements_attribute(tensor_type, extent, context)?;
         let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
         Ok(constant.result(0).unwrap().as_ref())
+    }
+}
+
+/// Lowering of a [`CaptureReference`] to StableHLO.
+trait CaptureReferenceLoweringExtension {
+    /// Lowers this captured constant reference by forwarding its runtime value among `captured_values`.
+    fn lower<'b, 'c: 'b, 't: 'c>(
+        &self,
+        captured_values: &[ValueRef<'b, 'c, 't>],
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+}
+
+impl<T: CoreType> CaptureReferenceLoweringExtension for CaptureReference<T> {
+    fn lower<'b, 'c: 'b, 't: 'c>(
+        &self,
+        captured_values: &[ValueRef<'b, 'c, 't>],
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        captured_values
+            .get(self.index())
+            .copied()
+            .ok_or(Error::Lowering(LoweringError::MissingCapturedConstant { index: self.index() }))
     }
 }
 
