@@ -5,12 +5,12 @@ use ryft_mlir::{Block, Context as MlirContext, Location, Operation as MlirOperat
 
 use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat};
 use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_inputs};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for SinOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -38,7 +38,7 @@ impl LowerableOperation for SinOperation<ArrayType> {
 }
 
 impl LowerableOperation for CosOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -66,7 +66,7 @@ impl LowerableOperation for CosOperation<ArrayType> {
 }
 
 impl LowerableOperation for TanOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -84,7 +84,7 @@ impl LowerableOperation for TanOperation<ArrayType> {
 }
 
 impl LowerableOperation for Atan2Operation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -105,7 +105,7 @@ impl LowerableOperation for Atan2Operation<ArrayType> {
 }
 
 impl LowerableOperation for TanhOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

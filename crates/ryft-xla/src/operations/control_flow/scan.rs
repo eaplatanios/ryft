@@ -45,12 +45,12 @@ use crate::operations::control_flow::{
     lower_refined_region_outputs, lower_region_guard, lowered_effect_classes, set_threaded_effect_tokens,
     threaded_effect_token_values, validate_unthreaded_effect_tokens,
 };
-use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
+use crate::{Constant, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for ScanOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -69,7 +69,7 @@ impl LowerableOperation for ScanOperation<ArrayType> {
 }
 
 impl LowerableOperation for ScanOperation<Type> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -300,7 +300,7 @@ enum ScanLoopLength<'b, 'c: 'b, 't: 'c> {
 }
 
 /// Inputs of the lowering of one scan that its accumulators, its straight-line iterations, and its loops share.
-struct ScanLoopInputs<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> {
+struct ScanLoopInputs<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> {
     /// Lowered body program over `[index, carries..., stacked_input_slices...]`.
     body: &'o FlatProgram<EagerContext<Constant, O>>,
 
@@ -346,7 +346,7 @@ struct ScanLoopInputs<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> {
     lowering_context: &'o ProgramLoweringContext,
 }
 
-impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b, 'c, 't, O> {
+impl<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> ScanLoopInputs<'o, 'b, 'c, 't, O> {
     /// Lowers one zero accumulator per stacked output. Each accumulator is allocated at the physical bound of the scan
     /// length and, for a dynamic length, given the runtime length as the runtime extent of its leading axis with
     /// `stablehlo.set_dimension_size`.

@@ -23,7 +23,7 @@ use crate::lowering::types::{
 use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::call::CallFunctionMap;
-use crate::{Constant, Error, LowerableOperationFamily, Type};
+use crate::{Constant, Error, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -88,7 +88,7 @@ pub(crate) fn lower_region_guard<'b, 'c: 'b, 't: 'c>(
 /// [`emitted_regions`]), which omits only what lowering omits on every platform, so an assertion in the body of a scan
 /// that admits no iteration adds no token, while one in a body that the implementation of a named composite replaces
 /// only on some platform still adds one.
-pub(crate) fn lowered_effect_classes<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+pub(crate) fn lowered_effect_classes<ProgramInput, ProgramOutput, O: ProgramLoweringOperation>(
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
 ) -> Result<EffectClasses, Error>
 where
@@ -341,7 +341,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Lowering of a nested program to the region of a StableHLO control flow operation.
-pub(crate) trait ControlFlowRegionLoweringExtension<O: LowerableOperationFamily> {
+pub(crate) trait ControlFlowRegionLoweringExtension<O: ProgramLoweringOperation> {
     /// Lowers one nested control flow branch program into a fresh region with a single block.
     ///
     /// `entry_effect_tokens` are the active tokens of each effect class in the enclosing scope, which the region
@@ -367,7 +367,7 @@ pub(crate) trait ControlFlowRegionLoweringExtension<O: LowerableOperationFamily>
     ) -> Result<DetachedRegion<'c, 't>, Error>;
 }
 
-impl<O: LowerableOperationFamily> ControlFlowRegionLoweringExtension<O> for FlatProgram<EagerContext<Constant, O>> {
+impl<O: ProgramLoweringOperation> ControlFlowRegionLoweringExtension<O> for FlatProgram<EagerContext<Constant, O>> {
     #[allow(clippy::too_many_arguments)]
     fn lower_control_flow_region<'b, 'c: 'b, 't: 'c>(
         &self,

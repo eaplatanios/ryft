@@ -18,12 +18,12 @@ use crate::operations::control_flow::{
     ControlFlowRegionLoweringExtension, lower_explicit_sharding_constraints, lower_refined_region_input,
     lower_region_guard, lowered_effect_classes, set_threaded_effect_tokens,
 };
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
+use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for ConditionOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -42,7 +42,7 @@ impl LowerableOperation for ConditionOperation<ArrayType> {
 }
 
 impl LowerableOperation for ConditionOperation<Type> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

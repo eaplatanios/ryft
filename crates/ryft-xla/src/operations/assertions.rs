@@ -27,7 +27,7 @@ use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::manipulation::conversions::TypeCastLoweringExtension;
 use crate::sessions::effects::EffectCallbackGuard;
 use crate::{
-    Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, RuntimeExtension,
+    Error, ExecutionError, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, RuntimeExtension,
     RuntimeProvider, RuntimeRequirement, Type,
 };
 
@@ -588,7 +588,7 @@ pub(crate) unsafe fn copy_cuda_bytes(
 }
 
 impl LowerableOperation for GuardOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -603,7 +603,7 @@ impl LowerableOperation for GuardOperation<ArrayType> {
 }
 
 impl LowerableOperation for GuardOperation<Type> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -622,7 +622,7 @@ impl LowerableOperation for GuardOperation<Type> {
 }
 
 impl LowerableOperation for AssertOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -649,7 +649,7 @@ impl LowerableOperation for AssertOperation<ArrayType> {
 }
 
 impl LowerableOperation for AssertOperation<Type> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -858,7 +858,7 @@ fn output_extent_checks<'o>(
 /// the check, and converting each input's shape with [`TypeCastLoweringExtension::lower_cast_shape`]. The conversions
 /// only re-describe values that the check has related, including outputs that narrow some axes and give others a
 /// [retained](GuardOperation::retained_identities) identity. Guards preserve their inputs' layout and sharding.
-fn lower_guard_with_outputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+fn lower_guard_with_outputs<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     boundary: &str,
     declared_types: &[Type],
     input_values: &[ValueRef<'b, 'c, 't>],

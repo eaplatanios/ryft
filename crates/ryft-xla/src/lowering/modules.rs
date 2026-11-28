@@ -9,7 +9,7 @@ use ryft_mlir::{Module, Operation as MlirOperation, OperationPrintingFlags, Walk
 
 use crate::lowering::emissions::emitted_regions;
 use crate::lowering::states::ProgramLoweringContext;
-use crate::lowering::{LowerableOperationFamily, LoweringError};
+use crate::lowering::{LoweringError, ProgramLoweringOperation};
 use crate::{Constant, Error};
 
 // TODO(eaplatanios): Review this module.
@@ -22,7 +22,7 @@ use crate::{Constant, Error};
 /// Regions that lowering never reaches (e.g., the rule regions of composites, the transpose region of a `linear_call`,
 /// or the body of a scan that admits no iteration, refer to [`emitted_regions`], here for no target platform) are not
 /// part of the lowered module, so state in them is never lowered and cannot reject the program.
-pub(crate) fn contains_unresolved_state<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+pub(crate) fn contains_unresolved_state<ProgramInput, ProgramOutput, O: ProgramLoweringOperation>(
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
 ) -> bool
 where
@@ -48,7 +48,7 @@ where
 /// reference capture can carry reference values without executing a stateful instruction. Both predicates back the
 /// state checks that precede compilation and the two direct module lowering entry points. Eager binding, dispatch, and
 /// staging enforce their corresponding boundary invariants separately.
-pub(crate) fn contains_unresolved_references<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+pub(crate) fn contains_unresolved_references<ProgramInput, ProgramOutput, O: ProgramLoweringOperation>(
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
 ) -> bool
 where

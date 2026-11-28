@@ -34,20 +34,6 @@ pub(crate) fn validate_boundary_memory(memory: Memory, target_platform: Option<&
     Ok(())
 }
 
-/// Applies the non-default memory placement declared by `output_type` to `value`.
-pub fn annotate_output_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
-    value: ValueRef<'b, 'c, 't>,
-    output_type: &ArrayType,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    if output_type.memory() == Memory::Device {
-        return Ok(value);
-    }
-    Ok(output_type.memory().lower_transfer(&[value], block, context, location)?[0])
-}
-
 /// Lowering of transfers to a [`Memory`] to StableHLO.
 pub trait MemoryLoweringExtension {
     /// Lowers one staged [`TransferToMemoryOperation`](ryft_core::TransferToMemoryOperation) to the
@@ -278,7 +264,10 @@ pub fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy +
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let values = lower_unplaced_constant_output(output_types, integer_value, block, context, location)?;
     check_count!("output", output_types, 1, ProgramError);
-    Ok(vec![annotate_output_memory(values[0], &output_types[0], block, context, location)?])
+    match output_types[0].memory() {
+        Memory::Device => Ok(values),
+        memory => memory.lower_transfer(&values, block, context, location),
+    }
 }
 
 /// Returns the static dimensions for one tensor type.
@@ -1049,7 +1038,7 @@ mod tests {
     }
 
     #[test]
-    fn test_annotate_output_memory() {
+    fn test_lower_constant_output_memory_placement() {
         // Device outputs need no annotation, while host outputs gain one `annotate_device_placement` custom call in
         // addition to their `mhlo.memory_kind` signature attribute.
         let zero_program = |memory| {

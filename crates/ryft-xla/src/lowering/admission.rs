@@ -11,7 +11,7 @@ use ryft_core::{
     DimensionFromScalarOperation, DimensionVariable, EagerContext, FlatProgram, ProgramError, Type as CoreType, Typed,
 };
 
-use crate::lowering::LowerableOperationFamily;
+use crate::lowering::ProgramLoweringOperation;
 use crate::lowering::emissions::emitted_regions;
 use crate::{Constant, Error, Type};
 
@@ -39,7 +39,7 @@ use crate::{Constant, Error, Type};
 /// [`XlaMasked`]: DataDependentPaddingDiscipline::XlaMasked
 /// [`XlaZeroPadded`]: DataDependentPaddingDiscipline::XlaZeroPadded
 /// [`RyftMasked`]: DataDependentPaddingDiscipline::RyftMasked
-pub(crate) fn validate_data_dependent_compilation<O: LowerableOperationFamily>(
+pub(crate) fn validate_data_dependent_compilation<O: ProgramLoweringOperation>(
     program: &FlatProgram<EagerContext<Constant, O>>,
     target_platform: Option<&str>,
 ) -> Result<(), Error> {

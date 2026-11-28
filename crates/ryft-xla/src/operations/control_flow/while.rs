@@ -34,12 +34,12 @@ use crate::operations::control_flow::{
 };
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
+use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for WhileOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -58,7 +58,7 @@ impl LowerableOperation for WhileOperation<ArrayType> {
 }
 
 impl LowerableOperation for WhileOperation<Type> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

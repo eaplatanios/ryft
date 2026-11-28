@@ -18,12 +18,12 @@ use ryft_mlir::{
 use crate::lowering::types::{ArrayTypeLoweringExtension, lower_signed_one_bit_to_mlir, physical_bound_type};
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::operations::normalize_elementwise_input;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
+use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for SelectOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

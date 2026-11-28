@@ -11,12 +11,12 @@ use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::operations::collectives::{collapse_singleton_axis, refine_collective_result_dimensions};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation, Type};
+use crate::{Error, LowerableOperation, Lowerer, MemberLowerableOperation, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for ParallelAllToAllOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -53,7 +53,7 @@ impl LowerableOperation for ParallelAllToAllOperation {
 }
 
 impl MemberLowerableOperation<Type> for ParallelAllToAllOperation {
-    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

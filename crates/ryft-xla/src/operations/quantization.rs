@@ -17,7 +17,7 @@ use crate::lowering::types::{
 };
 use crate::operations::call::lower_shared_function_call;
 use crate::operations::composites::{NamedCompositionKey, named_composition_input_types};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer, Type};
+use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Session, Tracer, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -99,7 +99,7 @@ impl LowerableOperation for ScaledDotOperation {
     /// Either scale omitted by the public Ryft call is represented by the same JAX-compatible identity scale used by
     /// the pinned composite contract. The typed decomposition remains the portable fallback when XLA does not replace
     /// the composite.
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

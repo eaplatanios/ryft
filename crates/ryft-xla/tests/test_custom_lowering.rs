@@ -13,7 +13,7 @@ use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{AttributeRef, Block, Operation as MlirOperation, StringRef, Value as MlirValue, ValueRef};
 use ryft_xla::operations::NamedCompositionKey;
 use ryft_xla::{
-    Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, Operation, ProgramLoweringExtension,
+    Constant, Error, LowerableOperation, Lowerer, Operation, ProgramLoweringExtension, ProgramLoweringOperation,
     ProgramLoweringOptions, Type, lower_operation_variants,
 };
 
@@ -39,7 +39,7 @@ impl CoreOperation for TwiceOperation {
 }
 
 impl LowerableOperation for TwiceOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -78,7 +78,7 @@ impl CoreOperation for SquareOperation {
 }
 
 impl LowerableOperation for SquareOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -124,7 +124,7 @@ enum ExtendedOperation {
 }
 
 impl LowerableOperation for ExtendedOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

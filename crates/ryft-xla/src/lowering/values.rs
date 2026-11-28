@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use ryft_core::{
-    Array, ArrayType, CaptureReference, DataType, DimensionValue, ProgramError, Type as CoreType, Typed, Value,
+    Array, ArrayType, CaptureReference, DataType, DimensionValue, Memory, ProgramError, Type as CoreType, Typed, Value,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -12,7 +12,7 @@ use ryft_mlir::{
 use crate::lowering::LoweringError;
 use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, DataTypeLoweringExtension, annotate_output_memory, dimension_extent_i64,
+    ArrayTypeLoweringExtension, DataTypeLoweringExtension, MemoryLoweringExtension, dimension_extent_i64,
 };
 use crate::{ArrayConstant, Constant, Error};
 
@@ -43,8 +43,11 @@ pub(crate) trait MlirLowerableValue: 'static + Value<Type = ArrayType> {
         let tensor_type = value_type.lower(context, location)?;
         let elements = self.to_dense_elements_attribute(tensor_type, context)?;
         let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-        let constant = constant.result(0).unwrap().as_ref();
-        annotate_output_memory(constant, &value_type, block, context, location)
+        let constant = constant.result(0)?.as_ref();
+        match value_type.memory() {
+            Memory::Device => Ok(constant),
+            memory => Ok(memory.lower_transfer(&[constant], block, context, location)?[0]),
+        }
     }
 
     /// Lowers this program constant inside a function body.

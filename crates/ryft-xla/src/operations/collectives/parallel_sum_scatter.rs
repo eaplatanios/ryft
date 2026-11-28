@@ -15,12 +15,12 @@ use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::operations::collectives::{collapse_singleton_axis, refine_collective_result_dimensions};
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::build_reduce_body_region;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation, Type};
+use crate::{Error, LowerableOperation, Lowerer, MemberLowerableOperation, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for ParallelSumScatterOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -56,7 +56,7 @@ impl LowerableOperation for ParallelSumScatterOperation {
 }
 
 impl MemberLowerableOperation<Type> for ParallelSumScatterOperation {
-    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

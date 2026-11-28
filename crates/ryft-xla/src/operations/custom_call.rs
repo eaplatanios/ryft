@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, CUSTOM_CALL_OPERATION_NAME, CustomCallArrayAttribute, CustomCallAttribute, CustomCallOperation,
-    DataType, Dimension, EffectClass, Layout, ProgramError, Shape,
+    DataType, Dimension, EffectClass, Layout, Memory, ProgramError, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -13,18 +13,20 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::types::{ArrayTypeLoweringExtension, annotate_output_memory, lower_unplaced_constant_output};
-use crate::lowering::{EffectTokens, current_or_new_token};
+use crate::lowering::{
+    ArrayTypeLoweringExtension, EffectTokens, MemoryLoweringExtension, current_or_new_token,
+    lower_unplaced_constant_output,
+};
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{
-    CustomCallOperationExtension, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
-    MemberLowerableOperation, RUNTIME_REQUIREMENTS_ATTRIBUTE, Type,
+    CustomCallOperationExtension, Error, LowerableOperation, Lowerer, LoweringError, MemberLowerableOperation,
+    ProgramLoweringOperation, RUNTIME_REQUIREMENTS_ATTRIBUTE, Type,
 };
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for CustomCallOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -49,7 +51,7 @@ impl LowerableOperation for CustomCallOperation {
 }
 
 impl MemberLowerableOperation<Type> for CustomCallOperation {
-    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -253,7 +255,10 @@ fn lower_custom_call_output_memories<'b, 'c: 'b, 't: 'c>(
     results
         .into_iter()
         .zip(output_types)
-        .map(|(result, output_type)| annotate_output_memory(result, output_type, block, context, location))
+        .map(|(result, output_type)| match output_type.memory() {
+            Memory::Device => Ok(result),
+            memory => Ok(memory.lower_transfer(&[result], block, context, location)?[0]),
+        })
         .collect()
 }
 

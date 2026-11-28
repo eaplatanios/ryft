@@ -5,7 +5,7 @@ use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value 
 
 use crate::lowering::types::lower_signed_one_bit_to_mlir;
 use crate::operations::normalize_binary_elementwise_inputs;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
+use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -56,7 +56,7 @@ impl ComparisonDirectionLoweringExtension for ComparisonDirection {
 }
 
 impl LowerableOperation for CompareOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -89,7 +89,7 @@ impl LowerableOperation for CompareOperation<ArrayType> {
 }
 
 impl LowerableOperation for CompareOperation<Type> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

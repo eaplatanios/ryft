@@ -18,7 +18,7 @@ use crate::lowering::types::{ArrayTypeLoweringExtension, lower_signed_one_bit_to
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::sessions::effects::EffectCallbackGuard;
 use crate::{
-    Error, ExecutionError, FromPjrt, LowerableOperation, LowerableOperationFamily, Lowerer, RuntimeExtension,
+    Error, ExecutionError, FromPjrt, LowerableOperation, Lowerer, ProgramLoweringOperation, RuntimeExtension,
     RuntimeProvider, RuntimeRequirement,
 };
 
@@ -140,7 +140,7 @@ pub(crate) fn ordered_io_runtime_provider() -> Arc<dyn RuntimeProvider> {
 }
 
 impl LowerableOperation for PrintOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

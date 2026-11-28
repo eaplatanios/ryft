@@ -1,6 +1,6 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, DROPOUT_OPERATION_NAME, DataType, Dimension, DropoutOperation, Operation, ProgramError,
+    ArrayType, DROPOUT_OPERATION_NAME, DataType, Dimension, DropoutOperation, Memory, Operation, ProgramError,
     RNG_BIT_GENERATOR_OPERATION_NAME, RandomAlgorithm, RngBitGeneratorOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
@@ -8,14 +8,14 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::types::{ArrayTypeLoweringExtension, annotate_output_memory, lower_f64_constant_splat};
+use crate::lowering::{ArrayTypeLoweringExtension, MemoryLoweringExtension, lower_f64_constant_splat};
 use crate::operations::assertions::lower_output_extent_validation;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
+use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for RngBitGeneratorOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -34,7 +34,7 @@ impl LowerableOperation for RngBitGeneratorOperation<ArrayType> {
 }
 
 impl LowerableOperation for RngBitGeneratorOperation<Type> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -86,7 +86,7 @@ impl LowerableOperation for RngBitGeneratorOperation<Type> {
 }
 
 impl LowerableOperation for DropoutOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -243,7 +243,10 @@ impl RandomAlgorithmLoweringExtension for RandomAlgorithm {
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let mut generated = self.lower_unplaced_bit_generator(bits_type, input_values, block, context, location)?;
-        generated[1] = annotate_output_memory(generated[1], bits_type, block, context, location)?;
+        let memory = bits_type.memory();
+        if memory != Memory::Device {
+            generated[1] = memory.lower_transfer(&[generated[1]], block, context, location)?[0];
+        }
         Ok(generated)
     }
 

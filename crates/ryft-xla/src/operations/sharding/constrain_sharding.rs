@@ -3,12 +3,12 @@ use ryft_core::{ArrayType, ConstrainShardingOperation, ProgramError};
 use ryft_mlir::ValueRef;
 
 use crate::lowering::sharding::OpenDimensions;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for ConstrainShardingOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

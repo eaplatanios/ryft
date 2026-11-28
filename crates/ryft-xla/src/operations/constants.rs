@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
     Array, ArrayType, ConstantOperation, DataType, Dimension, DimensionError, FillLikeOperation, IotaLikeOperation,
-    IotaOperation, Layout, OneLikeOperation, OneOperation, Operation, ProgramError, Shape, TypeError,
+    IotaOperation, Layout, Memory, OneLikeOperation, OneOperation, Operation, ProgramError, Shape, TypeError,
     ZeroLikeOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
@@ -11,14 +11,14 @@ use ryft_mlir::{
 
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::states::ProgramLoweringContext;
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, annotate_output_memory, lower_constant_output, physical_bound_type,
+use crate::lowering::values::MlirLowerableValue;
+use crate::lowering::{
+    ArrayTypeLoweringExtension, MemoryLoweringExtension, lower_constant_output, physical_bound_type,
     stable_hlo_dynamic_dimension_bound,
 };
-use crate::lowering::values::MlirLowerableValue;
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{
-    Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation, Type,
+    Error, LowerableOperation, Lowerer, LoweringError, MemberLowerableOperation, ProgramLoweringOperation, Type,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -172,7 +172,7 @@ pub(crate) fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
 }
 
 impl LowerableOperation for IotaOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -189,13 +189,10 @@ impl LowerableOperation for IotaOperation<ArrayType> {
             lowerer.location(),
         )?)?;
         let result = result.result(0).unwrap().as_ref();
-        let result = annotate_output_memory(
-            result,
-            &output_types[0],
-            &mut lowerer.block(),
-            lowerer.context(),
-            lowerer.location(),
-        )?;
+        let result = match output_types[0].memory() {
+            Memory::Device => result,
+            memory => memory.lower_transfer(&[result], &mut lowerer.block(), lowerer.context(), lowerer.location())?[0],
+        };
         lower_constructor_sharding_constraint(
             vec![result],
             output_types.first(),
@@ -207,7 +204,7 @@ impl LowerableOperation for IotaOperation<ArrayType> {
 }
 
 impl LowerableOperation for ConstantOperation<Array> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -225,7 +222,7 @@ impl LowerableOperation for ConstantOperation<Array> {
 }
 
 impl LowerableOperation for FillLikeOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -262,7 +259,7 @@ impl LowerableOperation for FillLikeOperation<ArrayType> {
 }
 
 impl LowerableOperation for IotaLikeOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -295,7 +292,7 @@ impl LowerableOperation for IotaLikeOperation<ArrayType> {
 }
 
 impl LowerableOperation for ZeroOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -319,7 +316,7 @@ impl LowerableOperation for ZeroOperation<ArrayType> {
 }
 
 impl LowerableOperation for OneOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -343,7 +340,7 @@ impl LowerableOperation for OneOperation<ArrayType> {
 }
 
 impl LowerableOperation for ZeroLikeOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -364,7 +361,7 @@ impl LowerableOperation for ZeroLikeOperation<ArrayType> {
 }
 
 impl LowerableOperation for OneLikeOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -385,7 +382,7 @@ impl LowerableOperation for OneLikeOperation<ArrayType> {
 }
 
 impl MemberLowerableOperation<Type> for ZeroOperation<ArrayType> {
-    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -413,7 +410,7 @@ impl MemberLowerableOperation<Type> for ZeroOperation<ArrayType> {
 }
 
 impl MemberLowerableOperation<Type> for OneOperation<ArrayType> {
-    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -441,7 +438,7 @@ impl MemberLowerableOperation<Type> for OneOperation<ArrayType> {
 }
 
 impl MemberLowerableOperation<Type> for IotaOperation<ArrayType> {
-    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -458,7 +455,10 @@ impl MemberLowerableOperation<Type> for IotaOperation<ArrayType> {
         let iota = block.append_operation(stable_hlo::iota(tensor_type, self.dimension(), location)?)?;
         let result = iota.result(0).unwrap().as_ref();
         // The declared memory applies to the allocation at the bounds, like for the other dynamic constructors.
-        let result = annotate_output_memory(result, &physical_type, block, context, location)?;
+        let result = match physical_type.memory() {
+            Memory::Device => result,
+            memory => memory.lower_transfer(&[result], block, context, location)?[0],
+        };
         let result = refine_dynamic_constructor_result(
             result,
             &input_values,
@@ -554,7 +554,10 @@ fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let physical_type = physical_bound_type(output_type)?;
-    let result = annotate_output_memory(result, &physical_type, block, context, location)?;
+    let result = match physical_type.memory() {
+        Memory::Device => result,
+        memory => memory.lower_transfer(&[result], block, context, location)?[0],
+    };
     let result = physical_type.lower_layout_constraint(result, block, location)?;
     let sources = (0..output_type.rank()).map(|axis| (exemplar, axis)).collect::<Vec<_>>();
     let result = output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)?;
@@ -594,7 +597,7 @@ fn lower_constructor_sharding_constraint<'b, 'c: 'b, 't: 'c>(
 /// dimension value). This function omits the inputs of refined axes after validating them. It emits runtime
 /// assertions, through [`lower_output_extent_validation`], that every symbolic input of a refined axis equals the
 /// refined extent.
-fn dynamic_constructor_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+fn dynamic_constructor_inputs<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     name: &str,
     declared_type: &ArrayType,
     input_values: &[ValueRef<'b, 'c, 't>],

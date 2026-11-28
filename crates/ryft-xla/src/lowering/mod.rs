@@ -2,7 +2,7 @@
 //!
 //! # Exporting Programs
 //!
-//! [`ProgramLoweringExtension`] lowers a staged program over any [`LowerableOperationFamily`].
+//! [`ProgramLoweringExtension`] lowers a staged program over any [`ProgramLoweringOperation`].
 //! [`ProgramLoweringExtension::to_rendered_mlir`] renders the module according to its [`ProgramLoweringOptions`]. The
 //! default options read the entry signature from the global input and output types of the program, pass the arrays that
 //! the program imports as hidden inputs that precede its public inputs, and prune the program first. Other options
@@ -191,10 +191,10 @@ pub use sharding::{
 };
 pub use types::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, MemoryLoweringExtension, TypeLoweringExtension,
-    annotate_output_memory, dimension_extent_i32, dimension_extent_i64, lower_constant_output, lower_explicit_shape,
-    lower_f64_constant_splat, lower_runtime_dimension_size_i64, lower_signed_one_bit_to_mlir,
-    lower_static_index_constants, lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type,
-    stable_hlo_dynamic_dimension_bound, static_dimensions,
+    dimension_extent_i32, dimension_extent_i64, lower_constant_output, lower_explicit_shape, lower_f64_constant_splat,
+    lower_runtime_dimension_size_i64, lower_signed_one_bit_to_mlir, lower_static_index_constants,
+    lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type, stable_hlo_dynamic_dimension_bound,
+    static_dimensions,
 };
 
 /// Per-class StableHLO tokens owned by one lowering scope.
@@ -519,7 +519,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
     where
-        O: LowerableOperationFamily,
+        O: ProgramLoweringOperation,
     {
         let Some(region) = self.regions.get(index) else {
             return Err(ProgramError::MalformedProgram(format!(
@@ -550,7 +550,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
 ///
 /// Families such as [`ArrayOperation`](ryft_core::ArrayOperation) and [`Operation`] implement this trait by dispatching
 /// each variant to its payload through [`lower_operation_variants`](crate::lower_operation_variants), which also handles
-/// projected and mixed members. Downstream families that meet the bounds of [`LowerableOperationFamily`] can lower whole
+/// projected and mixed members. Downstream families that meet the bounds of [`ProgramLoweringOperation`] can lower whole
 /// programs through [`ProgramLoweringExtension`].
 ///
 /// Operations lower attached regions through methods such as [`Lowerer::lower_region_inline`]. This keeps the bounds of
@@ -565,7 +565,7 @@ pub trait LowerableOperation: CoreOperation {
     ///   - `input_values`: Lowered MLIR values of the instruction inputs, one per input.
     ///   - `input_types`: Declared types of the instruction inputs, in input order.
     ///   - `output_types`: Declared types of the instruction outputs, in output order.
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -660,9 +660,9 @@ pub trait LowerableOperation: CoreOperation {
 /// inside the family, for example when deduplicating calls or deciding which regions to emit.
 ///
 /// The blanket implementation covers every type that meets these bounds, including downstream operation families.
-pub trait LowerableOperationFamily: LowerableOperation<Type = Type> + OperationPayloadProjection {}
+pub trait ProgramLoweringOperation: LowerableOperation<Type = Type> + OperationPayloadProjection {}
 
-impl<O: LowerableOperation<Type = Type> + OperationPayloadProjection> LowerableOperationFamily for O {}
+impl<O: LowerableOperation<Type = Type> + OperationPayloadProjection> ProgramLoweringOperation for O {}
 
 /// Operations whose own type universe is a member universe of an enclosing operation family that lowers them at the
 /// family's parent universe `T` (e.g., [`ZeroOperation<ArrayType>`](ryft_core::ZeroOperation) stored in an
@@ -680,7 +680,7 @@ pub trait MemberLowerableOperation<T: CoreType>: CoreOperation {
     ///   - `input_values`: Lowered MLIR values of the instruction inputs, one per input.
     ///   - `input_types`: Declared parent-universe types of the instruction inputs, in input order.
     ///   - `output_types`: Declared parent-universe types of the instruction outputs, in output order.
-    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -693,7 +693,7 @@ pub trait MemberLowerableOperation<T: CoreType>: CoreOperation {
 /// parent-universe types to `U` before delegating to the payload's [`LowerableOperation`] implementation. This function
 /// supports the expansion of [`lower_operation_variants`](crate::lower_operation_variants).
 #[doc(hidden)]
-pub fn lower_projected_operation<'b, 'c: 'b, 't: 'c, U, T, P, O: LowerableOperationFamily>(
+pub fn lower_projected_operation<'b, 'c: 'b, 't: 'c, U, T, P, O: ProgramLoweringOperation>(
     operation: &P,
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -736,7 +736,7 @@ where
 ///
 /// ```ignore
 /// impl LowerableOperation for MyOperation {
-///     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+///     fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
 ///         &self,
 ///         lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ///         input_values: &[ValueRef<'b, 'c, 't>],
@@ -845,7 +845,7 @@ pub(crate) fn current_or_new_token<'b, 'c: 'b, 't: 'c>(
 /// other instruction pays one scan of its input types and of its output types, without allocating or walking the
 /// emitted operations. The constraints are emitted for every target, and lowering removes them, with every other
 /// Shardy operation, for a target without the Shardy dialect (refer to `remove_shardy_operations`).
-fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     operation: &O,
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -1809,7 +1809,7 @@ pub(crate) mod tests {
     }
 
     impl LowerableOperation for BorrowingOperation<'_> {
-        fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
             &self,
             lowerer: &mut Lowerer<'b, 'c, 't, O>,
             input_values: &[ValueRef<'b, 'c, 't>],

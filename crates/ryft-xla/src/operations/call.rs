@@ -54,7 +54,7 @@ use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::TypeCastLoweringExtension;
 use crate::operations::{Operation, unread_lifted_captures};
 use crate::{
-    Array, Constant, Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
+    Array, Constant, Error, ExecutionError, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation,
     Session, Type, Value,
 };
 
@@ -155,7 +155,7 @@ impl<O: CoreOperation<Type = Type>> Default for CallFunctionMap<O> {
     }
 }
 
-impl<O: LowerableOperationFamily> CallFunctionMap<O> {
+impl<O: ProgramLoweringOperation> CallFunctionMap<O> {
     /// Returns the shared function for `program`, if one was emitted for its identity.
     pub(crate) fn get(&self, program: &FlatProgram<EagerContext<Constant, O>>) -> Option<&CallFunction<O>> {
         self.functions.get(&call_program_key(program)?)
@@ -228,7 +228,7 @@ impl NamedFunction {
 ///
 /// Returns an error when the effects that lowering a callee introduces cannot be determined (refer to
 /// [`lowered_effect_classes`]).
-pub(crate) fn collect_call_functions<Input, Output, O: LowerableOperationFamily>(
+pub(crate) fn collect_call_functions<Input, Output, O: ProgramLoweringOperation>(
     program: &Program<Constant, O, Input, Output>,
     target_platform: Option<&str>,
 ) -> Result<CallFunctionMap<O>, Error>
@@ -817,7 +817,7 @@ impl InterpretableOperation<Session> for CallOperation<Type> {
 // mesh has auto axes, along which the input type cannot show where the input is (refer to
 // `CallOperation::boundary_input_sharding_constraint`).
 impl LowerableOperation for CallOperation<Type> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -967,7 +967,7 @@ struct NamedRegionCall {
 /// identifies a slot and type rather than the runtime value in the surrounding capture table, so programs with
 /// constants remain ineligible. `shard_map` also remains outside this deduplication path because its lowering owns a
 /// separate outlined boundary.
-fn supports_structural_deduplication<O: LowerableOperationFamily>(
+fn supports_structural_deduplication<O: ProgramLoweringOperation>(
     program: &FlatProgram<EagerContext<Constant, O>>,
 ) -> bool {
     program.regions().iter().all(|region| {
@@ -980,10 +980,10 @@ fn supports_structural_deduplication<O: LowerableOperationFamily>(
 }
 
 /// Returns whether a borrowed rooted region may be deduplicated by structural identity.
-fn supports_structural_deduplication_of_region<O: LowerableOperationFamily>(
+fn supports_structural_deduplication_of_region<O: ProgramLoweringOperation>(
     region: RegionRef<'_, Constant, O>,
 ) -> bool {
-    fn walk<O: LowerableOperationFamily>(region: RegionRef<'_, Constant, O>, visited: &mut HashSet<RegionId>) -> bool {
+    fn walk<O: ProgramLoweringOperation>(region: RegionRef<'_, Constant, O>, visited: &mut HashSet<RegionId>) -> bool {
         if !visited.insert(region.id()) {
             return true;
         }
@@ -1005,20 +1005,20 @@ fn supports_structural_deduplication_of_region<O: LowerableOperationFamily>(
 /// structural deduplication (refer to [`supports_structural_deduplication`]) and therefore always inline. The key is
 /// generic over the program's constant universe so that lookups from the value-generic lowering path type-check,
 /// although the map itself is only ever populated from the staged [`Constant`]-keyed pipeline.
-fn call_program_key<O: LowerableOperationFamily>(
+fn call_program_key<O: ProgramLoweringOperation>(
     program: &FlatProgram<EagerContext<Constant, O>>,
 ) -> Option<CallProgramKey> {
     supports_structural_deduplication(program).then(|| structural_key(program))
 }
 
 /// Computes the deduplication key for a borrowed callee region, materializing only after borrowed eligibility checks.
-fn call_region_key<O: LowerableOperationFamily>(region: RegionRef<'_, Constant, O>) -> Option<CallProgramKey> {
+fn call_region_key<O: ProgramLoweringOperation>(region: RegionRef<'_, Constant, O>) -> Option<CallProgramKey> {
     supports_structural_deduplication_of_region(region).then(|| structural_key(&region.to_program()))
 }
 
 /// Returns the deduplication key of `program`, an eligible callee (refer to [`CallProgramKey`]).
-fn structural_key<O: LowerableOperationFamily>(program: &FlatProgram<EagerContext<Constant, O>>) -> CallProgramKey {
-    fn walk<O: LowerableOperationFamily>(
+fn structural_key<O: ProgramLoweringOperation>(program: &FlatProgram<EagerContext<Constant, O>>) -> CallProgramKey {
+    fn walk<O: ProgramLoweringOperation>(
         region: RegionRef<'_, Constant, O>,
         visited: &mut HashSet<RegionId>,
         calls: &mut Vec<CallOperation<Type>>,
@@ -1062,7 +1062,7 @@ fn structural_key<O: LowerableOperationFamily>(program: &FlatProgram<EagerContex
 /// `counts` accumulates the occurrence count and a representative materialized program per identity, `order` records
 /// keys in first-occurrence order, and `memo` caches the (possibly expensive) key computation per callee root
 /// [`RegionId`]. Interned shared callees repeat their root region id, so each shared callee is rendered once.
-fn count_calls<Input, Output, O: LowerableOperationFamily>(
+fn count_calls<Input, Output, O: ProgramLoweringOperation>(
     program: &Program<Constant, O, Input, Output>,
     target_platform: Option<&str>,
     counts: &mut HashMap<CallProgramKey, (usize, FlatProgram<EagerContext<Constant, O>>)>,
@@ -1076,7 +1076,7 @@ where
     Output: Parameterized<Constant>,
 {
     #[allow(clippy::too_many_arguments)]
-    fn walk<Input, Output, O: LowerableOperationFamily>(
+    fn walk<Input, Output, O: ProgramLoweringOperation>(
         program: &Program<Constant, O, Input, Output>,
         region: RegionId,
         target_platform: Option<&str>,
@@ -1223,7 +1223,7 @@ where
 }
 
 /// Lowering of the callee program of a `call`.
-trait CallProgramLoweringExtension<O: LowerableOperationFamily> {
+trait CallProgramLoweringExtension<O: ProgramLoweringOperation> {
     /// Lowers one `call` to either a `func.call` of a shared private function (when its callee was deduplicated) or
     /// an inlined copy of the callee body (otherwise).
     ///
@@ -1246,7 +1246,7 @@ trait CallProgramLoweringExtension<O: LowerableOperationFamily> {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
 
-impl<O: LowerableOperationFamily> CallProgramLoweringExtension<O> for FlatProgram<EagerContext<Constant, O>> {
+impl<O: ProgramLoweringOperation> CallProgramLoweringExtension<O> for FlatProgram<EagerContext<Constant, O>> {
     #[allow(clippy::too_many_arguments)]
     fn lower_call<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -1309,7 +1309,7 @@ impl<O: LowerableOperationFamily> CallProgramLoweringExtension<O> for FlatProgra
 ///
 /// Returns [`LoweringError::UnsupportedOperation`] when the boundary sharding declares a pending maximum or minimum
 /// that `r#type` does not record (refer to [`validate_declared_pending_reduction`]), which XLA cannot introduce.
-fn lower_boundary_constraint<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+fn lower_boundary_constraint<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
     value: ValueRef<'b, 'c, 't>,
     r#type: &Type,

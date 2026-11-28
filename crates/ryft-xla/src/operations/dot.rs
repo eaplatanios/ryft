@@ -16,7 +16,7 @@ use crate::lowering::types::{
     physical_bound_type,
 };
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, RaggedDotLoweringStrategy};
+use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, RaggedDotLoweringStrategy};
 
 // TODO(eaplatanios): Review this module.
 
@@ -24,7 +24,7 @@ impl LowerableOperation for DotOperation {
     // Lower a dot to one `stablehlo.dot_general` that carries its per-input precisions and its algorithm. An algorithm
     // may compute with other element types than the inputs and the output have, in which case the inputs are converted
     // before the contraction and its result is converted after it, exactly like JAX's `_dot_general_lower`.
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -122,7 +122,7 @@ impl LowerableOperation for DotOperation {
 
 impl LowerableOperation for RaggedDotOperation {
     // Lower a ragged dot either to its portable masked dense decomposition or to the opt-in CHLO instruction.
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

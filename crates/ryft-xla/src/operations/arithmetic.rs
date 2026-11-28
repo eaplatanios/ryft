@@ -8,12 +8,12 @@ use ryft_mlir::{Block, Operation as MlirOperation, TensorTypeRef, Type as MlirTy
 
 use crate::lowering::types::{ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_signed_one_bit_to_mlir};
 use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_inputs};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
+use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for AddOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -27,7 +27,7 @@ impl LowerableOperation for AddOperation<ArrayType> {
 }
 
 impl LowerableOperation for SubOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -41,7 +41,7 @@ impl LowerableOperation for SubOperation<ArrayType> {
 }
 
 impl LowerableOperation for SaturatingSubOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -126,7 +126,7 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
 }
 
 impl LowerableOperation for MulOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -140,7 +140,7 @@ impl LowerableOperation for MulOperation<ArrayType> {
 }
 
 impl LowerableOperation for DivOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -154,7 +154,7 @@ impl LowerableOperation for DivOperation<ArrayType> {
 }
 
 impl LowerableOperation for NegOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -171,7 +171,7 @@ impl LowerableOperation for NegOperation<ArrayType> {
 }
 
 impl LowerableOperation for SqrtOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -189,7 +189,7 @@ impl LowerableOperation for SqrtOperation<ArrayType> {
 }
 
 impl LowerableOperation for RsqrtOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -207,7 +207,7 @@ impl LowerableOperation for RsqrtOperation<ArrayType> {
 }
 
 impl LowerableOperation for PowOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -228,7 +228,7 @@ impl LowerableOperation for PowOperation<ArrayType> {
 }
 
 impl LowerableOperation for SignOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -245,7 +245,7 @@ impl LowerableOperation for SignOperation<ArrayType> {
 }
 
 impl LowerableOperation for RemOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -259,7 +259,7 @@ impl LowerableOperation for RemOperation<ArrayType> {
 }
 
 impl LowerableOperation for AbsOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -273,7 +273,7 @@ impl LowerableOperation for AbsOperation<ArrayType> {
 }
 
 /// Recovers signed one-bit values before promotion and computes one-bit arithmetic in a byte carrier.
-fn normalize_arithmetic_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+fn normalize_arithmetic_inputs<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
     output_types: &[ArrayType],
@@ -302,7 +302,7 @@ fn normalize_arithmetic_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
 }
 
 /// Restores wrapping one-bit arithmetic by retaining the low bit before converting to the predicate carrier.
-fn lower_arithmetic_output<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+fn lower_arithmetic_output<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     output: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
     lowerer: &mut Lowerer<'b, 'c, 't, O>,

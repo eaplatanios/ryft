@@ -19,12 +19,12 @@ use crate::operations::assertions::{
     ASSERT_RIGHT_ATTRIBUTE, ASSERT_SUB_KIND, lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
+use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for DimensionSizeOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -65,7 +65,7 @@ impl LowerableOperation for DimensionSizeOperation {
 }
 
 impl LowerableOperation for DimensionFromScalarOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -121,7 +121,7 @@ impl LowerableOperation for DimensionFromScalarOperation {
 }
 
 impl LowerableOperation for DimensionToScalarOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -137,7 +137,7 @@ impl LowerableOperation for DimensionToScalarOperation {
 }
 
 impl LowerableOperation for ConstantOperation<DimensionValue> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -153,7 +153,7 @@ impl LowerableOperation for ConstantOperation<DimensionValue> {
 }
 
 impl LowerableOperation for DimensionMaxOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -166,7 +166,7 @@ impl LowerableOperation for DimensionMaxOperation {
 }
 
 impl LowerableOperation for DimensionMinOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -179,7 +179,7 @@ impl LowerableOperation for DimensionMinOperation {
 }
 
 impl LowerableOperation for DimensionAddOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -192,7 +192,7 @@ impl LowerableOperation for DimensionAddOperation {
 }
 
 impl LowerableOperation for DimensionSubOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -205,7 +205,7 @@ impl LowerableOperation for DimensionSubOperation {
 }
 
 impl LowerableOperation for SaturatingSubOperation<DimensionType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -218,7 +218,7 @@ impl LowerableOperation for SaturatingSubOperation<DimensionType> {
 }
 
 impl LowerableOperation for DimensionMulOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -231,7 +231,7 @@ impl LowerableOperation for DimensionMulOperation {
 }
 
 impl LowerableOperation for DimensionDivOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -244,7 +244,7 @@ impl LowerableOperation for DimensionDivOperation {
 }
 
 impl LowerableOperation for DimensionRemOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -257,7 +257,7 @@ impl LowerableOperation for DimensionRemOperation {
 }
 
 impl LowerableOperation for DimensionPowOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -273,7 +273,7 @@ impl LowerableOperation for DimensionPowOperation {
 trait DimensionOperationLoweringExtension {
     /// Lowers one first-class dimension arithmetic operation on scalar `i64` extents. Arithmetic that the input bounds
     /// do not prove safe keeps the checked eager semantics through a runtime assertion on the ordered assertion chain.
-    fn lower_arithmetic<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_arithmetic<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -295,7 +295,7 @@ trait DimensionOperationLoweringExtension {
 }
 
 impl DimensionOperationLoweringExtension for DimensionOperation<DimensionValue> {
-    fn lower_arithmetic<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_arithmetic<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

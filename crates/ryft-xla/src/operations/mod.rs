@@ -58,7 +58,7 @@ use crate::lowering::{DataDependentPaddingDiscipline, validate_local_output_plac
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::{
-    Constant, Error, KernelOperation, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type,
+    Constant, Error, KernelOperation, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type,
     lower_operation_variants,
 };
 
@@ -710,7 +710,7 @@ impl_array_ir_operation_conversion!(TagOperation<Type>);
 impl_array_ir_operation_conversion!(PrintOperation<Type>);
 
 impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -740,7 +740,7 @@ impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
 }
 
 impl LowerableOperation for DimensionOperation<DimensionValue> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -908,7 +908,7 @@ impl LowerableOperation for Operation {
         unread_lifted_captures(callee, capture_count, target_platform)
     }
 
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

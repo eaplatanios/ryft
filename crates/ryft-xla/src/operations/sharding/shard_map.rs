@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use ryft_core::{
-    ArrayType, PARALLEL_ALL_GATHER_OPERATION_NAME, ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
+    ArrayType, Memory, PARALLEL_ALL_GATHER_OPERATION_NAME, ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
     Parameterized, Program, ProgramError, SHARD_MAP_OPERATION_NAME, ShardMapBoundary, ShardMapError, ShardMapOperation,
     ShardMapValueKind, Sharding, ShardingDimension, Typed, TypedProgram,
 };
@@ -17,15 +17,16 @@ use ryft_mlir::{
 use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::sharding::UnreducedKindExtension;
 use crate::lowering::states::ProgramLoweringContext;
-use crate::lowering::types::{ArrayTypeLoweringExtension, annotate_output_memory};
-use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects};
+use crate::lowering::{
+    ArrayTypeLoweringExtension, EffectTokens, MemoryLoweringExtension, current_or_new_token, token_threaded_effects,
+};
 use crate::operations::control_flow::lowered_effect_classes;
-use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, SHARDY_MESH_SYMBOL_NAME, Type};
+use crate::{Constant, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, SHARDY_MESH_SYMBOL_NAME, Type};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for ShardMapOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -76,7 +77,7 @@ impl LowerableOperation for ShardMapOperation {
 /// `DeviceOrderedIo`), because core `shard_map` boundary validation rejects bodies with the `OrderedIo` effect (refer
 /// to [`ShardMapError::OrderedIoNotSupported`]).
 #[allow(clippy::too_many_arguments)]
-fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: ProgramLoweringOperation>(
     block: &mut BlockRef<'b, 'c, 't>,
     outer_inputs: &[ValueRef<'b, 'c, 't>],
     boundary: &ShardMapBoundary,
@@ -271,7 +272,13 @@ where
         .results()
         .take(global_output_types.len())
         .zip(global_output_types)
-        .map(|(result, output_type)| annotate_output_memory(result?.as_ref(), output_type, block, context, location))
+        .map(|(result, output_type)| {
+            let result = result?.as_ref();
+            match output_type.memory() {
+                Memory::Device => Ok(result),
+                memory => Ok(memory.lower_transfer(&[result], block, context, location)?[0]),
+            }
+        })
         .collect()
 }
 

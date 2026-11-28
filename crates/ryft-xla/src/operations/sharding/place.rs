@@ -9,7 +9,7 @@ use crate::arrays::placement::place_operation_bindings;
 use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::lowering::types::MemoryLoweringExtension;
 use crate::operations::manipulation::conversions::ArrayTypeLayoutConversionLoweringExtension;
-use crate::{Array, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
+use crate::{Array, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
@@ -25,7 +25,7 @@ impl PlaceDispatch<ArrayType, Array> for ValueDomainDispatch {
 }
 
 impl LowerableOperation for PlaceOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

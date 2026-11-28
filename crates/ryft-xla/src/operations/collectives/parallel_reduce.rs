@@ -10,7 +10,7 @@ use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
 use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat};
 use crate::operations::collectives::CollectiveLoweringExtension;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
@@ -197,7 +197,7 @@ impl ParallelReduceOperationLoweringExtension for ParallelReduceOperation {
 }
 
 impl LowerableOperation for ParallelReduceOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

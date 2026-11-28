@@ -15,7 +15,7 @@ use ryft_mlir::{Block as _, Operation as _, Value as _};
 use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::operations::attention::{AttentionConfigurationLoweringExtension, select_attention_implementation};
 use crate::operations::call::lower_shared_function_call;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Session, Type};
+use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Session, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -111,7 +111,7 @@ impl NamedCompositeImplementation {
 
     /// Lowers one call with this implementation, whose boundary has the provided input and output types, returning
     /// one MLIR value per output.
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -175,7 +175,7 @@ where
         self.key()
     }
 
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -267,7 +267,7 @@ impl<V: Typed + Parameter, RegionOperation, S> LowerableOperation for CompositeT
 where
     Self: Operation,
 {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

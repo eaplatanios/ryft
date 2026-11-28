@@ -10,12 +10,12 @@ use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value 
 use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::states::ProgramLoweringContext;
 use crate::operations::collectives::CollectiveLoweringExtension;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer, Type};
+use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Session, Tracer, Type};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for ParallelBroadcastOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

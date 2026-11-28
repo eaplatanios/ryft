@@ -19,12 +19,12 @@ use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::operations::collectives::axis_index::AxisIndexOperationLoweringExtension;
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation, Type};
+use crate::{Error, LowerableOperation, Lowerer, MemberLowerableOperation, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for ParallelRaggedAllToAllOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -59,7 +59,7 @@ impl LowerableOperation for ParallelRaggedAllToAllOperation {
 }
 
 impl MemberLowerableOperation<Type> for ParallelRaggedAllToAllOperation {
-    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

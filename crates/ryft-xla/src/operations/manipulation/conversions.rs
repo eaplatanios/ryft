@@ -19,12 +19,12 @@ use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::operations::control_flow::{lower_refined_region_input, lower_refined_region_outputs};
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
+use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
 impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -223,7 +223,7 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
 }
 
 impl LowerableOperation for ReducePrecisionOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -243,7 +243,7 @@ impl LowerableOperation for ReducePrecisionOperation<ArrayType> {
 }
 
 impl LowerableOperation for CastOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -255,7 +255,7 @@ impl LowerableOperation for CastOperation<ArrayType> {
 }
 
 impl LowerableOperation for CastOperation<Type> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -372,7 +372,7 @@ pub(crate) trait ArrayTypeLayoutConversionLoweringExtension {
     /// of this type, which must name one. The `LayoutConstraint` custom call that enforces the layout takes a static
     /// physical buffer, so the logical sizes of any bounded dynamic axes are kept on the converted value while that
     /// buffer is exposed and are restored after its allocation is constrained. No padding becomes logical data.
-    fn lower_layout_conversion<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_layout_conversion<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         value: ValueRef<'b, 'c, 't>,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
@@ -380,7 +380,7 @@ pub(crate) trait ArrayTypeLayoutConversionLoweringExtension {
 }
 
 impl ArrayTypeLayoutConversionLoweringExtension for ArrayType {
-    fn lower_layout_conversion<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_layout_conversion<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         value: ValueRef<'b, 'c, 't>,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
@@ -407,7 +407,7 @@ trait CastOperationLoweringExtension<T> {
     /// after preceding assertions, because its dependency barrier consumes the current assertion token, without
     /// advancing it, whether or not the cast emits a check of its own. A checked cast emits no check when the actual
     /// input types prove its relationship. An unchecked cast never consumes the assertion token.
-    fn lower_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_operation<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -420,7 +420,7 @@ trait CastOperationLoweringExtension<T> {
     /// output type and the witnesses at their declared types satisfy their shared identity relationships. The source
     /// and output declarations observe the same first input, preserving its original nominal bindings. Unchecked casts
     /// emit nothing.
-    fn lower_check<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_check<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[T],
@@ -429,7 +429,7 @@ trait CastOperationLoweringExtension<T> {
 }
 
 impl<T: CastType + Into<Type>> CastOperationLoweringExtension<T> for CastOperation<T> {
-    fn lower_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_operation<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -458,7 +458,7 @@ impl<T: CastType + Into<Type>> CastOperationLoweringExtension<T> for CastOperati
         Ok(vec![lower_cast(values[0], &input_types[0].clone().into(), &output_types[0].clone().into(), lowerer)?])
     }
 
-    fn lower_check<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower_check<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[T],
@@ -494,7 +494,7 @@ impl<T: CastType + Into<Type>> CastOperationLoweringExtension<T> for CastOperati
 }
 
 /// Converts a cast's shape and enforces its requested physical layout and explicit sharding.
-fn lower_cast<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+fn lower_cast<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     value: ValueRef<'b, 'c, 't>,
     input_type: &Type,
     output_type: &Type,

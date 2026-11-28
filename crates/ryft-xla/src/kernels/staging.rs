@@ -35,7 +35,7 @@ use crate::kernels::{
 };
 use crate::lowering::emissions::emitted_regions;
 use crate::{
-    Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Operation, Session, Target,
+    Constant, Error, LowerableOperation, Lowerer, LoweringError, Operation, ProgramLoweringOperation, Session, Target,
     Type,
 };
 
@@ -823,7 +823,7 @@ where
 }
 
 impl LowerableOperation for KernelOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],

@@ -10,7 +10,7 @@ use ryft_core::{
     TypedProgram, Value,
 };
 
-use crate::lowering::LowerableOperationFamily;
+use crate::lowering::ProgramLoweringOperation;
 use crate::operations::call::CallFunctionMap;
 use crate::{Constant, RetainedArray, Type};
 
@@ -20,7 +20,7 @@ use crate::{Constant, RetainedArray, Type};
 /// named composite call, which `LowerableOperation::composite_key` identifies, that a backend implementation replaces
 /// or whose body lowers to a shared function. The lowering loops skip materializing the regions of such instructions,
 /// which would otherwise copy the body per call.
-pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
+pub(crate) fn lowers_without_regions<O: ProgramLoweringOperation>(
     operation: &O,
     input_types: &[Type],
     output_types: &[Type],
@@ -45,7 +45,7 @@ pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
 /// compiled program (refer to `validate_placements`), so that a placement request or a captured array inside a region
 /// that lowering omits is never validated, placed, or passed. The eager application of an operation asks the same
 /// question of that operation (refer to [`omits_operation_regions`]).
-pub(crate) fn omits_regions<V: Value<Type = Type>, O: LowerableOperationFamily>(
+pub(crate) fn omits_regions<V: Value<Type = Type>, O: ProgramLoweringOperation>(
     region: RegionRef<'_, V, O>,
     instruction: &Instruction<O>,
     target_platform: Option<&str>,
@@ -65,7 +65,7 @@ pub(crate) fn omits_regions<V: Value<Type = Type>, O: LowerableOperationFamily>(
 /// named composite call needs them, and the platform, so that the eager application of an operation (refer to
 /// `Session::bind`) asks the same question of the operation that it binds as the walks of the regions that lowering
 /// emits ask of each instruction.
-pub(crate) fn omits_operation_regions<O: LowerableOperationFamily>(
+pub(crate) fn omits_operation_regions<O: ProgramLoweringOperation>(
     operation: &O,
     boundary_types: impl FnOnce() -> (Vec<Type>, Vec<Type>),
     target_platform: Option<&str>,
@@ -87,7 +87,7 @@ pub(crate) fn omits_operation_regions<O: LowerableOperationFamily>(
 /// that lowering emits, which the collection of the module mesh and of the session constants and the selection of the
 /// partitioner read, and it visits the same regions in the same order as [`RegionRef::computation_regions`] when no
 /// instruction omits its regions.
-pub(crate) fn emitted_regions<'r, V: Value<Type = Type>, O: LowerableOperationFamily>(
+pub(crate) fn emitted_regions<'r, V: Value<Type = Type>, O: ProgramLoweringOperation>(
     entry: RegionRef<'r, V, O>,
     target_platform: Option<&'r str>,
 ) -> impl Iterator<Item = RegionRef<'r, V, O>> {
@@ -98,7 +98,7 @@ pub(crate) fn emitted_regions<'r, V: Value<Type = Type>, O: LowerableOperationFa
 /// those callees unless `enters_calls` is set. Without them, these are the regions of one capture scope: a constant of
 /// one of them that names capture `k` names capture `k` of `entry`, whereas the same constant in a callee names its own
 /// input `k` (refer to `CallProgramLoweringExtension::lower_call`), which the call receives as its input `k`.
-pub(crate) fn emitted_regions_entering_calls<'r, V: Value<Type = Type>, O: LowerableOperationFamily>(
+pub(crate) fn emitted_regions_entering_calls<'r, V: Value<Type = Type>, O: ProgramLoweringOperation>(
     entry: RegionRef<'r, V, O>,
     target_platform: Option<&'r str>,
     enters_calls: bool,
@@ -139,7 +139,7 @@ pub(crate) fn emitted_regions_entering_calls<'r, V: Value<Type = Type>, O: Lower
 /// either (refer to [`visit_emitted_reads`]). The regions of the callees of calls are not visited, because their
 /// constants name the captures of those callees, which a callee reads only through the inputs of its call (refer to
 /// [`emitted_regions_entering_calls`]).
-pub(crate) fn emitted_capture_reads<'r, O: LowerableOperationFamily>(
+pub(crate) fn emitted_capture_reads<'r, O: ProgramLoweringOperation>(
     entry: RegionRef<'r, Constant, O>,
     capture_count: usize,
     lifted: bool,
@@ -175,7 +175,7 @@ pub(crate) fn emitted_capture_reads<'r, O: LowerableOperationFamily>(
 /// [`emitted_capture_reads`]) and its session constants (refer to [`partition_session_constants`]) are read, so that
 /// the admission of a function, the signature of its executable, its session constants, and the lowering of its calls
 /// agree. A call without captures costs one comparison.
-fn visit_emitted_reads<O: LowerableOperationFamily>(
+fn visit_emitted_reads<O: ProgramLoweringOperation>(
     region: RegionRef<'_, Constant, O>,
     target_platform: Option<&str>,
     mut visit: impl FnMut(AtomId, bool),
@@ -202,7 +202,7 @@ fn visit_emitted_reads<O: LowerableOperationFamily>(
 /// captures, whether it is a capture that the callee never reads, as the family of the call answers it (refer to
 /// `LowerableOperation::unread_captures`, which `Operation` answers with `unread_lifted_captures`), or [`None`]
 /// when every capture counts as read.
-pub(crate) fn unread_call_captures<O: LowerableOperationFamily>(
+pub(crate) fn unread_call_captures<O: ProgramLoweringOperation>(
     callee: RegionRef<'_, Constant, O>,
     capture_count: usize,
     target_platform: Option<&str>,
@@ -219,7 +219,7 @@ pub(crate) fn unread_call_captures<O: LowerableOperationFamily>(
 /// `reference_state_inputs`). Input admission and placement use this liveness decision during compilation. The
 /// executable boundary mapping records it for execution and persistence, so an unread input requires no buffer
 /// (refer to [`MlirProgramBoundaryMapping::is_unread_input`](super::MlirProgramBoundaryMapping::is_unread_input)).
-pub(crate) fn unread_entry_inputs<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+pub(crate) fn unread_entry_inputs<ProgramInput, ProgramOutput, O: ProgramLoweringOperation>(
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
     logical_input_types: &[ArrayType],
     capture_count: usize,
@@ -257,7 +257,7 @@ where
 /// `linear_call`, or a named composite body replaced for the target) are skipped, and their arrays get no slot unless
 /// an emitted region reads them. Arrays passed only as unread captures also get no slot (refer to
 /// [`partition_session_constants`]).
-pub(crate) fn collect_session_constants<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+pub(crate) fn collect_session_constants<ProgramInput, ProgramOutput, O: ProgramLoweringOperation>(
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
     target_platform: Option<&str>,
 ) -> Vec<RetainedArray>
@@ -274,7 +274,7 @@ where
 /// their callees never read (refer to [`visit_emitted_reads`]). The latter require nothing of an execution, so they
 /// have no input slot. Lowering binds them to the same bufferless value the entry function uses for erased inputs,
 /// and passes that value to the calls.
-pub(crate) fn partition_session_constants<O: LowerableOperationFamily>(
+pub(crate) fn partition_session_constants<O: ProgramLoweringOperation>(
     entry: RegionRef<'_, Constant, O>,
     target_platform: Option<&str>,
 ) -> (Vec<RetainedArray>, Vec<RetainedArray>) {
@@ -284,7 +284,7 @@ pub(crate) fn partition_session_constants<O: LowerableOperationFamily>(
 /// Returns the distinct [`RetainedArray`]s that `regions` reference, in the order of their first occurrence in them,
 /// split into those that they read and those that they only pass on to calls as captures which the callees never read
 /// (refer to [`partition_session_constants`]).
-pub(crate) fn partition_region_session_constants<'r, O: LowerableOperationFamily + 'r>(
+pub(crate) fn partition_region_session_constants<'r, O: ProgramLoweringOperation + 'r>(
     regions: impl Iterator<Item = RegionRef<'r, Constant, O>>,
     target_platform: Option<&str>,
 ) -> (Vec<RetainedArray>, Vec<RetainedArray>) {

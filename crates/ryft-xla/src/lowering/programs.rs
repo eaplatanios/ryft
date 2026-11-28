@@ -38,7 +38,7 @@ use crate::lowering::types::{
     lower_unplaced_constant_output, validate_boundary_memory,
 };
 use crate::lowering::{
-    EffectTokens, LowerableOperationFamily, Lowerer, LoweringError, RaggedDotLoweringStrategy,
+    EffectTokens, Lowerer, LoweringError, ProgramLoweringOperation, RaggedDotLoweringStrategy,
     lower_instruction_operation,
 };
 use crate::operations::call::{CallFunctionMap, collect_call_functions};
@@ -598,7 +598,7 @@ impl MlirProgramBoundaryMappingOutputDimension {
     }
 }
 
-/// Lowering of staged [`Program`]s of the XLA backend, over any [`LowerableOperationFamily`], to StableHLO/Shardy MLIR
+/// Lowering of staged [`Program`]s of the XLA backend, over any [`ProgramLoweringOperation`], to StableHLO/Shardy MLIR
 /// modules. References and mutable state must have been discharged from a program before it is lowered.
 pub trait ProgramLoweringExtension {
     /// Lowers this program according to `options` and returns its [`MlirProgram`], which pairs the textual module
@@ -643,7 +643,7 @@ pub trait ProgramLoweringExtension {
 
 impl<O, Input, Output> ProgramLoweringExtension for Program<Constant, O, Input, Output>
 where
-    O: LowerableOperationFamily,
+    O: ProgramLoweringOperation,
     Input: Parameterized<Constant>,
     Output: Parameterized<Constant>,
 {
@@ -1530,7 +1530,6 @@ impl ProgramBoundary {
         Ok(aliases)
     }
 
-    // TODO(eaplatanios): Review this.
     /// Returns the MLIR types and attributes of the entry function arguments and results in executable order.
     /// `input_shardings` and `output_shardings` follow logical boundary order, with captures first on the input side.
     /// The attributes declare the sharding, memory kind, layout, and aliased output of each value.
@@ -1554,16 +1553,20 @@ impl ProgramBoundary {
             .iter()
             .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
+
         if boundary_mapping.has_ordered_io() {
             argument_types.push(context.stable_hlo_token_type()?.as_ref());
         }
+
         let mut result_types = executable_output_types
             .iter()
             .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
+
         if boundary_mapping.has_ordered_io() {
             result_types.push(context.stable_hlo_token_type()?.as_ref());
         }
+
         let mut argument_sharding_attributes = boundary_mapping
             .executable_optional_input_shardings(input_shardings)?
             .iter()
@@ -1571,8 +1574,8 @@ impl ProgramBoundary {
                 sharding.as_ref().map(|sharding| sharding.lower(OpenDimensions::None, location)).transpose()
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // Results whose placement over auto mesh axes the compiler chooses are open over those axes, like JAX lowers
-        // the shardings of output types without `out_shardings` (refer to `ShardingExtension::lower`).
+
+        // Results whose placement over auto mesh axes the compiler chooses are open over those axes.
         let executable_open_outputs =
             if open_outputs.is_empty() { Vec::new() } else { boundary_mapping.select_output_entries(open_outputs)? };
         let mut result_sharding_attributes = boundary_mapping
@@ -1585,6 +1588,7 @@ impl ProgramBoundary {
                 sharding.as_ref().map(|sharding| sharding.lower(open_dimensions, location)).transpose()
             })
             .collect::<Result<Vec<_>, _>>()?;
+
         // The effect token of a signature side is annotated when any value of that side is, as each device threads its
         // own token.
         if boundary_mapping.has_ordered_io() {
@@ -1595,12 +1599,14 @@ impl ProgramBoundary {
                 &[],
                 shardy::ReductionOperation::Sum,
             )?;
+
             for shardings in [&mut argument_sharding_attributes, &mut result_sharding_attributes] {
                 if shardings.iter().any(Option::is_some) {
                     shardings.push(Some(token_sharding));
                 }
             }
         }
+
         // Internal layout constraints do not constrain the executable ABI. Declare layouts at the executable boundary,
         // whose types already omit static zeros and include hidden extent scalars, while tokens have no array type.
         // Declare placements for array slots, including captures. The appended effect token carries only ordering.
@@ -1616,6 +1622,7 @@ impl ProgramBoundary {
                 {
                     attributes.insert("sdy.sharding".into(), sharding.as_ref());
                 }
+
                 if let Some(r#type) =
                     executable_input_types.get(index).filter(|r#type| r#type.memory() != Memory::Device)
                 {
@@ -1625,21 +1632,25 @@ impl ProgramBoundary {
                         context.string_attribute(r#type.memory().placement_kind()).as_ref(),
                     );
                 }
+
                 if let Some(output_index) = aliases.get(&index) {
                     attributes.insert(
                         "tf.aliasing_output".into(),
                         context.integer_attribute(context.signless_integer_type(64), *output_index as i64).as_ref(),
                     );
                 }
+
                 if let Some(array_type) = executable_input_types.get(index)
                     && let Some(layout) = array_type.lower_boundary_layout("input", context)?
                 {
                     attributes.insert("mhlo.layout_mode".into(), layout);
                 }
+
                 let attributes = (!attributes.is_empty()).then_some(attributes);
                 Ok::<_, Error>(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes })
             })
             .collect::<Result<Vec<_>, _>>()?;
+
         let function_results = result_types
             .iter()
             .enumerate()
@@ -1650,6 +1661,7 @@ impl ProgramBoundary {
                 {
                     attributes.insert("sdy.sharding".into(), sharding.as_ref());
                 }
+
                 if let Some(r#type) =
                     executable_output_types.get(index).filter(|r#type| r#type.memory() != Memory::Device)
                 {
@@ -1659,11 +1671,13 @@ impl ProgramBoundary {
                         context.string_attribute(r#type.memory().placement_kind()).as_ref(),
                     );
                 }
+
                 if let Some(array_type) = executable_output_types.get(index)
                     && let Some(layout) = array_type.lower_boundary_layout("output", context)?
                 {
                     attributes.insert("mhlo.layout_mode".into(), layout);
                 }
+
                 let attributes = (!attributes.is_empty()).then_some(attributes);
                 Ok::<_, Error>(TypeAndAttributes { r#type: tensor_type.as_ref(), attributes })
             })
@@ -1672,12 +1686,11 @@ impl ProgramBoundary {
         Ok((function_arguments, function_results))
     }
 
-    // TODO(eaplatanios): Review this.
     /// Lowers the entry function body into `function_block`. It reconstructs the logical inputs from the executable
     /// arguments, completes pending input reductions, lowers `program`, and emits `func.return` with the executable
     /// results. `input_shardings` follows logical input order, with the `capture_count` captures first.
     #[allow(clippy::too_many_arguments)]
-    fn lower_body<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+    fn lower_body<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: ProgramLoweringOperation>(
         &self,
         program: &Program<Constant, O, ProgramInput, ProgramOutput>,
         capture_count: usize,
@@ -1701,6 +1714,7 @@ impl ProgramBoundary {
             executable_input_types,
             ..
         } = self;
+
         let session_count = session_constants.len();
         let mut function_block_ref = function_block.as_ref();
         let mut logical_input_values = Vec::with_capacity(logical_input_types.len());
@@ -1741,6 +1755,7 @@ impl ProgramBoundary {
                     .into_iter()
                     .next()
                     .unwrap();
+
                     // An unread input (refer to `unread_logical_inputs` above) is a placeholder that no emitted region
                     // reads and that XLA removes, so its sharding is not applied either.
                     if boundary_mapping.is_unread_input(logical_index) {
@@ -1750,23 +1765,17 @@ impl ProgramBoundary {
                     value
                 }
             };
+
             debug_assert_eq!(value.r#type()?, array_type.lower(context, location)?.as_ref());
-            // An input that arrives with a pending reduction that its type does not record (i.e., over auto mesh
-            // axes, which an input sharding override states and types never record, refer to
-            // `receivable_input_sharding` in `crate::compilation::domains`) is reduced where it enters, because
-            // no value of the program can carry that reduction. The sharding constraint is the transition that
-            // Shardy accepts, and it completes the reduction (e.g., in the reshard that `Array::to_placement`
-            // compiles from such a source onto a sharding without it). An input whose type records a pending
-            // reduction and that arrives split along auto mesh axes, which its type cannot record, is constrained
-            // to its sharding where it enters as well, so that the constraints that carry its pending reduction
-            // through the program keep that split (refer to `constrained_dimensions`).
-            let states_auto_split = |sharding: &Sharding| {
-                !array_type.unreduced_axes().is_empty()
-                    && array_type.sharding().is_some_and(|stated| {
-                        stated.dimensions_with_unconstrained_replicated()
-                            != sharding.dimensions_with_unconstrained_replicated()
-                    })
-            };
+
+            // An input that arrives with a pending reduction that its type does not record (i.e., over auto mesh axes,
+            // which an input sharding override states and types never record) is reduced where it enters, because no
+            // value of the program can carry that reduction. The sharding constraint is the transition that Shardy
+            // accepts, and it completes the reduction (e.g., in the reshard that `Array::to_placement` compiles from
+            // such a source onto a sharding without it). An input whose type records a pending reduction and that
+            // arrives split along auto mesh axes, which its type cannot record, is constrained to its sharding where
+            // it enters as well, so that the constraints that carry its pending reduction through the program keep
+            // that split.
             let value = match &input_shardings[logical_index] {
                 Some(sharding)
                     if supports_shardy
@@ -1774,11 +1783,15 @@ impl ProgramBoundary {
                             .unreduced_axes()
                             .iter()
                             .any(|axis| !array_type.unreduced_axes().contains(axis))
-                            || states_auto_split(sharding)) =>
+                            || !array_type.unreduced_axes().is_empty()
+                                && array_type.sharding().is_some_and(|stated| {
+                                    stated.dimensions_with_unconstrained_replicated()
+                                        != sharding.dimensions_with_unconstrained_replicated()
+                                })) =>
                 {
-                    // The constraint completes the pending reduction along the axes that the type does not record,
-                    // with a collective that must make that completion for the data type of the input.
-                    // The whole transition is checked as well, because the axes that the type records stay pending.
+                    // The constraint completes the pending reduction along the axes that the type does not record, with
+                    // a collective that must make that completion for the data type of the input. The whole transition
+                    // is checked as well, because the axes that the type records stay pending.
                     let unrecorded = |axis: &&String| !array_type.unreduced_axes().contains(*axis);
                     let (completed, kept): (Vec<&String>, Vec<&String>) =
                         sharding.unreduced_axes().iter().partition(unrecorded);
@@ -1786,29 +1799,35 @@ impl ProgramBoundary {
                     let change = ReductionChange::Complete(kind);
                     let data_type = array_type.data_type();
                     let axes = completed.iter().copied();
+
                     validate_pending_reduction_change(data_type, change, sharding, axes, "input_shardings")?;
                     validate_partial_completion(data_type, kind, sharding, completed, kept, "input_shardings")?;
+
                     let reduced = sharding.clone().with_unreduced_axes(array_type.unreduced_axes().iter().cloned())?;
                     let block = &mut function_block_ref;
+
                     reduced.lower_pending_reduction_constraint(value, lowering_context, block, location.as_ref())?
                 }
                 _ => value,
             };
+
             logical_input_values.push(value);
         }
+
         let (capture_values, public_input_values) = logical_input_values.split_at(capture_count);
-        // Ordinary module callers lower an unlifted program whose entry inputs are only the public inputs.
-        // The compilation domain instead supplies the program with lifted captures, so that core reference
-        // discharge and lowering observe the same arena. In that form the complete logical input list is also
-        // the entry input list, while the leading prefix still serves attached `CaptureReference` constants. No
-        // third boundary form exists, so the entry input count must match one of those two shapes exactly.
-        // Session constants are not program inputs, so the lifted form omits the trailing session constants of the
-        // capture prefix from the entry inputs, while `capture_values` keeps them as its suffix for
-        // `ProgramLoweringContext::lower_session_constant`.
+
+        // Ordinary module callers lower an unlifted program whose entry inputs are only the public inputs. The
+        // compilation domain instead supplies the program with lifted captures, so that core reference discharge and
+        // lowering observe the same arena. In that form the complete logical input list is also the entry input list,
+        // while the leading prefix still serves attached `CaptureReference` constants. No third boundary form exists,
+        // so the entry input count must match one of those two shapes exactly. Session constants are not program
+        // inputs, so the lifted form omits the trailing session constants of the capture prefix from the entry inputs,
+        // while `capture_values` keeps them as its suffix for `ProgramLoweringContext::lower_session_constant`.
         debug_assert!(
             program.input_count() + session_count == logical_input_values.len()
                 || program.input_count() == public_input_values.len(),
         );
+
         let lifted_input_values: Vec<_>;
         let input_values = if program.input_count() + session_count == logical_input_values.len() {
             lifted_input_values = capture_values[..capture_values.len() - session_count]
@@ -1820,8 +1839,9 @@ impl ProgramBoundary {
         } else {
             public_input_values
         };
+
         // The arrays that the program only passes on to calls that never read them are bound like unread inputs,
-        // after the session constants (refer to `lowering_context` above).
+        // after the session constants.
         let mut captured_values = Cow::Borrowed(capture_values);
         for constant in passed_on_constants {
             let r#type = constant.r#type();
@@ -1834,10 +1854,12 @@ impl ProgramBoundary {
             )?;
             captured_values.to_mut().extend(values);
         }
+
         let mut effect_tokens = EffectTokens::default();
         if let Some(index) = boundary_mapping.ordered_io_input_index() {
             effect_tokens.set(EffectClass::OrderedIo, function_block.argument(index).unwrap().as_ref());
         }
+
         let logical_outputs = program.lower_inline(
             &captured_values,
             input_values,
@@ -1847,15 +1869,17 @@ impl ProgramBoundary {
             function_block_ref,
             location.as_ref(),
         )?;
+
         let mut executable_outputs = boundary_mapping.select_output_entries(logical_outputs.as_slice())?;
+
         // XLA writes the runtime-size trailer of a bounded dynamic result only in the `SliceToDynamic` that
         // `DynamicPadder` inserts before each output leaf. When several such leaves carry values that XLA proves
-        // equal (e.g., the same SSA value or equal computations merged by CSE), one `SliceToDynamic` survives and
-        // copy insertion fills the other result with a plain copy of the bounded payload, which leaves its trailer
-        // unset (i.e., the buffer reports zero-sized dynamic dimensions). Routing these results through one
-        // optimization barrier makes every leaf a distinct barrier result. XLA expands barriers only after copy
-        // insertion, so each leaf keeps its own `SliceToDynamic`. A single dynamic result cannot alias a static
-        // one, so the barrier is only needed with two or more of them.
+        // equal (e.g., the same SSA value or equal computations merged by CSE), one `SliceToDynamic` survives and copy
+        // insertion fills the other result with a plain copy of the bounded payload, which leaves its trailer unset
+        // (i.e., the buffer reports zero-sized dynamic dimensions). Routing these results through one optimization
+        // barrier makes every leaf a distinct barrier result. XLA expands barriers only after copy insertion, so each
+        // leaf keeps its own `SliceToDynamic`. A single dynamic result cannot alias a static one, so the barrier is
+        // only needed with two or more of them.
         let mut dynamic_output_slots = boundary_mapping
             .output_dimensions()
             .iter()
@@ -1871,6 +1895,7 @@ impl ProgramBoundary {
                 executable_outputs[executable_index] = barrier.result(result_index).unwrap().as_ref();
             }
         }
+
         for output_dimension in boundary_mapping.output_dimensions() {
             executable_outputs.push(lower_runtime_dimension_size_i64(
                 logical_outputs[output_dimension.logical_output_index()],
@@ -1880,10 +1905,13 @@ impl ProgramBoundary {
                 location.as_ref(),
             )?);
         }
+
         if boundary_mapping.has_ordered_io() {
             executable_outputs.push(effect_tokens.get(EffectClass::OrderedIo).unwrap());
         }
+
         function_block_ref.append_operation(func::r#return(executable_outputs.as_slice(), location)?)?;
+
         Ok(())
     }
 }
@@ -1891,7 +1919,7 @@ impl ProgramBoundary {
 /// Prepares XLA programs for lowering and analyzes their entry placements.
 pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
     /// Operation family of the program.
-    type Operation: LowerableOperationFamily;
+    type Operation: ProgramLoweringOperation;
 
     /// Returns this program as lowering emits it, without the unused outputs of its instructions that carry regions,
     /// together with the computations that only those outputs use (i.e., like [`Program::into_pruned`]), and without
@@ -2002,7 +2030,7 @@ pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
 
 impl<O, Input, Output> ProgramLoweringAnalysisExtension for Program<Constant, O, Input, Output>
 where
-    O: LowerableOperationFamily,
+    O: ProgramLoweringOperation,
     Input: Parameterized<Constant>,
     Output: Parameterized<Constant>,
 {
@@ -2038,7 +2066,7 @@ where
         /// together with the position of that value among the outputs of its producer, are indexed once, so that
         /// following an output back to an input costs one lookup per step rather than a scan of the inputs or of the
         /// outputs of an instruction.
-        fn region_output_sharding_sources<O: LowerableOperationFamily, F: Fn(&RetainedArray) -> Sharding>(
+        fn region_output_sharding_sources<O: ProgramLoweringOperation, F: Fn(&RetainedArray) -> Sharding>(
             region: RegionRef<'_, Constant, O>,
             constant_sharding: &F,
             callee_sources: &mut HashMap<RegionId, Rc<[Option<OutputShardingSource>]>>,
@@ -2338,7 +2366,7 @@ where
 /// Lowering of a program body into an existing MLIR block.
 pub(crate) trait ProgramInlineLoweringExtension {
     /// Operation family of the program.
-    type Operation: LowerableOperationFamily;
+    type Operation: ProgramLoweringOperation;
 
     /// Appends the program body to `block` and returns its flat outputs. Captured constants resolve against
     /// `captured_values` and the program's input atoms bind to `input_values`. Each instruction inherits its
@@ -2367,7 +2395,7 @@ pub(crate) trait ProgramInlineLoweringExtension {
 
 impl<O, Input, Output> ProgramInlineLoweringExtension for Program<Constant, O, Input, Output>
 where
-    O: LowerableOperationFamily,
+    O: ProgramLoweringOperation,
     Input: Parameterized<Constant>,
     Output: Parameterized<Constant>,
 {
@@ -2453,7 +2481,7 @@ pub(crate) trait RegionPlacementRequestsExtension: Sized {
     fn for_lowering<V, O>(region: RegionRef<'_, V, O>, target_platform: Option<&str>) -> Self
     where
         V: 'static + Value<Type = Type>,
-        O: 'static + LowerableOperationFamily;
+        O: 'static + ProgramLoweringOperation;
 
     /// Returns the devices that the placement requests of the program name (refer to
     /// [`RegionPlacementRequests::requests`]), as the mesh of a request that names devices together with the name
@@ -2474,7 +2502,7 @@ impl RegionPlacementRequestsExtension for RegionPlacementRequests {
     fn for_lowering<V, O>(region: RegionRef<'_, V, O>, target_platform: Option<&str>) -> Self
     where
         V: 'static + Value<Type = Type>,
-        O: 'static + LowerableOperationFamily,
+        O: 'static + ProgramLoweringOperation,
     {
         match target_platform {
             None => Self::new(region),
@@ -2670,7 +2698,7 @@ pub(crate) fn entry_outputs_with_compiler_chosen_placement(
 /// lowered (e.g., `collect_call_functions` leaves out callees whose lowering has effects, including synthesized
 /// entry guards), because the function threads no effect token. It must also read no session constant, because
 /// only the entry function receives the hidden inputs that carry them.
-fn lower_private_function<'c, 't: 'c, O: LowerableOperationFamily>(
+fn lower_private_function<'c, 't: 'c, O: ProgramLoweringOperation>(
     symbol: &str,
     program: &FlatProgram<EagerContext<Constant, O>>,
     nested_functions: Option<&Rc<CallFunctionMap<O>>>,
@@ -2726,6 +2754,9 @@ fn lower_private_function<'c, 't: 'c, O: LowerableOperationFamily>(
         location,
     )?)
 }
+
+// TODO(eaplatanios): Can you make a pass over the tests in @here making sure that all the test code complies with our
+//  conventions around test naming, placement, coverage, non-redundancy, code style, code comments, documentation, etc.?
 
 #[cfg(test)]
 mod tests {
