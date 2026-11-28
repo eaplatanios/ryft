@@ -7,7 +7,7 @@ use ryft_core::{
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, Location, LocationRef,
-    Operation as MlirOperation, TensorTypeRef, Type as MlirType, Value as MlirValue, ValueRef,
+    Operation as MlirOperation, Size as MlirSize, TensorTypeRef, Type as MlirType, Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::LoweringError;
@@ -212,33 +212,20 @@ pub(crate) trait DimensionValueLoweringExtension {
     /// that represents a dimension in StableHLO. Immediate [`Constant::Dimension`] atoms and staged
     /// [`DimensionOperation::Constant`](ryft_core::DimensionOperation::Constant) instructions must
     /// agree on this representation, and so both lowering paths route through this function.
-    fn lower<'b, 'c: 'b, 't: 'c, B, L>(
-        &self,
-        block: &mut B,
-        context: &'c MlirContext<'t>,
-        location: L,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error>
+    fn lower<'b, 'c: 'b, 't: 'c, B, L>(&self, block: &mut B, location: L) -> Result<ValueRef<'b, 'c, 't>, Error>
     where
         B: Block<'b, 'c, 't>,
         L: Copy + Location<'c, 't>;
 }
 
 impl DimensionValueLoweringExtension for DimensionValue {
-    fn lower<'b, 'c: 'b, 't: 'c, B, L>(
-        &self,
-        block: &mut B,
-        context: &'c MlirContext<'t>,
-        location: L,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error>
+    #[inline]
+    fn lower<'b, 'c: 'b, 't: 'c, B, L>(&self, block: &mut B, location: L) -> Result<ValueRef<'b, 'c, 't>, Error>
     where
         B: Block<'b, 'c, 't>,
         L: Copy + Location<'c, 't>,
     {
-        let tensor_type = ArrayType::scalar(DataType::I64).lower(context, location)?;
-        let extent = dimension_extent_to_i64(self.extent())?;
-        let elements = DataType::I64.lower_i64_splat_attribute(tensor_type, extent, context)?;
-        let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-        Ok(constant.result(0)?.as_ref())
+        lower_index_constant(self.extent(), block, location)
     }
 }
 
@@ -299,10 +286,93 @@ impl Constant {
         match self {
             Constant::Captured(value) => value.lower(captured_values),
             Constant::Session(value) => lowering_context.lower_session_constant(value, captured_values),
-            Constant::Dimension(value) => value.lower(block, context, location),
+            Constant::Dimension(value) => value.lower(block, location),
             Constant::Boolean(value) => ArrayConstant::Boolean(*value).lower_constant(block, context, location),
         }
     }
+}
+
+/// Emits a host index or dimension extent as a scalar `tensor<i64>` StableHLO constant.
+///
+/// # Errors
+///
+/// Returns [`DimensionError::ExtentExceedsBackendWidth`](ryft_core::DimensionError::ExtentExceedsBackendWidth)
+/// if `index` exceeds [`i64::MAX`]. Propagates errors from constructing and appending the constant.
+#[inline]
+pub fn lower_index_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+    index: usize,
+    block: &mut B,
+    location: L,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let value = dimension_extent_to_i64(index)?;
+    ArrayType::scalar(DataType::I64).lower_i64_splat(value, block, location)
+}
+
+/// Emits `value` as a scalar `tensor<ui64>` StableHLO constant, preserving all 64 bits.
+///
+/// # Errors
+///
+/// Propagates errors from constructing and appending the constant.
+pub fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+    value: u64,
+    block: &mut B,
+    location: L,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let context = block.context();
+    let tensor_type = ArrayType::scalar(DataType::U64).lower(context, location)?;
+    let elements = context.dense_u64_elements_attribute(tensor_type, &[value])?;
+    let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
+    Ok(constant.result(0)?.as_ref())
+}
+
+/// Packs scalar `i64` tensors into a rank-one `i64` tensor in input order. An empty slice produces an empty
+/// vector constant. A singleton needs only a reshape.
+///
+/// # Errors
+///
+/// Returns [`ProgramError::InvalidArgument`] if a value is not a rank-zero tensor of signless `i64` elements.
+/// Propagates MLIR errors from inspecting the values or building the vector.
+pub fn lower_i64_vector<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+    values: &[ValueRef<'b, 'c, 't>],
+    block: &mut B,
+    location: L,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let context = block.context();
+    let element_type = context.signless_integer_type(64);
+    if values.is_empty() {
+        let vector_type = context.tensor_type(element_type, &[MlirSize::Static(0)], None, location)?;
+        let elements = context.dense_i64_elements_attribute(vector_type, &[])?;
+        let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
+        return Ok(constant.result(0)?.as_ref());
+    }
+
+    for value in values {
+        let value_type = value.r#type()?;
+        if !matches!(value_type.cast::<TensorTypeRef>(), Some(tensor)
+            if tensor.rank() == 0 && tensor.element_type()? == element_type.as_ref())
+        {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("expected a scalar `i64` tensor when packing a vector, got `{value_type}`"),
+            }
+            .into());
+        }
+    }
+
+    let elements = values
+        .iter()
+        .map(|value| {
+            let reshape = block.append_operation(stable_hlo::reshape(*value, &[1], location)?)?;
+            Ok(reshape.result(0)?.as_ref())
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+
+    if let [element] = elements.as_slice() {
+        return Ok(*element);
+    }
+
+    let vector = block.append_operation(stable_hlo::concatenate(elements.as_slice(), 0, location)?)?;
+
+    Ok(vector.result(0)?.as_ref())
 }
 
 #[cfg(test)]
@@ -310,10 +380,13 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use ryft_core::{Complex, ConvertElementTypeOperation, Placeholder, Shape, StridedLayout, i1, i2, i4, u1, u2, u4};
+    use ryft_core::{
+        Complex, ConvertElementTypeOperation, DimensionError, Error as CoreError, Placeholder, Shape, StridedLayout,
+        i1, i2, i4, u1, u2, u4,
+    };
+    use ryft_mlir::Region;
     use ryft_mlir::dialects::builtin::attributes::DenseElementsAttribute;
     use ryft_mlir::dialects::func;
-    use ryft_mlir::{Region, Size as MlirSize};
 
     use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, test_vector_type, unproject_plain_program};
     use crate::sessions::tests::{domain_mesh, f32_scalar};
@@ -671,7 +744,7 @@ mod tests {
         let context = MlirContext::new();
         let location = context.unknown_location();
         let block = context.block_with_no_arguments();
-        let output = DimensionValue::constant(3).unwrap().lower(&mut block.as_ref(), &context, location).unwrap();
+        let output = DimensionValue::constant(3).unwrap().lower(&mut block.as_ref(), location).unwrap();
         let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(output, operations[0].result(0).unwrap().as_ref());
         assert_eq!(
@@ -738,5 +811,110 @@ mod tests {
             operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
             vec!["%c = stablehlo.constant dense<3> : tensor<i64>", "%c = stablehlo.constant dense<true> : tensor<i1>"],
         );
+    }
+
+    #[test]
+    fn test_lower_index_constant() {
+        let context = MlirContext::new();
+        let block = context.block_with_no_arguments();
+        let index = i64::MAX as usize;
+        let value = lower_index_constant(index, &mut block.as_ref(), context.unknown_location()).unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(value, operations[0].result(0).unwrap().as_ref());
+        assert_eq!(operations[0].to_string(), format!("%c = stablehlo.constant dense<{index}> : tensor<i64>"));
+    }
+
+    #[test]
+    fn test_lower_index_constant_rejects_index_above_i64_max() {
+        let maximum = i64::MAX as usize;
+        let Some(index) = maximum.checked_add(1) else { return };
+        let context = MlirContext::new();
+        let block = context.block_with_no_arguments();
+        let error = lower_index_constant(index, &mut block.as_ref(), context.unknown_location()).unwrap_err();
+        let Error::Core(error) = error else { unreachable!() };
+        let CoreError::Type(error) = *error else { unreachable!() };
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::ExtentExceedsBackendWidth { value: index, maximum }),
+        );
+        assert!(block.operations().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn test_lower_u64_scalar_constant() {
+        let context = MlirContext::new();
+        let block = context.block_with_no_arguments();
+        let value = lower_u64_scalar_constant(u64::MAX, &mut block.as_ref(), context.unknown_location()).unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(value, operations[0].result(0).unwrap().as_ref());
+        assert_eq!(operations[0].to_string(), "%c = stablehlo.constant dense<18446744073709551615> : tensor<ui64>");
+    }
+
+    #[test]
+    fn test_lower_i64_vector() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let scalar_type = ArrayType::scalar(DataType::I64).lower(&context, location).unwrap();
+        let block = context.block(&[(scalar_type, location), (scalar_type, location)]);
+        let mut block_ref = block.as_ref();
+        let first = block.argument(0).unwrap().as_ref();
+        let second = block.argument(1).unwrap().as_ref();
+        let vectors = [
+            lower_i64_vector(&[], &mut block_ref, location).unwrap(),
+            lower_i64_vector(&[second], &mut block_ref, location).unwrap(),
+            lower_i64_vector(&[second, first], &mut block_ref, location).unwrap(),
+        ];
+        let attributes = func::FuncAttributes {
+            arguments: vec![scalar_type.into(); 2],
+            results: vectors.iter().map(|vector| vector.r#type().unwrap().into()).collect(),
+            ..Default::default()
+        };
+        block_ref.append_operation(func::r#return(&vectors, location).unwrap()).unwrap();
+        let mut region = context.region();
+        region.append_block(block).unwrap();
+        let module = context.module(location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation(func::func("main", attributes, region, location).unwrap())
+            .unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) -> (tensor<0xi64>, tensor<1xi64>, tensor<2xi64>) {
+                    %c = stablehlo.constant dense<> : tensor<0xi64>
+                    %0 = stablehlo.reshape %arg1 : (tensor<i64>) -> tensor<1xi64>
+                    %1 = stablehlo.reshape %arg1 : (tensor<i64>) -> tensor<1xi64>
+                    %2 = stablehlo.reshape %arg0 : (tensor<i64>) -> tensor<1xi64>
+                    %3 = stablehlo.concatenate %1, %2, dim = 0 : (tensor<1xi64>, tensor<1xi64>) -> tensor<2xi64>
+                    return %c, %0, %3 : tensor<0xi64>, tensor<1xi64>, tensor<2xi64>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_lower_i64_vector_rejects_other_types() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let scalar_type = ArrayType::scalar(DataType::I64).lower(&context, location).unwrap();
+        for invalid_type in [ArrayType::new_static(DataType::I64, [1]), ArrayType::scalar(DataType::U64)] {
+            let invalid_type = invalid_type.lower(&context, location).unwrap();
+            let block = context.block(&[(scalar_type, location), (invalid_type, location)]);
+            let values = [block.argument(0).unwrap().as_ref(), block.argument(1).unwrap().as_ref()];
+            assert_eq!(
+                lower_i64_vector(&values, &mut block.as_ref(), location),
+                Err(ProgramError::InvalidArgument {
+                    message: format!("expected a scalar `i64` tensor when packing a vector, got `{invalid_type}`"),
+                }
+                .into()),
+            );
+            assert!(block.operations().unwrap().next().is_none());
+        }
     }
 }

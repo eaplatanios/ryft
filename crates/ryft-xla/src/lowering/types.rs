@@ -210,6 +210,49 @@ pub trait ArrayTypeLoweringExtension {
         location: L,
     ) -> Result<TensorTypeRef<'c, 't>, Error>;
 
+    /// Emits a splat of `value` with this array's element type and shape. Integer elements retain the low bits of
+    /// `value` at their declared width, including all 64 bits for 64-bit elements. Complex elements have a zero
+    /// imaginary component. This emits a scalar constant followed by a broadcast for arrays of positive rank.
+    /// Callers that need a runtime shape must supply its extents separately.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from lowering the element type, encoding the constant, or constructing the MLIR operations.
+    fn lower_i64_splat<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+        &self,
+        value: i64,
+        block: &mut B,
+        location: L,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+
+    /// Emits a splat of `value` with this array's element type and shape. The real component uses the conversion
+    /// rules of [`DataTypeLoweringExtension::lower_f64_splat_attribute`], and the imaginary component of a complex
+    /// result is zero. Like [`Self::lower_i64_splat`], this uses a scalar constant and broadcasts it for arrays of
+    /// positive rank.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from lowering the element type, encoding the constant, or constructing the MLIR operations.
+    fn lower_f64_splat<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+        &self,
+        value: f64,
+        block: &mut B,
+        location: L,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+
+    /// Emits [`Self::lower_i64_splat`] and annotates its result with this array's memory placement when it resides
+    /// outside device memory. Constructors use this function to place their result in its declared memory space.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from the splat and from [`MemoryLoweringExtension::lower_transfer`].
+    fn lower_i64_splat_in_declared_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+        &self,
+        value: i64,
+        block: &mut B,
+        location: L,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+
     /// Exposes a bounded dynamic value as a statically shaped value of its [`ArrayTypeExtension::physical_bound_type`].
     /// Sets the size of each dynamic axis to its physical bound. Elements outside the original runtime shape have
     /// unspecified values. Callers must discard those elements or accept unspecified padding.
@@ -270,6 +313,39 @@ impl ArrayTypeLoweringExtension for ArrayType {
         context.tensor_type(element_type, dimensions.as_slice(), encoding, location).map_err(Error::from)
     }
 
+    #[inline]
+    fn lower_i64_splat<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+        &self,
+        value: i64,
+        block: &mut B,
+        location: L,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        SplatValue::Integer(value).lower(self, block, location)
+    }
+
+    #[inline]
+    fn lower_f64_splat<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+        &self,
+        value: f64,
+        block: &mut B,
+        location: L,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        SplatValue::Float(value).lower(self, block, location)
+    }
+
+    fn lower_i64_splat_in_declared_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+        &self,
+        value: i64,
+        block: &mut B,
+        location: L,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        let splat = self.lower_i64_splat(value, block, location)?;
+        match self.memory() {
+            Memory::Device => Ok(splat),
+            memory => Ok(memory.lower_transfer(&[splat], block, block.context(), location)?[0]),
+        }
+    }
+
     fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
         &self,
         value: ValueRef<'b, 'c, 't>,
@@ -285,14 +361,11 @@ impl ArrayTypeLoweringExtension for ArrayType {
                 continue;
             }
             let bound = physical_type.shape().dimensions()[axis].value().unwrap();
-            let size = lower_unplaced_constant_output(
-                &[ArrayType::scalar(DataType::I32)],
+            let size = ArrayType::scalar(DataType::I32).lower_i64_splat(
                 i64::from(dimension_extent_to_i32(bound)?),
                 block,
-                context,
                 location,
-            )?
-            .remove(0);
+            )?;
             dimensions[axis] = Dimension::Static(bound);
             let exposed_type = self.clone().with_shape(Shape::new(dimensions.clone()));
             let exposed = block.append_operation(stable_hlo::set_dimension_size(
@@ -353,24 +426,15 @@ impl ArrayTypeLoweringExtension for ArrayType {
             });
         }
 
-        let physical_tensor_type = physical_type.lower(context, location)?;
         let padding = match padding {
-            PhysicalStoragePadding::Constant(value) if physical_type.data_type().is_complex() => {
-                let part_type = physical_type.clone().with_data_type(if physical_type.data_type() == DataType::C64 {
-                    DataType::F32
-                } else {
-                    DataType::F64
-                });
-                let part_tensor_type = part_type.lower(context, location)?;
-                let real = lower_f64_constant_splat(value, &part_type, part_tensor_type, block, context, location)?;
-                let imaginary = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
-                block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0)?.as_ref()
-            }
-            PhysicalStoragePadding::Constant(value) => {
-                lower_f64_constant_splat(value, &physical_type, physical_tensor_type, block, context, location)?
-            }
+            PhysicalStoragePadding::Constant(value) => physical_type.lower_f64_splat(value, block, location)?,
             PhysicalStoragePadding::Scalar(scalar) => block
-                .append_operation(stable_hlo::broadcast(scalar, physical_tensor_type, &[], location)?)?
+                .append_operation(stable_hlo::broadcast(
+                    scalar,
+                    physical_type.lower(context, location)?,
+                    &[],
+                    location,
+                )?)?
                 .result(0)?
                 .as_ref(),
         };
@@ -476,274 +540,70 @@ pub fn dimension_extent_to_i32(extent: usize) -> Result<i32, Error> {
         .map_err(|_| DimensionError::ExtentExceedsBackendWidth { value: extent, maximum: i32::MAX as usize }.into())
 }
 
-// TODO(eaplatanios): Review from here onwards.
+/// Host value used to build a splat, retaining integer precision until the target element type is known.
+enum SplatValue {
+    /// An integer encoded at the target integer width or converted to the target floating-point format.
+    Integer(i64),
 
-/// Lowers static start indices to scalar `i64` StableHLO constants, as consumed by the index operands of
-/// `stablehlo.dynamic_update_slice` when lowering the statically indexed `update_slice` operation, because StableHLO
-/// has no statically indexed update operation.
-pub fn lower_static_index_constants<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
-    start_indices: &[usize],
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let element_type = DataType::I64.lower(context)?;
-    let tensor_type = context.tensor_type(element_type, &[], None, location)?;
-    start_indices
-        .iter()
-        .map(|index| {
-            let elements = DataType::I64.lower_i64_splat_attribute(tensor_type, *index as i64, context)?;
-            let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-            Ok(constant.result(0).unwrap().as_ref())
-        })
-        .collect()
+    /// A real number converted to the target element type.
+    Float(f64),
 }
 
-/// Lowers `integer_value` as a constant of the single type in `output_types`, without applying its memory placement
-/// (refer to [`lower_constant_output`] for the placed variant). Scalars lower to one `stablehlo.constant`, while
-/// shaped outputs and complex values are built from scalar constants and broadcast to the output shape.
-///
-/// # Errors
-///
-/// Returns an [`Error`] when `output_types` does not contain exactly one type, or when the type cannot be lowered or
-/// represent `integer_value`.
-pub fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
-    output_types: &[ArrayType],
-    integer_value: i64,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    check_count!("output", output_types, 1, ProgramError);
-    let output_type = &output_types[0];
-    let tensor_type = output_type.lower(context, location)?;
-    let data_type = output_type.data_type();
+impl SplatValue {
+    /// Emits a scalar constant and broadcasts it to the array shape when the result has positive rank.
+    fn lower<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
+        self,
+        array_type: &ArrayType,
+        block: &mut B,
+        location: L,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        let context = block.context();
+        let data_type = array_type.data_type();
+        let real_type = match data_type {
+            DataType::C64 => DataType::F32,
+            DataType::C128 => DataType::F64,
+            data_type => data_type,
+        };
 
-    // Complex constants are composed as `value + 0i` from two real part constants through `stablehlo.complex`, so that
-    // the dense elements attribute helpers stay real valued, because MLIR has no complex scalar attribute to splat.
-    if data_type.is_complex() {
-        let part_data_type = if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
-        let part_tensor_type = context.tensor_type(part_data_type.lower(context)?, &[], None, location)?;
-        let real_elements = part_data_type.lower_i64_splat_attribute(part_tensor_type, integer_value, context)?;
-        let real = block.append_operation(stable_hlo::constant(real_elements, location)?)?;
-        let imaginary_elements = part_data_type.lower_i64_splat_attribute(part_tensor_type, 0, context)?;
-        let imaginary = block.append_operation(stable_hlo::constant(imaginary_elements, location)?)?;
-        let complex = block.append_operation(stable_hlo::complex(
-            real.result(0).unwrap().as_ref(),
-            imaginary.result(0).unwrap().as_ref(),
-            location,
-        )?)?;
-        let complex = complex.result(0).unwrap().as_ref();
-        if output_type.shape().dimensions().is_empty() {
-            return Ok(vec![complex]);
+        let scalar_type = context.tensor_type(real_type.lower(context)?, &[], None, location)?;
+        let elements = match self {
+            Self::Integer(value) => real_type.lower_i64_splat_attribute(scalar_type, value, context)?,
+            Self::Float(value) => real_type.lower_f64_splat_attribute(scalar_type, value, context)?,
+        };
+
+        let real = block.append_operation(stable_hlo::constant(elements, location)?)?.result(0)?.as_ref();
+
+        // Build a complex scalar from real and imaginary constants before broadcasting it.
+        let scalar = if data_type.is_complex() {
+            let zero = real_type.lower_f64_splat_attribute(scalar_type, 0.0, context)?;
+            let imaginary = block.append_operation(stable_hlo::constant(zero, location)?)?.result(0)?.as_ref();
+            block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0)?.as_ref()
+        } else {
+            real
+        };
+
+        if array_type.rank() == 0 {
+            return Ok(scalar);
         }
-        let broadcast = block.append_operation(stable_hlo::broadcast(complex, tensor_type, &[], location)?)?;
-        return Ok(vec![broadcast.result(0).unwrap().as_ref()]);
-    }
 
-    if !output_type.shape().dimensions().is_empty() {
-        let scalar_tensor_type = context.tensor_type(data_type.lower(context)?, &[], None, location)?;
-        let scalar_elements = data_type.lower_i64_splat_attribute(scalar_tensor_type, integer_value, context)?;
-        let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location)?)?;
-        let broadcast = block.append_operation(stable_hlo::broadcast(
-            scalar_constant.result(0).unwrap().as_ref(),
-            tensor_type,
-            &[],
-            location,
-        )?)?;
-        return Ok(vec![broadcast.result(0).unwrap().as_ref()]);
-    }
-    let elements = data_type.lower_i64_splat_attribute(tensor_type, integer_value, context)?;
-    let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-    Ok(vec![constant.result(0).unwrap().as_ref()])
-}
+        let tensor_type = array_type.lower(context, location)?;
+        let broadcast = block.append_operation(stable_hlo::broadcast(scalar, tensor_type, &[], location)?)?;
 
-/// Lowers one constant with an integer value like [`lower_unplaced_constant_output`] and applies the declared memory
-/// placement of its output type to the final value when that placement is not the device memory.
-pub fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
-    output_types: &[ArrayType],
-    integer_value: i64,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let values = lower_unplaced_constant_output(output_types, integer_value, block, context, location)?;
-    check_count!("output", output_types, 1, ProgramError);
-    match output_types[0].memory() {
-        Memory::Device => Ok(values),
-        memory => memory.lower_transfer(&values, block, context, location),
+        Ok(broadcast.result(0)?.as_ref())
     }
-}
-
-/// Lowers a scalar `u64` constant. It is shared by the group interval arithmetic of ragged dots, the device shard and
-/// batch item arithmetic of `parallel_ragged_all_to_all`, and the coordinate arithmetic of
-/// [`AxisIndexOperation`](ryft_core::AxisIndexOperation).
-pub fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c>(
-    value: u64,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let tensor_type = ArrayType::scalar(DataType::U64).lower(context, location)?;
-    let attribute = context.dense_u64_elements_attribute(tensor_type, &[value])?;
-    let constant = block.append_operation(stable_hlo::constant(attribute, location)?)?;
-    Ok(constant.result(0)?.as_ref())
-}
-
-/// Lowers an arbitrary `f64` factor into a splatted scalar StableHLO constant whose element type matches
-/// `output_type`, then broadcasts that scalar to the full output shape. It is used when synthesizing zeros, ones, and
-/// padding values and when lowering literal constants.
-pub fn lower_f64_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
-    factor: f64,
-    output_type: &ArrayType,
-    output_tensor_type: TensorTypeRef<'c, 't>,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<ValueRef<'b, 'c, 't>, Error>
-where
-    B: Block<'b, 'c, 't>,
-    L: Copy + Location<'c, 't>,
-{
-    let data_type = output_type.data_type();
-    let scalar_tensor_type = context.tensor_type(data_type.lower(context)?, &[], None, location)?;
-    let elements = data_type.lower_f64_splat_attribute(scalar_tensor_type, factor, context)?;
-    let scalar_constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-    if output_type.shape().dimensions().is_empty() {
-        return Ok(scalar_constant.result(0).unwrap().as_ref());
-    }
-    let broadcast = block.append_operation(stable_hlo::broadcast(
-        scalar_constant.result(0).unwrap().as_ref(),
-        output_tensor_type,
-        &[],
-        location,
-    )?)?;
-    Ok(broadcast.result(0).unwrap().as_ref())
-}
-
-/// Packs scalar first-class dimension operands into the rank-1 `i64` shape tensor consumed by dynamic StableHLO
-/// shape operations.
-pub fn lower_explicit_shape<'b, 'c: 'b, 't: 'c>(
-    extents: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let shape_type =
-        context.tensor_type(context.signless_integer_type(64), &[MlirSize::Static(extents.len())], None, location)?;
-    if extents.is_empty() {
-        let elements = context.dense_i64_elements_attribute(shape_type, &[])?;
-        let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-        return Ok(constant.result(0).unwrap().as_ref());
-    }
-
-    let dimensions = extents
-        .iter()
-        .map(|extent| {
-            let reshape = block.append_operation(stable_hlo::reshape(*extent, &[1], location)?)?;
-            Ok(reshape.result(0).unwrap().as_ref())
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
-    if let [dimension] = dimensions.as_slice() {
-        return Ok(*dimension);
-    }
-    let shape = block.append_operation(stable_hlo::concatenate(dimensions.as_slice(), 0, location)?)?;
-    Ok(shape.result(0).unwrap().as_ref())
-}
-
-/// Packs scalar first-class dimension operands into the rank-1 `i32` shape tensor required by
-/// `stablehlo.dynamic_reshape`.
-pub(crate) fn lower_explicit_reshape_shape<'b, 'c: 'b, 't: 'c>(
-    extents: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
-    let shape_type =
-        context.tensor_type(context.signless_integer_type(32), &[MlirSize::Static(extents.len())], None, location)?;
-    if extents.is_empty() {
-        let elements = context.dense_i32_elements_attribute(shape_type, &[])?;
-        let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-        return Ok(constant.result(0).unwrap().as_ref());
-    }
-
-    let dimensions = extents
-        .iter()
-        .map(|extent| {
-            let extent = block.append_operation(stable_hlo::convert(*extent, scalar_type, location)?)?;
-            let extent = extent.result(0).unwrap().as_ref();
-            let reshape = block.append_operation(stable_hlo::reshape(extent, &[1], location)?)?;
-            Ok(reshape.result(0).unwrap().as_ref())
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
-    if let [dimension] = dimensions.as_slice() {
-        return Ok(*dimension);
-    }
-    let shape = block.append_operation(stable_hlo::concatenate(dimensions.as_slice(), 0, location)?)?;
-    Ok(shape.result(0)?.as_ref())
 }
 
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
+
     use ryft_core::{DimensionBounds, DimensionType, Error as CoreError, Placeholder, ReferenceType, ZeroOperation};
 
     use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, test_vector_type, unproject_plain_program};
     use crate::{ArrayConstant, ProgramLoweringExtension, ProgramLoweringOptions};
 
     use super::*;
-
-    #[test]
-    fn test_lower_constant_output_memory_placement() {
-        // Device outputs need no annotation, while host outputs gain one `annotate_device_placement` custom call in
-        // addition to their `mhlo.memory_kind` signature attribute.
-        let zero_program = |memory| {
-            let mut builder = ProgramBuilder::new();
-            let output_type = test_vector_type(4).with_memory(memory);
-            let output =
-                builder.add_instruction(ZeroOperation::new(output_type), Vec::new(), Vec::new(), None).unwrap()[0];
-            builder
-                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
-                .unwrap()
-        };
-        assert_eq!(
-            unproject_plain_program(zero_program(Memory::Device))
-                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
-                .unwrap(),
-            indoc! {r#"
-            module {
-              func.func @main() -> tensor<4xf32> {
-                %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                return %0 : tensor<4xf32>
-              }
-            }
-        "#},
-        );
-        for (memory, kind) in
-            [(Memory::Host { pinned: true }, "pinned_host"), (Memory::Host { pinned: false }, "unpinned_host")]
-        {
-            let expected = indoc! {r#"
-                module {
-                  func.func @main() -> (tensor<4xf32> {mhlo.memory_kind = "KIND"}) {
-                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                    %1 = stablehlo.custom_call @annotate_device_placement(%0) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "KIND"}} : (tensor<4xf32>) -> tensor<4xf32>
-                    return %1 : tensor<4xf32>
-                  }
-                }
-            "#}
-            .replace("KIND", kind);
-            assert_eq!(
-                unproject_plain_program(zero_program(memory))
-                    .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
-                    .unwrap(),
-                expected
-            );
-        }
-    }
 
     #[test]
     fn test_memory_lower_transfer() {
@@ -826,6 +686,95 @@ mod tests {
         let unbounded_type =
             ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", None), Dimension::Static(3)]));
         assert_eq!(lower(unbounded_type), "tensor<?x3xf32>");
+    }
+
+    #[test]
+    fn test_array_type_lower_i64_splat() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let block = context.block_with_no_arguments();
+        let r#type = ArrayType::new_static(DataType::I64, [2]).with_memory(Memory::Host { pinned: true });
+        let output = r#type.lower_i64_splat((1i64 << 53) + 1, &mut block.as_ref(), location).unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output, operations.last().unwrap().result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "%c = stablehlo.constant dense<9007199254740993> : tensor<i64>",
+                "%0 = stablehlo.broadcast_in_dim <<UNKNOWN SSA VALUE>>, dims = [] : (tensor<i64>) -> tensor<2xi64>",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_array_type_lower_f64_splat() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let block = context.block_with_no_arguments();
+        let output = ArrayType::new_static(DataType::C64, [2])
+            .lower_f64_splat(1.5, &mut block.as_ref(), location)
+            .unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output, operations.last().unwrap().result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "%cst = stablehlo.constant dense<1.500000e+00> : tensor<f32>",
+                "%cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>",
+                "%0 = stablehlo.complex <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>> : tensor<complex<f32>>",
+                "%0 = stablehlo.broadcast_in_dim <<UNKNOWN SSA VALUE>>, dims = [] : (tensor<complex<f32>>) -> tensor<2xcomplex<f32>>",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_array_type_lower_i64_splat_in_declared_memory() {
+        // Device outputs need no annotation, while host outputs gain one `annotate_device_placement` custom call in
+        // addition to their `mhlo.memory_kind` signature attribute.
+        let zero_program = |memory| {
+            let mut builder = ProgramBuilder::new();
+            let output_type = test_vector_type(4).with_memory(memory);
+            let output =
+                builder.add_instruction(ZeroOperation::new(output_type), Vec::new(), Vec::new(), None).unwrap()[0];
+            builder
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
+                .unwrap()
+        };
+        assert_eq!(
+            unproject_plain_program(zero_program(Memory::Device))
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap(),
+            indoc! {r#"
+            module {
+              func.func @main() -> tensor<4xf32> {
+                %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                return %0 : tensor<4xf32>
+              }
+            }
+        "#},
+        );
+        for (memory, kind) in
+            [(Memory::Host { pinned: true }, "pinned_host"), (Memory::Host { pinned: false }, "unpinned_host")]
+        {
+            let expected = indoc! {r#"
+                module {
+                  func.func @main() -> (tensor<4xf32> {mhlo.memory_kind = "KIND"}) {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                    %1 = stablehlo.custom_call @annotate_device_placement(%0) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "KIND"}} : (tensor<4xf32>) -> tensor<4xf32>
+                    return %1 : tensor<4xf32>
+                  }
+                }
+            "#}
+            .replace("KIND", kind);
+            assert_eq!(
+                unproject_plain_program(zero_program(memory))
+                    .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                    .unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
