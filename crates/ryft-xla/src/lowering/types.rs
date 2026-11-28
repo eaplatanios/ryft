@@ -74,9 +74,7 @@ impl MemoryLoweringExtension for Memory {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Lowering of a [`DataType`] to StableHLO.
+/// Provides lowering support of [`DataType`]s to StableHLO.
 pub trait DataTypeLoweringExtension {
     /// Lowers one [`DataType`] to the corresponding MLIR element type.
     fn lower<'c, 't>(self, context: &'c MlirContext<'t>) -> Result<TypeRef<'c, 't>, Error>;
@@ -114,10 +112,12 @@ impl DataTypeLoweringExtension for DataType {
                     context: "tensor element representation".to_string(),
                 }));
             }
-            // StableHLO has no element type that carries zero information. Use an `i1` tensor as an unobservable
-            // physical carrier while retaining the logical `DataType::Zero` in the lowered and compiled metadata of
-            // Ryft.
-            DataType::Zero => context.signless_integer_type(1).as_ref(),
+            DataType::Zero => {
+                // StableHLO has no element type that carries zero information. Use an `i1` tensor as an unobservable
+                // physical carrier while retaining the logical `DataType::Zero` in the lowered and compiled metadata
+                // of Ryft.
+                context.signless_integer_type(1).as_ref()
+            }
             DataType::Boolean => context.signless_integer_type(1).as_ref(),
             DataType::I1 => context.signless_integer_type(1).as_ref(),
             DataType::I2 => context.signless_integer_type(2).as_ref(),
@@ -126,10 +126,12 @@ impl DataTypeLoweringExtension for DataType {
             DataType::I16 => context.signless_integer_type(16).as_ref(),
             DataType::I32 => context.signless_integer_type(32).as_ref(),
             DataType::I64 => context.signless_integer_type(64).as_ref(),
-            // StableHLO admits signless `i1` as its Boolean and one-bit carrier but rejects `ui1`. The unsigned
-            // semantics of `U1` remain selected by Ryft operation metadata (e.g., comparison direction), while its sole
-            // bit is unchanged.
-            DataType::U1 => context.signless_integer_type(1).as_ref(),
+            DataType::U1 => {
+                // StableHLO admits signless `i1` as its Boolean and one-bit carrier but rejects `ui1`. The unsigned
+                // semantics of `U1` remain selected by Ryft operation metadata (e.g., comparison direction), while its
+                // sole bit is unchanged.
+                context.signless_integer_type(1).as_ref()
+            }
             DataType::U2 => context.unsigned_integer_type(2).as_ref(),
             DataType::U4 => context.unsigned_integer_type(4).as_ref(),
             DataType::U8 => context.unsigned_integer_type(8).as_ref(),
@@ -197,6 +199,8 @@ impl DataTypeLoweringExtension for DataType {
             .map_err(Error::from)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Widens a logical signed one-bit integer to `i8`, recovering `-1` from StableHLO's predicate carrier.
 pub fn lower_signed_one_bit_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
@@ -392,9 +396,10 @@ pub fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let output_type = ArrayType::scalar(DataType::U64);
-    let output_tensor_type = output_type.lower(context, location)?;
-    lower_u64_constant_splat(value, &output_type, output_tensor_type, block, context, location)
+    let tensor_type = ArrayType::scalar(DataType::U64).lower(context, location)?;
+    let attribute = context.dense_u64_elements_attribute(tensor_type, &[value])?;
+    let constant = block.append_operation(stable_hlo::constant(attribute, location)?)?;
+    Ok(constant.result(0)?.as_ref())
 }
 
 /// Lowering of an [`ArrayType`], and of values of that type, to StableHLO.
@@ -842,31 +847,7 @@ pub(crate) fn lower_explicit_reshape_shape<'b, 'c: 'b, 't: 'c>(
         return Ok(*dimension);
     }
     let shape = block.append_operation(stable_hlo::concatenate(dimensions.as_slice(), 0, location)?)?;
-    Ok(shape.result(0).unwrap().as_ref())
-}
-
-/// Lowers an exact `u64` value as a splatted constant of `output_type`.
-fn lower_u64_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
-    value: u64,
-    output_type: &ArrayType,
-    output_tensor_type: TensorTypeRef<'c, 't>,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<ValueRef<'b, 'c, 't>, Error>
-where
-    B: Block<'b, 'c, 't>,
-    L: Copy + Location<'c, 't>,
-{
-    let scalar_tensor_type = ArrayType::scalar(DataType::U64).lower(context, location)?;
-    let attribute = context.dense_u64_elements_attribute(scalar_tensor_type, &[value])?;
-    let constant = block.append_operation(stable_hlo::constant(attribute, location)?)?;
-    let constant = constant.result(0).unwrap().as_ref();
-    if output_type.shape().dimensions().is_empty() {
-        return Ok(constant);
-    }
-    let broadcast = block.append_operation(stable_hlo::broadcast(constant, output_tensor_type, &[], location)?)?;
-    Ok(broadcast.result(0).unwrap().as_ref())
+    Ok(shape.result(0)?.as_ref())
 }
 
 #[cfg(test)]

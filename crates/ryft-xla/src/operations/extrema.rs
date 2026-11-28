@@ -198,10 +198,11 @@ impl FloatExtremumForm {
     }
 }
 
-/// Lowers one minimum or maximum that is compatible with JAX. Integer and Boolean values use the corresponding
-/// StableHLO operation. Floating-point values use the provided [`FloatExtremumForm`] and explicit NaN propagation, so
-/// that every XLA backend preserves the IEEE semantics of signed zeros and NaNs. Complex values use JAX's
-/// lexicographic `(real, imaginary)` compare/select sequence.
+/// Lowers one minimum or maximum that is compatible with JAX. For [`DataType::I1`], a set bit represents `-1`, so
+/// maximum uses AND and minimum uses OR. Other integer and Boolean values use the corresponding StableHLO extremum.
+/// Floating-point values use the provided [`FloatExtremumForm`] and explicit NaN propagation, so that every XLA backend
+/// preserves the IEEE semantics of signed zeros and NaNs. Complex values use JAX's lexicographic `(real, imaginary)`
+/// compare/select sequence.
 pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
     maximum: bool,
     element_type: DataType,
@@ -212,10 +213,11 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if !element_type.is_complex() && !element_type.is_floating_point() {
-        let result = if maximum {
-            block.append_operation(stable_hlo::maximum(left, right, location)?)?
-        } else {
-            block.append_operation(stable_hlo::minimum(left, right, location)?)?
+        let result = match (element_type, maximum) {
+            (DataType::I1, true) => block.append_operation(stable_hlo::and(left, right, location)?)?,
+            (DataType::I1, false) => block.append_operation(stable_hlo::or(left, right, location)?)?,
+            (_, true) => block.append_operation(stable_hlo::maximum(left, right, location)?)?,
+            (_, false) => block.append_operation(stable_hlo::minimum(left, right, location)?)?,
         };
         return Ok(result.result(0).unwrap().as_ref());
     }

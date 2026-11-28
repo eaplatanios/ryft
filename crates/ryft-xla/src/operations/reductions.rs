@@ -964,7 +964,7 @@ mod tests {
         ArgMax, ArgMin, ArrayOperation, ArrayOperations, BroadcastLike, ConvertElementType, Cumulative, DeviceMesh,
         Dimension, DimensionBounds, DimensionVariable, Div, DomainTracer, Exp, Instruction, LogicalMesh, MeshAxis,
         MeshAxisType, Placeholder, ProgramError, ProjectedContext, Reduce, ReduceOperation, Shape, Sharding,
-        ShardingDimension, Sub, UnreducedKind, composite,
+        ShardingDimension, Sub, UnreducedKind, composite, i1,
     };
     use ryft_mlir::Location;
 
@@ -1690,6 +1690,19 @@ mod tests {
             }
             "#},
         );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_signed_one_bit_extrema() {
+        let client = execution_client();
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        // A set bit encodes -1, so the input is [0, -1].
+        let input = replicated_array(&session, &mesh, DataType::I1, &[2], &[0, 1]);
+        let maximum = input.reduce_max(&[0]).unwrap().copy_to_host().unwrap();
+        let minimum = input.reduce_min(&[0]).unwrap().copy_to_host().unwrap();
+        assert_eq!(maximum.elements::<i1>().unwrap(), [i1::MAX]);
+        assert_eq!(minimum.elements::<i1>().unwrap(), [i1::MIN]);
     }
 
     #[test]
