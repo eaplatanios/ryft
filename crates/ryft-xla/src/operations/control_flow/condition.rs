@@ -64,6 +64,7 @@ impl LowerableOperation for ConditionOperation<Type> {
         //
         // The program that attaches the condition validated its region and input counts, so a mismatch here is an
         // internal error, reported as the operation's own region contract and input count would report it.
+        lowerer.validate_pending_reductions_across_regions(self.name(), input_types, output_types)?;
         self.validate_region_count(lowerer.regions().len())?;
         let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
         let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =

@@ -31,10 +31,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
-    AtomId, AttachedRegions, CALL_OPERATION_NAME, CallOperation, CompositeKey, ConstrainShardingOperation, Device,
-    DeviceMesh, EagerContext, FlatProgram, InterpretableOperation, InterpretationDriver, Operation as CoreOperation,
-    Parameterized, Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RegionRole, ShardMapOperation,
-    Sharding, Typed, TypedProgram,
+    AtomId, AttachedRegions, CALL_OPERATION_NAME, CallOperation, CompositeKey, Device, DeviceMesh, EagerContext,
+    FlatProgram, InterpretableOperation, InterpretationDriver, Operation as CoreOperation, Parameterized, Program,
+    ProgramError, RegionId, RegionPlacementRequests, RegionRef, RegionRole, ShardMapOperation, Sharding, Typed,
+    TypedProgram,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -49,10 +49,10 @@ use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::programs::{
     CallTraversal, ProgramInlineLoweringExtension, RegionLoweringExtension, RegionPlacementRequestsExtension,
 };
-use crate::lowering::reductions::validate_declared_pending_reduction;
 use crate::lowering::types::{TypeLoweringExtension, lower_unplaced_constant_output};
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::TypeCastLoweringExtension;
+use crate::operations::sharding::constrain_sharding::lower_declared_sharding_constraint;
 use crate::operations::{Operation, unread_lifted_captures};
 use crate::{
     Array, Constant, Error, ExecutionError, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation,
@@ -1308,9 +1308,9 @@ impl<O: ProgramLoweringOperation> CallProgramLoweringExtension<O> for FlatProgra
 /// # Errors
 ///
 /// Returns [`LoweringError::UnsupportedOperation`] when the boundary sharding declares a pending maximum or minimum
-/// that `r#type` does not record (refer to [`validate_declared_pending_reduction`]), which XLA cannot introduce.
+/// that `r#type` does not record (refer to [`lower_declared_sharding_constraint`]), which XLA cannot introduce.
 fn lower_boundary_constraint<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
-    lowerer: &mut Lowerer<'b, 'c, 't, O>,
+    lowerer: &Lowerer<'b, 'c, 't, O>,
     value: ValueRef<'b, 'c, 't>,
     r#type: &Type,
     sharding: &Sharding,
@@ -1318,22 +1318,9 @@ fn lower_boundary_constraint<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     let Type::Array(array_type) = r#type else {
         return Ok(value);
     };
-    // The override states the placement along every mesh axis, so it is lowered for a type that tracks no placement,
-    // with which a constraint is not merged (refer to `ConstrainShardingOperation::lowered_sharding`).
-    let untracked_type = array_type.clone().with_sharding(None)?;
+    // The boundary states the whole placement. Its reduction transition starts from the value's original type.
     let declared = sharding.with_unconstrained_dimensions_replicated();
-    // The constraint is lowered for the untracked type, so what the value already carries is read from its own type.
-    let bound_manual_axes = lowerer.lowering_context().bound_manual_axes();
-    validate_declared_pending_reduction(
-        &declared,
-        array_type.sharding(),
-        array_type.data_type(),
-        bound_manual_axes,
-        CALL_OPERATION_NAME,
-    )?;
-    let constraint = ConstrainShardingOperation::new(declared);
-    let types = std::slice::from_ref(&untracked_type);
-    Ok(constraint.lower(lowerer, &[value], types, types)?.remove(0))
+    lower_declared_sharding_constraint(lowerer, value, array_type, &declared, CALL_OPERATION_NAME)
 }
 
 #[cfg(test)]

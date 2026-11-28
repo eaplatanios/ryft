@@ -26,8 +26,7 @@ use crate::lowering::sharding::{
     validate_declared_pending_reduction, validate_partial_completion, validate_pending_reduction_change,
 };
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, TypeLoweringExtension, lower_runtime_dimension_size_i64,
-    lower_unplaced_constant_output, validate_boundary_memory,
+    ArrayTypeLoweringExtension, TypeLoweringExtension, lower_runtime_dimension_size_i64, lower_unplaced_constant_output,
 };
 use crate::lowering::{
     EffectTokens, Lowerer, LoweringError, ProgramLoweringOperation, RaggedDotLoweringStrategy,
@@ -817,7 +816,6 @@ where
             output_shardings,
             open_outputs,
             supports_shardy,
-            target_platform,
             &context,
             location.as_ref(),
         )?;
@@ -1551,7 +1549,7 @@ impl ProgramBoundary {
     ///
     /// # Errors
     ///
-    /// Returns [`LoweringError::UnsupportedBoundaryMemory`] for a boundary memory that `target_platform` cannot use.
+    /// Returns errors from lowering the boundary types, shardings, or layouts.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn lower_attributes<'c, 't>(
         &self,
@@ -1559,7 +1557,6 @@ impl ProgramBoundary {
         output_shardings: &[Option<Sharding>],
         open_outputs: &[bool],
         supports_shardy: bool,
-        target_platform: Option<&str>,
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<(Vec<TypeAndAttributes<'c, 't, 'static>>, Vec<TypeAndAttributes<'c, 't, 'static>>), Error> {
@@ -1641,7 +1638,6 @@ impl ProgramBoundary {
                 if let Some(r#type) =
                     executable_input_types.get(index).filter(|r#type| r#type.memory() != Memory::Device)
                 {
-                    validate_boundary_memory(r#type.memory(), target_platform)?;
                     attributes.insert(
                         "mhlo.memory_kind".into(),
                         context.string_attribute(r#type.memory().placement_kind()).as_ref(),
@@ -1680,7 +1676,6 @@ impl ProgramBoundary {
                 if let Some(r#type) =
                     executable_output_types.get(index).filter(|r#type| r#type.memory() != Memory::Device)
                 {
-                    validate_boundary_memory(r#type.memory(), target_platform)?;
                     attributes.insert(
                         "mhlo.memory_kind".into(),
                         context.string_attribute(r#type.memory().placement_kind()).as_ref(),

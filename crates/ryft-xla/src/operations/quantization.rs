@@ -12,11 +12,12 @@ use ryft_mlir::{
     Type as MlirType, Value as MlirValue, ValueRef,
 };
 
+use crate::lowering::NamedCompositionKey;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_f64_constant_splat, physical_bound_type,
 };
 use crate::operations::call::lower_shared_function_call;
-use crate::operations::composites::{NamedCompositionKey, named_composition_input_types};
+use crate::operations::composites::named_composition_input_types;
 use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Session, Tracer, Type};
 
 // TODO(eaplatanios): Review this module.

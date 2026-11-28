@@ -1,12 +1,10 @@
-use std::collections::HashMap;
 use std::hash::Hash;
-use std::rc::Rc;
 
 use ryft_core::{
     ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, COMPOSITE_OPERATION_NAME,
     COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation, CompositeTransposeOperation,
     CustomRuleSource, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-    DifferentiableType, FlatProgram, Operation, Parameter, Placeholder, ProgramError, Typed,
+    DifferentiableType, Operation, Parameter, Placeholder, ProgramError, Typed,
 };
 use ryft_mlir::ValueRef;
 #[cfg(test)]
@@ -15,7 +13,7 @@ use ryft_mlir::{Block as _, Operation as _, Value as _};
 use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::operations::attention::{AttentionConfigurationLoweringExtension, select_attention_implementation};
 use crate::operations::call::lower_shared_function_call;
-use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Session, Type};
+use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -289,7 +287,8 @@ where
 /// Private decomposition functions contain local array computations and bind no manual axes. Manual variation has
 /// already determined the explicit transitions and adjoints of the enclosing program, so it must not trigger new
 /// transitions when expanding these functions. Retain mesh placement and reduction state, and keep the original types
-/// in the [`NamedCompositionKey`] so the external operation contract remains unchanged.
+/// in the [`NamedCompositionKey`](crate::lowering::NamedCompositionKey) so the external operation contract remains
+/// unchanged.
 pub(crate) fn named_composition_input_types(input_types: &[ArrayType]) -> Result<Vec<Type>, Error> {
     input_types
         .iter()
@@ -303,110 +302,18 @@ pub(crate) fn named_composition_input_types(input_types: &[ArrayType]) -> Result
         .collect()
 }
 
-/// Identity of one generated decomposition of a named composition at a concrete typed boundary. The lowering of an
-/// operation requests the private function that holds such a decomposition through
-/// [`Lowerer::require_named_composition`], and requests with equal keys share one function.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct NamedCompositionKey {
-    /// Semantic identity of the composition, whose name also names the emitted private function.
-    composite: CompositeKey,
-
-    /// Logical input types of the composition boundary.
-    input_types: Vec<ArrayType>,
-
-    /// Logical output types of the composition boundary.
-    output_types: Vec<ArrayType>,
-}
-
-impl NamedCompositionKey {
-    /// Creates the key of the decomposition of `composite` at the boundary with the provided logical types.
-    pub fn new(composite: CompositeKey, input_types: Vec<ArrayType>, output_types: Vec<ArrayType>) -> Self {
-        Self { composite, input_types, output_types }
-    }
-}
-
-/// Private decomposition function emitted for one [`NamedCompositionKey`].
-#[derive(Clone)]
-pub(crate) struct NamedCompositionFunction {
-    /// Module-unique decomposition symbol.
-    symbol: Rc<str>,
-
-    /// Canonical typed decomposition program.
-    program: Rc<FlatProgram<Session>>,
-}
-
-impl NamedCompositionFunction {
-    /// Returns the module-unique decomposition symbol.
-    #[inline]
-    pub(crate) fn symbol(&self) -> &str {
-        &self.symbol
-    }
-
-    /// Returns the canonical typed decomposition program.
-    #[inline]
-    pub(crate) fn program(&self) -> &FlatProgram<Session> {
-        &self.program
-    }
-}
-
-/// Module-owned registry of canonical named compositions and their private decomposition functions. The lowering of
-/// an operation requests the function of the composition that it emits (refer to
-/// `ProgramLoweringContext::require_named_composition`), and the module emits the functions that were requested, so
-/// that a module holds a decomposition exactly when something that lowering emitted refers to it.
-#[derive(Default)]
-pub(crate) struct NamedCompositionFunctionMap {
-    /// Functions indexed by semantic operation and typed boundary.
-    functions: HashMap<NamedCompositionKey, NamedCompositionFunction>,
-
-    /// Keys in the stable order of their first occurrence, used for deterministic function emission.
-    order: Vec<NamedCompositionKey>,
-}
-
-impl NamedCompositionFunctionMap {
-    /// Returns the functions in the stable order of the first occurrence of their keys, which is the order in which
-    /// a module emits them, so that the layout of the module is deterministic.
-    #[inline]
-    pub(crate) fn functions(&self) -> impl Iterator<Item = &NamedCompositionFunction> {
-        self.order.iter().map(|key| &self.functions[key])
-    }
-
-    /// Returns the private function that holds the decomposition of `key`, after tracing `program` and adding the
-    /// function when `key` has none yet, so that every request for the complete semantic key shares one function. The
-    /// registry is independent of the operation family that produced `key` and `program`, and closed backend
-    /// operation enums only decide when to call this seam. A key whose composite name is already taken by another key
-    /// receives a symbol suffixed with the number of earlier keys of that name.
-    pub(crate) fn require<F: FnOnce() -> Result<FlatProgram<Session>, Error>>(
-        &mut self,
-        key: NamedCompositionKey,
-        program: F,
-    ) -> Result<&NamedCompositionFunction, Error> {
-        if !self.functions.contains_key(&key) {
-            let name = key.composite.name();
-            let symbol = match self.order.iter().filter(|existing| existing.composite.name() == name).count() {
-                0 => name.to_string(),
-                count => format!("{name}_{count}"),
-            };
-            let function = NamedCompositionFunction { symbol: symbol.into(), program: Rc::new(program()?) };
-            self.functions.insert(key.clone(), function);
-            self.order.push(key.clone());
-        }
-        Ok(&self.functions[&key])
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, BatchAxis, BatchingLevelExtent, Compare, ComparisonDirection, CompositeAttribute,
-        CompositeJvpRule, CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionValue, DomainTracer,
-        DomainTracingContext, Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Mul, MulOperation,
-        NamedComposite, PrintOperation, Program, ProgramBuilder, ProjectedContext, Reduce, Shape, Sharding,
-        ShardingDimension, Softmax, batch, composite, differentiate_at, softmax,
+        AddOperation, BatchAxis, BatchingLevelExtent, Compare, ComparisonDirection, CompositeJvpRule,
+        CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionValue, DomainTracer, Error as CoreError,
+        FlatProgram, LogicalMesh, MeshAxis, MeshAxisType, Mul, MulOperation, NamedComposite, PrintOperation, Program,
+        ProgramBuilder, ProjectedContext, Reduce, Shape, Sharding, ShardingDimension, Softmax, batch, composite,
+        differentiate_at, softmax,
     };
     use ryft_mlir::{Block, Context as MlirContext, Location};
 
@@ -415,7 +322,7 @@ mod tests {
     use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
-    use crate::{Array, Constant, ProgramLoweringExtension, ProgramLoweringOptions, Session, Tracer};
+    use crate::{Array, Constant, ProgramLoweringExtension, ProgramLoweringOptions, Session};
 
     use super::*;
 
@@ -1210,64 +1117,5 @@ mod tests {
             named_composition_input_types(&[boundary, unsharded.clone()]).unwrap(),
             vec![Type::from(local), Type::from(unsharded)],
         );
-    }
-
-    #[test]
-    fn test_named_composition_function_map_require() {
-        // Registration consumes a semantic key and an ordinary typed program, not a Ryft operation enum variant.
-        // Consequently a downstream lowerer can use the same sharing seam after performing its own family conversion.
-        let boundary_type = ArrayType::scalar(DataType::F32);
-        let (_, program) = DomainTracingContext::<Session>::trace(
-            |inputs: Vec<Tracer>| Ok(inputs),
-            vec![Type::from(boundary_type.clone())],
-        )
-        .unwrap();
-        let program = program.into_simplified().unwrap();
-        let key = NamedCompositionKey {
-            composite: CompositeKey::new("downstream.example", 1)
-                .with_attribute("enabled", CompositeAttribute::Boolean(true)),
-            input_types: vec![boundary_type.clone()],
-            output_types: vec![boundary_type],
-        };
-        let trace_count = Cell::new(0);
-        let mut registry = NamedCompositionFunctionMap::default();
-        for _ in 0..2 {
-            let function = registry
-                .require(key.clone(), || {
-                    trace_count.set(trace_count.get() + 1);
-                    Ok(program.clone())
-                })
-                .unwrap();
-            assert_eq!(function.symbol(), "downstream.example");
-        }
-
-        assert_eq!(trace_count.get(), 1);
-        assert_eq!(registry.functions.len(), 1);
-        assert_eq!(registry.order.len(), 1);
-    }
-
-    #[test]
-    fn test_named_composition_function_map_require_suffixes_shared_names() {
-        // Keys that share a composite name but differ in their boundary types receive distinct symbols, suffixed with
-        // the number of earlier keys of that name.
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![4.into()]));
-        let composite = CompositeKey::new("downstream.example", 1);
-        let mut registry = NamedCompositionFunctionMap::default();
-        for boundary_type in [scalar_type.clone(), vector_type.clone(), scalar_type.clone()] {
-            let (_, program) = DomainTracingContext::<Session>::trace(
-                |inputs: Vec<Tracer>| Ok(inputs),
-                vec![Type::from(boundary_type.clone())],
-            )
-            .unwrap();
-            let key = NamedCompositionKey::new(composite.clone(), vec![boundary_type.clone()], vec![boundary_type]);
-            registry.require(key, || Ok(program.into_simplified().unwrap())).unwrap();
-        }
-
-        assert_eq!(
-            registry.functions().map(NamedCompositionFunction::symbol).collect::<Vec<_>>(),
-            vec!["downstream.example", "downstream.example_1"],
-        );
-        assert_eq!(registry.order[1].input_types, vec![vector_type]);
     }
 }

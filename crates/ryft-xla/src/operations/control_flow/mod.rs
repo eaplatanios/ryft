@@ -3,9 +3,9 @@ use std::rc::Rc;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, CONDITION_OPERATION_NAME, ConditionOperation, CustomCallOperation, DataType, Dimension, EagerContext,
-    EffectClass, EffectClasses, FlatProgram, GuardOperation, IotaOperation, MeshAxisType, OneOperation, Parameterized,
-    Program, ProgramError, RngBitGeneratorOperation, SCAN_OPERATION_NAME, ScanOperation, Shape, Typed, TypedProgram,
-    WHILE_OPERATION_NAME, WhileOperation, ZeroOperation,
+    EffectClass, EffectClasses, FlatProgram, GuardOperation, IotaOperation, MeshAxisType, OneOperation,
+    Operation as CoreOperation, Parameterized, Program, ProgramError, RngBitGeneratorOperation, SCAN_OPERATION_NAME,
+    ScanOperation, Shape, Typed, TypedProgram, WHILE_OPERATION_NAME, WhileOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -22,7 +22,7 @@ use crate::lowering::types::{
 use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::call::CallFunctionMap;
-use crate::{Constant, Error, ProgramLoweringOperation, Type};
+use crate::{Constant, Error, Lowerer, LoweringError, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -30,6 +30,54 @@ pub(crate) mod condition;
 pub(crate) mod scan;
 pub(crate) mod select;
 pub(crate) mod r#while;
+
+impl<O: CoreOperation<Type = Type>> Lowerer<'_, '_, '_, O> {
+    /// Validates the instruction boundary of a branch or loop whose regions must agree on the placement of their
+    /// inputs and outputs. Shardy cannot enforce that agreement for a value that carries a pending reduction on a mesh
+    /// with an auto axis, because the value's type does not record its placement along the auto axis. A loop over a
+    /// split value could then count its contributions twice, and Shardy can reject a replicated value for dropping an
+    /// unreduced axis. Axes bound by an enclosing manual region are excluded from the check.
+    ///
+    /// Call this from a control-flow operation's lowering before emitting its regions. The built-in condition, while,
+    /// and scan lowerers apply it, including scans that admit no iterations or are fully unrolled.
+    /// `operation` names the operation in the diagnostic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoweringError::UnsupportedOperation`] when an input or output has both an unbound pending
+    /// reduction and an unbound auto mesh axis.
+    pub fn validate_pending_reductions_across_regions(
+        &self,
+        operation: &str,
+        input_types: &[Type],
+        output_types: &[Type],
+    ) -> Result<(), Error> {
+        let bound_manual_axes = self.lowering_context().bound_manual_axes();
+        let unbound = |axis: &str| !bound_manual_axes.iter().any(|bound| bound == axis);
+        for r#type in input_types.iter().chain(output_types) {
+            let Type::Array(r#type) = r#type else { continue };
+            let Some(sharding) = r#type.sharding() else { continue };
+            let pending = sharding.unreduced_axes().iter().any(|axis| unbound(axis));
+            let has_auto_axes = sharding
+                .mesh()
+                .axes()
+                .iter()
+                .any(|axis| axis.r#type() == MeshAxisType::Auto && unbound(axis.name()));
+            if pending && has_auto_axes {
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: operation.to_string(),
+                    reason: format!(
+                        "a value of type `{type}` with a pending reduction cannot cross its regions on the mesh `{}`, which \
+                         also has auto mesh axes, along which no type records where the value is; complete the reduction \
+                         before the operation (e.g., with `reshard`), or use a mesh whose axes are all explicit",
+                        sharding.mesh(),
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Lowers the input relationship guard of a region invoked with `values` of the `actual_types`, before any conversion
 /// to the region's declared input types. Lowering retypes each region input independently, so a relationship between

@@ -76,28 +76,6 @@ impl MemoryLoweringExtension for Memory {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Rejects known unsupported input and output memory placements at the executable boundary for `target_platform`.
-///
-/// The bundled CUDA and ROCm plugins share XLA's [StreamExecutor executable memory handling]. It supports pinned
-/// host memory at executable boundaries. The plugins can also allocate unpinned host buffers for transfers, so
-/// device memory discovery alone cannot validate an executable signature. For other targets, compilation through a
-/// [`Session`](crate::Session) checks the input and output memory kinds that the compiled executable reports, when
-/// the plugin provides them.
-///
-/// # Errors
-///
-/// Returns [`LoweringError::UnsupportedBoundaryMemory`] for unpinned host memory at a CUDA or ROCm boundary.
-///
-/// [StreamExecutor executable memory handling]: https://github.com/openxla/xla/blob/aaed3e0327d520ee375451ca42dd239ee40a50e6/xla/pjrt/se/stream_executor_executable.cc#L258-L341
-pub(crate) fn validate_boundary_memory(memory: Memory, target_platform: Option<&str>) -> Result<(), Error> {
-    if memory == (Memory::Host { pinned: false })
-        && let Some(platform @ ("cuda" | "rocm")) = target_platform
-    {
-        return Err(LoweringError::UnsupportedBoundaryMemory { memory, platform: platform.to_string() }.into());
-    }
-    Ok(())
-}
-
 /// Widens a logical signed one-bit integer to `i8`, recovering `-1` from StableHLO's predicate carrier.
 pub fn lower_signed_one_bit_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
     input: ValueRef<'b, 'c, 't>,
@@ -1015,33 +993,6 @@ mod tests {
     use crate::{ArrayConstant, ProgramLoweringExtension, ProgramLoweringOptions};
 
     use super::*;
-
-    #[test]
-    fn test_validate_boundary_memory() {
-        let unpinned = Memory::Host { pinned: false };
-        for target_platform in [None, Some("cpu"), Some("custom-plugin")] {
-            for memory in [Memory::Device, Memory::Host { pinned: true }, unpinned] {
-                assert_eq!(validate_boundary_memory(memory, target_platform), Ok(()));
-            }
-        }
-        for target_platform in ["cuda", "rocm"] {
-            assert_eq!(validate_boundary_memory(Memory::Device, Some(target_platform)), Ok(()));
-            assert_eq!(validate_boundary_memory(Memory::Host { pinned: true }, Some(target_platform)), Ok(()));
-            let error = validate_boundary_memory(unpinned, Some(target_platform)).unwrap_err();
-            assert!(matches!(
-                &error,
-                Error::Lowering(LoweringError::UnsupportedBoundaryMemory { memory, platform })
-                    if *memory == unpinned && platform == target_platform,
-            ));
-            assert_eq!(
-                error.to_string(),
-                format!(
-                    "programs compiled for platform `{target_platform}` cannot take or return values in \
-                         `Host[Unpinned]` memory"
-                ),
-            );
-        }
-    }
 
     #[test]
     fn test_lower_constant_output_memory_placement() {

@@ -82,6 +82,7 @@ impl LowerableOperation for WhileOperation<Type> {
         // The program that attaches the loop validated its regions, their signatures, and its input count, so a
         // mismatch here is an internal error, reported as the operation's own region contract and input count would
         // report it.
+        lowerer.validate_pending_reductions_across_regions(self.name(), input_types, output_types)?;
         self.validate_region_count(lowerer.regions().len())?;
         let (context, location) = (lowerer.context(), lowerer.location());
         let block = &mut lowerer.block();

@@ -1,9 +1,9 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, ConstrainShardingOperation, ProgramError};
+use ryft_core::{ArrayType, CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainShardingOperation, ProgramError, Sharding};
 use ryft_mlir::ValueRef;
 
-use crate::lowering::sharding::OpenDimensions;
-use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
+use crate::lowering::sharding::validate_declared_pending_reduction;
+use crate::{Error, LowerableOperation, Lowerer, OpenDimensions, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
@@ -15,22 +15,46 @@ impl LowerableOperation for ConstrainShardingOperation {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let _ = input_types;
-        // The constraint is untracked, so the output type is the input type, and the emitted constraint must
-        // carry the input's tracked placement alongside the constraint's own auto-axis placement. Unlike a tracked
-        // placement, the constraint does describe the placement along auto axes, so its dimensions stay closed.
         check_count!("input", input_values, 1, ProgramError);
+        check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let sharding = self.lowered_sharding(&output_types[0]).map_err(ProgramError::from)?;
-        let value = lowerer.lowering_context().lower_sharding_constraint(
-            &sharding,
+        // Add the constraint's auto-axis placement to the tracked placement that its input already carries.
+        let input_type = &input_types[0];
+        let declared = self.lowered_sharding(input_type).map_err(ProgramError::from)?;
+        let value = lower_declared_sharding_constraint(
+            lowerer,
             input_values[0],
-            OpenDimensions::None,
-            &mut lowerer.block(),
-            lowerer.location(),
+            input_type,
+            &declared,
+            CONSTRAIN_SHARDING_OPERATION_NAME,
         )?;
         Ok(vec![value])
     }
+}
+
+/// Constrains `value` to the placement `operation` declares, including its placement along auto axes.
+/// The pending reduction carried by `value` comes from `value_type` even when a call overrides its placement.
+///
+/// # Errors
+///
+/// Returns an error if the declared transition cannot be lowered (refer to [`validate_declared_pending_reduction`])
+/// or the sharding constraint cannot be emitted.
+pub(in crate::operations) fn lower_declared_sharding_constraint<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
+    lowerer: &Lowerer<'b, 'c, 't, O>,
+    value: ValueRef<'b, 'c, 't>,
+    value_type: &ArrayType,
+    declared: &Sharding,
+    operation: &str,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let context = lowerer.lowering_context();
+    validate_declared_pending_reduction(
+        declared,
+        value_type.sharding(),
+        value_type.data_type(),
+        context.bound_manual_axes(),
+        operation,
+    )?;
+    context.lower_sharding_constraint(declared, value, OpenDimensions::None, &mut lowerer.block(), lowerer.location())
 }
 
 #[cfg(test)]

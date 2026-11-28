@@ -6,12 +6,13 @@ use indoc::indoc;
 use pretty_assertions::assert_eq;
 
 use ryft_core::{
-    AddOperation, ArrayType, CompositeKey, DataType, MulOperation, Operation as CoreOperation, Placeholder,
-    ProgramBuilder, ProgramError, RegionInterface, TypeError,
+    AddOperation, ArrayType, CompositeKey, DataType, LogicalMesh, MeshAxis, MeshAxisType, MulOperation,
+    Operation as CoreOperation, Placeholder, ProgramBuilder, ProgramError, RegionInterface, SCAN_OPERATION_NAME,
+    Sharding, TypeError,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{AttributeRef, Block, Operation as MlirOperation, StringRef, Value as MlirValue, ValueRef};
-use ryft_xla::operations::NamedCompositionKey;
+use ryft_xla::lowering::NamedCompositionKey;
 use ryft_xla::{
     Constant, Error, LowerableOperation, Lowerer, Operation, ProgramLoweringExtension, ProgramLoweringOperation,
     ProgramLoweringOptions, Type, lower_operation_variants,
@@ -113,14 +114,48 @@ impl LowerableOperation for SquareOperation {
     }
 }
 
-/// Downstream operation family that extends the backend-owned XLA operations with [`TwiceOperation`] and
-/// [`SquareOperation`].
+/// Downstream identity that shares the diagnostic name of the built-in scan.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct IdentityOperation;
+
+impl CoreOperation for IdentityOperation {
+    type Type = Type;
+
+    fn name(&self) -> &'static str {
+        SCAN_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[Type],
+        region_interfaces: &[RegionInterface<Type>],
+    ) -> Result<Vec<Type>, TypeError> {
+        let _ = region_interfaces;
+        Ok(input_types.to_vec())
+    }
+}
+
+impl LowerableOperation for IdentityOperation {
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[Type],
+        output_types: &[Type],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (lowerer, input_types, output_types);
+        Ok(input_values.to_vec())
+    }
+}
+
+/// Downstream operation family that extends the backend-owned XLA operations with user-defined payloads.
 #[derive(Clone, Debug, ryft_macros::Operation)]
 #[ryft(crate = "ryft_core", type(Type), constant(Constant))]
 enum ExtendedOperation {
     Xla(Box<Operation>),
     Twice(TwiceOperation),
     Square(SquareOperation),
+    Identity(IdentityOperation),
 }
 
 impl LowerableOperation for ExtendedOperation {
@@ -136,6 +171,7 @@ impl LowerableOperation for ExtendedOperation {
             Xla => boxed,
             Twice,
             Square,
+            Identity,
         )
     }
 }
@@ -171,6 +207,39 @@ fn test_downstream_operation_family_lowers_through_the_public_api() {
               }
             }
         "},
+    );
+}
+
+#[test]
+fn test_downstream_operation_named_scan_carries_a_pending_reduction_without_regions() {
+    // The pending sum on the explicit axis may pass through an identity on a mixed mesh. The operation shares
+    // its diagnostic name with a built-in scan, whose region boundary would reject this input.
+    let mesh = LogicalMesh::new(vec![
+        MeshAxis::new("e", 2, MeshAxisType::Explicit).unwrap(),
+        MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+    ])
+    .unwrap();
+    let sharding = Sharding::replicated(mesh, 0).with_unreduced_axes(["e"]).unwrap();
+    let input_type = ArrayType::scalar(DataType::F32).with_sharding(sharding).unwrap();
+    let mut builder = ProgramBuilder::<Constant, ExtendedOperation>::new();
+    let input = builder.add_input(input_type.into());
+    let output = builder
+        .add_instruction(ExtendedOperation::Identity(IdentityOperation), Vec::new(), vec![input], None)
+        .unwrap()[0];
+    let program = builder
+        .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+        .unwrap();
+    assert_eq!(
+        program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap(),
+        indoc! {r#"
+            module {
+              sdy.mesh @mesh = <["e"=2, "a"=2]>
+              func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], unreduced={"e"}>}) -> (tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], unreduced={"e"}>}) {
+                %0 = sdy.sharding_constraint %arg0 <@mesh, [], unreduced={"e"}> : tensor<f32>
+                return %0 : tensor<f32>
+              }
+            }
+        "#},
     );
 }
 

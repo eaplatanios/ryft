@@ -211,7 +211,8 @@ use crate::devices::{PjrtDeviceExtension, devices_span_processes};
 use crate::sessions::synchronization::WorkReservation;
 use crate::types::DataTypeExtension;
 use crate::{
-    CompiledFunction, Constant, Error, FromPjrt, LoweringError, Operation, Options, Session, ToPjrt, Type, stage,
+    CompilationError, CompiledFunction, Constant, Error, FromPjrt, LoweringError, Operation, Options, Session, ToPjrt,
+    Type, stage,
 };
 
 /// Diagnostic message for a placement that can only combine contributions it must keep separate.
@@ -1806,6 +1807,7 @@ impl Array {
     ) -> Result<Option<Arc<Buffer<'static>>>, Error> {
         // A single-device program treats this buffer as an independent value, even when it holds only one
         // contribution to an unreduced array. Its input uses the buffer's existing layout.
+        let memory = input_type.memory();
         let input = Self::from_device_buffer(session, input_type.clone(), device, buffer)?;
         let output_type = input_type.clone().with_layout(layout.clone());
         let mut builder = ProgramBuilder::<Constant, Operation>::new();
@@ -1824,12 +1826,17 @@ impl Array {
             }
             Err(
                 Error::Lowering(
-                    LoweringError::UnsupportedOperation { .. }
-                    | LoweringError::UnsupportedElementType { .. }
-                    | LoweringError::UnsupportedBoundaryMemory { .. },
+                    LoweringError::UnsupportedOperation { .. } | LoweringError::UnsupportedElementType { .. },
                 )
+                | Error::Compilation(CompilationError::ExecutableMemoryKindMismatch { .. })
                 | Error::Pjrt(PjrtError::Unimplemented { .. } | PjrtError::MissingFunction { .. }),
             ) => Ok(None),
+            Err(Error::Pjrt(PjrtError::InvalidArgument { .. } | PjrtError::FailedPrecondition { .. }))
+                if matches!(memory, Memory::Host { .. }) =>
+            {
+                // PJRT may reject a host-memory signature before it can report executable memory kinds.
+                Ok(None)
+            }
             Err(error) => Err(error),
         }
     }
@@ -4224,8 +4231,9 @@ fn gathered_sharding(input: &Sharding, output: &Sharding, mesh: &LogicalMesh, ra
 ///   - **Introducing a Pending Sum:** No program of a placement does, because the planner introduces pending sums with
 ///     additive identities after a placement without them. This check validates only the completion of a pending
 ///     reduction of `input` along such an axis.
-///   - **Introducing a Pending Maximum or Minimum:** XLA cannot (refer to `validate_declared_pending_reduction` in
-///     `crate::lowering`, whose check would reject the program).
+///   - **Introducing a Pending Maximum or Minimum:** XLA cannot introduce these reductions.
+///     Lowering rejects the program in
+///     [`validate_declared_pending_reduction`](crate::lowering::sharding::validate_declared_pending_reduction).
 ///   - **Completing or Introducing a Completed Reduction:** This changes no value.
 ///   - **Partial Completions of Wider Sums:** A completion of a pending sum along some axes that keeps it along another
 ///     is declined as a whole where [`partial_completion_rejection`] rejects it (i.e., where the partial sums would be
@@ -4321,6 +4329,7 @@ mod tests {
     use ryft_core::{
         Array as CoreArray, ConvertElementType, Dimension, DimensionBounds, DimensionVariable, Shape, StridedLayout,
     };
+    use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
 
     use crate::arrays::tests::{
         explicit_mesh, first_device, pending_replicated_vector, place_through_entry_points, process_one_cpu_client,
@@ -6549,6 +6558,52 @@ mod tests {
         // Another layout converts every shard into that layout, which the result declares.
         let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
         let placed = source.place_storage(Memory::Device, Some(column_major.clone())).unwrap();
+        assert_eq!(placed.layout(), Some(&column_major));
+        assert_eq!(placed.copy_to_host_bytes().unwrap(), values);
+    }
+
+    #[test]
+    fn test_array_place_storage_falls_back_when_executable_memory_differs() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(client, "x", 1);
+        let memory = Memory::Host { pinned: false };
+        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let argument_shape = BufferSpecification::new(BufferType::F32, [2, 3]).proto().unwrap();
+        let result_shape = BufferSpecification::with_layout(BufferType::F32, [2, 3], column_major.to_pjrt().unwrap())
+            .proto()
+            .unwrap();
+
+        // Override the compiled layouts to use device memory. The on-device relayout requests unpinned host memory
+        // for its input and output, so the resulting executable cannot be used even though it compiled.
+        let options = CompilationOptions {
+            argument_layouts: vec![argument_shape],
+            executable_build_options: Some(ExecutableCompilationOptions {
+                result_shape: Some(result_shape),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let session = Session::builder().client(client).compilation_options(options).build().unwrap();
+        let r#type = ArrayType::new_static(DataType::F32, [2, 3]).with_memory(memory);
+        let values = values_to_bytes(&[1f32, 2., 3., 4., 5., 6.]);
+        let source = Array::from_host_buffer(&session, r#type.clone(), mesh, None, values.as_slice()).unwrap();
+        let shard = source.addressable_shards().next().unwrap();
+        let buffer = shard.buffer().unwrap();
+        let source_layout = Layout::from_pjrt(buffer.specification().unwrap().layout).unwrap();
+        assert_ne!(source_layout, column_major);
+        let converted = Array::try_relayout_shard_on_device(
+            &session,
+            shard.device(),
+            Arc::clone(buffer),
+            r#type.with_layout(source_layout),
+            &column_major,
+            &mut PlacementCompletion::default(),
+        )
+        .unwrap();
+        assert!(converted.is_none());
+
+        let placed = source.place_storage(Memory::Device, Some(column_major.clone())).unwrap();
+        assert_eq!(placed.r#type().memory(), Memory::Device);
         assert_eq!(placed.layout(), Some(&column_major));
         assert_eq!(placed.copy_to_host_bytes().unwrap(), values);
     }

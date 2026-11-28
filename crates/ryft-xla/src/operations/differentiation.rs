@@ -155,10 +155,11 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayOperation, AssertOperation, CaptureReference, Context, CosOperation, DataType,
-        DomainTracingContext, Error as CoreError, EverythingSavable, FlatProgram, Memory, MulOperation, NothingSavable,
-        Placeholder, PrintOperation, ProgramBuilder, ProgramError, RematerializationOptimizationBarrier,
-        ResidualPolicyReference, SaveAndOffloadOnlyTheseNames, SinOperation, StopGradient, TagOperation, TypedProgram,
-        Value, differentiate_at, rematerialize,
+        DomainTracingContext, Error as CoreError, EverythingSavable, FlatProgram, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, MulOperation, NothingSavable, Placeholder, PrintOperation, ProgramBuilder, ProgramError,
+        RematerializationOptimizationBarrier, ResidualPolicyReference, SaveAndOffloadOnlyTheseNames, Sharding,
+        ShardingDimension, SinOperation, StopGradient, TagOperation, TypedProgram, UnreducedKind, Value,
+        differentiate_at, rematerialize,
     };
 
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
@@ -489,6 +490,146 @@ mod tests {
                     .with_optimization_barrier(RematerializationOptimizationBarrier::None),
             ),
             unbarriered,
+        );
+    }
+
+    #[test]
+    fn test_rematerialize_operation_lower_preserves_pending_reductions_per_barrier_result() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("d", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let replicated = Sharding::replicated(mesh, 1);
+        let sum = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let max = sum.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
+        let lower = |shardings: [Sharding; 2]| {
+            let types = shardings
+                .each_ref()
+                .map(|sharding| test_vector_type(4).with_sharding(sharding.without_auto_axes()).unwrap());
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let [x, y] = types.clone().map(|r#type| builder.add_input(r#type.into()));
+            let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![x, x], None).unwrap()[0];
+            let body = builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![doubled, y], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap();
+
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let body = builder.import_region(body.entry_region_ref());
+            let inputs = types.map(|r#type| builder.add_input(r#type.into())).to_vec();
+            let operation =
+                RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable)).with_differentiated(true);
+            let outputs = builder
+                .add_instruction(Operation::Rematerialize(operation), vec![body], inputs, None)
+                .unwrap()
+                .to_vec();
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap();
+            program.to_rendered_mlir(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_shardings(shardings.to_vec())
+                    .with_output_shardings(shardings.to_vec()),
+            )
+        };
+
+        // The addition consumes the replicated result directly. The second result alone carries the pending sum
+        // over x and retains the split over d that only its input sharding records.
+        let split_sum = sum.with_dimensions(vec![ShardingDimension::sharded(["d"])]).unwrap();
+        assert_eq!(
+            lower([replicated, split_sum]).unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["d"=2, "x"=2]>
+                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], replicated={"x"}>}, %arg1: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"d"}], unreduced={"x"}>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], replicated={"x"}>}, tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"d"}], unreduced={"x"}>}) {
+                    %0 = sdy.sharding_constraint %arg1 <@mesh, [{"d"}], unreduced={"x"}> : tensor<4xf32>
+                    %1:2 = stablehlo.optimization_barrier %arg0, %0 : tensor<4xf32>, tensor<4xf32>
+                    %2 = stablehlo.add %1#0, %1#0 : tensor<4xf32>
+                    %3 = sdy.sharding_constraint %1#1 <@mesh, [{"d"}], unreduced={"x"}> : tensor<4xf32>
+                    return %2, %3 : tensor<4xf32>, tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+        assert!(matches!(
+            lower([sum, max]),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "stablehlo.optimization_barrier"
+                    && reason == "Shardy cannot represent pending reductions of different kinds `sum` and `max` on \
+                                  the results of one optimization barrier",
+        ));
+    }
+
+    #[test]
+    fn test_rematerialize_operation_lower_keeps_pending_reductions_off_effect_tokens() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sum = Sharding::replicated(mesh, 0).with_unreduced_axes(["x"]).unwrap();
+        let max = sum.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
+        let [sum_type, max_type] =
+            [sum, max].map(|sharding| ArrayType::scalar(DataType::F32).with_sharding(sharding).unwrap());
+        let rematerialize = RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable));
+
+        // The nested barrier must order the print of the max after the print of the sum. Only its tensor result
+        // carries the pending max.
+        let mut inner = ProgramBuilder::<Constant, Operation>::new();
+        let max = inner.add_input(max_type.clone().into());
+        let printed_max =
+            inner.add_instruction(PrintOperation::<ArrayType>::new("max"), Vec::new(), vec![max], None).unwrap()[0];
+        let inner = inner
+            .build::<Vec<Constant>, Vec<Constant>>(vec![printed_max], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut body = ProgramBuilder::<Constant, Operation>::new();
+        let inner = body.import_region(inner.entry_region_ref());
+        let sum = body.add_input(sum_type.clone().into());
+        let max = body.add_input(max_type.clone().into());
+        body.add_instruction(PrintOperation::<ArrayType>::new("sum"), Vec::new(), vec![sum], None).unwrap();
+        let output = body
+            .add_instruction(
+                Operation::Rematerialize(rematerialize.clone().with_differentiated(true)),
+                vec![inner],
+                vec![max],
+                None,
+            )
+            .unwrap()[0];
+        let body = body
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let inputs = [sum_type, max_type].map(|r#type| builder.add_input(r#type.into())).to_vec();
+        let output =
+            builder.add_instruction(Operation::Rematerialize(rematerialize), vec![body], inputs, None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let lowered = program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap();
+        assert_eq!(
+            lowered,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=2]>
+                  func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], unreduced={\"x\"}>}, \
+                      %arg1: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], unreduced=max{\"x\"}>}) -> \
+                      (tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], unreduced=max{\"x\"}>}) {
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = \
+                        {label = \"sum\"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, \
+                        dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f32>, \
+                        !stablehlo.token) -> !stablehlo.token
+                    %2 = sdy.sharding_constraint %arg0 <@mesh, [], unreduced={\"x\"}> : tensor<f32>
+                    %3:2 = stablehlo.optimization_barrier %arg1, %1 : tensor<f32>, !stablehlo.token
+                    %4 = stablehlo.custom_call @ryft.print(%3#0, %3#1) {api_version = 4 : i32, backend_config = \
+                        {label = \"max\"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, \
+                        dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f32>, \
+                        !stablehlo.token) -> !stablehlo.token
+                    %5 = sdy.sharding_constraint %3#0 <@mesh, [], unreduced=max{\"x\"}> : tensor<f32>
+                    return %5 : tensor<f32>
+                  }
+                }
+            "},
         );
     }
 

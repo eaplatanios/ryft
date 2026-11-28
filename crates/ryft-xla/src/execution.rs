@@ -292,11 +292,13 @@ impl ExecutionPlan {
                     })
                 })?;
                 if actual.as_ref() != expected {
-                    return Err(Error::Compilation(CompilationError::IncompatibleExecutable {
-                        reason: format!(
-                            "executable {kind} {index} uses memory kind `{actual}` but its type declares `{expected}`",
-                        ),
-                    }));
+                    return Err(CompilationError::ExecutableMemoryKindMismatch {
+                        kind,
+                        index,
+                        expected: expected.to_string(),
+                        actual: actual.to_string(),
+                    }
+                    .into());
                 }
             }
         }
@@ -2431,31 +2433,32 @@ mod tests {
             compilation_options.executable_build_options.as_mut().unwrap().result_shape = Some(result_shape.clone());
             session.compile_program(&lowered.with_compilation_options(compilation_options))
         };
-        let message = |result: Result<_, Error>| match result {
-            Err(error @ Error::Compilation(CompilationError::IncompatibleExecutable { .. })) => error.to_string(),
-            Err(error) => panic!("unexpected error: {error}"),
-            Ok(_) => panic!("conflicting executable memory unexpectedly accepted"),
-        };
-        assert_eq!(
-            message(compile(&host_type, &device_shape, &host_shape)),
-            "incompatible XLA executable: executable input 0 uses memory kind `device` but its type declares \
-             `pinned_host`",
-        );
-        assert_eq!(
-            message(compile(&device_type, &host_shape, &device_shape)),
-            "incompatible XLA executable: executable input 0 uses memory kind `pinned_host` but its type declares \
-             `device`",
-        );
-        assert_eq!(
-            message(compile(&host_type, &host_shape, &device_shape)),
-            "incompatible XLA executable: executable output 0 uses memory kind `device` but its type declares \
-             `pinned_host`",
-        );
-        assert_eq!(
-            message(compile(&device_type, &device_shape, &host_shape)),
-            "incompatible XLA executable: executable output 0 uses memory kind `pinned_host` but its type declares \
-             `device`",
-        );
+        for (r#type, argument_shape, result_shape, kind, expected, actual) in [
+            (&host_type, &device_shape, &host_shape, "input", "pinned_host", "device"),
+            (&device_type, &host_shape, &device_shape, "input", "device", "pinned_host"),
+            (&host_type, &host_shape, &device_shape, "output", "pinned_host", "device"),
+            (&device_type, &device_shape, &host_shape, "output", "device", "pinned_host"),
+        ] {
+            let Err(error) = compile(r#type, argument_shape, result_shape) else {
+                panic!("conflicting executable memory unexpectedly accepted");
+            };
+            assert_eq!(
+                error,
+                Error::Compilation(CompilationError::ExecutableMemoryKindMismatch {
+                    kind,
+                    index: 0,
+                    expected: expected.to_string(),
+                    actual: actual.to_string(),
+                }),
+            );
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "incompatible XLA executable: executable {kind} 0 uses memory kind `{actual}` but its type \
+                     declares `{expected}`"
+                ),
+            );
+        }
 
         // Overrides that agree with the declared memories are accepted, and the output occupies the declared memory.
         let compiled = compile(&host_type, &host_shape, &host_shape).unwrap();

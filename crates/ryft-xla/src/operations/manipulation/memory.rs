@@ -29,9 +29,9 @@ mod tests {
     use crate::lowering::tests::{ProgramBuilder, test_vector_type};
     use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, ArrayTracer, CompiledFunction, Constant, Error, LoweringError, ProgramLoweringExtension,
+        Array, ArrayConstant, ArrayTracer, CompiledFunction, Constant, ProgramLoweringExtension,
         ProgramLoweringOptions, Session, compile, trace_with_context,
     };
 
@@ -97,7 +97,6 @@ mod tests {
     #[test]
     fn test_transfer_to_memory_operation_lower_round_trip() {
         let client = execution_client();
-        let target_platform = client.platform_name().unwrap();
         let devices = client.addressable_devices().unwrap();
         let device = &devices[0];
         let device_kind = device.default_memory().unwrap().kind().unwrap().into_owned();
@@ -113,7 +112,6 @@ mod tests {
             let available =
                 device.addressable_memories().unwrap().iter().any(|memory| memory.kind().unwrap() == memory_kind);
             assert!(available, "execution device does not expose required memory kind `{memory_kind}`");
-            let host_type = input_type.clone().with_memory(memory);
             let values = [i64::MIN, i64::MAX, 9_007_199_254_740_993, -9_007_199_254_740_993];
             let source = Array::from_host_buffer(
                 &engine,
@@ -133,7 +131,7 @@ mod tests {
                 mesh.clone(),
             )
             .unwrap();
-            let output = round_trip.executable().execute(&engine, source.clone()).unwrap();
+            let output = round_trip.executable().execute(&engine, source).unwrap();
             assert_eq!(output.r#type().as_ref(), &input_type);
             let buffer = output.device_shard(device_id).unwrap().buffer().unwrap();
             assert_eq!(buffer.memory().unwrap().kind().unwrap(), device_kind);
@@ -141,37 +139,35 @@ mod tests {
                 values_from_bytes::<i64>(buffer.copy_to_host(None).unwrap().r#await().unwrap().as_slice()),
                 values,
             );
+        }
+    }
 
-            // CUDA and ROCm can hold unpinned host buffers, but their StreamExecutor executables require pinned
-            // host memory at program boundaries.
-            if matches!(target_platform.as_ref(), "cuda" | "rocm") && memory == (Memory::Host { pinned: false }) {
-                let to_host: Result<CompiledFunction<ArrayType, ArrayType>, Error> = compile(
-                    |input| input.transfer_to_memory(memory).unwrap(),
-                    input_type.clone(),
-                    &engine,
-                    mesh.clone(),
-                );
-                assert!(matches!(
-                    to_host,
-                    Err(Error::Lowering(LoweringError::UnsupportedBoundaryMemory { memory: actual, platform }))
-                        if actual == memory && platform == target_platform.as_ref(),
-                ));
-                let identity: Result<CompiledFunction<ArrayType, ArrayType>, Error> =
-                    compile(|input| input, host_type, &engine, mesh.clone());
-                assert!(matches!(
-                    identity,
-                    Err(Error::Lowering(LoweringError::UnsupportedBoundaryMemory { memory: actual, platform }))
-                        if actual == memory && platform == target_platform.as_ref(),
-                ));
-                continue;
-            }
+    #[test]
+    fn test_transfer_to_memory_operation_lower_host_boundaries() {
+        let client = cpu_client(1);
+        let devices = client.addressable_devices().unwrap();
+        let device = &devices[0];
+        let device_kind = device.default_memory().unwrap().kind().unwrap().into_owned();
+        let device_id = device.id().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let engine = Session::builder().client(client).build().unwrap();
+        let input_type = ArrayType::new_static(DataType::I64, [4])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let values = [i64::MIN, i64::MAX, 9_007_199_254_740_993, -9_007_199_254_740_993];
+        let source =
+            Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), None, values_to_bytes(&values)).unwrap();
 
+        for (memory, memory_kind) in
+            [(Memory::Host { pinned: true }, "pinned_host"), (Memory::Host { pinned: false }, "unpinned_host")]
+        {
+            let host_type = input_type.clone().with_memory(memory);
             // A compiled host output must occupy the requested host memory, not just carry host metadata on a device
             // buffer.
             let to_host: CompiledFunction<ArrayType, ArrayType> =
                 compile(|input| input.transfer_to_memory(memory).unwrap(), input_type.clone(), &engine, mesh.clone())
                     .unwrap();
-            let host = to_host.executable().execute(&engine, source).unwrap();
+            let host = to_host.executable().execute(&engine, source.clone()).unwrap();
             assert_eq!(host.r#type().as_ref(), &host_type);
             let buffer = host.device_shard(device_id).unwrap().buffer().unwrap();
             assert_eq!(buffer.memory().unwrap().kind().unwrap(), memory_kind);
@@ -232,19 +228,11 @@ mod tests {
             // An explicit transfer isolates the output check because the input stays in device memory.
             let to_host =
                 trace_with_context(|_, input: ArrayTracer| input.transfer_to_memory(memory), input_type).unwrap();
-            for platform in ["cuda", "rocm"] {
+            let expected_to_host = to_host.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
+            for platform in ["cuda", "rocm", "custom-plugin"] {
                 let options = ProgramLoweringOptions::new().with_target_platform(Some(platform));
-                let lowered = program.to_rendered_mlir("main", &options);
-                if memory == (Memory::Host { pinned: true }) {
-                    assert_eq!(lowered.unwrap(), expected);
-                } else {
-                    let error = Err(Error::Lowering(LoweringError::UnsupportedBoundaryMemory {
-                        memory,
-                        platform: platform.to_string(),
-                    }));
-                    assert_eq!(lowered, error);
-                    assert_eq!(to_host.to_rendered_mlir("main", &options), error);
-                }
+                assert_eq!(program.to_rendered_mlir("main", &options).unwrap(), expected);
+                assert_eq!(to_host.to_rendered_mlir("main", &options).unwrap(), expected_to_host);
             }
         }
     }
