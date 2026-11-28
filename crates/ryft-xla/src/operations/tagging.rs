@@ -30,7 +30,7 @@ mod tests {
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
     use crate::Session;
-    use crate::lowering::states::ProgramLoweringContext;
+    use crate::lowering::contexts::ProgramLoweringContext;
     use crate::lowering::types::ArrayTypeLoweringExtension;
 
     use super::*;

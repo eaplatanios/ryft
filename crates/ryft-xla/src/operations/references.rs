@@ -106,7 +106,7 @@ mod tests {
     use ryft_mlir::{Block, Context as MlirContext, Location};
 
     use crate::Session;
-    use crate::lowering::states::ProgramLoweringContext;
+    use crate::lowering::contexts::ProgramLoweringContext;
 
     use super::*;
 

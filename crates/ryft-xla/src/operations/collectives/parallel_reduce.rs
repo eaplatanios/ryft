@@ -7,7 +7,7 @@ use ryft_mlir::{
 };
 
 use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
-use crate::lowering::states::ProgramLoweringContext;
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat};
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
@@ -171,7 +171,7 @@ impl ParallelReduceOperationLoweringExtension for ParallelReduceOperation {
         let result = block.append_operation(stable_hlo::all_reduce(
             &[input_value],
             stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-            Some(lowering_context.next_channel_id()),
+            Some(lowering_context.allocate_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             true,
             computation,

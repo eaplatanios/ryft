@@ -10,7 +10,7 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::states::ProgramLoweringContext;
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_constant_output, lower_u64_scalar_constant,
     physical_bound_type,
@@ -137,7 +137,7 @@ fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let replica_groups = context.dense_i64_elements_attribute(replica_group_type, replica_group_values.as_slice())?;
-    let channel_id = lowering_context.next_channel_id();
+    let channel_id = lowering_context.allocate_channel_id();
     let channel_id = i64::try_from(channel_id).map_err(|_| {
         ProgramError::MalformedProgram(format!(
             "`parallel_ragged_all_to_all` channel id {channel_id} cannot be represented as an `i64` backend \

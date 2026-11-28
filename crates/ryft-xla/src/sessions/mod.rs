@@ -129,7 +129,6 @@ use crate::compilation::programs::EagerDispatchProgram;
 use crate::lowering::emissions::{
     emitted_regions, emitted_regions_entering_calls, omits_operation_regions, partition_region_session_constants,
 };
-use crate::lowering::modules::render_devices;
 use crate::lowering::programs::{RegionPlacementRequestsExtension, merge_requested_placement};
 use crate::operations::call::{CallEagerExtension, EagerCallDecision};
 use crate::operations::composites::NamedCompositeImplementation;
@@ -1193,8 +1192,7 @@ impl Session {
         }
 
         // Arrays produced by the same program, or cloned from one array, share their mesh allocation, so pointer
-        // equality settles the common case without comparing devices. Devices are rendered with their processes
-        // (refer to `render_devices`).
+        // equality settles the common case without comparing devices.
         let shares_devices =
             |mesh: &DeviceMesh, other: &DeviceMesh| std::ptr::eq(mesh, other) || mesh.devices() == other.devices();
         if let Some(first) = inputs.first() {
@@ -1203,11 +1201,11 @@ impl Session {
                 let mesh = input.mesh();
                 if !shares_devices(mesh, first_mesh) {
                     return Err(invalid_argument(format!(
-                        "received incompatible devices for eager XLA execution: input #{} is placed on devices {} \
-                         but input #0 is placed on devices {}",
+                        "received incompatible devices for eager XLA execution: input #{} is placed on devices [{}] \
+                         but input #0 is placed on devices [{}]",
                         index,
-                        render_devices(mesh.devices()),
-                        render_devices(first_mesh.devices()),
+                        mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+                        first_mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
                     )));
                 }
             }
@@ -1228,11 +1226,11 @@ impl Session {
             if !shares_devices(mesh, reference_mesh) {
                 return Err(invalid_argument(format!(
                     "received incompatible devices for eager XLA execution: captured array #{} is placed on devices \
-                     {} but {} is placed on devices {}",
+                     [{}] but {} is placed on devices [{}]",
                     index,
-                    render_devices(mesh.devices()),
+                    mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
                     reference,
-                    render_devices(reference_mesh.devices()),
+                    reference_mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
                 )));
             }
         }
@@ -1479,8 +1477,8 @@ impl Context for Session {
         };
 
         // The intrinsic operation effects alone would miss state carried by regions, while effect scans alone
-        // would miss a pure pass-through or capture of a reference type. See `contains_unresolved_state` and
-        // `contains_unresolved_references` in the lowering module for the corresponding admission checks.
+        // would miss a pure pass-through or capture of a reference type. The corresponding program checks are
+        // `ProgramLoweringAnalysisExtension::contains_unresolved_state` and `contains_unresolved_references`.
         if operation.effects().classes().contains(EffectClass::OrderedState)
             || computation_regions().any(|region| {
                 region.atoms().iter().any(|atom| atom.r#type().is_reference())
@@ -1780,11 +1778,11 @@ impl Context for Session {
                     |other: &DeviceMesh| std::ptr::eq(other, mesh) || other.devices() == mesh.devices();
                 let incompatible = |label: String, other: &DeviceMesh| ProgramError::InvalidArgument {
                     message: format!(
-                        "received incompatible devices for eager XLA execution: {} is committed to devices {} \
-                         but the session mesh is on devices {}",
+                        "received incompatible devices for eager XLA execution: {} is committed to devices [{}] \
+                         but the session mesh is on devices [{}]",
                         label,
-                        render_devices(other.devices()),
-                        render_devices(mesh.devices()),
+                        other.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+                        mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
                     ),
                 };
 
@@ -1901,11 +1899,11 @@ impl Context for Session {
             {
                 return Err(ProgramError::InvalidArgument {
                     message: format!(
-                        "received incompatible devices for eager XLA execution: uncommitted input #{} on devices {} \
-                         cannot move onto the session mesh on devices {}",
+                        "received incompatible devices for eager XLA execution: uncommitted input #{} on devices [{}] \
+                         cannot move onto the session mesh on devices [{}]",
                         index,
-                        render_devices(input.mesh().devices()),
-                        render_devices(target.devices()),
+                        input.mesh().devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+                        target.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
                     ),
                 });
             }

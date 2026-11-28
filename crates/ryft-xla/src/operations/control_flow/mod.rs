@@ -13,10 +13,10 @@ use ryft_mlir::{
     Type as MlirType, TypeRef, Value as MlirValue, ValueRef,
 };
 
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::emissions::emitted_regions;
 use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::sharding::OpenDimensions;
-use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, dimension_extent_i64, lower_unplaced_constant_output, physical_bound_type,
 };

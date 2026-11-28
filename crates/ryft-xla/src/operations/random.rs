@@ -287,7 +287,7 @@ mod tests {
     };
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
-    use crate::lowering::states::ProgramLoweringContext;
+    use crate::lowering::contexts::ProgramLoweringContext;
     use crate::lowering::tests::{MixedValue, ProgramBuilder, execute_mixed_program, unproject_plain_program};
     use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::operations::Operation;

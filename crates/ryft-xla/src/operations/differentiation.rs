@@ -114,7 +114,7 @@ impl LowerableOperation for RematerializeOperation<Type> {
         // Like composite bodies, rematerialized bodies have fresh tracing roots. They inherit only the session
         // constants visible in the enclosing scope.
         body.lower_inline(
-            lowering_context.session_values(captured_values),
+            lowering_context.session_constant_values(captured_values),
             &inputs,
             nested_functions,
             lowering_context,
@@ -163,7 +163,7 @@ mod tests {
 
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
-    use crate::lowering::states::ProgramLoweringContext;
+    use crate::lowering::contexts::ProgramLoweringContext;
     use crate::lowering::tests::test_vector_type;
     use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::operations::Operation;

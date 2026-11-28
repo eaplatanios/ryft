@@ -1,71 +1,14 @@
 //! Lowering of whole programs to StableHLO modules, including the entry function, its boundary attributes, the
 //! private functions that calls share, and the passes that run over the emitted module.
 
-use ryft_core::{
-    ArrayType, Device, Dimension, EffectClass, MeshAxisType, Parameterized, Program, Sharding, ShardingDimension,
-    Type as CoreType, Typed,
-};
+use ryft_core::Sharding;
 use ryft_mlir::{Module, Operation as MlirOperation, OperationPrintingFlags, WalkOrder, WalkResult};
 
-use crate::lowering::emissions::emitted_regions;
-use crate::lowering::states::ProgramLoweringContext;
-use crate::lowering::{LoweringError, ProgramLoweringOperation};
-use crate::{Constant, Error};
+use crate::Error;
+use crate::lowering::LoweringError;
+use crate::lowering::contexts::ProgramLoweringContext;
 
 // TODO(eaplatanios): Review this module.
-
-/// Returns `true` if any operation in a region of `program` that lowering emits (i.e., its entry region and the
-/// executed nested regions of that region) carries unresolved ordered state.
-///
-/// This scans those regions rather than consulting the effect summary of the program, because ordinary XLA cannot
-/// preserve state in any lowered region, including one whose effects the summary of its owner does not expose.
-/// Regions that lowering never reaches (e.g., the rule regions of composites, the transpose region of a `linear_call`,
-/// or the body of a scan that admits no iteration, refer to [`emitted_regions`], here for no target platform) are not
-/// part of the lowered module, so state in them is never lowered and cannot reject the program.
-pub(crate) fn contains_unresolved_state<ProgramInput, ProgramOutput, O: ProgramLoweringOperation>(
-    program: &Program<Constant, O, ProgramInput, ProgramOutput>,
-) -> bool
-where
-    ProgramInput: Parameterized<Constant>,
-    ProgramOutput: Parameterized<Constant>,
-{
-    emitted_regions(program.entry_region_ref(), None).any(|region| {
-        region
-            .instructions()
-            .iter()
-            .any(|instruction| instruction.operation().effects().classes().contains(EffectClass::OrderedState))
-    })
-}
-
-/// Returns `true` if `program` contains a reference-typed atom or a [`CoreOperation`](ryft_core::Operation) whose
-/// [effects](ryft_core::Operation::effects) declare a [`ReferenceEffect`](ryft_core::ReferenceEffect) in a region that
-/// lowering emits (i.e., its entry region and the executed nested regions of that region, refer to [`emitted_regions`],
-/// here for no target platform). Regions that lowering never reaches (e.g., the rule regions of composites, the
-/// transpose region of a `linear_call`, or the body of a scan that admits no iteration) are not part of the lowered
-/// module, so references in them neither need discharge nor reject the program.
-///
-/// This check is independent from [`contains_unresolved_state`], because a pure reference pass-through or a forwarded
-/// reference capture can carry reference values without executing a stateful instruction. Both predicates back the
-/// state checks that precede compilation and the two direct module lowering entry points. Eager binding, dispatch, and
-/// staging enforce their corresponding boundary invariants separately.
-pub(crate) fn contains_unresolved_references<ProgramInput, ProgramOutput, O: ProgramLoweringOperation>(
-    program: &Program<Constant, O, ProgramInput, ProgramOutput>,
-) -> bool
-where
-    ProgramInput: Parameterized<Constant>,
-    ProgramOutput: Parameterized<Constant>,
-{
-    // The atom scan dominates for every well-formed program, because reference operations always touch an atom of a
-    // reference type. The declaration scan is an independent check that still catches a core discharge bug which
-    // retyped the boundary atoms but left a reference operation behind.
-    emitted_regions(program.entry_region_ref(), None).any(|region| {
-        region.atoms().iter().any(|atom| atom.r#type().is_reference())
-            || region
-                .instructions()
-                .iter()
-                .any(|instruction| instruction.operation().effects().has_reference_effects())
-    })
-}
 
 /// Serializes one lowered module to StableHLO text, printing MLIR debug information (i.e., locations) exactly when
 /// the lowering constructed provenance locations specific to instructions. Modules without provenance keep the plain
@@ -96,82 +39,6 @@ pub(crate) fn serialize_lowered_module(
             ..OperationPrintingFlags::default()
         })
         .map_err(|error| ryft_mlir::Error::internal(format!("serialized module is not valid UTF-8: {error}")).into())
-}
-
-/// Renders `devices` as a list in diagnostics (e.g., `[0, 1]`), naming the process of each device that is not on
-/// process zero (e.g., `[0, 5@1]`, refer to the [`Display`](std::fmt::Display) implementation of [`Device`]), so that
-/// devices of different processes with the same identifier are told apart.
-pub(crate) fn render_devices(devices: &[Device]) -> String {
-    format!("[{}]", devices.iter().map(Device::to_string).collect::<Vec<_>>().join(", "))
-}
-
-/// Returns whether a broadcast from `input_type` to `output_type`, which maps each input axis to the corresponding
-/// entry of `output_axes`, changes the placement over explicit mesh axes and therefore requires an explicit output
-/// placement constraint.
-pub(crate) fn broadcast_changes_explicit_sharding(
-    input_type: &ArrayType,
-    output_type: &ArrayType,
-    output_axes: &[usize],
-) -> bool {
-    let Some(output_sharding) = output_type.sharding() else {
-        return false;
-    };
-    let input_sharding = input_type.sharding();
-    let uses_explicit_axis = |dimension: &ShardingDimension, sharding: &Sharding| match dimension {
-        ShardingDimension::Sharded(axis_names) => {
-            axis_names.iter().any(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Explicit))
-        }
-        ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
-    };
-    if input_sharding.is_none() {
-        return output_sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Explicit);
-    }
-    if let Some(input_sharding) = input_sharding
-        && input_sharding.mesh() != output_sharding.mesh()
-    {
-        return input_sharding
-            .mesh()
-            .axes()
-            .iter()
-            .chain(output_sharding.mesh().axes())
-            .any(|axis| axis.r#type() == MeshAxisType::Explicit);
-    }
-
-    let projected_input_sharding = input_sharding
-        .map(|sharding| sharding.with_broadcasted_dimensions(output_type.rank(), output_axes).unwrap())
-        .unwrap_or_else(|| Sharding::replicated(output_sharding.mesh().clone(), output_type.rank()));
-
-    // Even when the ranked placement labels are unchanged, expanding a unit dimension that is partitioned over an
-    // explicit mesh axis changes which partitions own the replicated values and must remain visible to Shardy.
-    let expands_explicit_dimension = output_axes.iter().copied().enumerate().any(|(input_axis, output_axis)| {
-        input_type.dimension(input_axis as isize) == Dimension::Static(1)
-            && output_type.dimension(output_axis as isize) != Dimension::Static(1)
-            && (uses_explicit_axis(&projected_input_sharding.dimensions()[output_axis], &projected_input_sharding)
-                || uses_explicit_axis(&output_sharding.dimensions()[output_axis], output_sharding))
-    });
-
-    expands_explicit_dimension || projected_input_sharding.conflicts_on_explicit_axes_with(output_sharding)
-}
-
-/// Returns whether a cast from `input_type` to `output_type` changes the placement that the type system tracks over
-/// explicit mesh axes and therefore emits a sharding constraint carrying its complete output sharding, like
-/// [`ReshardOperation`](ryft_core::ReshardOperation). Carrying an existing sharding forward requests no redistribution,
-/// and an output without a sharding is untracked rather than replicated. Type inference guarantees that the placement
-/// over auto and manual axes is unchanged, as documented on [`CastOperation`](ryft_core::CastOperation), so the emitted
-/// constraint never contradicts the type the program was checked against.
-pub(crate) fn cast_changes_explicit_placement(input_type: &ArrayType, output_type: &ArrayType) -> bool {
-    let Some(output_sharding) = output_type.sharding() else {
-        return false;
-    };
-    let has_explicit_axis =
-        |sharding: &Sharding| sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Explicit);
-    match input_type.sharding() {
-        None => has_explicit_axis(output_sharding),
-        Some(input_sharding) if input_sharding.mesh() != output_sharding.mesh() => {
-            has_explicit_axis(input_sharding) || has_explicit_axis(output_sharding)
-        }
-        Some(input_sharding) => input_sharding.conflicts_on_explicit_axes_with(output_sharding),
-    }
 }
 
 /// Removes every Shardy operation from `module` (refer to [`Module::remove_shardy_operations`]), for a plugin that
@@ -260,43 +127,15 @@ mod tests {
     use crate::lowering::{LoweringError, token_threaded_effects};
 
     use crate::lowering::tests::{
-        TEST_ARRAY_DOMAIN, add_reference_state, dynamic_dimension, linear_call_program,
-        lower_replicated_shard_map_body, neg_branch, scalar_bilinear_sin, scalar_linear_region,
-        scalar_quartic_plus_sin, shard_map_module, stateful_scan_program, test_manual_mesh, test_matrix_type,
-        test_vector_type, to_rendered_mlir_for_plain_program, unproject_plain_program,
+        TEST_ARRAY_DOMAIN, dynamic_dimension, lower_replicated_shard_map_body, neg_branch, scalar_bilinear_sin,
+        scalar_quartic_plus_sin, shard_map_module, test_manual_mesh, test_matrix_type, test_vector_type,
+        to_rendered_mlir_for_plain_program, unproject_plain_program,
     };
 
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
 
     use super::*;
     use crate::lowering::programs::{MlirProgram, ProgramLoweringExtension, ProgramLoweringOptions};
-
-    #[test]
-    fn test_contains_unresolved_state_ignores_dormant_regions() {
-        let stateful =
-            |extended| scalar_linear_region(&ArrayType::scalar(DataType::F32), extended, add_reference_state);
-
-        // State in the dormant transpose region of a `linear_call` is never lowered, unlike state in its forward
-        // region, and neither is state in the body of a scan that admits no iteration, unlike state in one that
-        // iterates.
-        assert!(!contains_unresolved_state(&linear_call_program(&stateful(false), &stateful(true))));
-        assert!(contains_unresolved_state(&linear_call_program(&stateful(true), &stateful(false))));
-        assert!(!contains_unresolved_state(&stateful_scan_program(0)));
-        assert!(contains_unresolved_state(&stateful_scan_program(1)));
-    }
-
-    #[test]
-    fn test_contains_unresolved_references_ignores_dormant_regions() {
-        let stateful =
-            |extended| scalar_linear_region(&ArrayType::scalar(DataType::F32), extended, add_reference_state);
-
-        // References in the dormant transpose region of a `linear_call` are never lowered, unlike references in its
-        // forward region, and neither are references in the body of a scan that admits no iteration.
-        assert!(!contains_unresolved_references(&linear_call_program(&stateful(false), &stateful(true))));
-        assert!(contains_unresolved_references(&linear_call_program(&stateful(true), &stateful(false))));
-        assert!(!contains_unresolved_references(&stateful_scan_program(0)));
-        assert!(contains_unresolved_references(&stateful_scan_program(1)));
-    }
 
     #[test]
     fn test_lowered_module_new() {
@@ -1423,123 +1262,6 @@ mod tests {
                 }
             "#},
         );
-    }
-
-    #[test]
-    fn test_broadcast_changes_explicit_sharding() {
-        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let replicated = test_vector_type(4).with_sharding(Sharding::replicated(explicit_mesh.clone(), 1)).unwrap();
-        let explicitly_sharded = test_vector_type(4)
-            .with_sharding(Sharding::new(explicit_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
-            .unwrap();
-        assert!(broadcast_changes_explicit_sharding(&test_vector_type(4), &replicated, &[0]));
-        assert!(broadcast_changes_explicit_sharding(&replicated, &explicitly_sharded, &[0]));
-        assert!(!broadcast_changes_explicit_sharding(&explicitly_sharded, &explicitly_sharded, &[0]));
-
-        let first_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let second_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let first_mesh_replicated = test_vector_type(4).with_sharding(Sharding::replicated(first_mesh, 1)).unwrap();
-        let second_mesh_replicated = test_vector_type(4).with_sharding(Sharding::replicated(second_mesh, 1)).unwrap();
-        assert!(broadcast_changes_explicit_sharding(&first_mesh_replicated, &second_mesh_replicated, &[0]));
-
-        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let replicated = test_vector_type(4).with_sharding(Sharding::replicated(manual_mesh.clone(), 1)).unwrap();
-        let manually_sharded = test_vector_type(4)
-            .with_sharding(
-                Sharding::new(manual_mesh, vec![ShardingDimension::sharded(["x"])])
-                    .unwrap()
-                    .with_varying_manual_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        assert!(!broadcast_changes_explicit_sharding(&replicated, &manually_sharded, &[0]));
-
-        // Expanding a partitioned singleton and changing explicit reduction state both require constraints even when
-        // the ranked sharding dimensions themselves remain unchanged.
-        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let singleton = test_vector_type(1)
-            .with_sharding(Sharding::new(explicit_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
-            .unwrap();
-        let expanded = test_vector_type(4)
-            .with_sharding(Sharding::new(explicit_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
-            .unwrap();
-        assert!(broadcast_changes_explicit_sharding(&singleton, &expanded, &[0]));
-
-        let unreduced = test_vector_type(4)
-            .with_sharding(Sharding::replicated(explicit_mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap())
-            .unwrap();
-        let reduced = test_vector_type(4)
-            .with_sharding(Sharding::replicated(explicit_mesh, 1).with_reduced_axes(["x"]).unwrap())
-            .unwrap();
-        assert!(broadcast_changes_explicit_sharding(&unreduced, &reduced, &[0]));
-    }
-
-    #[test]
-    fn test_cast_changes_explicit_placement() {
-        let explicit_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
-        let resized_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
-        let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap()]).unwrap();
-        let extended_auto_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("b", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
-        let unsharded = ArrayType::new_static(DataType::F64, [4, 4]);
-        let placed = |mesh: &LogicalMesh, first: ShardingDimension| {
-            unsharded
-                .clone()
-                .with_sharding(Sharding::new(mesh.clone(), vec![first, ShardingDimension::replicated()]).unwrap())
-                .unwrap()
-        };
-        let sharded = |axes: &[&str]| ShardingDimension::sharded(axes.iter().copied());
-        let replicated = ShardingDimension::replicated;
-
-        // An output without a sharding stays untracked, whatever the input placement.
-        assert!(!cast_changes_explicit_placement(&unsharded, &unsharded));
-        assert!(!cast_changes_explicit_placement(&placed(&explicit_mesh, sharded(&["x"])), &unsharded));
-
-        // An unsharded input acquires a tracked placement only when the output mesh has explicit axes. Types record no
-        // placement over auto mesh axes, so the placements below are replicated over them.
-        assert!(cast_changes_explicit_placement(&unsharded, &placed(&explicit_mesh, replicated())));
-        assert!(!cast_changes_explicit_placement(&unsharded, &placed(&auto_mesh, replicated())));
-
-        // Carrying a mesh forward requests a redistribution only when the placement over explicit axes conflicts.
-        assert!(!cast_changes_explicit_placement(
-            &placed(&explicit_mesh, sharded(&["x"])),
-            &placed(&explicit_mesh, sharded(&["x"])),
-        ));
-        assert!(cast_changes_explicit_placement(
-            &placed(&explicit_mesh, sharded(&["x"])),
-            &placed(&explicit_mesh, sharded(&["y"])),
-        ));
-        assert!(cast_changes_explicit_placement(
-            &placed(&explicit_mesh, replicated()),
-            &placed(&explicit_mesh, sharded(&["x"])),
-        ));
-
-        // A mesh change requests one whenever either mesh has explicit axes, but never between auto-only meshes.
-        assert!(cast_changes_explicit_placement(
-            &placed(&explicit_mesh, replicated()),
-            &placed(&resized_mesh, replicated()),
-        ));
-        assert!(cast_changes_explicit_placement(
-            &placed(&explicit_mesh, replicated()),
-            &placed(&auto_mesh, replicated()),
-        ));
-        assert!(!cast_changes_explicit_placement(
-            &placed(&auto_mesh, replicated()),
-            &placed(&extended_auto_mesh, replicated()),
-        ));
     }
 
     #[test]

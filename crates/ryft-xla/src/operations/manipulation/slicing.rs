@@ -696,7 +696,7 @@ mod tests {
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::states::ProgramLoweringContext;
+    use crate::lowering::contexts::ProgramLoweringContext;
     use crate::lowering::tests::{
         ProgramBuilder, test_matrix_type, to_rendered_mlir_for_plain_program, unproject_plain_program,
     };

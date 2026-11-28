@@ -499,7 +499,7 @@ mod tests {
     };
     use ryft_mlir::{Context as MlirContext, Location};
 
-    use crate::lowering::states::ProgramLoweringContext;
+    use crate::lowering::contexts::ProgramLoweringContext;
     use crate::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, identity_branch, unproject_plain_program,
     };

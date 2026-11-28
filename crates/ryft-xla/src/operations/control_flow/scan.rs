@@ -32,8 +32,8 @@ use ryft_mlir::{
 };
 
 use crate::lowering::EffectTokens;
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::programs::ProgramInlineLoweringExtension;
-use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, TypeLoweringExtension, lower_constant_output, lower_static_index_constants,
     stable_hlo_dynamic_dimension_bound, static_dimensions,

@@ -42,8 +42,8 @@ mod tests {
     };
     use ryft_mlir::{Block, Context as MlirContext, Location, Operation as MlirOperation, Value as MlirValue};
 
+    use crate::lowering::contexts::ProgramLoweringContext;
     use crate::lowering::sharding::tests::{test_input_type, test_mesh};
-    use crate::lowering::states::ProgramLoweringContext;
     use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::operations::Operation;
     use crate::sessions::tests::two_device_mesh;

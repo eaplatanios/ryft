@@ -156,7 +156,7 @@ mod tests {
     use ryft_mlir::{Context as MlirContext, Location};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::states::ProgramLoweringContext;
+    use crate::lowering::contexts::ProgramLoweringContext;
     use crate::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, identity_branch, neg_branch, unproject_plain_program,
     };

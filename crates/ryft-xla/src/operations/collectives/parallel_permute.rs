@@ -3,7 +3,7 @@ use ryft_core::{ArrayType, Operation, ParallelPermuteOperation};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::lowering::states::ProgramLoweringContext;
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
 
@@ -69,7 +69,7 @@ impl ParallelPermuteOperationLoweringExtension for ParallelPermuteOperation {
         let result = block.append_operation(stable_hlo::collective_permute(
             input_value,
             source_target_pairs.as_slice(),
-            Some(lowering_context.next_channel_id()),
+            Some(lowering_context.allocate_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             location,
         )?)?;

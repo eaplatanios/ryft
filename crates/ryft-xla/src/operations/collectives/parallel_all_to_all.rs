@@ -7,7 +7,7 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::states::ProgramLoweringContext;
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::operations::collectives::{collapse_singleton_axis, refine_collective_result_dimensions};
@@ -160,7 +160,7 @@ impl ParallelAllToAllOperationLoweringExtension for ParallelAllToAllOperation {
             axis_size,
             concatenation_axis,
             stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-            Some(lowering_context.next_channel_id()),
+            Some(lowering_context.allocate_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             true,
             location,
@@ -491,7 +491,7 @@ mod tests {
                 (Err(Error::Core(error)), Some(expected)) => {
                     assert_eq!(error.as_ref(), &CoreError::Program(expected));
                     // Rejection happens before a channel is allocated, so the next channel is still the first one.
-                    assert_eq!(lowering_context.next_channel_id(), 1);
+                    assert_eq!(lowering_context.allocate_channel_id(), 1);
                 }
                 (result, expected) => panic!("{sharding}: expected {expected:?} but got {result:?}"),
             }

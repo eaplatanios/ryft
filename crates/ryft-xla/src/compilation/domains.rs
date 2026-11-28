@@ -35,7 +35,7 @@ use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::emissions::{
     collect_session_constants, emitted_capture_reads, emitted_regions, omits_regions, unread_entry_inputs,
 };
-use crate::lowering::modules::{contains_unresolved_references, contains_unresolved_state, value_shardings};
+use crate::lowering::modules::value_shardings;
 use crate::lowering::programs::{
     OutputShardingSource, ProgramLoweringAnalysisExtension, ProgramLoweringExtension, ProgramLoweringOptions,
     entry_output_shardings, entry_outputs_with_compiler_chosen_placement,
@@ -338,7 +338,7 @@ impl Session {
         }
         // Avoid cloning the dominant reference-free program path. Discharge returns such a program untouched with an
         // empty external state list, so the same metadata can cross the lowering boundary by borrow instead.
-        if !contains_unresolved_references(program) {
+        if !program.contains_unresolved_references() {
             return self.lower_verified_reference_free_program(
                 program,
                 capture_count,
@@ -366,7 +366,7 @@ impl Session {
         // The backend verifier remains independent from core discharge and runs before boundary projection,
         // partitioner selection, or StableHLO construction. The reference scan runs first so a malformed artifact
         // containing both a reference and ordered state receives the more precise reference diagnostic.
-        if contains_unresolved_references(discharged.program()) {
+        if discharged.program().contains_unresolved_references() {
             return Err(ProgramError::UnsupportedOperation {
                 message: "discharged program still contains references, which XLA lowering cannot represent"
                     .to_string(),
@@ -394,7 +394,7 @@ impl Session {
         options: &Options,
         function: bool,
     ) -> Result<ProgramLowering, Error> {
-        if contains_unresolved_state(program) {
+        if program.contains_unresolved_state() {
             return Err(ProgramError::UnsupportedOperation {
                 message: "discharged program still contains ordered state, which XLA lowering cannot represent"
                     .to_string(),

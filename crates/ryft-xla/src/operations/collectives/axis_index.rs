@@ -7,7 +7,7 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::states::ProgramLoweringContext;
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::types::{ArrayTypeLoweringExtension, lower_u64_scalar_constant};
 use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation};
 

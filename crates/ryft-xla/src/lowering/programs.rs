@@ -20,19 +20,17 @@ use ryft_mlir::{
 
 use crate::arrays::host::ReductionChange;
 use crate::devices::MemoryExtension;
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::emissions::{
-    collect_session_constants, lowers_without_regions, omits_regions, partition_session_constants, unread_entry_inputs,
+    collect_session_constants, emitted_regions, lowers_without_regions, omits_regions, partition_session_constants,
+    unread_entry_inputs,
 };
-use crate::lowering::modules::{
-    contains_unresolved_references, contains_unresolved_state, normalize_function_name, remove_shardy_operations,
-    render_devices, serialize_lowered_module,
-};
+use crate::lowering::modules::{normalize_function_name, remove_shardy_operations, serialize_lowered_module};
 use crate::lowering::reductions::{
     ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
     validate_pending_reduction_change,
 };
 use crate::lowering::sharding::{LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension};
-use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, TypeLoweringExtension, lower_runtime_dimension_size_i64,
     lower_unplaced_constant_output, validate_boundary_memory,
@@ -889,7 +887,7 @@ where
             return Err(Error::Lowering(LoweringError::VerificationFailure));
         }
 
-        if lowering_context.has_assertions() {
+        if lowering_context.requires_assertion_handler() {
             boundary_mapping.require_assertion_handler();
         }
 
@@ -1916,7 +1914,7 @@ impl ProgramBoundary {
     }
 }
 
-/// Prepares XLA programs for lowering and analyzes their entry placements.
+/// Prepares XLA programs for lowering and analyzes their effects, references, and placements.
 pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
     /// Operation family of the program.
     type Operation: ProgramLoweringOperation;
@@ -1935,6 +1933,18 @@ pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
     ///
     /// Returns the errors of [`Program::into_pruned`] and [`Program::into_simplified`].
     fn pruned_for_lowering(&self, target_platform: Option<&str>) -> Result<Self, ProgramError>;
+
+    /// Returns whether an instruction in a region that lowering emits declares ordered state. XLA cannot represent
+    /// state in any such region, including state omitted from the effect summary of the enclosing operation. This
+    /// checks the regions returned by [`emitted_regions`] without a target platform, skipping dormant rules and
+    /// bodies of scans that admit no iteration.
+    fn contains_unresolved_state(&self) -> bool;
+
+    /// Returns whether a region that lowering emits contains a reference-typed atom or an instruction
+    /// that declares a [`ReferenceEffect`](ryft_core::ReferenceEffect). This checks the same regions as
+    /// [`Self::contains_unresolved_state`]. Passing through a reference or forwarding a reference capture
+    /// can leave reference values in those regions even when no instruction declares ordered state.
+    fn contains_unresolved_references(&self) -> bool;
 
     /// Returns whether this program requests the placement of a value explicitly in any of the regions that lowering
     /// emits, through a `place` with a target, a `constrain_sharding`, or a `call` whose callee names devices (i.e.,
@@ -2039,6 +2049,29 @@ where
     #[inline]
     fn pruned_for_lowering(&self, target_platform: Option<&str>) -> Result<Self, ProgramError> {
         O::without_stale_call_meshes(self.clone().into_pruned()?.into_simplified()?, target_platform)
+    }
+
+    #[inline]
+    fn contains_unresolved_state(&self) -> bool {
+        emitted_regions(self.entry_region_ref(), None).any(|region| {
+            region
+                .instructions()
+                .iter()
+                .any(|instruction| instruction.operation().effects().classes().contains(EffectClass::OrderedState))
+        })
+    }
+
+    #[inline]
+    fn contains_unresolved_references(&self) -> bool {
+        // Checking declarations as well as atom types catches an incomplete discharge that retyped every atom but
+        // left a reference operation behind.
+        emitted_regions(self.entry_region_ref(), None).any(|region| {
+            region.atoms().iter().any(|atom| atom.r#type().is_reference())
+                || region
+                    .instructions()
+                    .iter()
+                    .any(|instruction| instruction.operation().effects().has_reference_effects())
+        })
     }
 
     #[inline]
@@ -2230,10 +2263,11 @@ where
 
         // XLA has no references or ordered state, so both must have been discharged from the program. References are
         // checked first, because a program with both gets the more precise diagnostic that way.
-        if contains_unresolved_references(self) {
+        if self.contains_unresolved_references() {
             return Err(Error::Lowering(LoweringError::UnresolvedReference { construct: "program".to_string() }));
         }
-        if contains_unresolved_state(self) {
+
+        if self.contains_unresolved_state() {
             return Err(Error::Lowering(LoweringError::UnresolvedState { construct: "program".to_string() }));
         }
 
@@ -2458,7 +2492,7 @@ where
                     lower_instruction_operation(operation, &mut lowerer, inputs, &input_types, &output_types)?;
 
                 if lowerer.effect_tokens.ordered_assertion.is_some() {
-                    lowering_context.record_assertion();
+                    lowering_context.require_assertion_handler();
                 }
 
                 *effect_tokens = lowerer.effect_tokens;
@@ -2563,10 +2597,10 @@ pub(crate) fn merge_requested_placement<'r>(
             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                 operation: operation.to_string(),
                 reason: format!(
-                    "it requests a placement onto the devices {}, while another placement request of the same \
-                     program names the devices {}, and the two do not form one mesh",
-                    render_devices(mesh.devices()),
-                    render_devices(first.devices()),
+                    "it requests a placement onto the devices [{}], while another placement request of the same \
+                     program names the devices [{}], and the two do not form one mesh",
+                    mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+                    first.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
                 ),
             }));
         }
@@ -2770,12 +2804,15 @@ mod tests {
         DimensionBounds, DimensionValue, DimensionVariable, DomainTracingContext, DotDimensionNumbers, EffectClass,
         Error as CoreError, FlatProgram, ImportingContext, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite,
         PLACE_OPERATION_NAME, Place, PlaceOperation, Placeholder, Placement, PlacementRequest, Print, ProgramBuilder,
-        ReshapeOperation, Reshard, ScaledDotOperation, ScanOperation, Shape, ShardMapOptions, Sharding,
-        ShardingDimension, Sin, StopGradient, Tag, TransferToMemory, TypeError, Typed, ValueProjection, shard_map,
+        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceWriteOperation, ReshapeOperation, Reshard,
+        ScaledDotOperation, ScanOperation, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin, StopGradient, Tag,
+        TransferToMemory, TypeError, Typed, ValueProjection, shard_map,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::tests::{dynamic_dimension, test_manual_mesh, test_sharding, test_vector_type};
+    use crate::lowering::tests::{
+        dynamic_dimension, linear_call_program, scalar_linear_region, test_manual_mesh, test_sharding, test_vector_type,
+    };
     use crate::sessions::tests::two_device_mesh;
     use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
@@ -2785,6 +2822,51 @@ mod tests {
     };
 
     use super::*;
+
+    /// Extends a [`scalar_linear_region`] with a reference that is allocated with its `value`, overwritten with its
+    /// `residual`, and frozen into its output.
+    fn add_reference_state(
+        builder: &mut ProgramBuilder<Constant, Operation>,
+        residual: AtomId,
+        value: AtomId,
+    ) -> AtomId {
+        let reference = builder
+            .add_instruction(Operation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![value], None)
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                Operation::ReferenceWrite(ReferenceWriteOperation::new()),
+                Vec::new(),
+                vec![reference, residual],
+                None,
+            )
+            .unwrap();
+        builder
+            .add_instruction(
+                Operation::ReferenceFreeze(ReferenceFreezeOperation::new()),
+                Vec::new(),
+                vec![reference],
+                None,
+            )
+            .unwrap()[0]
+    }
+
+    /// Builds a program whose scan of `length` iterations carries a scalar through a body that extends it with
+    /// reference state (refer to [`add_reference_state`]).
+    fn stateful_scan_program(length: usize) -> FlatProgram<Session> {
+        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let carry = builder.add_input(scalar_type.clone());
+        let output = add_reference_state(&mut builder, carry, carry);
+        let body = Arc::new(builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap());
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(scalar_type);
+        let regions = vec![builder.intern_callee(&body, None).unwrap()];
+        let scan = ScanOperation::<Type>::new(1, length);
+        let output = builder.add_instruction(scan, regions, vec![input], None).unwrap()[0];
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
 
     /// Traces a program over a sharded `f64[4]` input that invokes a `shard_map` over the manual mesh of two devices,
     /// whose body prints its local shard with the [`EffectClass::DeviceOrderedIo`] effect and whose only output is
@@ -3984,6 +4066,33 @@ mod tests {
                 ]
                 in (%1)"},
         );
+    }
+
+    #[test]
+    fn test_program_contains_unresolved_state() {
+        let stateful =
+            |extended| scalar_linear_region(&ArrayType::scalar(DataType::F32), extended, add_reference_state);
+
+        // State in the dormant transpose region of a `linear_call` is never lowered, unlike state in its forward
+        // region, and neither is state in the body of a scan that admits no iteration, unlike state in one that
+        // iterates.
+        assert!(!linear_call_program(&stateful(false), &stateful(true)).contains_unresolved_state());
+        assert!(linear_call_program(&stateful(true), &stateful(false)).contains_unresolved_state());
+        assert!(!stateful_scan_program(0).contains_unresolved_state());
+        assert!(stateful_scan_program(1).contains_unresolved_state());
+    }
+
+    #[test]
+    fn test_program_contains_unresolved_references() {
+        let stateful =
+            |extended| scalar_linear_region(&ArrayType::scalar(DataType::F32), extended, add_reference_state);
+
+        // References in the dormant transpose region of a `linear_call` are never lowered, unlike references in its
+        // forward region, and neither are references in the body of a scan that admits no iteration.
+        assert!(!linear_call_program(&stateful(false), &stateful(true)).contains_unresolved_references());
+        assert!(linear_call_program(&stateful(true), &stateful(false)).contains_unresolved_references());
+        assert!(!stateful_scan_program(0).contains_unresolved_references());
+        assert!(stateful_scan_program(1).contains_unresolved_references());
     }
 
     #[test]

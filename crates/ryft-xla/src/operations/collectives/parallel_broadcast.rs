@@ -7,8 +7,8 @@ use ryft_core::{
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::programs::ProgramInlineLoweringExtension;
-use crate::lowering::states::ProgramLoweringContext;
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Session, Tracer, Type};
 
@@ -144,7 +144,7 @@ impl ParallelBroadcastOperationLoweringExtension for ParallelBroadcastOperation 
             &[input_value],
             None,
             stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-            Some(lowering_context.next_channel_id()),
+            Some(lowering_context.allocate_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             location,
         )?)?;

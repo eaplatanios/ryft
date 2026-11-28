@@ -9,7 +9,7 @@ use ryft_mlir::{
 };
 
 use crate::arrays::host::{ReductionChange, compiled_reduction_rejection};
-use crate::lowering::states::ProgramLoweringContext;
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::operations::collectives::{collapse_singleton_axis, refine_collective_result_dimensions};
@@ -154,7 +154,7 @@ impl ParallelSumScatterOperationLoweringExtension for ParallelSumScatterOperatio
             input_value,
             self.scatter_axis(),
             stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-            Some(lowering_context.next_channel_id()),
+            Some(lowering_context.allocate_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             true,
             computation,

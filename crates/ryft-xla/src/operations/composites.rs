@@ -242,17 +242,15 @@ where
         // discarded, so they can never legally reference the enclosing function's captures, because the trace boundary
         // rejects bodies that register captures. Lowering the primal region with an empty capture namespace turns any
         // constant that references a capture and still sneaks in into a loud `MissingCapturedConstant` error instead of
-        // silently aliasing whatever value occupies the referenced slot of the enclosing capture prefix. Runtime arrays
-        // that such a body refers to are session constants instead, whose values are scoped to the module, so the
-        // empty namespace keeps them reachable. Only the primal region is lowered, because attached rule regions are
-        // dormant under lowering and retained rules are callbacks rather than regions. Regions traced as nested
-        // programs (i.e., those of `while`, `scan`, `condition`, and `linear_call`) share the enclosing capture scope
-        // and keep inheriting it.
+        // silently aliasing whatever value occupies the referenced slot of the enclosing capture prefix. The body
+        // inherits the session constant bindings visible in the enclosing scope. Lowering visits only the primal
+        // region because attached rules are dormant and retained rules are callbacks. Regions traced as nested programs
+        // (i.e., those of `while`, `scan`, `condition`, and `linear_call`) share the enclosing capture scope.
         let (block, location) = (lowerer.block(), lowerer.location());
         let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
             lowerer.split_effect_tokens();
         regions[0].lower_inline(
-            lowering_context.session_values(captured_values),
+            lowering_context.session_constant_values(captured_values),
             input_values,
             nested_functions,
             lowering_context,
@@ -412,8 +410,8 @@ mod tests {
     };
     use ryft_mlir::{Block, Context as MlirContext, Location};
 
+    use crate::lowering::contexts::ProgramLoweringContext;
     use crate::lowering::emissions::lowers_without_regions;
-    use crate::lowering::states::ProgramLoweringContext;
     use crate::lowering::tests::test_vector_type;
     use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;

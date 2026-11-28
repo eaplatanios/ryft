@@ -1,14 +1,14 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, CAST_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME, CastOperation, CastType,
-    ConvertElementTypeOperation, DataType, Dimension, ProgramError, ReducePrecisionOperation, ReductionKind, Shape,
+    ConvertElementTypeOperation, DataType, Dimension, MeshAxisType, ProgramError, ReducePrecisionOperation,
+    ReductionKind, Shape, Sharding,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::modules::cast_changes_explicit_placement;
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, lower_f64_constant_splat, lower_signed_one_bit_to_mlir, lower_unplaced_constant_output,
@@ -522,6 +522,27 @@ fn lower_cast<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         )?;
     }
     Ok(result)
+}
+
+/// Returns whether a cast from `input_type` to `output_type` changes the placement that the type system tracks over
+/// explicit mesh axes and therefore emits a sharding constraint carrying its complete output sharding, like
+/// [`ReshardOperation`](ryft_core::ReshardOperation). Carrying an existing sharding forward requests no redistribution,
+/// and an output without a sharding is untracked rather than replicated. Type inference guarantees that the placement
+/// over auto and manual axes is unchanged, as documented on [`CastOperation`](ryft_core::CastOperation), so the emitted
+/// constraint never contradicts the type the program was checked against.
+fn cast_changes_explicit_placement(input_type: &ArrayType, output_type: &ArrayType) -> bool {
+    let Some(output_sharding) = output_type.sharding() else {
+        return false;
+    };
+    let has_explicit_axis =
+        |sharding: &Sharding| sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Explicit);
+    match input_type.sharding() {
+        None => has_explicit_axis(output_sharding),
+        Some(input_sharding) if input_sharding.mesh() != output_sharding.mesh() => {
+            has_explicit_axis(input_sharding) || has_explicit_axis(output_sharding)
+        }
+        Some(input_sharding) => input_sharding.conflicts_on_explicit_axes_with(output_sharding),
+    }
 }
 
 /// Preserves rounding information in an intermediate `f32` before conversion to a lower precision float.
@@ -1152,7 +1173,7 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::states::ProgramLoweringContext;
+    use crate::lowering::contexts::ProgramLoweringContext;
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, shard_map_module, test_manual_mesh,
         to_rendered_mlir_for_plain_program,
@@ -4445,6 +4466,74 @@ mod tests {
                 None => assert_eq!(result.unwrap(), vec![source]),
             }
         }
+    }
+
+    #[test]
+    fn test_cast_changes_explicit_placement() {
+        let explicit_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let resized_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let extended_auto_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("b", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let unsharded = ArrayType::new_static(DataType::F64, [4, 4]);
+        let placed = |mesh: &LogicalMesh, first: ShardingDimension| {
+            unsharded
+                .clone()
+                .with_sharding(Sharding::new(mesh.clone(), vec![first, ShardingDimension::replicated()]).unwrap())
+                .unwrap()
+        };
+        let sharded = |axes: &[&str]| ShardingDimension::sharded(axes.iter().copied());
+        let replicated = ShardingDimension::replicated;
+
+        // An output without a sharding stays untracked, whatever the input placement.
+        assert!(!cast_changes_explicit_placement(&unsharded, &unsharded));
+        assert!(!cast_changes_explicit_placement(&placed(&explicit_mesh, sharded(&["x"])), &unsharded));
+
+        // An unsharded input acquires a tracked placement only when the output mesh has explicit axes. Types record no
+        // placement over auto mesh axes, so the placements below are replicated over them.
+        assert!(cast_changes_explicit_placement(&unsharded, &placed(&explicit_mesh, replicated())));
+        assert!(!cast_changes_explicit_placement(&unsharded, &placed(&auto_mesh, replicated())));
+
+        // Carrying a mesh forward requests a redistribution only when the placement over explicit axes conflicts.
+        assert!(!cast_changes_explicit_placement(
+            &placed(&explicit_mesh, sharded(&["x"])),
+            &placed(&explicit_mesh, sharded(&["x"])),
+        ));
+        assert!(cast_changes_explicit_placement(
+            &placed(&explicit_mesh, sharded(&["x"])),
+            &placed(&explicit_mesh, sharded(&["y"])),
+        ));
+        assert!(cast_changes_explicit_placement(
+            &placed(&explicit_mesh, replicated()),
+            &placed(&explicit_mesh, sharded(&["x"])),
+        ));
+
+        // A mesh change requests one whenever either mesh has explicit axes, but never between auto-only meshes.
+        assert!(cast_changes_explicit_placement(
+            &placed(&explicit_mesh, replicated()),
+            &placed(&resized_mesh, replicated()),
+        ));
+        assert!(cast_changes_explicit_placement(
+            &placed(&explicit_mesh, replicated()),
+            &placed(&auto_mesh, replicated()),
+        ));
+        assert!(!cast_changes_explicit_placement(
+            &placed(&auto_mesh, replicated()),
+            &placed(&extended_auto_mesh, replicated()),
+        ));
     }
 
     #[test]

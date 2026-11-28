@@ -9,8 +9,8 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::sharding::OpenDimensions;
-use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::values::ArrayLiteralLoweringExtension;
 use crate::lowering::{
     ArrayTypeLoweringExtension, MemoryLoweringExtension, lower_constant_output, physical_bound_type,
@@ -214,7 +214,8 @@ impl LowerableOperation for ConstantOperation<Array> {
         let _ = input_types;
         check_count!("input", input_values, 0, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let constant_value = self.value().lower_constant(&mut lowerer.block(), lowerer.context(), lowerer.location())?;
+        let constant_value =
+            self.value().lower_constant(&mut lowerer.block(), lowerer.context(), lowerer.location())?;
         Ok(vec![constant_value])
     }
 }

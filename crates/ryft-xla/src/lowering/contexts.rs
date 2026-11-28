@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -30,26 +30,19 @@ impl ProgramLoweringContext {
     pub(crate) fn new() -> Self {
         Self {
             state: Rc::new(ProgramLoweringContextState {
-                channel_ids: Rc::new(Cell::new(1)),
                 target_platform: None,
                 ragged_dot_lowering_strategy: RaggedDotLoweringStrategy::default(),
+                next_channel_id: Rc::new(Cell::new(1)),
                 named_compositions: Rc::default(),
+                mesh: Rc::default(),
                 has_provenance: Rc::new(Cell::new(false)),
-                has_assertions: Rc::new(Cell::new(false)),
+                requires_assertion_handler: Rc::new(Cell::new(false)),
                 runtime_requirements: Rc::new(RefCell::new(Vec::new())),
-                mesh: Rc::new(RefCell::new(None)),
                 manual_regions: Vec::new(),
                 bound_manual_axes: Vec::new(),
-                session_constants: Rc::default(),
+                session_constant_indices: Rc::default(),
             }),
         }
-    }
-
-    /// Makes the hidden entry inputs carrying `session_constants` reachable in this context.
-    pub(crate) fn with_session_constants(mut self, session_constants: &[RetainedArray]) -> Self {
-        let indices = session_constants.iter().enumerate().map(|(index, constant)| (constant.clone(), index)).collect();
-        Rc::make_mut(&mut self.state).session_constants = Rc::new(indices);
-        self
     }
 
     /// Returns this context carrying the PJRT platform name of the compilation target.
@@ -61,6 +54,14 @@ impl ProgramLoweringContext {
     /// Returns this context carrying the [`RaggedDotLoweringStrategy`] of the module.
     pub(crate) fn with_ragged_dot_lowering_strategy(mut self, strategy: RaggedDotLoweringStrategy) -> Self {
         Rc::make_mut(&mut self.state).ragged_dot_lowering_strategy = strategy;
+        self
+    }
+
+    /// Binds `session_constants` in the order their values appear at the end of the capture table. Hidden entry inputs
+    /// come first, followed by placeholders for arrays passed to callees that never read them.
+    pub(crate) fn with_session_constants(mut self, session_constants: &[RetainedArray]) -> Self {
+        let indices = session_constants.iter().enumerate().map(|(index, constant)| (constant.clone(), index)).collect();
+        Rc::make_mut(&mut self.state).session_constant_indices = Rc::new(indices);
         self
     }
 
@@ -77,10 +78,10 @@ impl ProgramLoweringContext {
 
     /// Returns the suffix of `captured_values` that holds the values of the session constants reachable in this scope.
     /// A scope whose `captured_values` table cannot hold them (e.g., a shared private function) has no such values.
-    pub(crate) fn session_values<'o, V>(&self, captured_values: &'o [V]) -> &'o [V] {
+    pub(crate) fn session_constant_values<'o, V>(&self, captured_values: &'o [V]) -> &'o [V] {
         captured_values
             .len()
-            .checked_sub(self.state.session_constants.len())
+            .checked_sub(self.state.session_constant_indices.len())
             .map_or(&[], |start| &captured_values[start..])
     }
 
@@ -105,10 +106,10 @@ impl ProgramLoweringContext {
         self.state.has_provenance.get()
     }
 
-    /// Returns `true` if lowering has emitted an assertion in this module.
+    /// Returns whether this module requires the runtime assertion handler.
     #[inline]
-    pub(super) fn has_assertions(&self) -> bool {
-        self.state.has_assertions.get()
+    pub(super) fn requires_assertion_handler(&self) -> bool {
+        self.state.requires_assertion_handler.get()
     }
 
     /// Returns the runtime requirements that lowering has recorded for this module so far.
@@ -122,13 +123,13 @@ impl ProgramLoweringContext {
     /// that lowering has emitted refers to a mesh.
     #[inline]
     pub(super) fn mesh(&self) -> Option<LogicalMesh> {
-        self.state.mesh.borrow().clone()
+        self.state.mesh.get().cloned()
     }
 
-    /// Records that lowering has emitted an assertion in this module.
+    /// Records that this module requires the runtime assertion handler.
     #[inline]
-    pub(super) fn record_assertion(&self) {
-        self.state.has_assertions.set(true);
+    pub(super) fn require_assertion_handler(&self) {
+        self.state.requires_assertion_handler.set(true);
     }
 
     /// Records `requirement` as a runtime requirement of this module.
@@ -157,23 +158,18 @@ impl ProgramLoweringContext {
     /// Returns [`LoweringError::MismatchedMeshTopology`] when the axis names or sizes of `mesh` differ from those of
     /// the recorded mesh, including in order.
     pub(crate) fn require_mesh(&self, mesh: &LogicalMesh) -> Result<(), Error> {
-        let mut recorded = self.state.mesh.borrow_mut();
-        match recorded.as_ref() {
-            Some(recorded) if !recorded.has_same_topology(mesh) => {
-                Err(Error::Lowering(LoweringError::MismatchedMeshTopology {
-                    expected: recorded.clone(),
-                    actual: mesh.clone(),
-                }))
-            }
-            Some(_) => Ok(()),
-            None => {
-                *recorded = Some(mesh.clone());
-                Ok(())
-            }
+        let recorded = self.state.mesh.get_or_init(|| mesh.clone());
+        if recorded.has_same_topology(mesh) {
+            Ok(())
+        } else {
+            Err(Error::Lowering(LoweringError::MismatchedMeshTopology {
+                expected: recorded.clone(),
+                actual: mesh.clone(),
+            }))
         }
     }
 
-    /// Returns the axes bound by every enclosing manual region, excluded from shard-local placement constraints.
+    /// Returns the axes bound by any enclosing manual region, excluded from shard-local placement constraints.
     #[inline]
     pub(crate) fn bound_manual_axes(&self) -> &[String] {
         &self.state.bound_manual_axes
@@ -206,14 +202,14 @@ impl ProgramLoweringContext {
     }
 
     /// Returns a fresh module-unique channel id for one channeled collective.
-    pub(crate) fn next_channel_id(&self) -> usize {
-        let channel_id = self.state.channel_ids.get();
-        self.state.channel_ids.set(channel_id + 1);
+    pub(crate) fn allocate_channel_id(&self) -> usize {
+        let channel_id = self.state.next_channel_id.get();
+        self.state.next_channel_id.set(channel_id + 1);
         channel_id
     }
 
     /// Derives a child context whose innermost manual region binds the axes of `boundary`. The body is isolated from
-    /// above, so its operations cannot use the enclosing scope's hidden entry inputs for session constants.
+    /// above, so its operations cannot use the enclosing scope's session constant bindings.
     pub(crate) fn enter_manual_region(&self, boundary: ShardMapBoundary) -> Self {
         let mut child = self.clone();
         let state = Rc::make_mut(&mut child.state);
@@ -223,7 +219,7 @@ impl ProgramLoweringContext {
             }
         }
         state.manual_regions.push(Rc::new(boundary));
-        state.session_constants = Rc::default();
+        state.session_constant_indices = Rc::default();
         child
     }
 
@@ -266,12 +262,12 @@ impl ProgramLoweringContext {
         constant: &RetainedArray,
         captured_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-        let values = self.session_values(captured_values);
+        let values = self.session_constant_values(captured_values);
         self.state
-            .session_constants
+            .session_constant_indices
             .get(constant)
             .copied()
-            .filter(|_| values.len() == self.state.session_constants.len())
+            .filter(|_| values.len() == self.state.session_constant_indices.len())
             .map(|index| values[index])
             .ok_or_else(|| {
                 Error::Lowering(LoweringError::UnreachableSessionConstant { constant: constant.to_string() })
@@ -321,9 +317,6 @@ impl ProgramLoweringContext {
 /// resources that all scopes update while emitting the module.
 #[derive(Clone)]
 struct ProgramLoweringContextState {
-    /// Module-scoped counter producing the next collective channel id.
-    channel_ids: Rc<Cell<usize>>,
-
     /// PJRT platform name of the compilation target (e.g., `"cuda"` or `"cpu"`), or `None` when the lowering has no
     /// target information. Lowerings that depend on the platform, such as fused attention, consult this and fall back
     /// to their portable form when it is absent.
@@ -332,9 +325,15 @@ struct ProgramLoweringContextState {
     /// Backend representation used to lower ragged dots in this module.
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
 
+    /// Next unused collective channel ID in this module.
+    next_channel_id: Rc<Cell<usize>>,
+
     /// Private decompositions of the named StableHLO composites that the emitted operations of every nested lowering
     /// scope refer to, which the module emits.
     named_compositions: Rc<RefCell<NamedCompositionFunctionMap>>,
+
+    /// First mesh recorded for a sharding in this module. Subsequent shardings must use the same topology.
+    mesh: Rc<OnceCell<LogicalMesh>>,
 
     /// Flag of the module recording whether any recursive lowering path constructed a location specific to an
     /// instruction (i.e., not the base location) from a known [`Provenance`]. It selects the module serialization mode
@@ -343,26 +342,21 @@ struct ProgramLoweringContextState {
     has_provenance: Rc<Cell<bool>>,
 
     /// Whether any emitted instruction requires the runtime assertion handler.
-    has_assertions: Rc<Cell<bool>>,
+    requires_assertion_handler: Rc<Cell<bool>>,
 
     /// Runtime contracts declared by emitted operations across every nested lowering scope.
     runtime_requirements: Rc<RefCell<Vec<RuntimeRequirement>>>,
 
-    /// Mesh that the emitted shardings of every nested lowering scope refer to, which the module declares, or [`None`]
-    /// while nothing that lowering has emitted refers to a mesh.
-    mesh: Rc<RefCell<Option<LogicalMesh>>>,
-
     /// Enclosing manual regions, ordered from outermost to innermost for named-axis resolution.
     manual_regions: Vec<Rc<ShardMapBoundary>>,
 
-    /// Axes bound by every enclosing manual region, excluded from shard-local placement constraints.
+    /// Axes bound by any enclosing manual region, excluded from shard-local placement constraints.
     bound_manual_axes: Vec<String>,
 
-    /// Distinct [`RetainedArray`]s of the module, in the order of the hidden entry inputs that carry them (refer to
-    /// `collect_session_constants`). Their values form the suffix of every `captured_values` table that can reach the
-    /// entry function's inputs. Scopes that cannot reach them (i.e., `sdy.manual_computation` bodies) carry no session
-    /// constants. Each one maps to its position among those inputs, so that looking one up costs one hash.
-    session_constants: Rc<HashMap<RetainedArray, usize>>,
+    /// Position of each retained array within the session constant suffix of `captured_values`. The suffix holds
+    /// hidden entry inputs followed by bufferless placeholders for arrays that the program only passes to callees that
+    /// never read them. Entering an `sdy.manual_computation` clears these bindings because its body is isolated.
+    session_constant_indices: Rc<HashMap<RetainedArray, usize>>,
 }
 
 #[cfg(test)]
@@ -460,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_lowering_context_next_channel_id() {
+    fn test_program_lowering_context_allocate_channel_id() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
@@ -548,16 +542,16 @@ mod tests {
         assert_eq!(sibling.manual_axis_region("x"), None);
 
         // The same allocator and module records remain visible across both levels of nesting.
-        assert_eq!(inner.next_channel_id(), 1);
-        assert_eq!(sibling.next_channel_id(), 2);
-        assert_eq!(root.next_channel_id(), 3);
+        assert_eq!(inner.allocate_channel_id(), 1);
+        assert_eq!(sibling.allocate_channel_id(), 2);
+        assert_eq!(root.allocate_channel_id(), 3);
         inner.require_mesh(&mesh).unwrap();
         assert_eq!(root.mesh(), Some(mesh));
         let requirement = RuntimeRequirement::new("ryft.tests.nested", 1).unwrap();
         sibling.require_runtime(requirement.clone()).unwrap();
         assert_eq!(inner.runtime_requirements(), vec![requirement]);
-        inner.record_assertion();
-        assert!(root.has_assertions());
+        inner.require_assertion_handler();
+        assert!(root.requires_assertion_handler());
         let context = MlirContext::new();
         let provenance = Provenance::scope(ProvenanceScope::new("nested"), Provenance::unknown());
         inner.instruction_location(&context, &provenance, context.unknown_location().as_ref());
@@ -573,8 +567,8 @@ mod tests {
         let boundary = ShardMapBoundary::new(test_mesh(), Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap();
         let child = root.enter_manual_region(boundary);
         let captures = [0, 1];
-        assert!(child.session_values(&captures).is_empty());
-        assert_eq!(root.session_values(&captures), &[1]);
+        assert!(child.session_constant_values(&captures).is_empty());
+        assert_eq!(root.session_constant_values(&captures), &[1]);
     }
 
     #[test]

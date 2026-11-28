@@ -55,17 +55,11 @@ impl LowerableOperation for PlaceOperation {
         check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
 
-        // A source only states where the input lives, and the forward program moves nothing to it, so it is lowered to
-        // nothing, also when it names devices inside a manual region or outside the program mesh, as JAX elides the
-        // source of a `device_put` inside `jit` and `shard_map`. Transposition turns such a source into the target of
-        // the transposed placement, which moves the cotangent there, so the program of reverse mode is rejected by the
-        // target rule below when that target leaves the region, and by the program mesh check when it leaves the mesh
-        // (refer to `LoweringError::PlacementOutsideProgramMesh`), when that program is compiled itself.
-        let is_inside_manual_region = !lowerer.lowering_context().bound_manual_axes().is_empty();
-
-        // A placement without a target leaves its input where it is, so it lowers to nothing, also inside a manual
-        // region. Its source only matters to transposition, and its copy policy is ignored like that of any other
-        // placement, because a compiled program has no observable buffer identity.
+        // A placement without a target leaves its input where it is, including inside a manual region. Its source only
+        // states where the input lives, as JAX elides the source of a `device_put` inside `jit` and `shard_map`.
+        // Transposition turns the source into the target of the cotangent. When that program is compiled, the manual
+        // axis check below rejects moving a shard-local cotangent, and the program mesh check rejects moving it off
+        // the mesh (refer to `LoweringError::PlacementOutsideProgramMesh`).
         let Some(target) = self.target() else {
             return Ok(vec![input_values[0]]);
         };
@@ -76,8 +70,9 @@ impl LowerableOperation for PlaceOperation {
         // is rejected there as well, because it moves the value onto one device, which a value of the region cannot
         // leave, even when the program mesh consists of that device alone. This rule exists only because those targets
         // move values, so an in-place target, which leaves the value on the devices of the region and changes only its
-        // storage, is lowered there like anywhere else.
-        if target.moves() && is_inside_manual_region {
+        // storage, is lowered there like anywhere else. Batching can release every manual axis of a region. If no
+        // enclosing region still binds one, the body operates on global values and may place them over the mesh.
+        if target.moves() && !lowerer.lowering_context().bound_manual_axes().is_empty() {
             return Err(LoweringError::UnsupportedOperation {
                 operation: PLACE_OPERATION_NAME.to_string(),
                 reason: "a value inside a manual region cannot be moved to another placement".to_string(),
@@ -551,6 +546,64 @@ mod tests {
                     } : (tensor<4xf32>) -> tensor<4xf32>
                     %1 = stablehlo.custom_call @annotate_device_placement(%0) {backend_config = "", has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = "pinned_host"}} : (tensor<4xf32>) -> tensor<4xf32>
                     return %1 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_place_operation_lower_after_batching_releases_every_manual_axis() {
+        // The batch is tiled along the only manual axis, which the scalar body does not use. Its placement target
+        // records that tiling, so the batched placement constrains the global vector along the released axis.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let devices = DeviceMesh::new(mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0)]).unwrap();
+        let items = Sharding::replicated(mesh.clone(), 0);
+        let batch_dimension = ShardingDimension::sharded(["x"]);
+        let target = Placement::new(devices, items.clone())
+            .unwrap()
+            .with_batch_sharding(batch_dimension.clone())
+            .unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::new(mesh.clone(), vec![batch_dimension]).unwrap())
+            .unwrap();
+        let traced: TracedProgram<ArrayType, ArrayType> = trace(
+            |input: ArrayTracer| {
+                let output = batch(
+                    |item| {
+                        let item = ValueProjection::<ArrayType>::into_projected(item)?;
+                        let output = shard_map(
+                            |local: ProjectedValue<ArrayType, _>| local.place(&target, None),
+                            item,
+                            mesh.clone(),
+                            items.clone(),
+                            items.clone(),
+                            ShardMapOptions::new(),
+                        )?;
+                        Ok(output.into_value())
+                    },
+                    input.into_value(),
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap();
+                ValueProjection::<ArrayType>::into_projected(output).unwrap()
+            },
+            input_type,
+        )
+        .unwrap();
+        assert_eq!(
+            traced.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x", ?}]>] out_shardings=[<@mesh, [{"x", ?}]>] manual_axes={} (%arg1: tensor<2xf32>) {
+                      %1 = sdy.sharding_constraint %arg1 <@mesh, [{"x"}]> : tensor<2xf32>
+                      sdy.return %1 : tensor<2xf32>
+                    } : (tensor<2xf32>) -> tensor<2xf32>
+                    return %0 : tensor<2xf32>
                   }
                 }
             "#},

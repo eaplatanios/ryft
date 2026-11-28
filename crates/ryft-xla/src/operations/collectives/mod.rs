@@ -5,7 +5,7 @@ use ryft_mlir::{
 };
 
 use crate::Error;
-use crate::lowering::states::ProgramLoweringContext;
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::types::ArrayTypeLoweringExtension;
 
 // TODO(eaplatanios): Review this module.
@@ -329,7 +329,7 @@ mod tests {
     use ryft_mlir::{Block, Location, Value as MlirValue};
     use ryft_pjrt::{BufferType, Program};
 
-    use crate::lowering::states::ProgramLoweringContext;
+    use crate::lowering::contexts::ProgramLoweringContext;
     use crate::lowering::tests::{shard_map_module, static_sharded_array_type, test_manual_mesh, test_vector_type};
     use crate::operations::Operation;
     use crate::operations::sharding::shard_map::tests::execute_inputs_on_cpu_devices;
@@ -357,7 +357,7 @@ mod tests {
         let mut lowerer: Lowerer<'_, '_, '_, Operation> =
             Lowerer::new(block.as_ref(), &context, location.as_ref(), lowering_context.clone());
         let result = operation.lower(&mut lowerer, &[input], &[input_type], output_types);
-        assert_eq!(lowering_context.next_channel_id(), 1);
+        assert_eq!(lowering_context.allocate_channel_id(), 1);
         assert!(block.operations()?.collect::<Result<Vec<_>, _>>()?.is_empty());
         let outputs = result?;
         assert_eq!(outputs, vec![input]);
@@ -1065,7 +1065,7 @@ mod tests {
                         assert_eq!(error.as_ref(), &CoreError::Program(expected));
                         // Reject the contract before allocating a channel or emitting a communication operation, so
                         // the next channel of the state is still its first one.
-                        assert_eq!(lowering_context.next_channel_id(), 1);
+                        assert_eq!(lowering_context.allocate_channel_id(), 1);
                     }
                     (result, expected) => panic!("{operation}: expected {expected:?} but got {result:?}"),
                 }

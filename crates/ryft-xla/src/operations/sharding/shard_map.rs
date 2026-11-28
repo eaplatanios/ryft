@@ -14,9 +14,9 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::sharding::UnreducedKindExtension;
-use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::{
     ArrayTypeLoweringExtension, EffectTokens, MemoryLoweringExtension, current_or_new_token, token_threaded_effects,
 };

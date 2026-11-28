@@ -45,10 +45,10 @@ use ryft_mlir::{
 use crate::compilation::domains::{commits_public_outputs, relocated_input_type};
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::EffectTokens;
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::emissions::{omits_regions, partition_session_constants, unread_call_captures};
 use crate::lowering::programs::{ProgramInlineLoweringExtension, RegionPlacementRequestsExtension};
 use crate::lowering::reductions::validate_declared_pending_reduction;
-use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{TypeLoweringExtension, lower_unplaced_constant_output};
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::operations::manipulation::conversions::TypeCastLoweringExtension;
@@ -1231,7 +1231,7 @@ trait CallProgramLoweringExtension<O: ProgramLoweringOperation> {
     /// exact leading lifted-capture prefix length. Deriving it from capture-constant indices instead would conflate the
     /// independent capture namespaces of nested calls inside the callee arena. `caller_captured_values` are the
     /// captured values of the calling scope, whose session-constant suffix the inlined callee inherits (refer to
-    /// [`ProgramLoweringContext::session_values`]).
+    /// [`ProgramLoweringContext::session_constant_values`]).
     fn lower_call<'b, 'c: 'b, 't: 'c>(
         &self,
         capture_count: usize,
@@ -1283,9 +1283,9 @@ impl<O: ProgramLoweringOperation> CallProgramLoweringExtension<O> for FlatProgra
             // The provided inputs cover the leading captures, so the first capture without a value is the next one.
             return Err(Error::Lowering(LoweringError::MissingCapturedConstant { index: input_values.len() }));
         }
-        // The callee's capture references name its own leading inputs, while session constants remain module-scoped.
+        // The callee binds its own leading inputs as captures and inherits the caller's session constant bindings.
         let mut captured_values = input_values[..capture_count].to_vec();
-        captured_values.extend_from_slice(lowering_context.session_values(caller_captured_values));
+        captured_values.extend_from_slice(lowering_context.session_constant_values(caller_captured_values));
         self.lower_inline(
             captured_values.as_slice(),
             input_values,

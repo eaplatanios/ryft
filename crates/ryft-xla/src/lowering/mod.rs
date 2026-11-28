@@ -42,13 +42,12 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::modules::render_devices;
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::reductions::{
     constrain_unreduced_intermediates, constrain_unreduced_outputs, validate_declared_pending_reduction,
     validate_pending_reductions_across_regions,
 };
-use crate::lowering::states::ProgramLoweringContext;
 use crate::operations::call::CallFunctionMap;
 use crate::operations::composites::NamedCompositionKey;
 use crate::{Constant, Error, Operation, RuntimeRequirement, Session, Type};
@@ -97,32 +96,32 @@ pub enum LoweringError {
     MismatchedMeshTopology { expected: LogicalMesh, actual: LogicalMesh },
 
     #[error(
-        "`{}` cannot move a value to the devices {} of mesh `{}` inside a program compiled for the devices {} of \
+        "`{}` cannot move a value to the devices [{}] of mesh `{}` inside a program compiled for the devices [{}] of \
          mesh `{}`",
         PLACE_OPERATION_NAME,
-        render_devices(.target.devices()),
+        .target.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
         .target.logical_mesh(),
-        render_devices(.mesh.devices()),
+        .mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
         .mesh.logical_mesh(),
     )]
     PlacementOutsideProgramMesh { target: DeviceMesh, mesh: DeviceMesh },
 
     #[error(
-        "`{}` cannot move a value to the device {} inside a program compiled for the devices {} of mesh `{}`",
+        "`{}` cannot move a value to the device {} inside a program compiled for the devices [{}] of mesh `{}`",
         PLACE_OPERATION_NAME,
         .device,
-        render_devices(.mesh.devices()),
+        .mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
         .mesh.logical_mesh(),
     )]
     DeviceOutsideProgramMesh { device: Device, mesh: DeviceMesh },
 
     #[error(
-        "`{}` cannot call a function compiled for the devices {} of mesh `{}` inside a program compiled for the \
-         devices {} of mesh `{}`",
+        "`{}` cannot call a function compiled for the devices [{}] of mesh `{}` inside a program compiled for the \
+         devices [{}] of mesh `{}`",
         CALL_OPERATION_NAME,
-        render_devices(.callee.devices()),
+        .callee.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
         .callee.logical_mesh(),
-        render_devices(.mesh.devices()),
+        .mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
         .mesh.logical_mesh(),
     )]
     CallOutsideProgramMesh { callee: DeviceMesh, mesh: DeviceMesh },
@@ -164,6 +163,8 @@ pub enum RaggedDotLoweringStrategy {
 }
 
 pub(crate) mod admission;
+/// Program lowering context for nested regions and their enclosing module.
+pub(crate) mod contexts;
 /// Decisions about which regions, captures, and session constants of a program lowering emits.
 pub(crate) mod emissions;
 /// Lowering of whole programs to StableHLO modules.
@@ -174,8 +175,6 @@ pub(crate) mod programs;
 pub(crate) mod reductions;
 /// Lowering of logical meshes, shardings, and sharding constraints to Shardy.
 pub(crate) mod sharding;
-/// Program lowering context for nested regions and their enclosing module.
-pub(crate) mod states;
 /// Shared StableHLO type, constant, and dynamic-dimension lowering helpers.
 pub(crate) mod types;
 /// Lowering of the values of programs (i.e., their constants) to StableHLO values.
@@ -953,9 +952,9 @@ pub(crate) mod tests {
         Error as CoreError, LinearCallOperation, LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation,
         NegOperation, Operation as CoreOperation, OperationPayloadProjection, Parameterized, ParameterizedFamily,
         Placeholder, Program, ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedContext, ReduceOperation,
-        ReductionKind, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceWriteOperation, RegionInterface,
-        Reshape, ScanOperation, ScanOptions, Shape, ShardMap, ShardMapBoundary, ShardMapOperation, ShardMapOptions,
-        Sharding, ShardingDimension, Sin, TypeError, Typed, TypedProgram, UnreducedKind, ValueProjection, scan,
+        ReductionKind, RegionInterface, Reshape, ScanOptions, Shape, ShardMap, ShardMapBoundary, ShardMapOperation,
+        ShardMapOptions, Sharding, ShardingDimension, Sin, TypeError, Typed, TypedProgram, UnreducedKind,
+        ValueProjection, scan,
     };
 
     use ryft_mlir::dialects::func;
@@ -975,7 +974,7 @@ pub(crate) mod tests {
     use crate::lowering::LoweringError;
     use crate::lowering::modules::{normalize_function_name, serialize_lowered_module};
 
-    use crate::lowering::states::ProgramLoweringContext;
+    use crate::lowering::contexts::ProgramLoweringContext;
     use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::lowering::values::ArrayLiteralLoweringExtension;
     use crate::operations::assertions::ensure_assertion_handler_registered;
@@ -1049,7 +1048,7 @@ pub(crate) mod tests {
                     output_types.as_slice(),
                 )?;
                 if lowerer.effect_tokens.ordered_assertion.is_some() {
-                    lowering_context.record_assertion();
+                    lowering_context.require_assertion_handler();
                 }
                 effect_tokens = lowerer.effect_tokens;
                 Ok(outputs)
@@ -1726,51 +1725,6 @@ pub(crate) mod tests {
             )
             .unwrap()[0];
         builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap()
-    }
-
-    /// Extends a [`scalar_linear_region`] with a reference that is allocated with its `value`, overwritten with its
-    /// `residual`, and frozen into its output.
-    pub(crate) fn add_reference_state(
-        builder: &mut CoreProgramBuilder<Constant, Operation>,
-        residual: AtomId,
-        value: AtomId,
-    ) -> AtomId {
-        let reference = builder
-            .add_instruction(Operation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![value], None)
-            .unwrap()[0];
-        builder
-            .add_instruction(
-                Operation::ReferenceWrite(ReferenceWriteOperation::new()),
-                Vec::new(),
-                vec![reference, residual],
-                None,
-            )
-            .unwrap();
-        builder
-            .add_instruction(
-                Operation::ReferenceFreeze(ReferenceFreezeOperation::new()),
-                Vec::new(),
-                vec![reference],
-                None,
-            )
-            .unwrap()[0]
-    }
-
-    /// Builds a program whose scan of `length` iterations carries a scalar through a body that extends it with
-    /// reference state (refer to [`add_reference_state`]).
-    pub(crate) fn stateful_scan_program(length: usize) -> FlatProgram<Session> {
-        let scalar_type = Type::Array(ArrayType::scalar(DataType::F32));
-        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
-        builder.add_input(ArrayType::scalar(DataType::I64).into());
-        let carry = builder.add_input(scalar_type.clone());
-        let output = add_reference_state(&mut builder, carry, carry);
-        let body = Arc::new(builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap());
-        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
-        let input = builder.add_input(scalar_type);
-        let regions = vec![builder.intern_callee(&body, None).unwrap()];
-        let scan = ScanOperation::<Type>::new(1, length);
-        let output = builder.add_instruction(scan, regions, vec![input], None).unwrap()[0];
-        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     /// Operation family whose operations borrow their configuration, which lowering admits for any lifetime of the

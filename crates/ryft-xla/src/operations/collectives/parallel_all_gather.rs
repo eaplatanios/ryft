@@ -7,7 +7,7 @@ use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::states::ProgramLoweringContext;
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::operations::collectives::refine_collective_result_dimensions;
@@ -124,7 +124,7 @@ impl ParallelAllGatherOperationLoweringExtension for ParallelAllGatherOperation 
             &[input_value],
             self.concatenation_axis(),
             stable_hlo::ReplicaGroups::dense(replica_groups.as_slice()),
-            Some(lowering_context.next_channel_id()),
+            Some(lowering_context.allocate_channel_id()),
             Some(stable_hlo::ChannelHandleType::DeviceToDevice),
             true,
             &[output_type],

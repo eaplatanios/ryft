@@ -19,8 +19,8 @@ use crate::arrays::host::{
     partial_completion_rejection,
 };
 use crate::lowering::LoweringError;
+use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::sharding::OpenDimensions;
-use crate::lowering::states::ProgramLoweringContext;
 use crate::{Error, Type};
 
 // TODO(eaplatanios): Review this module.
