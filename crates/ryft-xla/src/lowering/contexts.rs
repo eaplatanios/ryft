@@ -212,9 +212,7 @@ impl ProgramLoweringContext {
         Ok(())
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns a fresh module-unique channel id for one channeled collective.
+    /// Returns a fresh module-unique channel ID for one channeled collective.
     pub(crate) fn allocate_channel_id(&self) -> usize {
         let channel_id = self.state.next_channel_id.get();
         self.state.next_channel_id.set(channel_id + 1);
@@ -238,8 +236,7 @@ impl ProgramLoweringContext {
 
     /// Lowers a tensor placement constraint of `input_value` to `sharding` in this scope and returns the constrained
     /// value. The constraint is that of [`ShardingExtension::lower_sharding_constraint`] without the mesh axes that
-    /// the enclosing manual regions bind, and the mesh of `sharding` is recorded as the mesh of the module (refer to
-    /// [`require_mesh`](Self::require_mesh)).
+    /// the enclosing manual regions bind, and the mesh of `sharding` is recorded as the mesh of the module.
     pub(crate) fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
         &self,
         sharding: &Sharding,
@@ -252,11 +249,10 @@ impl ProgramLoweringContext {
         sharding.lower_sharding_constraint(input_value, open_dimensions, self.bound_manual_axes(), block, location)
     }
 
-    /// Lowers a tensor placement constraint that replicates `input_value`, whose tracked placement is `sharding`,
-    /// along `axes` in this scope and returns the constrained value. The constraint is that of
+    /// Lowers a tensor placement constraint that replicates `input_value`, whose tracked placement
+    /// is `sharding`, along `axes` in this scope and returns the constrained value. The constraint is that of
     /// [`ShardingExtension::lower_replication_constraint`] without the mesh axes that the enclosing manual regions
-    /// bind, and the mesh of `sharding` is recorded as the mesh of the module (refer to
-    /// [`require_mesh`](Self::require_mesh)).
+    /// bind, and the mesh of `sharding` is recorded as the mesh of the module.
     pub(crate) fn lower_replication_constraint<'b, 'c: 'b, 't: 'c>(
         &self,
         sharding: &Sharding,
@@ -286,6 +282,8 @@ impl ProgramLoweringContext {
                 Error::Lowering(LoweringError::UnreachableSessionConstant { constant: constant.to_string() })
             })
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Lowers one instruction's [`Provenance`] onto MLIR locations above the provided base location and records
     /// module-wide whether any instruction-specific location was constructed. Unknown provenance uses the base
