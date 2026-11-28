@@ -2048,11 +2048,12 @@ pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
     /// Returns where the sharding of each of the first `output_count` outputs of this program comes from (refer to
     /// [`OutputShardingSource`]), or [`None`] for an output whose sharding the program does not determine. An output
     /// that a `place` in the entry region produces has the placement of its target, which states the placement along
-    /// every mesh axis, including the auto mesh axes that the output type drops. A bufferless output of `condition`,
-    /// `scan`, or `while` uses its declared sharding or an entry output override, because the compiler has no output
-    /// buffer from which to report a placement along auto axes. An output that is an entry input is placed where that
-    /// input enters the program. An output that returns a [`RetainedArray`] is placed as the hidden input that supplies
-    /// it, whose sharding `constant_sharding` returns.
+    /// every mesh axis, including the auto mesh axes that the output type drops. The program determines no sharding
+    /// for an output of `condition`, `scan`, or `while`, whose regions are not followed, so [`entry_output_shardings`]
+    /// gives it its declared sharding or an entry output override. For a bufferless output that is also its final
+    /// placement, because the compiler has no output buffer from which to report a placement along auto axes. An output
+    /// that is an entry input is placed where that input enters the program. An output that returns a [`RetainedArray`]
+    /// is placed as the hidden input that supplies it, whose sharding `constant_sharding` returns.
     ///
     /// Operations that return the value of an input together with its placement are followed back to that input, so
     /// that an output keeps the placement of a `place` or of an entry input that precedes them. These are a `place`

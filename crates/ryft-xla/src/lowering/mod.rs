@@ -48,7 +48,7 @@ use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::operations::call::CallFunctionMap;
 use crate::{Constant, Error, Operation, RuntimeRequirement, Session, Type};
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents errors produced while validating a program for XLA lowering, constructing its StableHLO
 /// representation, or verifying the result.
@@ -159,11 +159,11 @@ pub use sharding::{
     LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension, UnreducedKindExtension,
 };
 pub use types::{
-    ArrayTypeLoweringExtension, DataTypeLoweringExtension, MemoryLoweringExtension, TypeLoweringExtension,
-    dimension_extent_i32, dimension_extent_i64, lower_constant_output, lower_explicit_shape, lower_f64_constant_splat,
-    lower_runtime_dimension_size_i64, lower_signed_one_bit_to_mlir, lower_static_index_constants,
-    lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type, stable_hlo_dynamic_dimension_bound,
-    static_dimensions,
+    ArrayTypeLoweringExtension, DataTypeLoweringExtension, MemoryLoweringExtension, PhysicalStoragePadding,
+    TypeLoweringExtension, dimension_extent_i32, dimension_extent_i64, lower_constant_output, lower_explicit_shape,
+    lower_f64_constant_splat, lower_runtime_dimension_size_i64, lower_signed_one_bit_to_mlir,
+    lower_static_index_constants, lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type,
+    stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 
 /// Per-class StableHLO tokens owned by one lowering scope.
