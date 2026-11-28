@@ -1,8 +1,7 @@
 use std::borrow::Cow;
 
 use ryft_core::{
-    Array, ArrayType, CaptureReference, DataType, DimensionValue, LogicalMesh, Memory, ProgramError, Type as CoreType,
-    Typed, Value,
+    Array, ArrayType, CaptureReference, DataType, DimensionValue, Memory, ProgramError, Type as CoreType, Typed, Value,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{

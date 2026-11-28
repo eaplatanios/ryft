@@ -1,5 +1,5 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, DataType, Dimension, DimensionError, DimensionValue, Layout, Memory, ProgramError, Shape};
+use ryft_core::{ArrayType, DataType, Dimension, DimensionError, Layout, Memory, ProgramError, Shape};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::CustomCallApiVersion;
 use ryft_mlir::{
