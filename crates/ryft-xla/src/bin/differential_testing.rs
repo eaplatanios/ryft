@@ -1113,7 +1113,7 @@ fn emit_placement_forward_derivatives() -> Result<DifferentialObservation, Box<d
                 };
                 let expected = match name {
                     "add_fused_primal" | "add_fused_tangent" => {
-                        ProgramError::custom(LoweringError::MismatchedMeshTopology {
+                        ProgramError::custom(LoweringError::MeshTopologyMismatch {
                             expected: LogicalMesh::single_device(),
                             actual: source.mesh().logical_mesh().clone(),
                         })

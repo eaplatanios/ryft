@@ -15,7 +15,9 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::types::{ArrayTypeLoweringExtension, lower_signed_one_bit_to_mlir, physical_bound_type};
+use crate::lowering::types::{
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_signed_one_bit_to_mlir, physical_bound_type,
+};
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::operations::normalize_elementwise_input;
 use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
@@ -112,9 +114,9 @@ where
             // expose its physical capacity, broadcast that capacity, then restore the composed logical extents.
             let converted_type = input_types[index].clone().with_data_type(target_type.data_type());
             let converted = normalize_elementwise_input(inputs[index], &converted_type, block, context, location)?;
-            let physical_input = converted_type.lower_physical_bound_value(
+            let physical_input = converted_type.lower_padded_physical_storage(
                 converted,
-                0.0,
+                PhysicalStoragePadding::Constant(0.0),
                 &mut block.as_ref(),
                 context,
                 location.as_ref(),
@@ -142,7 +144,7 @@ where
                 &mut block.as_ref(),
                 location.as_ref(),
             )?;
-            inputs[index] = target_type.lower_restore_dynamic_dimensions(
+            inputs[index] = target_type.restore_dynamic_dimensions(
                 result,
                 &sources,
                 &mut block.as_ref(),

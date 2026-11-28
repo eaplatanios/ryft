@@ -1625,7 +1625,7 @@ fn runtime_output_sharding(annotation: &Sharding, declaration: Option<&Sharding>
 ///
 /// # Errors
 ///
-/// Returns [`LoweringError::UnevenSharding`] for the first dimension whose static extent that number does not divide.
+/// Returns [`CompilationError::UnevenBoundarySharding`] for the first dimension whose static extent that number does not divide.
 fn validate_even_sharding(
     kind: &'static str,
     index: usize,
@@ -1643,7 +1643,7 @@ fn validate_even_sharding(
         };
         let shard_count = axes.iter().filter_map(|axis| sharding.mesh().axis_size(axis)).product::<usize>();
         if extent % shard_count != 0 {
-            return Err(Error::Lowering(LoweringError::UnevenSharding {
+            return Err(Error::Compilation(CompilationError::UnevenBoundarySharding {
                 kind,
                 index,
                 dimension,
@@ -1734,9 +1734,9 @@ fn contains_shard_map(program: &FlatProgram<Session>, target_platform: Option<&s
 ///
 /// # Errors
 ///
-/// Returns [`LoweringError::PlacementOutsideProgramMesh`] for the first `place` whose target mesh has other devices,
-/// the same devices in another order, or another topology than `mesh`, [`LoweringError::DeviceOutsideProgramMesh`] for
-/// the first `place` whose device target is not the only device of `mesh`, [`LoweringError::CallOutsideProgramMesh`]
+/// Returns [`CompilationError::PlacementMeshMismatch`] for the first `place` whose target mesh has other devices,
+/// the same devices in another order, or another topology than `mesh`, [`CompilationError::PlacementDeviceMismatch`] for
+/// the first `place` whose device target is not the only device of `mesh`, [`CompilationError::CalleeMeshMismatch`]
 /// for the first `call` whose callee mesh differs from `mesh` in the same ways, and
 /// [`LoweringError::UnsupportedOperation`] for the first `place` whose target sharding or `call` whose effective
 /// boundary sharding (i.e., an override or where the executable of the callee places an input, refer to
@@ -1760,7 +1760,7 @@ fn validate_placements(
                     && (call_mesh.devices() != mesh.devices()
                         || !call_mesh.logical_mesh().has_same_topology(mesh.logical_mesh()))
                 {
-                    return Err(Error::Lowering(LoweringError::CallOutsideProgramMesh {
+                    return Err(Error::Compilation(CompilationError::CalleeMeshMismatch {
                         callee: call_mesh.clone(),
                         mesh: mesh.clone(),
                     }));
@@ -1811,7 +1811,7 @@ fn validate_placements(
                 // A device keeps the sharding of the value, which is over the program mesh, so it is valid exactly when
                 // that mesh consists of the device alone.
                 Some(PlacementRequest::Device { device, .. }) if mesh.devices() != [*device] => {
-                    return Err(Error::Lowering(LoweringError::DeviceOutsideProgramMesh {
+                    return Err(Error::Compilation(CompilationError::PlacementDeviceMismatch {
                         device: *device,
                         mesh: mesh.clone(),
                     }));
@@ -1821,7 +1821,7 @@ fn validate_placements(
                     if placement_mesh.devices() != mesh.devices()
                         || !placement_mesh.logical_mesh().has_same_topology(mesh.logical_mesh())
                     {
-                        return Err(Error::Lowering(LoweringError::PlacementOutsideProgramMesh {
+                        return Err(Error::Compilation(CompilationError::PlacementMeshMismatch {
                             target: placement_mesh.clone(),
                             mesh: mesh.clone(),
                         }));
@@ -3575,16 +3575,16 @@ mod tests {
         // same devices can.
         assert!(matches!(
             session.lower_program(&program(&second_mesh, &single_replicated, &vector_type), 0, &Options::new(first_mesh.clone())),
-            Err(Error::Lowering(LoweringError::CallOutsideProgramMesh { callee, mesh }))
+            Err(Error::Compilation(CompilationError::CalleeMeshMismatch { callee, mesh }))
                 if callee == second_mesh && mesh == first_mesh,
         ));
         assert_eq!(
-            Error::Lowering(LoweringError::CallOutsideProgramMesh {
+            Error::Compilation(CompilationError::CalleeMeshMismatch {
                 callee: second_mesh.clone(),
                 mesh: first_mesh.clone()
             })
             .to_string(),
-            "`call` cannot call a function compiled for the devices [1] of mesh `['x'=1:explicit]` inside a program \
+            "cannot `call` a function compiled for the devices [1] of mesh `['x'=1:explicit]` inside a program \
              compiled for the devices [0] of mesh `['x'=1:explicit]`",
         );
         assert!(
@@ -3647,7 +3647,7 @@ mod tests {
         let input_options = Options::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]);
         assert!(matches!(
             compile(5, input_options.clone()),
-            Err(Error::Lowering(LoweringError::UnevenSharding { .. })),
+            Err(Error::Compilation(CompilationError::UnevenBoundarySharding { .. })),
         ));
         assert_eq!(compile(5, input_options).err().unwrap().to_string(), uneven("input"));
         let placement_options = Options::new(mesh.clone()).with_input_placements(vec![Some(sharded.clone())].into());
@@ -3820,7 +3820,7 @@ mod tests {
         assert_eq!(validate(Some("cuda")), Ok(()));
         assert_eq!(
             validate(Some("cpu")),
-            Err(Error::Lowering(LoweringError::DeviceOutsideProgramMesh { device: elsewhere, mesh: mesh.clone() })
+            Err(Error::Compilation(CompilationError::PlacementDeviceMismatch { device: elsewhere, mesh: mesh.clone() })
                 .to_string()),
         );
         assert_eq!(validate(None), validate(Some("cpu")));
@@ -3852,13 +3852,13 @@ mod tests {
         let error = place_error(devices[1], &mesh);
         assert!(matches!(
             &error,
-            Error::Lowering(LoweringError::DeviceOutsideProgramMesh { device, mesh: program_mesh })
+            Error::Compilation(CompilationError::PlacementDeviceMismatch { device, mesh: program_mesh })
                 if device == &devices[1] && program_mesh == &mesh,
         ));
         assert_eq!(
             error.to_string(),
             format!(
-                "`place` cannot move a value to the device {} inside a program compiled for the devices [{}] of mesh \
+                "cannot `place` a value on the device {} inside a program compiled for the devices [{}] of mesh \
                  `{}`",
                 devices[1].id(),
                 devices[0].id(),
@@ -3871,13 +3871,13 @@ mod tests {
         let error = place_error(devices[0], &mesh);
         assert!(matches!(
             &error,
-            Error::Lowering(LoweringError::DeviceOutsideProgramMesh { device, mesh: program_mesh })
+            Error::Compilation(CompilationError::PlacementDeviceMismatch { device, mesh: program_mesh })
                 if device == &devices[0] && program_mesh == &mesh,
         ));
         assert_eq!(
             error.to_string(),
             format!(
-                "`place` cannot move a value to the device {} inside a program compiled for the devices [{}, {}] of \
+                "cannot `place` a value on the device {} inside a program compiled for the devices [{}, {}] of \
                  mesh `{}`",
                 devices[0].id(),
                 devices[0].id(),
@@ -3956,7 +3956,7 @@ mod tests {
             validate_placements(&program(length), &mesh, true, target_platform).map_err(|error| error.to_string())
         };
         let rejected =
-            Err(Error::Lowering(LoweringError::DeviceOutsideProgramMesh { device: elsewhere, mesh: mesh.clone() })
+            Err(Error::Compilation(CompilationError::PlacementDeviceMismatch { device: elsewhere, mesh: mesh.clone() })
                 .to_string());
         assert_eq!(validate(0, Some("cpu")), Ok(()));
         assert_eq!(validate(0, None), Ok(()));
@@ -4203,8 +4203,8 @@ mod tests {
         let (eager, compiled) = place(&committed, &source);
         assert_eq!(eager, Ok((devices[..2].to_vec(), true, vec![1., 2., 3., 4.])));
         assert_eq!(compiled, eager);
-        let rejection = LoweringError::PlacementOutsideProgramMesh { target: elsewhere.clone(), mesh };
-        assert_eq!(reverse(&committed, &source), Some(Error::Lowering(rejection).to_string()));
+        let rejection = CompilationError::PlacementMeshMismatch { target: elsewhere.clone(), mesh };
+        assert_eq!(reverse(&committed, &source), Some(Error::Compilation(rejection).to_string()));
 
         let source = PlacementRequest::from(devices[3]);
         let (eager, compiled) = place(&uncommitted, &source);
@@ -4212,8 +4212,8 @@ mod tests {
         assert_eq!(compiled, eager);
         // The untracked input leaves the transposed placement's source as a bare device request.
         let rejection =
-            LoweringError::DeviceOutsideProgramMesh { device: devices[3], mesh: uncommitted.mesh().clone() };
-        assert_eq!(reverse(&uncommitted, &source), Some(Error::Lowering(rejection).to_string()));
+            CompilationError::PlacementDeviceMismatch { device: devices[3], mesh: uncommitted.mesh().clone() };
+        assert_eq!(reverse(&uncommitted, &source), Some(Error::Compilation(rejection).to_string()));
 
         let (eager, compiled) =
             place(&committed, &PlacementRequest::from(Placement::new(elsewhere, split.clone()).unwrap()));
@@ -6198,7 +6198,7 @@ mod tests {
             );
             assert!(matches!(
                 attempted,
-                Err(Error::Lowering(LoweringError::DeviceOutsideProgramMesh { device, mesh }))
+                Err(Error::Compilation(CompilationError::PlacementDeviceMismatch { device, mesh }))
                     if device == capture_device && mesh == target_mesh
             ));
             assert_eq!(session.array_statistics(), statistics);

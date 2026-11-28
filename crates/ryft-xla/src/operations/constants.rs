@@ -557,7 +557,7 @@ fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
     };
     let result = physical_type.lower_layout_constraint(result, block, location)?;
     let sources = (0..output_type.rank()).map(|axis| (exemplar, axis)).collect::<Vec<_>>();
-    let result = output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)?;
+    let result = output_type.restore_dynamic_dimensions(result, &sources, block, context, location)?;
     let result = match output_type.sharding() {
         Some(sharding) => {
             lowering_context.lower_sharding_constraint(sharding, result, OpenDimensions::All, block, location)?

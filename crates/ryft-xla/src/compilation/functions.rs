@@ -6738,7 +6738,7 @@ mod tests {
         let pending = "input override that states the pending reduction of an input";
         let maximum = "input override that states the pending maximum of an input";
         let other_devices = "fails with `\
-            `call` cannot call a function compiled for the devices [1] of mesh `['x'=1:explicit]` inside a program \
+            cannot `call` a function compiled for the devices [1] of mesh `['x'=1:explicit]` inside a program \
             compiled for the devices [0] of mesh `['x'=1:explicit]``";
         let split_replicas = "fails with `cannot lower `call`: bounded-dynamic multi-device programs currently \
                               require fully replicated boundary shardings of called functions because Shardy rejects \
@@ -6956,7 +6956,7 @@ mod tests {
             (
                 "bufferless output",
                 "compiled gradient",
-                "fails with `cannot lower element type `zero` for sum reduction identity`".to_string(),
+                "fails with `cannot lower data type `zero` for sum reduction identity`".to_string(),
             ),
             ("placement in the body", "eager VJP cotangent", moved_without_commitment(second)),
             (

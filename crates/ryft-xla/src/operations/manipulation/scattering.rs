@@ -11,8 +11,8 @@ use ryft_mlir::{
 
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, lower_explicit_shape, lower_runtime_dimension_size_i64, lower_static_index_constants,
-    lower_unplaced_constant_output, physical_bound_type,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_explicit_shape, lower_runtime_dimension_size_i64,
+    lower_static_index_constants, lower_unplaced_constant_output, physical_bound_type,
 };
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
@@ -392,7 +392,13 @@ fn lower_index_broadcast<'b, 'c: 'b, 't: 'c>(
             output_type.data_type(),
             Shape::new(axes.iter().map(|axis| output_type.shape().dimensions()[*axis].clone()).collect()),
         );
-        let value = input_type.lower_physical_bound_value(value, 0.0, block, context, location)?;
+        let value = input_type.lower_padded_physical_storage(
+            value,
+            PhysicalStoragePadding::Constant(0.0),
+            block,
+            context,
+            location,
+        )?;
         let physical_type = physical_bound_type(output_type)?;
         let result = block
             .append_operation(stable_hlo::broadcast(value, physical_type.lower(context, location)?, axes, location)?)?
@@ -400,7 +406,7 @@ fn lower_index_broadcast<'b, 'c: 'b, 't: 'c>(
             .unwrap()
             .as_ref();
         let sources = (0..output_type.rank()).map(|axis| (exemplar, axis)).collect::<Vec<_>>();
-        output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)
+        output_type.restore_dynamic_dimensions(result, &sources, block, context, location)
     } else {
         Ok(block
             .append_operation(stable_hlo::broadcast(value, output_type.lower(context, location)?, axes, location)?)?

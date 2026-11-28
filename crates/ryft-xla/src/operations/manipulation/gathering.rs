@@ -7,8 +7,8 @@ use ryft_mlir::{
 
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, lower_explicit_shape, lower_runtime_dimension_size_i64, lower_static_index_constants,
-    lower_unplaced_constant_output, physical_bound_type,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_explicit_shape, lower_runtime_dimension_size_i64,
+    lower_static_index_constants, lower_unplaced_constant_output, physical_bound_type,
 };
 use crate::lowering::values::ArrayLiteralLoweringExtension;
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
@@ -137,7 +137,13 @@ impl GatherOperationLoweringExtension for GatherOperation {
         // constants to dynamic tensor types without supplying their runtime sizes.
         let comparison_type = physical_bound_type(&indices_type)?;
         let physical_output_type = physical_bound_type(&output_types[0])?;
-        let indices = indices_type.lower_physical_bound_value(indices, 0.0, block, context, location)?;
+        let indices = indices_type.lower_padded_physical_storage(
+            indices,
+            PhysicalStoragePadding::Constant(0.0),
+            block,
+            context,
+            location,
+        )?;
 
         // Widen before comparing, because a legal input extent can exceed the range of an i8 or u8 index. In
         // particular, converting u64 indices to i64 would incorrectly turn its largest values into negative indices or
@@ -201,11 +207,15 @@ impl GatherOperationLoweringExtension for GatherOperation {
                 .result(0)
                 .unwrap()
                 .as_ref();
-            let clipped = output_types[0].lower_physical_bound_value(clipped, 0.0, block, context, location)?;
+            let clipped = output_types[0].lower_padded_physical_storage(
+                clipped,
+                PhysicalStoragePadding::Constant(0.0),
+                block,
+                context,
+                location,
+            )?;
             let sources = (0..output_types[0].rank()).map(|axis| (result, axis)).collect::<Vec<_>>();
-            return Ok(vec![
-                output_types[0].lower_restore_dynamic_dimensions(clipped, &sources, block, context, location)?,
-            ]);
+            return Ok(vec![output_types[0].restore_dynamic_dimensions(clipped, &sources, block, context, location)?]);
         }
         let upper_mask =
             ComparisonDirection::LessThanOrEqual.lower_comparison(indices, upper_bounds, block, location)?;
@@ -256,14 +266,20 @@ impl GatherOperationLoweringExtension for GatherOperation {
             .result(0)
             .unwrap()
             .as_ref();
-        let physical_result = output_types[0].lower_physical_bound_value(result, 0.0, block, context, location)?;
+        let physical_result = output_types[0].lower_padded_physical_storage(
+            result,
+            PhysicalStoragePadding::Constant(0.0),
+            block,
+            context,
+            location,
+        )?;
         let filled = block
             .append_operation(stable_hlo::select(mask, physical_result, fill, location)?)?
             .result(0)
             .unwrap()
             .as_ref();
         let sources = (0..output_types[0].rank()).map(|axis| (result, axis)).collect::<Vec<_>>();
-        Ok(vec![output_types[0].lower_restore_dynamic_dimensions(filled, &sources, block, context, location)?])
+        Ok(vec![output_types[0].restore_dynamic_dimensions(filled, &sources, block, context, location)?])
     }
 }
 

@@ -1,16 +1,16 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, DataType, Dimension, DimensionError, Layout, Memory, ProgramError, Shape};
+use ryft_core::{ArrayType, DataType, Dimension, DimensionError, Memory, ProgramError, Shape};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::CustomCallApiVersion;
 use ryft_mlir::{
-    Attribute, AttributeRef, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, FloatTypeRef,
-    IntegerTypeRef, Location, LocationRef, Operation as MlirOperation, Size as MlirSize, TensorTypeRef,
-    Type as MlirType, TypeRef, Value as MlirValue, ValueRef,
+    Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, FloatTypeRef, IntegerTypeRef,
+    Location, LocationRef, Operation as MlirOperation, Size as MlirSize, TensorTypeRef, Type as MlirType, TypeRef,
+    Value as MlirValue, ValueRef,
 };
 
 use crate::devices::MemoryExtension;
 use crate::lowering::LoweringError;
-use crate::{ArrayError, Error, ToPjrt, Type};
+use crate::{ArrayError, Error, Type};
 
 /// Provides lowering support transfers to a [`Memory`] to StableHLO.
 pub trait MemoryLoweringExtension {
@@ -202,6 +202,227 @@ impl DataTypeLoweringExtension for DataType {
 
 // TODO(eaplatanios): Review from here onwards.
 
+/// Lowering of an [`ArrayType`], and of values of that type, to StableHLO.
+pub trait ArrayTypeLoweringExtension {
+    /// Lowers an [`ArrayType`] to a typed MLIR tensor type.
+    fn lower<'c, 't, L: Location<'c, 't>>(
+        &self,
+        context: &'c MlirContext<'t>,
+        location: L,
+    ) -> Result<TensorTypeRef<'c, 't>, Error>;
+
+    /// Exposes a bounded dynamic value as a statically shaped value of its [`physical_bound_type`]. Sets the size of
+    /// each dynamic axis to its physical bound. Elements outside the original runtime shape have unspecified values.
+    /// Callers must discard those elements or accept unspecified padding.
+    fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
+        &self,
+        value: ValueRef<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+
+    /// Exposes the full buffer using [`Self::lower_physical_storage`] and fills every position outside the original
+    /// runtime shape with `padding`. A statically shaped input passes through unchanged.
+    fn lower_padded_physical_storage<'b, 'c: 'b, 't: 'c>(
+        &self,
+        value: ValueRef<'b, 'c, 't>,
+        padding: PhysicalStoragePadding<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+
+    /// Restores the dynamic dimensions of this type on a value of its [`physical_bound_type`]. Each entry in `sources`
+    /// identifies the value and axis that define the corresponding output dimension.
+    fn restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
+        &self,
+        value: ValueRef<'b, 'c, 't>,
+        sources: &[(ValueRef<'b, 'c, 't>, usize)],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
+}
+
+impl ArrayTypeLoweringExtension for ArrayType {
+    fn lower<'c, 't, L: Location<'c, 't>>(
+        &self,
+        context: &'c MlirContext<'t>,
+        location: L,
+    ) -> Result<TensorTypeRef<'c, 't>, Error> {
+        let element_type = self.data_type().lower(context)?;
+        let dimensions = self
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|size| match size {
+                Dimension::Static(value) => MlirSize::Static(*value),
+                Dimension::Dynamic(_) => MlirSize::Dynamic,
+            })
+            .collect::<Vec<_>>();
+        let bounds = self.shape().dimensions().iter().map(stable_hlo_dynamic_dimension_bound).collect::<Vec<_>>();
+        let encoding = bounds
+            .iter()
+            .any(Option::is_some)
+            .then(|| context.stable_hlo_tensor_type_extensions(bounds.as_slice()))
+            .transpose()?
+            .map(|attribute| attribute.as_ref());
+        context.tensor_type(element_type, dimensions.as_slice(), encoding, location).map_err(Error::from)
+    }
+
+    fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
+        &self,
+        value: ValueRef<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        let physical_type = physical_bound_type(self)?;
+        let mut dimensions = self.shape().dimensions().to_vec();
+        let mut value = value;
+        for (axis, dimension) in self.shape().dimensions().iter().enumerate() {
+            if matches!(dimension, Dimension::Static(_)) {
+                continue;
+            }
+            let bound = physical_type.shape().dimensions()[axis].value().unwrap();
+            let size = lower_unplaced_constant_output(
+                &[ArrayType::scalar(DataType::I32)],
+                i64::from(dimension_extent_i32(bound)?),
+                block,
+                context,
+                location,
+            )?
+            .remove(0);
+            dimensions[axis] = Dimension::Static(bound);
+            let exposed_type = self.clone().with_shape(Shape::new(dimensions.clone()));
+            let exposed = block.append_operation(stable_hlo::set_dimension_size(
+                value,
+                size,
+                exposed_type.lower(context, location)?,
+                axis,
+                location,
+            )?)?;
+            value = exposed.result(0).unwrap().as_ref();
+        }
+        Ok(value)
+    }
+
+    fn lower_padded_physical_storage<'b, 'c: 'b, 't: 'c>(
+        &self,
+        value: ValueRef<'b, 'c, 't>,
+        padding: PhysicalStoragePadding<'b, 'c, 't>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        let mut runtime_sizes = Vec::new();
+        for (axis, dimension) in self.shape().dimensions().iter().enumerate() {
+            if matches!(dimension, Dimension::Dynamic(_)) {
+                let size = block.append_operation(stable_hlo::get_dimension_size(value, axis, location)?)?;
+                runtime_sizes.push((axis, size.result(0)?.as_ref()));
+            }
+        }
+        if runtime_sizes.is_empty() {
+            return Ok(value);
+        }
+
+        let data = self.lower_physical_storage(value, block, context, location)?;
+        let physical_type = physical_bound_type(self)?;
+        let index_type = ArrayType::new(DataType::I32, physical_type.shape().clone());
+        let index_tensor_type = index_type.lower(context, location)?;
+        let mut in_bounds = None;
+        for (axis, size) in runtime_sizes {
+            let indices = block.append_operation(stable_hlo::iota(index_tensor_type, axis, location)?)?;
+            let indices = indices.result(0).unwrap().as_ref();
+            let size = block.append_operation(stable_hlo::broadcast(size, index_tensor_type, &[], location)?)?;
+            let size = size.result(0).unwrap().as_ref();
+            let axis_in_bounds = block.append_operation(stable_hlo::compare(
+                indices,
+                size,
+                stable_hlo::ComparisonDirection::LessThan,
+                stable_hlo::ComparisonType::for_type(indices.r#type()?)?,
+                location,
+            )?)?;
+            let axis_in_bounds = axis_in_bounds.result(0).unwrap().as_ref();
+            in_bounds = Some(match in_bounds {
+                None => axis_in_bounds,
+                Some(in_bounds) => block
+                    .append_operation(stable_hlo::and(in_bounds, axis_in_bounds, location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref(),
+            });
+        }
+        let physical_tensor_type = physical_type.lower(context, location)?;
+        let padding = match padding {
+            PhysicalStoragePadding::Constant(value) if physical_type.data_type().is_complex() => {
+                let part_type = physical_type.clone().with_data_type(if physical_type.data_type() == DataType::C64 {
+                    DataType::F32
+                } else {
+                    DataType::F64
+                });
+                let part_tensor_type = part_type.lower(context, location)?;
+                let real = lower_f64_constant_splat(value, &part_type, part_tensor_type, block, context, location)?;
+                let imaginary = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
+                block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0)?.as_ref()
+            }
+            PhysicalStoragePadding::Constant(value) => {
+                lower_f64_constant_splat(value, &physical_type, physical_tensor_type, block, context, location)?
+            }
+            PhysicalStoragePadding::Scalar(scalar) => block
+                .append_operation(stable_hlo::broadcast(scalar, physical_tensor_type, &[], location)?)?
+                .result(0)?
+                .as_ref(),
+        };
+        let masked = block.append_operation(stable_hlo::select(in_bounds.unwrap(), data, padding, location)?)?;
+        Ok(masked.result(0).unwrap().as_ref())
+    }
+
+    fn restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
+        &self,
+        mut value: ValueRef<'b, 'c, 't>,
+        sources: &[(ValueRef<'b, 'c, 't>, usize)],
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        if sources.len() != self.rank() {
+            return Err(ProgramError::InvalidInputCount { expected: self.rank(), actual: sources.len() }.into());
+        }
+        let mut dimensions = physical_bound_type(self)?.shape().dimensions().to_vec();
+        for (axis, dimension) in self.shape().dimensions().iter().enumerate() {
+            if matches!(dimension, Dimension::Static(_)) {
+                continue;
+            }
+            let size =
+                block.append_operation(stable_hlo::get_dimension_size(sources[axis].0, sources[axis].1, location)?)?;
+            let size = size.result(0).unwrap().as_ref();
+            dimensions[axis] = dimension.clone();
+            let refined_type = self.clone().with_shape(Shape::new(dimensions.clone()));
+            let refined = block.append_operation(stable_hlo::set_dimension_size(
+                value,
+                size,
+                refined_type.lower(context, location)?,
+                axis,
+                location,
+            )?)?;
+            value = refined.result(0).unwrap().as_ref();
+        }
+        Ok(value)
+    }
+}
+
+/// Value used by [`ArrayTypeLoweringExtension::lower_padded_physical_storage`] for elements outside the runtime shape.
+#[derive(Copy, Clone, Debug)]
+pub enum PhysicalStoragePadding<'b, 'c: 'b, 't: 'c> {
+    /// A real constant converted to the array's element type. Complex elements receive a zero imaginary component.
+    Constant(f64),
+
+    /// A rank-0 MLIR tensor of the array's element type, broadcast with its exact value.
+    Scalar(ValueRef<'b, 'c, 't>),
+}
+
 /// Widens a logical signed one-bit integer to `i8`, recovering `-1` from StableHLO's predicate carrier.
 pub fn lower_signed_one_bit_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
     input: ValueRef<'b, 'c, 't>,
@@ -254,7 +475,7 @@ pub fn physical_bound_type(r#type: &ArrayType) -> Result<ArrayType, Error> {
                 variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).map(Dimension::Static).ok_or_else(
                     || {
                         Error::Lowering(LoweringError::UnsupportedOperation {
-                            operation: "physical_bound_type".to_string(),
+                            operation: "physical bound".to_string(),
                             reason: format!("dynamic dimension `{variable}` needs a finite positive physical bound"),
                         })
                     },
@@ -402,326 +623,6 @@ pub fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c>(
     Ok(constant.result(0)?.as_ref())
 }
 
-/// Lowering of an [`ArrayType`], and of values of that type, to StableHLO.
-pub trait ArrayTypeLoweringExtension {
-    /// Lowers an [`ArrayType`] to a typed MLIR tensor type.
-    fn lower<'c, 't, L: Location<'c, 't>>(
-        &self,
-        context: &'c MlirContext<'t>,
-        location: L,
-    ) -> Result<TensorTypeRef<'c, 't>, Error>;
-
-    /// Encodes the requested layout of an executable boundary value using the `mhlo.layout_mode` convention of PJRT,
-    /// where `kind` names the boundary side (i.e., `"input"` or `"output"`). Internal `LayoutConstraint` custom calls
-    /// (refer to `ArrayTypeLayoutConstraintLoweringExtension::lower_layout_constraint`) alone do not constrain the
-    /// parameter or result ABI.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LoweringError::UnsupportedOperation`] for strided layouts and for bounded dynamic outputs whose layout
-    /// is not row-major.
-    fn lower_boundary_layout<'c, 't>(
-        &self,
-        kind: &str,
-        context: &'c MlirContext<'t>,
-    ) -> Result<Option<AttributeRef<'c, 't>>, Error>;
-
-    /// Materializes the full physical buffer of one bounded dynamic value. The original runtime sizes are retained
-    /// before each dynamic axis is widened to its physical bound, and every newly exposed position is replaced with
-    /// `padding_value`.
-    fn lower_physical_bound_value<'b, 'c: 'b, 't: 'c>(
-        &self,
-        value: ValueRef<'b, 'c, 't>,
-        padding_value: f64,
-        block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
-        location: LocationRef<'c, 't>,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
-
-    /// Exposes the bounded storage of one bounded dynamic value like
-    /// [`ArrayTypeLoweringExtension::lower_physical_bound_value`], masking the inactive positions with
-    /// `scalar_padding`, which is an exact scalar value, when it is provided, and with the numeric constant
-    /// `padding_value` otherwise.
-    fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
-        &self,
-        value: ValueRef<'b, 'c, 't>,
-        padding_value: f64,
-        scalar_padding: Option<ValueRef<'b, 'c, 't>>,
-        block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
-        location: LocationRef<'c, 't>,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
-
-    /// Restores the dynamic dimensions of this type on a value of its [`physical_bound_type`]. Each entry in `sources`
-    /// identifies the value and axis that define the corresponding output dimension.
-    fn lower_restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
-        &self,
-        value: ValueRef<'b, 'c, 't>,
-        sources: &[(ValueRef<'b, 'c, 't>, usize)],
-        block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
-        location: LocationRef<'c, 't>,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
-
-    /// Exposes the physical storage of one bounded dynamic value as a statically shaped value of its
-    /// [`physical_bound_type`], by setting the runtime size of every dynamic axis to its physical bound. Unlike
-    /// [`ArrayTypeLoweringExtension::lower_physical_bound_value`], this does not mask the positions beyond the runtime
-    /// sizes, so it is only suitable for callers that discard those positions again (e.g., by slicing to a static
-    /// extent or by restoring the runtime sizes).
-    fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
-        &self,
-        value: ValueRef<'b, 'c, 't>,
-        block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
-        location: LocationRef<'c, 't>,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error>;
-}
-
-impl ArrayTypeLoweringExtension for ArrayType {
-    fn lower<'c, 't, L: Location<'c, 't>>(
-        &self,
-        context: &'c MlirContext<'t>,
-        location: L,
-    ) -> Result<TensorTypeRef<'c, 't>, Error> {
-        let element_type = self.data_type().lower(context)?;
-        let dimensions = self
-            .shape()
-            .dimensions()
-            .iter()
-            .map(|size| match size {
-                Dimension::Static(value) => MlirSize::Static(*value),
-                Dimension::Dynamic(_) => MlirSize::Dynamic,
-            })
-            .collect::<Vec<_>>();
-        let bounds = self.shape().dimensions().iter().map(stable_hlo_dynamic_dimension_bound).collect::<Vec<_>>();
-        let encoding = bounds
-            .iter()
-            .any(Option::is_some)
-            .then(|| context.stable_hlo_tensor_type_extensions(bounds.as_slice()))
-            .transpose()?
-            .map(|attribute| attribute.as_ref());
-        context.tensor_type(element_type, dimensions.as_slice(), encoding, location).map_err(Error::from)
-    }
-
-    fn lower_boundary_layout<'c, 't>(
-        &self,
-        kind: &str,
-        context: &'c MlirContext<'t>,
-    ) -> Result<Option<AttributeRef<'c, 't>>, Error> {
-        let Some(layout) = self.layout() else {
-            return Ok(None);
-        };
-        let Layout::Tiled(tiled) = layout else {
-            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                operation: "executable boundary layout".to_string(),
-                reason: format!("strided {kind} layout `{layout}`"),
-            }));
-        };
-        // The pinned XLA SliceToDynamic emitter assumes row-major source/result layouts. Requesting a different
-        // dynamic result layout can abort compilation rather than return an error.
-        if kind == "output"
-            && self.static_shape().is_none()
-            && !tiled.minor_to_major().iter().copied().eq((0..self.rank()).rev())
-        {
-            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                operation: "executable boundary layout".to_string(),
-                reason: format!("non-row-major bounded-dynamic output layout `{layout}`"),
-            }));
-        }
-        Ok(Some(
-            context
-                .string_attribute(tiled.to_pjrt().map_err(ProgramError::custom)?.to_string().as_str())
-                .as_ref(),
-        ))
-    }
-
-    fn lower_physical_bound_value<'b, 'c: 'b, 't: 'c>(
-        &self,
-        value: ValueRef<'b, 'c, 't>,
-        padding_value: f64,
-        block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
-        location: LocationRef<'c, 't>,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-        self.lower_physical_bound_value_with_padding(value, padding_value, None, block, context, location)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
-        &self,
-        value: ValueRef<'b, 'c, 't>,
-        padding_value: f64,
-        scalar_padding: Option<ValueRef<'b, 'c, 't>>,
-        block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
-        location: LocationRef<'c, 't>,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-        if self.static_shape().is_some() {
-            return Ok(value);
-        }
-        let runtime_sizes = self
-            .shape()
-            .dimensions()
-            .iter()
-            .enumerate()
-            .map(|(axis, dimension)| {
-                if matches!(dimension, Dimension::Static(_)) {
-                    return Ok(None);
-                }
-                let size = block.append_operation(stable_hlo::get_dimension_size(value, axis, location)?)?;
-                Ok(Some(size.result(0).unwrap().as_ref()))
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        let physical_type = physical_bound_type(self)?;
-        let size_type = ArrayType::scalar(DataType::I32).lower(context, location)?;
-        let mut data = value;
-        let mut physicalized_dimensions = self.shape().dimensions().to_vec();
-        for (axis, dimension) in self.shape().dimensions().iter().enumerate() {
-            if matches!(dimension, Dimension::Static(_)) {
-                continue;
-            }
-            let physical_extent = physical_type.shape().dimensions()[axis].value().unwrap();
-            let extent = dimension_extent_i32(physical_extent)?;
-            let elements = context.dense_i32_elements_attribute(size_type, &[extent])?;
-            let size = block.append_operation(stable_hlo::constant(elements, location)?)?;
-            let size = size.result(0).unwrap().as_ref();
-            physicalized_dimensions[axis] = Dimension::Static(physical_extent);
-            let physicalized_type = self.clone().with_shape(Shape::new(physicalized_dimensions.clone()));
-            let physicalized = block.append_operation(stable_hlo::set_dimension_size(
-                data,
-                size,
-                physicalized_type.lower(context, location)?,
-                axis,
-                location,
-            )?)?;
-            data = physicalized.result(0).unwrap().as_ref();
-        }
-        let index_type = ArrayType::new(DataType::I32, physical_type.shape().clone());
-        let index_tensor_type = index_type.lower(context, location)?;
-        let mut in_bounds = None;
-        for (axis, dimension) in self.shape().dimensions().iter().enumerate() {
-            if matches!(dimension, Dimension::Static(_)) {
-                continue;
-            }
-            let indices = block.append_operation(stable_hlo::iota(index_tensor_type, axis, location)?)?;
-            let indices = indices.result(0).unwrap().as_ref();
-            let size = runtime_sizes[axis].unwrap();
-            let size = block.append_operation(stable_hlo::broadcast(size, index_tensor_type, &[], location)?)?;
-            let size = size.result(0).unwrap().as_ref();
-            let axis_in_bounds = block.append_operation(stable_hlo::compare(
-                indices,
-                size,
-                stable_hlo::ComparisonDirection::LessThan,
-                stable_hlo::ComparisonType::for_type(indices.r#type()?)?,
-                location,
-            )?)?;
-            let axis_in_bounds = axis_in_bounds.result(0).unwrap().as_ref();
-            in_bounds = Some(match in_bounds {
-                None => axis_in_bounds,
-                Some(in_bounds) => block
-                    .append_operation(stable_hlo::and(in_bounds, axis_in_bounds, location)?)?
-                    .result(0)
-                    .unwrap()
-                    .as_ref(),
-            });
-        }
-        let physical_tensor_type = physical_type.lower(context, location)?;
-        let padding = if let Some(padding) = scalar_padding {
-            block
-                .append_operation(stable_hlo::broadcast(padding, physical_tensor_type, &[], location)?)?
-                .result(0)
-                .unwrap()
-                .as_ref()
-        } else if physical_type.data_type().is_complex() {
-            // Padding belongs to the complex element type too, so construct its real and imaginary components
-            // separately.
-            let part_type = physical_type.clone().with_data_type(if physical_type.data_type() == DataType::C64 {
-                DataType::F32
-            } else {
-                DataType::F64
-            });
-            let part_tensor_type = part_type.lower(context, location)?;
-            let real = lower_f64_constant_splat(padding_value, &part_type, part_tensor_type, block, context, location)?;
-            let imaginary = lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?;
-            block.append_operation(stable_hlo::complex(real, imaginary, location)?)?.result(0).unwrap().as_ref()
-        } else {
-            lower_f64_constant_splat(padding_value, &physical_type, physical_tensor_type, block, context, location)?
-        };
-        let masked = block.append_operation(stable_hlo::select(in_bounds.unwrap(), data, padding, location)?)?;
-        Ok(masked.result(0).unwrap().as_ref())
-    }
-
-    fn lower_restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
-        &self,
-        mut value: ValueRef<'b, 'c, 't>,
-        sources: &[(ValueRef<'b, 'c, 't>, usize)],
-        block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
-        location: LocationRef<'c, 't>,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-        if sources.len() != self.rank() {
-            return Err(ProgramError::InvalidInputCount { expected: self.rank(), actual: sources.len() }.into());
-        }
-        let mut dimensions = physical_bound_type(self)?.shape().dimensions().to_vec();
-        for (axis, dimension) in self.shape().dimensions().iter().enumerate() {
-            if matches!(dimension, Dimension::Static(_)) {
-                continue;
-            }
-            let size =
-                block.append_operation(stable_hlo::get_dimension_size(sources[axis].0, sources[axis].1, location)?)?;
-            let size = size.result(0).unwrap().as_ref();
-            dimensions[axis] = dimension.clone();
-            let refined_type = self.clone().with_shape(Shape::new(dimensions.clone()));
-            let refined = block.append_operation(stable_hlo::set_dimension_size(
-                value,
-                size,
-                refined_type.lower(context, location)?,
-                axis,
-                location,
-            )?)?;
-            value = refined.result(0).unwrap().as_ref();
-        }
-        Ok(value)
-    }
-
-    fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
-        &self,
-        value: ValueRef<'b, 'c, 't>,
-        block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
-        location: LocationRef<'c, 't>,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-        let physical_type = physical_bound_type(self)?;
-        let mut dimensions = self.shape().dimensions().to_vec();
-        let mut value = value;
-        for (axis, dimension) in self.shape().dimensions().iter().enumerate() {
-            if matches!(dimension, Dimension::Static(_)) {
-                continue;
-            }
-            let bound = physical_type.shape().dimensions()[axis].value().unwrap();
-            let size = lower_unplaced_constant_output(
-                &[ArrayType::scalar(DataType::I32)],
-                i64::from(dimension_extent_i32(bound)?),
-                block,
-                context,
-                location,
-            )?
-            .remove(0);
-            dimensions[axis] = Dimension::Static(bound);
-            let exposed_type = self.clone().with_shape(Shape::new(dimensions.clone()));
-            let exposed = block.append_operation(stable_hlo::set_dimension_size(
-                value,
-                size,
-                exposed_type.lower(context, location)?,
-                axis,
-                location,
-            )?)?;
-            value = exposed.result(0).unwrap().as_ref();
-        }
-        Ok(value)
-    }
-}
-
 /// Converts a Ryft exclusive dynamic dimension bound to StableHLO's inclusive maximum dimension size.
 pub fn stable_hlo_dynamic_dimension_bound(size: &Dimension) -> Option<usize> {
     match size {
@@ -856,7 +757,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ConvertElementTypeOperation, DimensionBounds, DimensionType, DimensionVariable, Error as CoreError,
-        Placeholder, ReferenceType, TiledLayout, ZeroOperation,
+        Placeholder, ReferenceType, ZeroOperation,
     };
 
     use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, test_vector_type, unproject_plain_program};
@@ -1061,17 +962,31 @@ mod tests {
     }
 
     #[test]
-    fn test_array_type_lower_boundary_layout() {
+    fn test_array_type_lower_physical_storage() {
+        // The runtime size of the dynamic dimension is set to its physical bound without masking.
+        let bounded_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(4)), Dimension::Static(2)]));
         let context = MlirContext::new();
-        let plain = ArrayType::new_static(DataType::F32, [2, 3]);
-        assert!(plain.lower_boundary_layout("input", &context).unwrap().is_none());
-        let column_major = plain.with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
-        let attribute = column_major.lower_boundary_layout("output", &context).unwrap().unwrap();
-        assert_eq!(attribute.to_string(), "\"{0,1}\"");
+        let location = context.unknown_location();
+        let block = context.block(&[(bounded_type.lower(&context, location).unwrap(), location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let output = bounded_type
+            .lower_physical_storage(input, &mut block.as_ref(), &context, location.as_ref())
+            .unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output, operations.last().unwrap().result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                "%c = stablehlo.constant dense<3> : tensor<i32>",
+                "%0 = stablehlo.set_dimension_size <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>>, dim = 0 : \
+                 (tensor<?x2xf32, #stablehlo.bounds<3, ?>>, tensor<i32>) -> tensor<3x2xf32>",
+            ],
+        );
     }
 
     #[test]
-    fn test_array_type_lower_physical_bound_value() {
+    fn test_array_type_lower_padded_physical_storage() {
         // The positions beyond the runtime size of the dynamic dimension are replaced with the padding value.
         let bounded_type =
             ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(4)), Dimension::Static(2)]));
@@ -1081,7 +996,15 @@ mod tests {
         let input = block.argument(0).unwrap().as_ref();
         let mut block_ref = block.as_ref();
         let location = location.as_ref();
-        let output = bounded_type.lower_physical_bound_value(input, -1.0, &mut block_ref, &context, location).unwrap();
+        let output = bounded_type
+            .lower_padded_physical_storage(
+                input,
+                PhysicalStoragePadding::Constant(-1.0),
+                &mut block_ref,
+                &context,
+                location,
+            )
+            .unwrap();
         let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(output, operations.last().unwrap().result(0).unwrap().as_ref());
         assert_eq!(
@@ -1107,14 +1030,20 @@ mod tests {
         let static_type = test_vector_type(2);
         let block = context.block(&[(static_type.lower(&context, location).unwrap(), location)]);
         let input = block.argument(0).unwrap().as_ref();
-        let output = static_type.lower_physical_bound_value(input, -1.0, &mut block.as_ref(), &context, location);
+        let output = static_type.lower_padded_physical_storage(
+            input,
+            PhysicalStoragePadding::Constant(-1.0),
+            &mut block.as_ref(),
+            &context,
+            location,
+        );
         assert_eq!(output.unwrap(), input);
         assert_eq!(block.operations().unwrap().count(), 0);
     }
 
     #[test]
-    fn test_array_type_lower_physical_bound_value_with_padding() {
-        // An exact scalar padding is broadcast in place of the numeric padding value.
+    fn test_array_type_lower_padded_physical_storage_with_scalar() {
+        // The exact padding scalar is broadcast across the physical buffer.
         let bounded_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(4))]));
         let context = MlirContext::new();
         let location = context.unknown_location();
@@ -1127,7 +1056,13 @@ mod tests {
         let mut block_ref = block.as_ref();
         let location = location.as_ref();
         let output = bounded_type
-            .lower_physical_bound_value_with_padding(input, -1.0, Some(padding), &mut block_ref, &context, location)
+            .lower_padded_physical_storage(
+                input,
+                PhysicalStoragePadding::Scalar(padding),
+                &mut block_ref,
+                &context,
+                location,
+            )
             .unwrap();
         let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(output, operations.last().unwrap().result(0).unwrap().as_ref());
@@ -1151,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_type_lower_restore_dynamic_dimensions() {
+    fn test_array_type_restore_dynamic_dimensions() {
         // The runtime size of the dynamic dimension is read from the source value and axis.
         let bounded_type =
             ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(4)), Dimension::Static(2)]));
@@ -1167,7 +1102,7 @@ mod tests {
         let location = location.as_ref();
         let sources = [(source, 0), (source, 1)];
         let output = bounded_type
-            .lower_restore_dynamic_dimensions(input, &sources, &mut block_ref, &context, location)
+            .restore_dynamic_dimensions(input, &sources, &mut block_ref, &context, location)
             .unwrap();
         let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(output, operations.last().unwrap().result(0).unwrap().as_ref());
@@ -1183,36 +1118,12 @@ mod tests {
 
         // Every dimension needs one source.
         assert!(matches!(
-            bounded_type.lower_restore_dynamic_dimensions(input, &sources[..1], &mut block_ref, &context, location),
+            bounded_type.restore_dynamic_dimensions(input, &sources[..1], &mut block_ref, &context, location),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
                 CoreError::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
             ),
         ));
-    }
-
-    #[test]
-    fn test_array_type_lower_physical_storage() {
-        // The runtime size of the dynamic dimension is set to its physical bound without masking.
-        let bounded_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(4)), Dimension::Static(2)]));
-        let context = MlirContext::new();
-        let location = context.unknown_location();
-        let block = context.block(&[(bounded_type.lower(&context, location).unwrap(), location)]);
-        let input = block.argument(0).unwrap().as_ref();
-        let output = bounded_type
-            .lower_physical_storage(input, &mut block.as_ref(), &context, location.as_ref())
-            .unwrap();
-        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
-        assert_eq!(output, operations.last().unwrap().result(0).unwrap().as_ref());
-        assert_eq!(
-            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            vec![
-                "%c = stablehlo.constant dense<3> : tensor<i32>",
-                "%0 = stablehlo.set_dimension_size <<UNKNOWN SSA VALUE>>, <<UNKNOWN SSA VALUE>>, dim = 0 : \
-                 (tensor<?x2xf32, #stablehlo.bounds<3, ?>>, tensor<i32>) -> tensor<3x2xf32>",
-            ],
-        );
     }
 
     #[test]

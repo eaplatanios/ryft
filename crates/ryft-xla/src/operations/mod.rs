@@ -1218,7 +1218,7 @@ where
     let input_type = input.r#type()?;
     let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| {
         Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: "normalize_elementwise_input".to_string(),
+            operation: "elementwise input".to_string(),
             reason: format!("elementwise operand has non-tensor MLIR type `{input_type}`"),
         })
     })?;
@@ -1236,7 +1236,7 @@ where
         let input_rank = input_tensor_type.rank();
         let first_dimension = output_rank.checked_sub(input_rank).ok_or_else(|| {
             Error::Lowering(LoweringError::UnsupportedOperation {
-                operation: "normalize_elementwise_input".to_string(),
+                operation: "elementwise input".to_string(),
                 reason: format!("cannot broadcast rank-{input_rank} elementwise operand to rank-{output_rank} output"),
             })
         })?;
@@ -1328,7 +1328,7 @@ where
                 location.as_ref(),
             )?;
             let sources = (0..output_type.rank()).map(|axis| (input_values[1 - index], axis)).collect::<Vec<_>>();
-            inputs[index] = output_type.lower_restore_dynamic_dimensions(
+            inputs[index] = output_type.restore_dynamic_dimensions(
                 result,
                 &sources,
                 &mut block.as_ref(),

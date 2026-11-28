@@ -21,7 +21,8 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, lower_f64_constant_splat, physical_bound_type, static_dimensions,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat, physical_bound_type,
+    static_dimensions,
 };
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::extrema::FloatExtremumForm;
@@ -225,7 +226,15 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
             let mut physical_inputs = input_values
                 .iter()
                 .zip(input_types)
-                .map(|(value, r#type)| r#type.lower_physical_bound_value(*value, 0.0, block, context, location))
+                .map(|(value, r#type)| {
+                    r#type.lower_padded_physical_storage(
+                        *value,
+                        PhysicalStoragePadding::Constant(0.0),
+                        block,
+                        context,
+                        location,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             for index in 0..3 {
                 let physical_type = physical_bound_type(&input_types[index])?;
@@ -336,7 +345,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 result = reshaped.result(0).unwrap().as_ref();
             }
             let output_sources = (0..input_types[0].rank()).map(|axis| (input_values[0], axis)).collect::<Vec<_>>();
-            let result = output_types[0].lower_restore_dynamic_dimensions(
+            let result = output_types[0].restore_dynamic_dimensions(
                 result,
                 output_sources.as_slice(),
                 block,
@@ -361,7 +370,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 }
                 let residual_sources =
                     (0..output_types[1].rank()).map(|axis| (input_values[0], axis)).collect::<Vec<_>>();
-                results.push(output_types[1].lower_restore_dynamic_dimensions(
+                results.push(output_types[1].restore_dynamic_dimensions(
                     residual,
                     residual_sources.as_slice(),
                     block,
@@ -427,7 +436,15 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
             let mut physical_inputs = input_values
                 .iter()
                 .zip(input_types)
-                .map(|(value, r#type)| r#type.lower_physical_bound_value(*value, 0.0, block, context, location))
+                .map(|(value, r#type)| {
+                    r#type.lower_padded_physical_storage(
+                        *value,
+                        PhysicalStoragePadding::Constant(0.0),
+                        block,
+                        context,
+                        location,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             for index in [0, 1, 2, offset, offset + 2] {
                 let physical_type = physical_bound_type(&input_types[index])?;
@@ -565,7 +582,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 }
                 let sources =
                     (0..input_types[index].rank()).map(|axis| (input_values[index], axis)).collect::<Vec<_>>();
-                results.push(output_types[index].lower_restore_dynamic_dimensions(
+                results.push(output_types[index].restore_dynamic_dimensions(
                     transposed,
                     sources.as_slice(),
                     block,
@@ -625,7 +642,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                     bias_cotangent = converted.result(0).unwrap().as_ref();
                 }
                 let sources = (0..bias_type.rank()).map(|axis| (input_values[bias_index], axis)).collect::<Vec<_>>();
-                results.push(output_types.last().unwrap().lower_restore_dynamic_dimensions(
+                results.push(output_types.last().unwrap().restore_dynamic_dimensions(
                     bias_cotangent,
                     sources.as_slice(),
                     block,
@@ -994,7 +1011,13 @@ fn synthesize_fused_attention_sequence_lengths<'b, 'c: 'b, 't: 'c>(
             location,
         )?)?;
         lengths = dynamic.result(0).unwrap().as_ref();
-        lengths = logical_type.lower_physical_bound_value(lengths, 0.0, block, context, location)?;
+        lengths = logical_type.lower_padded_physical_storage(
+            lengths,
+            PhysicalStoragePadding::Constant(0.0),
+            block,
+            context,
+            location,
+        )?;
     }
     Ok(lengths)
 }

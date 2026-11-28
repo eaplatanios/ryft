@@ -20,7 +20,7 @@ use ryft_pjrt::extensions::ffi::{
 use ryft_pjrt::{Client, Error as PjrtError};
 
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, lower_runtime_dimension_size_i64, lower_static_index_constants,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_runtime_dimension_size_i64, lower_static_index_constants,
 };
 use crate::lowering::{EffectTokens, current_or_new_token};
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
@@ -802,10 +802,13 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
                 DataType::U1 | DataType::U2 | DataType::U4 => DataType::U8,
                 data_type => data_type,
             };
-            *value = input_type
-                .clone()
-                .with_data_type(data_type)
-                .lower_physical_bound_value(*value, 0.0, block, context, location)?;
+            *value = input_type.clone().with_data_type(data_type).lower_padded_physical_storage(
+                *value,
+                PhysicalStoragePadding::Constant(0.0),
+                block,
+                context,
+                location,
+            )?;
         }
     }
     lower_assertion_custom_call(

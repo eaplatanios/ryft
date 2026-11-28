@@ -10,6 +10,8 @@
 
 // TODO(eaplatanios): Review this module.
 
+use ryft_core::{CALL_OPERATION_NAME, Device, DeviceMesh, PLACE_OPERATION_NAME};
+
 pub mod analysis;
 pub mod domains;
 pub mod functions;
@@ -39,34 +41,65 @@ pub use programs::{CompiledProgram, LoweredProgram};
 /// interpreting compilation analysis.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum CompilationError {
-    /// A requested compilation option combination is invalid.
     #[error("invalid compilation options: {reason}")]
     InvalidOptions { reason: String },
 
-    /// Signature sharding metadata has a different arity than the values it describes.
     #[error("invalid {kind} sharding count; expected {expected} but got {actual}")]
     ShardingCountMismatch { kind: &'static str, expected: usize, actual: usize },
 
-    /// A valid external reference configuration cannot be represented by this backend's executable ABI.
+    #[error(
+        "the sharding of {kind} {index} splits dimension {dimension} of extent {extent} into {shard_count} shards, but \
+         the boundary of an executable requires shards of equal extent, while XLA pads the last shards of an uneven \
+         split"
+    )]
+    UnevenBoundarySharding { kind: &'static str, index: usize, dimension: usize, extent: usize, shard_count: usize },
+
+    #[error(
+        "cannot `{}` a value on the devices [{}] of mesh `{}` inside a program compiled for the devices [{}] of mesh \
+         `{}`",
+        PLACE_OPERATION_NAME,
+        .target.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+        .target.logical_mesh(),
+        .mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+        .mesh.logical_mesh(),
+    )]
+    PlacementMeshMismatch { target: DeviceMesh, mesh: DeviceMesh },
+
+    #[error(
+        "cannot `{}` a value on the device {} inside a program compiled for the devices [{}] of mesh `{}`",
+        PLACE_OPERATION_NAME,
+        .device,
+        .mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+        .mesh.logical_mesh(),
+    )]
+    PlacementDeviceMismatch { device: Device, mesh: DeviceMesh },
+
+    #[error(
+        "cannot `{}` a function compiled for the devices [{}] of mesh `{}` inside a program compiled for the devices \
+         [{}] of mesh `{}`",
+        CALL_OPERATION_NAME,
+        .callee.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+        .callee.logical_mesh(),
+        .mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+        .mesh.logical_mesh(),
+    )]
+    CalleeMeshMismatch { callee: DeviceMesh, mesh: DeviceMesh },
+
     #[error("unsupported XLA reference ABI: {reason}")]
     UnsupportedReferenceAbi { reason: String },
 
-    /// A compiled executable does not preserve its declared invocation contract.
     #[error("incompatible XLA executable: {reason}")]
     IncompatibleExecutable { reason: String },
 
-    /// The executable reports a memory kind different from the one declared by its input or output type.
     #[error(
         "incompatible XLA executable: executable {kind} {index} uses memory kind `{actual}` but its type declares \
          `{expected}`"
     )]
     ExecutableMemoryKindMismatch { kind: &'static str, index: usize, expected: String, actual: String },
 
-    /// Persistent executable bytes or metadata violate their versioned transport contract.
     #[error("invalid persistent XLA executable: {reason}")]
     InvalidPersistentExecutable { reason: String },
 
-    /// Compiler analysis properties cannot be interpreted according to their declared schema.
     #[error("invalid XLA compilation analysis: {reason}")]
     InvalidAnalysis { reason: String },
 }

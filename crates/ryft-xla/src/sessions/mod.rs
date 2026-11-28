@@ -5436,7 +5436,7 @@ pub(crate) mod tests {
             .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "`place` cannot move a value to the devices [1] of mesh `['device'=1:auto]` inside a program compiled for \
+            "cannot `place` a value on the devices [1] of mesh `['device'=1:auto]` inside a program compiled for \
              the devices [0] of mesh `['device'=1:auto]`",
         );
 
@@ -5478,7 +5478,7 @@ pub(crate) mod tests {
         let carry_facts = |array: &Array| (facts(array), array.copy_to_host().unwrap().elements::<i32>().unwrap());
         let conflict = "cannot lower `place`: it requests a placement onto the devices [1], while another placement \
                         request of the same program names the devices [0], and the two do not form one mesh";
-        let outside = "`place` cannot move a value to the device 1 inside a program compiled for the devices [0] of \
+        let outside = "cannot `place` a value on the device 1 inside a program compiled for the devices [0] of \
                        mesh `['device'=1:auto]`";
         for length in [0usize, 1] {
             let slices_type = ArrayType::new_static(DataType::F32, [length, 4]);
@@ -8562,7 +8562,7 @@ pub(crate) mod tests {
             let DifferentiationError::Program(error) = result.unwrap_err() else { unreachable!() };
             assert_eq!(
                 error.downcast_custom(),
-                Some(&LoweringError::MismatchedMeshTopology {
+                Some(&LoweringError::MeshTopologyMismatch {
                     expected: LogicalMesh::single_device(),
                     actual: source.mesh().logical_mesh().clone(),
                 }),

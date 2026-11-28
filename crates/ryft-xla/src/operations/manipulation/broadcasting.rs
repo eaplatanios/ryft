@@ -8,8 +8,8 @@ use ryft_mlir::{Block, Operation as MlirOperation, Type as MlirType, Value as Ml
 
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, dimension_extent_i64, lower_explicit_shape, lower_runtime_dimension_size_i64,
-    lower_static_index_constants, physical_bound_type,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_i64, lower_explicit_shape,
+    lower_runtime_dimension_size_i64, lower_static_index_constants, physical_bound_type,
 };
 use crate::operations::constants::{
     ArrayTypeLayoutConstraintLoweringExtension, dynamic_constructor_types, refine_dynamic_constructor_result,
@@ -96,7 +96,13 @@ impl LowerableOperation for BroadcastOperation {
             // allocation for multiple dynamic axes or an explicit layout, then restore every logical size from its
             // mapped input axis.
             let physical_type = physical_bound_type(output_type)?;
-            let physical_input = input_types[0].lower_physical_bound_value(input, 0.0, block, context, location)?;
+            let physical_input = input_types[0].lower_padded_physical_storage(
+                input,
+                PhysicalStoragePadding::Constant(0.0),
+                block,
+                context,
+                location,
+            )?;
             let broadcast = block.append_operation(stable_hlo::broadcast(
                 physical_input,
                 physical_type.lower(context, location)?,
@@ -109,7 +115,7 @@ impl LowerableOperation for BroadcastOperation {
             for (input_axis, output_axis) in self.output_axes().iter().enumerate() {
                 sources[*output_axis] = (input, input_axis);
             }
-            output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)?
+            output_type.restore_dynamic_dimensions(result, &sources, block, context, location)?
         } else {
             let broadcast = block.append_operation(stable_hlo::broadcast(
                 input,
@@ -148,7 +154,13 @@ impl LowerableOperation for BroadcastLikeOperation {
         // allocation, where a stretched unit axis has a static extent even when its output axis is dynamic, and
         // every logical size is then restored from the exemplar.
         let physical_type = physical_bound_type(output_type)?;
-        let value = input_types[0].lower_physical_bound_value(input_values[0], 0.0, block, context, location)?;
+        let value = input_types[0].lower_padded_physical_storage(
+            input_values[0],
+            PhysicalStoragePadding::Constant(0.0),
+            block,
+            context,
+            location,
+        )?;
         let broadcast = block.append_operation(stable_hlo::broadcast(
             value,
             physical_type.lower(context, location)?,
@@ -158,7 +170,7 @@ impl LowerableOperation for BroadcastLikeOperation {
         let result = broadcast.result(0).unwrap().as_ref();
         let result = physical_type.lower_layout_constraint(result, block, location)?;
         let sources = (0..output_type.rank()).map(|axis| (input_values[1], axis)).collect::<Vec<_>>();
-        let result = output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)?;
+        let result = output_type.restore_dynamic_dimensions(result, &sources, block, context, location)?;
         let result = if broadcast_changes_explicit_sharding(&input_types[0], output_type, self.output_axes()) {
             lowerer.lowering_context().lower_sharding_constraint(
                 output_type.sharding().unwrap(),
@@ -223,7 +235,13 @@ impl LowerableOperation for DynamicBroadcastOperation {
                 .collect::<Vec<_>>();
             let (declared_type, physical_type) =
                 dynamic_constructor_types(self.name(), dynamic_extents.len(), output_types)?;
-            let input = input_type.lower_physical_bound_value(*input, 0.0, block, context, location)?;
+            let input = input_type.lower_padded_physical_storage(
+                *input,
+                PhysicalStoragePadding::Constant(0.0),
+                block,
+                context,
+                location,
+            )?;
             let output_tensor_type = physical_type.lower(context, location)?;
             let broadcast = block.append_operation(stable_hlo::broadcast(
                 input,

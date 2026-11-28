@@ -434,7 +434,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
                 lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
             let dimension_sources =
                 (0..expanded_output_type.rank()).map(|axis| (input_values[1], axis)).collect::<Vec<_>>();
-            expanded_output_type.lower_restore_dynamic_dimensions(
+            expanded_output_type.restore_dynamic_dimensions(
                 zero,
                 dimension_sources.as_slice(),
                 block,

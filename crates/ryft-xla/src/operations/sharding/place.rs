@@ -34,7 +34,7 @@ impl LowerableOperation for PlaceOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // A compiled program runs on the devices of one mesh, so inside it a placement can only redistribute a value
         // over those devices and change its storage. Compilation rejects targets on any other devices before lowering
-        // (refer to `LoweringError::PlacementOutsideProgramMesh`), because the lowering only knows the logical mesh,
+        // (refer to `CompilationError::PlacementMeshMismatch`), because the lowering only knows the logical mesh,
         // and it also rejects targets that are not replicated in bounded dynamic programs, whose replicas ignore
         // sharding constraints. What remains lowers to a sharding constraint for the target sharding, followed by a
         // layout constraint when the layout changes and by a memory annotation when the memory changes. Unlike the
@@ -59,7 +59,7 @@ impl LowerableOperation for PlaceOperation {
         // states where the input lives, as JAX elides the source of a `device_put` inside `jit` and `shard_map`.
         // Transposition turns the source into the target of the cotangent. When that program is compiled, the manual
         // axis check below rejects moving a shard-local cotangent, and the program mesh check rejects moving it off
-        // the mesh (refer to `LoweringError::PlacementOutsideProgramMesh`).
+        // the mesh (refer to `CompilationError::PlacementMeshMismatch`).
         let Some(target) = self.target() else {
             return Ok(vec![input_values[0]]);
         };
@@ -141,7 +141,7 @@ mod tests {
     use crate::sessions::tests::{f32_vector, two_device_mesh};
     use crate::tests::{cpu_client, native_buffer_addresses, shard_values, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayTracer, CompileTracer, CompiledFunction, Constant, FromPjrt, Options, PlacementOptions,
+        Array, ArrayTracer, CompilationError, CompileTracer, CompiledFunction, Constant, FromPjrt, Options, PlacementOptions,
         ProgramLoweringExtension, ProgramLoweringOptions, Session, StatefulCompileTracer, TracedProgram, Type, Value,
         compile, compile_statefully, compile_with_options, trace,
     };
@@ -710,7 +710,7 @@ mod tests {
             // The transposed placement of a source on the devices of the region is rejected for moving a value inside
             // it, and that of a source outside the program mesh for naming devices that the program does not run on.
             let outside_error = format!(
-                "`{PLACE_OPERATION_NAME}` cannot move a value to the devices [1] of mesh `['x'=1:manual]` inside a \
+                "cannot `{PLACE_OPERATION_NAME}` a value on the devices [1] of mesh `['x'=1:manual]` inside a \
                  program compiled for the devices [0] of mesh `['x'=1:explicit]`",
             );
             for source in sources {
@@ -819,14 +819,14 @@ mod tests {
         );
         assert!(matches!(
             &error,
-            Error::Lowering(LoweringError::PlacementOutsideProgramMesh { target, mesh: program_mesh })
+            Error::Compilation(CompilationError::PlacementMeshMismatch { target, mesh: program_mesh })
                 if target == &reversed && program_mesh == &mesh,
         ));
         let device_ids = |mesh: &DeviceMesh| mesh.devices().iter().map(|device| device.id()).collect::<Vec<_>>();
         assert_eq!(
             error.to_string(),
             format!(
-                "`place` cannot move a value to the devices {:?} of mesh `{}` inside a program compiled for the \
+                "cannot `place` a value on the devices {:?} of mesh `{}` inside a program compiled for the \
                  devices {:?} of mesh `{}`",
                 device_ids(&reversed),
                 reversed.logical_mesh(),
@@ -846,7 +846,7 @@ mod tests {
         );
         assert!(matches!(
             &error,
-            Error::Lowering(LoweringError::PlacementOutsideProgramMesh { target, mesh: program_mesh })
+            Error::Compilation(CompilationError::PlacementMeshMismatch { target, mesh: program_mesh })
                 if target == &single_device_mesh && program_mesh == &mesh,
         ));
     }

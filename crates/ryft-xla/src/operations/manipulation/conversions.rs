@@ -11,8 +11,8 @@ use ryft_mlir::{
 
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, lower_f64_constant_splat, lower_signed_one_bit_to_mlir, lower_unplaced_constant_output,
-    physical_bound_type, static_dimensions,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat, lower_signed_one_bit_to_mlir,
+    lower_unplaced_constant_output, physical_bound_type, static_dimensions,
 };
 use crate::operations::assertions::{lower_dependency_barrier, lower_type_relationship_checks};
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
@@ -390,13 +390,7 @@ impl ArrayTypeLayoutConversionLoweringExtension for ArrayType {
             self.lower_physical_storage(value, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
         let result = physical_type.lower_layout_constraint(physical, &mut lowerer.block(), lowerer.location())?;
         let sources = (0..self.rank()).map(|axis| (value, axis)).collect::<Vec<_>>();
-        self.lower_restore_dynamic_dimensions(
-            result,
-            &sources,
-            &mut lowerer.block(),
-            lowerer.context(),
-            lowerer.location(),
-        )
+        self.restore_dynamic_dimensions(result, &sources, &mut lowerer.block(), lowerer.context(), lowerer.location())
     }
 }
 
@@ -770,7 +764,13 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     let padding = if input_type.data_type() == DataType::F8E8M0FNU { 1.0 } else { 0.0 };
     let carrier_input_type =
         if input_one_bit { input_type.clone().with_data_type(DataType::Boolean) } else { input_type.clone() };
-    let physical_input = carrier_input_type.lower_physical_bound_value(input, padding, block, context, location)?;
+    let physical_input = carrier_input_type.lower_padded_physical_storage(
+        input,
+        PhysicalStoragePadding::Constant(padding),
+        block,
+        context,
+        location,
+    )?;
     let physical_output_type = physical_bound_type(output_type)?;
     let output_tensor_type = physical_output_type.lower(context, location)?;
     let result = if matches!(input_type.data_type(), DataType::F6E2M3FN | DataType::F6E3M2FN) {
@@ -946,7 +946,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         result.result(0).unwrap().as_ref()
     };
     let sources = (0..output_type.rank()).map(|axis| (input, axis)).collect::<Vec<_>>();
-    output_type.lower_restore_dynamic_dimensions(result, &sources, block, context, location)
+    output_type.restore_dynamic_dimensions(result, &sources, block, context, location)
 }
 
 /// Extracts a finite FP6 encoding through its exact `f32` representation, preserving the sign of zero.

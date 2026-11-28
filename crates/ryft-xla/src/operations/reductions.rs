@@ -860,7 +860,7 @@ fn lower_index_reduction_to_mlir<'b, 'c: 'b, 't: 'c>(
     let indices = block.append_operation(stable_hlo::iota(physical_index_tensor_type, axis, location)?)?;
     let indices = indices.result(0).unwrap().as_ref();
     let extent_sources = (0..index_type.rank()).map(|axis| (input_value, axis)).collect::<Vec<_>>();
-    let indices = index_type.lower_restore_dynamic_dimensions(indices, &extent_sources, block, context, location)?;
+    let indices = index_type.restore_dynamic_dimensions(indices, &extent_sources, block, context, location)?;
     let identity_kind = if maximize { ReductionKind::Max } else { ReductionKind::Min };
     let value_identity = build_reduction_identity_constant(identity_kind, value_data_type, block, context, location)?;
     let scalar_index_type = ArrayType::scalar(index_data_type);

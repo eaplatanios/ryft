@@ -10,8 +10,8 @@ use ryft_mlir::{
 
 use crate::lowering::EffectTokens;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, dimension_extent_i32, dimension_extent_i64, lower_constant_output,
-    lower_static_index_constants, physical_bound_type,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_i32, dimension_extent_i64,
+    lower_constant_output, lower_static_index_constants, physical_bound_type,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_CONCATENATE_KIND, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE,
@@ -120,8 +120,13 @@ impl LowerableOperation for ConcatenateOperation<Type> {
             // resize only its trailing padding, then restore the logical dimensions. Reshape cannot change an
             // allocation bound in XLA, even when its runtime element count stays unchanged.
             let padding_value = i64::from(output_type.data_type() == DataType::F8E8M0FNU);
-            result =
-                inferred_type.lower_physical_bound_value(result, padding_value as f64, block, context, location)?;
+            result = inferred_type.lower_padded_physical_storage(
+                result,
+                PhysicalStoragePadding::Constant(padding_value as f64),
+                block,
+                context,
+                location,
+            )?;
             let mut high_padding = vec![0; output_type.rank()];
             high_padding[self.axis()] =
                 dimension_extent_i64(physical_output_type.dimension(self.axis()).value().unwrap())?
@@ -146,7 +151,7 @@ impl LowerableOperation for ConcatenateOperation<Type> {
                 )?)?;
                 result = resized.result(0).unwrap().as_ref();
             }
-            result = output_type.lower_restore_dynamic_dimensions(
+            result = output_type.restore_dynamic_dimensions(
                 result,
                 &(0..output_type.rank()).map(|axis| (logical_result, axis)).collect::<Vec<_>>(),
                 block,

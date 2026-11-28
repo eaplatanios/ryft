@@ -181,14 +181,14 @@ impl ProgramLoweringContext {
     ///
     /// # Errors
     ///
-    /// Returns [`LoweringError::MismatchedMeshTopology`] when the axis names or sizes of `mesh` differ from those
+    /// Returns [`LoweringError::MeshTopologyMismatch`] when the axis names or sizes of `mesh` differ from those
     /// of the recorded mesh, including in order.
     pub(crate) fn require_mesh(&self, mesh: &LogicalMesh) -> Result<(), Error> {
         let recorded = self.state.module.mesh.get_or_init(|| mesh.clone());
         if recorded.has_same_topology(mesh) {
             Ok(())
         } else {
-            Err(Error::Lowering(LoweringError::MismatchedMeshTopology {
+            Err(Error::Lowering(LoweringError::MeshTopologyMismatch {
                 expected: recorded.clone(),
                 actual: mesh.clone(),
             }))
@@ -300,9 +300,7 @@ impl ProgramLoweringContext {
             .copied()
             .filter(|_| values.len() == self.state.session_constant_indices.len())
             .map(|index| values[index])
-            .ok_or_else(|| {
-                Error::Lowering(LoweringError::UnreachableSessionConstant { constant: constant.to_string() })
-            })
+            .ok_or_else(|| Error::Lowering(LoweringError::UnboundSessionConstant { constant: constant.to_string() }))
     }
 
     /// Lowers one instruction's [`Provenance`] onto MLIR locations above the provided base location and records
@@ -647,10 +645,7 @@ mod tests {
         ] {
             assert_eq!(
                 lowering_context.require_mesh(&other),
-                Err(Error::Lowering(LoweringError::MismatchedMeshTopology {
-                    expected: explicit.clone(),
-                    actual: other,
-                })),
+                Err(Error::Lowering(LoweringError::MeshTopologyMismatch { expected: explicit.clone(), actual: other })),
             );
         }
         assert_eq!(lowering_context.mesh(), Some(explicit));
@@ -859,7 +854,7 @@ mod tests {
                 &mut block_ref,
                 location,
             ),
-            Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected: test_mesh(), actual: other })),
+            Err(Error::Lowering(LoweringError::MeshTopologyMismatch { expected: test_mesh(), actual: other })),
         );
         let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(output, operations[0].result(0).unwrap().as_ref());
@@ -971,11 +966,11 @@ mod tests {
         let unbound = RetainedArray::new(&f32_scalar(&session, &mesh, 3.0));
         assert_eq!(
             lowering_context.lower_session_constant(&unbound, &captured_values),
-            Err(Error::Lowering(LoweringError::UnreachableSessionConstant { constant: unbound.to_string() })),
+            Err(Error::Lowering(LoweringError::UnboundSessionConstant { constant: unbound.to_string() })),
         );
         assert_eq!(
             lowering_context.lower_session_constant(&first, &captured_values[..1]),
-            Err(Error::Lowering(LoweringError::UnreachableSessionConstant { constant: first.to_string() })),
+            Err(Error::Lowering(LoweringError::UnboundSessionConstant { constant: first.to_string() })),
         );
     }
 

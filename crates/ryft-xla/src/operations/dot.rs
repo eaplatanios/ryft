@@ -12,8 +12,8 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_u64_scalar_constant, lower_unplaced_constant_output,
-    physical_bound_type,
+    ArrayTypeLoweringExtension, DataTypeLoweringExtension, PhysicalStoragePadding, lower_u64_scalar_constant,
+    lower_unplaced_constant_output, physical_bound_type,
 };
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, RaggedDotLoweringStrategy};
@@ -398,8 +398,13 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
             block.append_operation(stable_hlo::convert(group_sizes, wide_group_sizes_tensor_type, location)?)?;
         converted.result(0).unwrap().as_ref()
     };
-    let wide_group_sizes =
-        wide_group_sizes_type.lower_physical_bound_value(wide_group_sizes, 0.0, block, context, location)?;
+    let wide_group_sizes = wide_group_sizes_type.lower_padded_physical_storage(
+        wide_group_sizes,
+        PhysicalStoragePadding::Constant(0.0),
+        block,
+        context,
+        location,
+    )?;
     let physical_ragged_extent = u64::try_from(physical_ragged_extent).unwrap();
     if group_count == 0 {
         return Ok((wide_group_sizes, wide_group_sizes));
@@ -533,7 +538,7 @@ fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
     let before_end = ComparisonDirection::LessThan.lower_comparison(indices, group_ends, block, location)?;
     let mask = block.append_operation(stable_hlo::and(after_start, before_end, location)?)?;
     let mask = mask.result(0).unwrap().as_ref();
-    let mask = metadata_type.with_data_type(DataType::Boolean).lower_restore_dynamic_dimensions(
+    let mask = metadata_type.with_data_type(DataType::Boolean).restore_dynamic_dimensions(
         mask,
         dimension_sources.as_slice(),
         block,
@@ -1068,7 +1073,8 @@ mod tests {
                 f32_type,
                 None,
             ),
-            Err(Error::Lowering(LoweringError::VerificationFailure)),
+            Err(Error::Lowering(LoweringError::ModuleVerificationFailed { diagnostic }))
+                if diagnostic == "PLACEHOLDER",
         ));
     }
 

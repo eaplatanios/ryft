@@ -33,10 +33,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayType, CALL_OPERATION_NAME, CompositeKey, DataType, Device, DeviceMesh, EagerContext, EffectClass,
-    EffectClasses, FlatProgram, LogicalMesh, Operation as CoreOperation, OperationPayloadProjection,
-    PLACE_OPERATION_NAME, Parameterized, Program, ProgramError, RegionRef, ScanOperation, Sharding, ShardingDimension,
-    Type as CoreType,
+    ArrayType, CompositeKey, DataType, EagerContext, EffectClass, EffectClasses, FlatProgram, LogicalMesh,
+    Operation as CoreOperation, OperationPayloadProjection, Parameterized, Program, ProgramError, RegionRef,
+    ScanOperation, Sharding, ShardingDimension, Type as CoreType,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -48,8 +47,6 @@ use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::operations::call::CallFunctionMap;
 use crate::{Constant, Error, Operation, RuntimeRequirement, Session, Type};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents errors produced while validating a program for XLA lowering, constructing its StableHLO
 /// representation, or verifying the result.
 ///
@@ -57,73 +54,38 @@ use crate::{Constant, Error, Operation, RuntimeRequirement, Session, Type};
 /// retain their original types in [`Error::Core`] and [`Error::Mlir`], respectively.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum LoweringError {
-    #[error("invalid function name `{function_name}` used during XLA lowering")]
-    InvalidFunctionName { function_name: String },
-
-    #[error("missing captured constant #{index} during XLA lowering")]
-    MissingCapturedConstant { index: usize },
-
-    #[error("session constant `{constant}` cannot be referenced in this lowering scope")]
-    UnreachableSessionConstant { constant: String },
-
     #[error("unresolved reference construct `{construct}` must be discharged before XLA lowering")]
     UnresolvedReference { construct: String },
 
     #[error("unresolved state in `{construct}` must be discharged before XLA lowering")]
     UnresolvedState { construct: String },
 
+    #[error("invalid function name `{function_name}`")]
+    InvalidFunctionName { function_name: String },
+
     #[error("invalid XLA reference-state ABI: {message}")]
     InvalidReferenceStateAbi { message: String },
 
+    #[error("missing captured constant #{index}")]
+    MissingCapturedConstant { index: usize },
+
+    #[error("session constant `{constant}` is not bound in this lowering scope")]
+    UnboundSessionConstant { constant: String },
+
     #[error("mesh `{actual}` does not have the topology of the module mesh `{expected}`")]
-    MismatchedMeshTopology { expected: LogicalMesh, actual: LogicalMesh },
-
-    #[error(
-        "`{}` cannot move a value to the devices [{}] of mesh `{}` inside a program compiled for the devices [{}] of \
-         mesh `{}`",
-        PLACE_OPERATION_NAME,
-        .target.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-        .target.logical_mesh(),
-        .mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-        .mesh.logical_mesh(),
-    )]
-    PlacementOutsideProgramMesh { target: DeviceMesh, mesh: DeviceMesh },
-
-    #[error(
-        "`{}` cannot move a value to the device {} inside a program compiled for the devices [{}] of mesh `{}`",
-        PLACE_OPERATION_NAME,
-        .device,
-        .mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-        .mesh.logical_mesh(),
-    )]
-    DeviceOutsideProgramMesh { device: Device, mesh: DeviceMesh },
-
-    #[error(
-        "`{}` cannot call a function compiled for the devices [{}] of mesh `{}` inside a program compiled for the \
-         devices [{}] of mesh `{}`",
-        CALL_OPERATION_NAME,
-        .callee.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-        .callee.logical_mesh(),
-        .mesh.devices().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
-        .mesh.logical_mesh(),
-    )]
-    CallOutsideProgramMesh { callee: DeviceMesh, mesh: DeviceMesh },
-
-    #[error(
-        "the sharding of {kind} {index} splits dimension {dimension} of extent {extent} into {shard_count} shards, but \
-         XLA requires the number of shards to divide the extent"
-    )]
-    UnevenSharding { kind: &'static str, index: usize, dimension: usize, extent: usize, shard_count: usize },
+    MeshTopologyMismatch { expected: LogicalMesh, actual: LogicalMesh },
 
     #[error("cannot lower `{operation}`: {reason}")]
     UnsupportedOperation { operation: String, reason: String },
 
-    #[error("cannot lower element type `{data_type}` for {context}")]
+    #[error("cannot lower data type `{data_type}` for {context}")]
     UnsupportedDataType { data_type: DataType, context: String },
 
-    #[error("constructed MLIR module failed verification during XLA lowering")]
-    VerificationFailure,
+    #[error("lowered MLIR module failed verification: {diagnostic}")]
+    ModuleVerificationFailed { diagnostic: String },
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// XLA representation used when lowering ragged dots. Set it for a compilation with
 /// [`Options::with_ragged_dot_lowering_strategy`](crate::Options::with_ragged_dot_lowering_strategy) or for a direct
@@ -404,7 +366,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     ///
     /// # Errors
     ///
-    /// Returns [`LoweringError::MismatchedMeshTopology`] when the axis names or sizes of `mesh` differ from those of
+    /// Returns [`LoweringError::MeshTopologyMismatch`] when the axis names or sizes of `mesh` differ from those of
     /// the mesh that the module already refers to, including in order.
     pub fn require_mesh(&mut self, mesh: &LogicalMesh) -> Result<(), Error> {
         self.lowering_context.require_mesh(mesh)
@@ -1482,7 +1444,7 @@ pub(crate) mod tests {
             LogicalMesh::new(axes.to_vec()).unwrap()
         };
         assert_eq!(
-            LoweringError::MismatchedMeshTopology { expected: mesh(["y", "x"]), actual: mesh(["x", "y"]) }.to_string(),
+            LoweringError::MeshTopologyMismatch { expected: mesh(["y", "x"]), actual: mesh(["x", "y"]) }.to_string(),
             "mesh `['x'=2:explicit, 'y'=2:explicit]` does not have the topology of the module mesh \
              `['y'=2:explicit, 'x'=2:explicit]`",
         );
@@ -1500,7 +1462,7 @@ pub(crate) mod tests {
                 context: "sum reduction identity".to_string(),
             }
             .to_string(),
-            "cannot lower element type `zero` for sum reduction identity",
+            "cannot lower data type `zero` for sum reduction identity",
         );
     }
 

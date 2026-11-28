@@ -23,8 +23,8 @@ use ryft_mlir::{Block, Operation as MlirOperation, Region, Type as MlirType, Val
 use crate::lowering::EffectTokens;
 use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, TypeLoweringExtension, lower_explicit_shape, lower_runtime_dimension_size_i64,
-    lower_static_index_constants, physical_bound_type,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, TypeLoweringExtension, lower_explicit_shape,
+    lower_runtime_dimension_size_i64, lower_static_index_constants, physical_bound_type,
 };
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::control_flow::{
@@ -326,9 +326,9 @@ impl LowerableOperation for WhileOperation<Type> {
                                 // Broadcast bounded storage, then restore every logical extent from the carry. A
                                 // predicate cannot supply the dynamic sizes of trailing state axes, and native bounded
                                 // broadcast results admit at most one dynamic axis.
-                                let predicate = predicate_type.lower_physical_bound_value(
+                                let predicate = predicate_type.lower_padded_physical_storage(
                                     carried_predicate,
-                                    0.0,
+                                    PhysicalStoragePadding::Constant(0.0),
                                     &mut body_block_ref,
                                     context,
                                     location,
@@ -340,7 +340,7 @@ impl LowerableOperation for WhileOperation<Type> {
                                     location,
                                 )?)?;
                                 let sources = (0..state_type.rank()).map(|axis| (*carried, axis)).collect::<Vec<_>>();
-                                mask_type.lower_restore_dynamic_dimensions(
+                                mask_type.restore_dynamic_dimensions(
                                     broadcast.result(0).unwrap().as_ref(),
                                     &sources,
                                     &mut body_block_ref,

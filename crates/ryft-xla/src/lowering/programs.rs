@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -6,17 +7,17 @@ use std::sync::Arc;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, Atom, AtomId, BroadcastOperation, CallOperation, DataType, DeviceMesh, Dimension, EagerContext,
-    EffectClass, ExternalReferenceBinding, FlatProgram, Instruction, LogicalMesh, Memory, MeshAxisType, Parameterized,
-    PlaceOperation, PlacementRequest, Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RegionRole,
-    RequestedPlacement, Shape, Sharding, ShardingDimension, StopGradientOperation, TagOperation,
+    EffectClass, ExternalReferenceBinding, FlatProgram, Instruction, Layout, LogicalMesh, Memory, MeshAxisType,
+    Parameterized, PlaceOperation, PlacementRequest, Program, ProgramError, RegionId, RegionPlacementRequests,
+    RegionRef, RegionRole, RequestedPlacement, Shape, Sharding, ShardingDimension, StopGradientOperation, TagOperation,
     TransferToMemoryOperation, Type as CoreType, Typed, TypedProgram, UnreducedKind, Value,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, DetachedBlock, Error as MlirError, Location, LocationRef,
     OpRef, Operation as MlirOperation, OperationPrintingFlags, OperationRef, OperationResultRef, Region,
-    SymbolVisibility, TensorTypeRef, Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueRef, WalkOrder,
-    WalkResult,
+    StringAttributeRef, SymbolVisibility, TensorTypeRef, Type as MlirType, TypeAndAttributes, Value as MlirValue,
+    ValueRef, WalkOrder, WalkResult,
 };
 
 use crate::arrays::host::ReductionChange;
@@ -32,7 +33,7 @@ use crate::lowering::types::{
 use crate::lowering::{EffectTokens, Lowerer, LoweringError, ProgramLoweringOperation, RaggedDotLoweringStrategy};
 use crate::operations::call::{CallFunctionMap, collect_call_functions};
 use crate::{
-    CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement, Type,
+    CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement, ToPjrt, Type,
     normalize_runtime_requirements,
 };
 
@@ -887,8 +888,22 @@ where
 
         module.remove_unused_stable_hlo_constants()?;
 
-        if !module.verify()? {
-            return Err(Error::Lowering(LoweringError::VerificationFailure));
+        // The verifier reports why a module is invalid through the diagnostics of the context, so they are collected
+        // while it runs and carried by the error. Handling them here also keeps them from being printed.
+        let diagnostics = Rc::new(RefCell::new(Vec::new()));
+        let handler = context.attach_diagnostics_handler({
+            let diagnostics = Rc::clone(&diagnostics);
+            move |diagnostic| {
+                diagnostics.borrow_mut().push(diagnostic.to_string());
+                true
+            }
+        });
+        let verified = module.verify();
+        context.detach_diagnostics_handler(handler);
+        if !verified? {
+            return Err(Error::Lowering(LoweringError::ModuleVerificationFailed {
+                diagnostic: diagnostics.borrow().join("; "),
+            }));
         }
 
         if lowering_context.requires_assertion_handler() {
@@ -1650,9 +1665,9 @@ impl ProgramBoundary {
                 }
 
                 if let Some(array_type) = executable_input_types.get(index)
-                    && let Some(layout) = array_type.lower_boundary_layout("input", context)?
+                    && let Some(layout) = Self::lower_layout_attribute(array_type, ProgramBoundarySide::Input, context)?
                 {
-                    attributes.insert("mhlo.layout_mode".into(), layout);
+                    attributes.insert("mhlo.layout_mode".into(), layout.as_ref());
                 }
 
                 let attributes = (!attributes.is_empty()).then_some(attributes);
@@ -1681,9 +1696,10 @@ impl ProgramBoundary {
                 }
 
                 if let Some(array_type) = executable_output_types.get(index)
-                    && let Some(layout) = array_type.lower_boundary_layout("output", context)?
+                    && let Some(layout) =
+                        Self::lower_layout_attribute(array_type, ProgramBoundarySide::Output, context)?
                 {
-                    attributes.insert("mhlo.layout_mode".into(), layout);
+                    attributes.insert("mhlo.layout_mode".into(), layout.as_ref());
                 }
 
                 let attributes = (!attributes.is_empty()).then_some(attributes);
@@ -1692,6 +1708,48 @@ impl ProgramBoundary {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok((function_arguments, function_results))
+    }
+
+    /// Encodes the layout of an executable input or output as the PJRT `mhlo.layout_mode` attribute. An array
+    /// without a requested layout leaves the attribute unset. Internal layout constraints apply to intermediate
+    /// values, so executable inputs and outputs need their own layout attributes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoweringError::UnsupportedOperation`] for a strided layout or a bounded dynamic output whose
+    /// layout is not row-major.
+    fn lower_layout_attribute<'c, 't>(
+        array_type: &ArrayType,
+        side: ProgramBoundarySide,
+        context: &'c MlirContext<'t>,
+    ) -> Result<Option<StringAttributeRef<'c, 't>>, Error> {
+        let Some(layout) = array_type.layout() else {
+            return Ok(None);
+        };
+        let Layout::Tiled(tiled) = layout else {
+            let side = match side {
+                ProgramBoundarySide::Input => "input",
+                ProgramBoundarySide::Output => "output",
+            };
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: "executable boundary layout".to_string(),
+                reason: format!("strided {side} layout `{layout}`"),
+            }));
+        };
+
+        // The pinned XLA SliceToDynamic emitter assumes row-major source/result layouts. Requesting a different
+        // dynamic result layout can abort compilation.
+        if matches!(side, ProgramBoundarySide::Output)
+            && array_type.static_shape().is_none()
+            && !tiled.minor_to_major().iter().copied().eq((0..array_type.rank()).rev())
+        {
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: "executable boundary layout".to_string(),
+                reason: format!("non-row-major bounded-dynamic output layout `{layout}`"),
+            }));
+        }
+
+        Ok(Some(context.string_attribute(tiled.to_pjrt().map_err(ProgramError::custom)?.to_string().as_str())))
     }
 
     /// Lowers the entry function body into `function_block`. It reconstructs the logical inputs from the executable
@@ -1915,6 +1973,16 @@ impl ProgramBoundary {
 
         Ok(())
     }
+}
+
+/// Side of the entry function boundary to which an executable layout applies.
+#[derive(Copy, Clone)]
+enum ProgramBoundarySide {
+    /// An executable input, represented by an argument of the lowered entry function.
+    Input,
+
+    /// An executable output, represented by a result of the lowered entry function.
+    Output,
 }
 
 /// Distinct session constants bound by a lowered program's entry function. Each group preserves the order in which
@@ -3681,12 +3749,12 @@ mod tests {
         CompositeOperation, ConditionOperation, ConstrainSharding, Context, Cos, CustomRuleDefinition,
         CustomRuleRegistration, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionToScalarOperation,
         DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, Dot, DotDimensionNumbers, EffectClass,
-        FlatProgram, ImportingContext, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite, OneLike,
+        FlatProgram, ImportingContext, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite, OneLike,
         PLACE_OPERATION_NAME, Place, PlaceOperation, Placeholder, Placement, PlacementRequest, Print, PrintOperation,
         ProgramBuilder, Provenance, ProvenanceScope, ReferenceFreezeOperation, ReferenceNewOperation,
         ReferenceReadOperation, ReferenceSource, ReferenceType, ReferenceWriteOperation, ReshapeOperation, Reshard,
-        ScaledDotOperation, ScanOperation, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin, StopGradient, Tag,
-        TiledLayout, TransferToMemory, Transpose, TypeError, Typed, ValueProjection, ZeroLike,
+        ScaledDotOperation, ScanOperation, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin, StopGradient,
+        StridedLayout, Tag, TiledLayout, TransferToMemory, Transpose, TypeError, Typed, ValueProjection, ZeroLike,
         differentiate_in_parent_at, shard_map,
     };
     use ryft_kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
@@ -4613,14 +4681,14 @@ mod tests {
         let reordered = mesh_2x2(["y", "x"], MeshAxisType::Explicit);
         assert_eq!(
             lower(&reordered).err(),
-            Some(Error::Lowering(LoweringError::MismatchedMeshTopology { expected: reordered, actual: mesh.clone() })),
+            Some(Error::Lowering(LoweringError::MeshTopologyMismatch { expected: reordered, actual: mesh.clone() })),
         );
 
         // Meshes with other axes are not merged into a union.
         let other_axes = mesh_2x2(["x", "z"], MeshAxisType::Explicit);
         assert_eq!(
             lower(&other_axes).err(),
-            Some(Error::Lowering(LoweringError::MismatchedMeshTopology { expected: other_axes, actual: mesh.clone() })),
+            Some(Error::Lowering(LoweringError::MeshTopologyMismatch { expected: other_axes, actual: mesh.clone() })),
         );
 
         // A mesh with other axis sizes is another topology as well.
@@ -4631,7 +4699,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             lower(&other_sizes).err(),
-            Some(Error::Lowering(LoweringError::MismatchedMeshTopology { expected: other_sizes, actual: mesh })),
+            Some(Error::Lowering(LoweringError::MeshTopologyMismatch { expected: other_sizes, actual: mesh })),
         );
 
         // Meshes that differ only in axis types share the module mesh, which keeps the axis types of the first mesh
@@ -6224,6 +6292,41 @@ mod tests {
         assert_eq!(output_pointer, input_pointer);
         let output = output.copy_to_host(None).unwrap().r#await().unwrap();
         assert_eq!(values_from_bytes::<f32>(output.as_slice()), vec![2.0, 4.0, 6.0, 8.0]);
+    }
+
+    #[test]
+    fn test_program_boundary_lower_layout_attribute() {
+        let context = MlirContext::new();
+        let lower = |array_type: &ArrayType, side| ProgramBoundary::lower_layout_attribute(array_type, side, &context);
+        let plain = ArrayType::new_static(DataType::F32, [2, 3]);
+        assert_eq!(lower(&plain, ProgramBoundarySide::Input), Ok(None));
+
+        let column_major = plain.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
+        let layout = Some(context.string_attribute("{0,1}"));
+        assert_eq!(lower(&column_major, ProgramBoundarySide::Output), Ok(layout));
+
+        // A bounded dynamic input may request the same column-major layout as a static result.
+        let bounded =
+            column_major.with_shape(Shape::new(vec![dynamic_dimension("rows", Some(3)), Dimension::Static(3)]));
+        assert_eq!(lower(&bounded, ProgramBoundarySide::Input), Ok(layout));
+        assert_eq!(
+            lower(&bounded, ProgramBoundarySide::Output),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: "executable boundary layout".to_string(),
+                reason: "non-row-major bounded-dynamic output layout `tiled{0,1}`".to_string(),
+            })),
+        );
+
+        let strided = plain.with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])));
+        for (side, name) in [(ProgramBoundarySide::Input, "input"), (ProgramBoundarySide::Output, "output")] {
+            assert_eq!(
+                lower(&strided, side),
+                Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: "executable boundary layout".to_string(),
+                    reason: format!("strided {name} layout `strided{{12,4}}`"),
+                })),
+            );
+        }
     }
 
     #[test]

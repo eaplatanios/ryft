@@ -5930,7 +5930,7 @@ pub(crate) mod tests {
         // A map over the reordered mesh is rejected instead of computing coordinates that do not match the device ids.
         assert!(matches!(
             compile_maps(&reordered_mesh, device_mesh(&mesh)),
-            Err(Error::Lowering(crate::LoweringError::MismatchedMeshTopology { expected, actual }))
+            Err(Error::Lowering(crate::LoweringError::MeshTopologyMismatch { expected, actual }))
                 if expected == mesh && actual == reordered_mesh,
         ));
 

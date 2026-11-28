@@ -14,7 +14,8 @@ use ryft_mlir::{
 
 use crate::lowering::NamedCompositionKey;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_f64_constant_splat, physical_bound_type,
+    ArrayTypeLoweringExtension, DataTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat,
+    physical_bound_type,
 };
 use crate::operations::call::lower_shared_function_call;
 use crate::operations::composites::named_composition_input_types;
@@ -145,7 +146,15 @@ impl LowerableOperation for ScaledDotOperation {
             input_values
                 .iter()
                 .zip(input_types)
-                .map(|(value, r#type)| r#type.lower_physical_bound_value(*value, 0.0, block, context, location))
+                .map(|(value, r#type)| {
+                    r#type.lower_padded_physical_storage(
+                        *value,
+                        PhysicalStoragePadding::Constant(0.0),
+                        block,
+                        context,
+                        location,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             input_values.to_vec()
@@ -171,7 +180,7 @@ impl LowerableOperation for ScaledDotOperation {
             } else {
                 let sources =
                     (0..dummy_type.rank()).map(|axis| (input_values[element_index], axis)).collect::<Vec<_>>();
-                composite_values.push(dummy_type.lower_restore_dynamic_dimensions(
+                composite_values.push(dummy_type.restore_dynamic_dimensions(
                     dummy,
                     sources.as_slice(),
                     block,
@@ -214,7 +223,7 @@ impl LowerableOperation for ScaledDotOperation {
         if !uses_physical_boundary {
             return Ok(results);
         }
-        return Ok(vec![output_types[0].lower_restore_dynamic_dimensions(
+        return Ok(vec![output_types[0].restore_dynamic_dimensions(
             results[0],
             scaled_dot_output_sources(self, input_values, input_types).as_slice(),
             block,
@@ -263,7 +272,13 @@ impl ScaledDotOperationLoweringExtension for ScaledDotOperation {
         let mut operands = Vec::with_capacity(input_values.len());
         for (index, (value, r#type)) in input_values.iter().zip(input_types).enumerate() {
             let padding_value = if index < 2 { 0.0 } else { 1.0 };
-            let value = r#type.lower_physical_bound_value(*value, padding_value, block, context, location)?;
+            let value = r#type.lower_padded_physical_storage(
+                *value,
+                PhysicalStoragePadding::Constant(padding_value),
+                block,
+                context,
+                location,
+            )?;
             let permutation = &permutations[index % 2];
             if permutation.iter().enumerate().all(|(axis, source)| axis == *source) {
                 operands.push(value);
@@ -291,7 +306,7 @@ impl ScaledDotOperationLoweringExtension for ScaledDotOperation {
             location,
         )?)?;
         let result = custom_call.result(0).unwrap().as_ref();
-        Ok(vec![output_types[0].lower_restore_dynamic_dimensions(
+        Ok(vec![output_types[0].restore_dynamic_dimensions(
             result,
             scaled_dot_output_sources(self, input_values, input_types).as_slice(),
             block,

@@ -10,8 +10,9 @@ use ryft_mlir::{
 
 use crate::lowering::EffectTokens;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, dimension_extent_i32, lower_constant_output, lower_runtime_dimension_size_i64,
-    lower_static_index_constants, lower_unplaced_constant_output, physical_bound_type, static_dimensions,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_i32, lower_constant_output,
+    lower_runtime_dimension_size_i64, lower_static_index_constants, lower_unplaced_constant_output,
+    physical_bound_type, static_dimensions,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_KIND_ATTRIBUTE,
@@ -93,7 +94,7 @@ impl LowerableOperation for SliceOperation {
         )?)?;
         let result = result.result(0).unwrap().as_ref();
         let sources = (0..input_type.rank()).map(|axis| (input_values[0], axis)).collect::<Vec<_>>();
-        Ok(vec![output_types[0].lower_restore_dynamic_dimensions(result, &sources, block, context, location)?])
+        Ok(vec![output_types[0].restore_dynamic_dimensions(result, &sources, block, context, location)?])
     }
 }
 
@@ -319,8 +320,13 @@ impl LowerableOperation for DynamicSliceOperation<Type> {
         // window.
         // Only the requested logical size is exposed, so padded values never become observable elements.
         let padding_value = if input_type.data_type() == DataType::F8E8M0FNU { 1 } else { 0 };
-        let physical_input =
-            input_type.lower_physical_bound_value(*input, padding_value as f64, block, context, location)?;
+        let physical_input = input_type.lower_padded_physical_storage(
+            *input,
+            PhysicalStoragePadding::Constant(padding_value as f64),
+            block,
+            context,
+            location,
+        )?;
         let padding = lower_constant_output(
             &[ArrayType::scalar(input_type.data_type())],
             padding_value,

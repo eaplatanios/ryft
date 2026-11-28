@@ -1477,17 +1477,17 @@ impl Session {
     /// so that its copy policy applies wherever the staged program executes on concrete arrays.
     ///
     /// A placement inside a compiled function must target the device mesh that the function is compiled for (refer
-    /// to [`LoweringError::PlacementOutsideProgramMesh`](crate::LoweringError::PlacementOutsideProgramMesh)), so a
+    /// to [`CompilationError::PlacementMeshMismatch`](crate::CompilationError::PlacementMeshMismatch)), so a
     /// compiled function cannot move a value to other devices. The devices of a traced leaf that wraps no concrete
     /// array are not known while it is traced, so a bare device target stages a [`PlacementRequest::Device`] with its
     /// memory and layout, whose type rule selects the default memory of the device when it names none, as it does for
     /// a traced leaf that lives on a mesh of one device. Its type keeps the sharding of the leaf without the reduction
     /// state that one device completes, so it combines with the other values of the function. A compiled function
     /// accepts it only when the device is the only device of the mesh that the function is compiled for (refer to
-    /// [`LoweringError::DeviceOutsideProgramMesh`](crate::LoweringError::DeviceOutsideProgramMesh)), and the outputs
-    /// of such a function are committed, as an explicit device commits an [`Array`] eagerly. Wherever the staged
-    /// placement executes on a concrete array instead (e.g., when a traced program is evaluated on arrays), the device
-    /// resolves against that array as it does for an [`Array`] leaf. A bare device source of a traced leaf whose
+    /// [`CompilationError::PlacementDeviceMismatch`](crate::CompilationError::PlacementDeviceMismatch)), and the
+    /// outputs of such a function are committed, as an explicit device commits an [`Array`] eagerly. Wherever the
+    /// staged placement executes on a concrete array instead (e.g., when a traced program is evaluated on arrays), the
+    /// device resolves against that array as it does for an [`Array`] leaf. A bare device source of a traced leaf whose
     /// devices are not known stages a [`PlacementRequest::Device`] source, so that reverse mode differentiation moves
     /// the cotangent back to that device, and transposing the output again moves it to the target once more. Inside a
     /// compiled function, a target must lie on the mesh that the function is compiled for, whereas a source only states

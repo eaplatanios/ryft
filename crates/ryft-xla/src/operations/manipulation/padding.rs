@@ -10,7 +10,9 @@ use ryft_mlir::{
 };
 
 use crate::lowering::EffectTokens;
-use crate::lowering::types::{ArrayTypeLoweringExtension, lower_runtime_dimension_size_i64, physical_bound_type};
+use crate::lowering::types::{
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_runtime_dimension_size_i64, physical_bound_type,
+};
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE, ASSERT_PAD_KIND,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
@@ -223,10 +225,9 @@ impl<T: CoreType> PadOperationLoweringExtension for PadOperation<T> {
         } else {
             // Inactive input elements must contain the actual padding scalar, not a converted approximation or zero.
             // This makes every retained output prefix correct even when the runtime input is smaller than its capacity.
-            let input = input_types[0].lower_physical_bound_value_with_padding(
+            let input = input_types[0].lower_padded_physical_storage(
                 input_values[0],
-                0.0,
-                Some(input_values[1]),
+                PhysicalStoragePadding::Scalar(input_values[1]),
                 &mut block,
                 context,
                 location,
