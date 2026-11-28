@@ -65,7 +65,7 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
             )?]);
         }
         if !data_type.is_signed() {
-            return Err(Error::Lowering(LoweringError::UnsupportedElementType {
+            return Err(Error::Lowering(LoweringError::UnsupportedDataType {
                 data_type,
                 context: format!("`{}` operation", self.name()),
             }));
@@ -80,8 +80,7 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
         let constants = [minimum, maximum, 0]
             .into_iter()
             .map(|value| {
-                let elements =
-                    carrier_data_type.lower_constant_elements_attribute(scalar_type, value, lowerer.context())?;
+                let elements = carrier_data_type.lower_i64_splat_attribute(scalar_type, value, lowerer.context())?;
                 let constant = lowerer.block().append_operation(stable_hlo::constant(elements, lowerer.location())?)?;
                 // Broadcasting against a normalized input retains its runtime extents for bounded dynamic arrays.
                 Ok(normalize_binary_elementwise_inputs(
@@ -315,7 +314,7 @@ fn lower_arithmetic_output<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     let tensor_type = output.r#type()?.cast::<TensorTypeRef>().unwrap();
     let scalar_type = lowerer.context().tensor_type(tensor_type.element_type()?, &[], None, lowerer.location())?;
     let data_type = if output_type.data_type() == DataType::I1 { DataType::I8 } else { DataType::U8 };
-    let one = data_type.lower_constant_elements_attribute(scalar_type, 1, lowerer.context())?;
+    let one = data_type.lower_i64_splat_attribute(scalar_type, 1, lowerer.context())?;
     let one = lowerer.block().append_operation(stable_hlo::constant(one, lowerer.location())?)?;
     let one = normalize_binary_elementwise_inputs(
         &[one.result(0).unwrap().as_ref(), output],
@@ -568,7 +567,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             unproject_plain_program(program).to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()),
-            Err(Error::Lowering(LoweringError::UnsupportedElementType { data_type: DataType::F32, context }))
+            Err(Error::Lowering(LoweringError::UnsupportedDataType { data_type: DataType::F32, context }))
                 if context == "`saturating_sub` operation",
         ));
     }

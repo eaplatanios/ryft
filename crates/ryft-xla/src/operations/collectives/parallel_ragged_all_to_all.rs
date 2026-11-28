@@ -529,7 +529,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
         let source_copy_base = source_copy_base.result(0).unwrap().as_ref();
         let copy_indices = block.append_operation(stable_hlo::add(source_copy_base, transfer_slots, location)?)?;
         let copy_indices = copy_indices.result(0).unwrap().as_ref();
-        let copy_stride = DataType::U64.lower_constant_elements_attribute(
+        let copy_stride = DataType::U64.lower_i64_splat_attribute(
             metadata_tensor_type,
             i64::try_from(output_extent).map_err(|_| {
                 ProgramError::MalformedProgram(format!(

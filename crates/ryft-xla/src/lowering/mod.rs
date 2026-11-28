@@ -57,37 +57,24 @@ use crate::{Constant, Error, Operation, RuntimeRequirement, Session, Type};
 /// retain their original types in [`Error::Core`] and [`Error::Mlir`], respectively.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum LoweringError {
-    /// The caller selected an empty function symbol or one containing whitespace.
     #[error("invalid function name `{function_name}` used during XLA lowering")]
     InvalidFunctionName { function_name: String },
 
-    /// A captured constant has no binding in the capture namespace available to this lowering.
     #[error("missing captured constant #{index} during XLA lowering")]
     MissingCapturedConstant { index: usize },
 
-    /// A session constant appears where no hidden input of the entry function is reachable (e.g., inside a
-    /// `shard_map` body or a shared private function).
     #[error("session constant `{constant}` cannot be referenced in this lowering scope")]
     UnreachableSessionConstant { constant: String },
 
-    /// References reached a lowering boundary that requires their discharge.
     #[error("unresolved reference construct `{construct}` must be discharged before XLA lowering")]
     UnresolvedReference { construct: String },
 
-    /// Mutable state reached a lowering boundary that requires its discharge.
     #[error("unresolved state in `{construct}` must be discharged before XLA lowering")]
     UnresolvedState { construct: String },
 
-    /// The logical reference-state metadata cannot produce a valid executable buffer alias.
     #[error("invalid XLA reference-state ABI: {message}")]
     InvalidReferenceStateAbi { message: String },
 
-    /// A sharding or `shard_map` boundary of the module refers to a mesh whose topology (i.e., axis names and sizes in
-    /// order, refer to [`LogicalMesh::has_same_topology`]) differs from the topology of the module mesh. A lowered
-    /// module declares one `sdy.mesh`, which assigns device ids to mesh coordinates, while collectives and
-    /// `axis_index` compute coordinates from the order of the axes of their own mesh. Meshes that differ in order or
-    /// in axes would therefore disagree about which device holds which coordinate, and a union of different meshes
-    /// cannot be placed on one device mesh. Meshes that differ only in axis types share the module mesh.
     #[error("mesh `{actual}` does not have the topology of the module mesh `{expected}`")]
     MismatchedMeshTopology { expected: LogicalMesh, actual: LogicalMesh },
 
@@ -128,15 +115,12 @@ pub enum LoweringError {
     )]
     UnevenSharding { kind: &'static str, index: usize, dimension: usize, extent: usize, shard_count: usize },
 
-    /// A valid operation requests behavior this backend cannot lower.
     #[error("cannot lower `{operation}`: {reason}")]
     UnsupportedOperation { operation: String, reason: String },
 
-    /// A valid element type cannot be represented in the selected lowering context.
     #[error("cannot lower element type `{data_type}` for {context}")]
-    UnsupportedElementType { data_type: DataType, context: String },
+    UnsupportedDataType { data_type: DataType, context: String },
 
-    /// The constructed MLIR module failed verification without returning a native error value.
     #[error("constructed MLIR module failed verification during XLA lowering")]
     VerificationFailure,
 }
@@ -455,7 +439,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     ///
     /// # Errors
     ///
-    /// Returns [`LoweringError::UnsupportedElementType`] when an element type has no StableHLO tensor representation,
+    /// Returns [`LoweringError::UnsupportedDataType`] when an element type has no StableHLO tensor representation,
     /// and propagates native construction failures through [`Error::Mlir`].
     pub fn lower_tensor_type(&self, array_type: &ArrayType) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, Error> {
         array_type.lower(self.context, self.location)
@@ -1489,6 +1473,64 @@ pub(crate) mod tests {
             let _ = (lowerer, input_types, output_types);
             Ok(self.positions.iter().map(|position| input_values[*position]).collect())
         }
+    }
+
+    #[test]
+    fn test_lowering_error_display() {
+        let mesh = |names: [&str; 2]| {
+            let axes = names.map(|name| MeshAxis::new(name, 2, MeshAxisType::Explicit).unwrap());
+            LogicalMesh::new(axes.to_vec()).unwrap()
+        };
+        assert_eq!(
+            LoweringError::MismatchedMeshTopology { expected: mesh(["y", "x"]), actual: mesh(["x", "y"]) }.to_string(),
+            "mesh `['x'=2:explicit, 'y'=2:explicit]` does not have the topology of the module mesh \
+             `['y'=2:explicit, 'x'=2:explicit]`",
+        );
+        assert_eq!(
+            LoweringError::UnsupportedOperation {
+                operation: "sdy.manual_computation".to_string(),
+                reason: "the target plugin cannot compile with Shardy".to_string(),
+            }
+            .to_string(),
+            "cannot lower `sdy.manual_computation`: the target plugin cannot compile with Shardy",
+        );
+        assert_eq!(
+            LoweringError::UnsupportedDataType {
+                data_type: DataType::Zero,
+                context: "sum reduction identity".to_string(),
+            }
+            .to_string(),
+            "cannot lower element type `zero` for sum reduction identity",
+        );
+    }
+
+    #[test]
+    fn test_token_threaded_effects() {
+        let classes = |effects: EffectClasses| token_threaded_effects(effects).collect::<Vec<_>>();
+        let ordered_io = EffectClasses::single(EffectClass::OrderedIo);
+
+        // Unordered I/O and ordered state have no token slot, the latter because lowering rejects unresolved state.
+        assert_eq!(classes(EffectClasses::NONE), vec![]);
+        assert_eq!(classes(EffectClasses::single(EffectClass::UnorderedIo)), vec![]);
+        assert_eq!(classes(EffectClasses::single(EffectClass::OrderedState)), vec![]);
+
+        // Both ordered I/O classes share the ordered I/O slot.
+        assert_eq!(classes(ordered_io), vec![EffectClass::OrderedIo]);
+        assert_eq!(classes(EffectClasses::single(EffectClass::DeviceOrderedIo)), vec![EffectClass::OrderedIo]);
+        assert_eq!(
+            classes(ordered_io.union(EffectClasses::single(EffectClass::DeviceOrderedIo))),
+            vec![EffectClass::OrderedIo],
+        );
+
+        // The assertion token precedes the ordered I/O token, and threading it also threads the ordered I/O slot.
+        assert_eq!(
+            classes(EffectClasses::single(EffectClass::OrderedAssertion)),
+            vec![EffectClass::OrderedAssertion, EffectClass::OrderedIo],
+        );
+        assert_eq!(
+            classes(ordered_io.union(EffectClasses::single(EffectClass::OrderedAssertion))),
+            vec![EffectClass::OrderedAssertion, EffectClass::OrderedIo],
+        );
     }
 
     #[test]

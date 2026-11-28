@@ -76,6 +76,128 @@ impl MemoryLoweringExtension for Memory {
 
 // TODO(eaplatanios): Review from here onwards.
 
+/// Lowering of a [`DataType`] to StableHLO.
+pub trait DataTypeLoweringExtension {
+    /// Lowers one [`DataType`] to the corresponding MLIR element type.
+    fn lower<'c, 't>(self, context: &'c MlirContext<'t>) -> Result<TypeRef<'c, 't>, Error>;
+
+    /// Builds a dense elements attribute of `tensor_type` by splatting the `f64` input `value` in this data type.
+    /// Boolean splats hold `value != 0.0`, integer splats truncate the fractional part, and floating-point splats
+    /// round to the element format, including the supported `f8`, `f6`, and `f4` formats. [`DataType::Zero`] admits
+    /// only zero, encoded in its `i1` carrier. Integer splats use the MLIR element type from [`Self::lower`],
+    /// including signless `i1` for [`DataType::U1`].
+    fn lower_f64_splat_attribute<'c, 't>(
+        self,
+        tensor_type: TensorTypeRef<'c, 't>,
+        value: f64,
+        context: &'c MlirContext<'t>,
+    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error>;
+
+    /// Builds a dense elements attribute of `tensor_type` by splatting the `i64` input `value` in this data type.
+    /// Integer splats encode `value` directly at the target width, preserving all 64 bits for 64-bit integers.
+    /// They use the MLIR element type from [`Self::lower`], including signless `i1` for [`DataType::U1`]. Other
+    /// data types convert `value` to `f64` and use [`Self::lower_f64_splat_attribute`].
+    fn lower_i64_splat_attribute<'c, 't>(
+        self,
+        tensor_type: TensorTypeRef<'c, 't>,
+        value: i64,
+        context: &'c MlirContext<'t>,
+    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error>;
+}
+
+impl DataTypeLoweringExtension for DataType {
+    fn lower<'c, 't>(self, context: &'c MlirContext<'t>) -> Result<TypeRef<'c, 't>, Error> {
+        Ok(match self {
+            DataType::Token => {
+                return Err(Error::Lowering(LoweringError::UnsupportedDataType {
+                    data_type: self,
+                    context: "tensor element representation".to_string(),
+                }));
+            }
+            // StableHLO has no element type that carries zero information. Use an `i1` tensor as an unobservable
+            // physical carrier while retaining the logical `DataType::Zero` in the lowered and compiled metadata of
+            // Ryft.
+            DataType::Zero => context.signless_integer_type(1).as_ref(),
+            DataType::Boolean => context.signless_integer_type(1).as_ref(),
+            DataType::I1 => context.signless_integer_type(1).as_ref(),
+            DataType::I2 => context.signless_integer_type(2).as_ref(),
+            DataType::I4 => context.signless_integer_type(4).as_ref(),
+            DataType::I8 => context.signless_integer_type(8).as_ref(),
+            DataType::I16 => context.signless_integer_type(16).as_ref(),
+            DataType::I32 => context.signless_integer_type(32).as_ref(),
+            DataType::I64 => context.signless_integer_type(64).as_ref(),
+            // StableHLO admits signless `i1` as its Boolean and one-bit carrier but rejects `ui1`. The unsigned
+            // semantics of `U1` remain selected by Ryft operation metadata (e.g., comparison direction), while its sole
+            // bit is unchanged.
+            DataType::U1 => context.signless_integer_type(1).as_ref(),
+            DataType::U2 => context.unsigned_integer_type(2).as_ref(),
+            DataType::U4 => context.unsigned_integer_type(4).as_ref(),
+            DataType::U8 => context.unsigned_integer_type(8).as_ref(),
+            DataType::U16 => context.unsigned_integer_type(16).as_ref(),
+            DataType::U32 => context.unsigned_integer_type(32).as_ref(),
+            DataType::U64 => context.unsigned_integer_type(64).as_ref(),
+            DataType::BF16 => context.bfloat16_type().as_ref(),
+            DataType::F16 => context.float16_type().as_ref(),
+            DataType::F32 => context.float32_type().as_ref(),
+            DataType::F64 => context.float64_type().as_ref(),
+            DataType::F4E2M1FN => context.float4e2m1fn_type().as_ref(),
+            DataType::F6E2M3FN => context.float6e2m3fn_type().as_ref(),
+            DataType::F6E3M2FN => context.float6e3m2fn_type().as_ref(),
+            DataType::F8E3M4 => context.float8e3m4_type().as_ref(),
+            DataType::F8E4M3 => context.float8e4m3_type().as_ref(),
+            DataType::F8E4M3FN => context.float8e4m3fn_type().as_ref(),
+            DataType::F8E4M3FNUZ => context.float8e4m3fnuz_type().as_ref(),
+            DataType::F8E4M3B11FNUZ => context.float8e4m3b11fnuz_type().as_ref(),
+            DataType::F8E5M2 => context.float8e5m2_type().as_ref(),
+            DataType::F8E5M2FNUZ => context.float8e5m2fnuz_type().as_ref(),
+            DataType::F8E8M0FNU => context.float8e8m0fnu_type().as_ref(),
+            DataType::C64 => context.complex_type(context.float32_type()).as_ref(),
+            DataType::C128 => context.complex_type(context.float64_type()).as_ref(),
+        })
+    }
+
+    fn lower_f64_splat_attribute<'c, 't>(
+        self,
+        tensor_type: TensorTypeRef<'c, 't>,
+        value: f64,
+        context: &'c MlirContext<'t>,
+    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
+        let attribute = match self {
+            DataType::Zero if value == 0.0 => context.boolean_attribute(false).as_ref(),
+            DataType::Boolean => context.boolean_attribute(value != 0.0).as_ref(),
+            data_type if data_type.is_integer() => {
+                return self.lower_i64_splat_attribute(tensor_type, value as i64, context);
+            }
+            data_type if data_type.is_floating_point() => {
+                let element_type = self.lower(context)?.cast::<FloatTypeRef>().unwrap();
+                context.float_attribute(element_type, value).as_ref()
+            }
+            _ => {
+                return Err(Error::Lowering(LoweringError::UnsupportedDataType {
+                    data_type: self,
+                    context: "floating-point splat constant".to_string(),
+                }));
+            }
+        };
+        context.splatted_dense_attribute_elements_attribute(tensor_type, attribute).map_err(Error::from)
+    }
+
+    fn lower_i64_splat_attribute<'c, 't>(
+        self,
+        tensor_type: TensorTypeRef<'c, 't>,
+        value: i64,
+        context: &'c MlirContext<'t>,
+    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
+        if !self.is_integer() {
+            return self.lower_f64_splat_attribute(tensor_type, value as f64, context);
+        }
+        let element_type = self.lower(context)?.cast::<IntegerTypeRef>().unwrap();
+        context
+            .splatted_dense_attribute_elements_attribute(tensor_type, context.integer_attribute(element_type, value))
+            .map_err(Error::from)
+    }
+}
+
 /// Widens a logical signed one-bit integer to `i8`, recovering `-1` from StableHLO's predicate carrier.
 pub fn lower_signed_one_bit_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
     input: ValueRef<'b, 'c, 't>,
@@ -165,7 +287,7 @@ pub fn lower_static_index_constants<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L:
     start_indices
         .iter()
         .map(|index| {
-            let elements = DataType::I64.lower_constant_elements_attribute(tensor_type, *index as i64, context)?;
+            let elements = DataType::I64.lower_i64_splat_attribute(tensor_type, *index as i64, context)?;
             let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
             Ok(constant.result(0).unwrap().as_ref())
         })
@@ -197,10 +319,9 @@ pub fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, 
     if data_type.is_complex() {
         let part_data_type = if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
         let part_tensor_type = context.tensor_type(part_data_type.lower(context)?, &[], None, location)?;
-        let real_elements =
-            part_data_type.lower_constant_elements_attribute(part_tensor_type, integer_value, context)?;
+        let real_elements = part_data_type.lower_i64_splat_attribute(part_tensor_type, integer_value, context)?;
         let real = block.append_operation(stable_hlo::constant(real_elements, location)?)?;
-        let imaginary_elements = part_data_type.lower_constant_elements_attribute(part_tensor_type, 0, context)?;
+        let imaginary_elements = part_data_type.lower_i64_splat_attribute(part_tensor_type, 0, context)?;
         let imaginary = block.append_operation(stable_hlo::constant(imaginary_elements, location)?)?;
         let complex = block.append_operation(stable_hlo::complex(
             real.result(0).unwrap().as_ref(),
@@ -217,8 +338,7 @@ pub fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, 
 
     if !output_type.shape().dimensions().is_empty() {
         let scalar_tensor_type = context.tensor_type(data_type.lower(context)?, &[], None, location)?;
-        let scalar_elements =
-            data_type.lower_constant_elements_attribute(scalar_tensor_type, integer_value, context)?;
+        let scalar_elements = data_type.lower_i64_splat_attribute(scalar_tensor_type, integer_value, context)?;
         let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location)?)?;
         let broadcast = block.append_operation(stable_hlo::broadcast(
             scalar_constant.result(0).unwrap().as_ref(),
@@ -228,7 +348,7 @@ pub fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, 
         )?)?;
         return Ok(vec![broadcast.result(0).unwrap().as_ref()]);
     }
-    let elements = data_type.lower_constant_elements_attribute(tensor_type, integer_value, context)?;
+    let elements = data_type.lower_i64_splat_attribute(tensor_type, integer_value, context)?;
     let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
     Ok(vec![constant.result(0).unwrap().as_ref()])
 }
@@ -605,199 +725,6 @@ pub fn stable_hlo_dynamic_dimension_bound(size: &Dimension) -> Option<usize> {
     }
 }
 
-/// Lowering of a [`DataType`] to StableHLO.
-pub trait DataTypeLoweringExtension {
-    /// Lowers one [`DataType`] to the corresponding MLIR element type.
-    fn lower<'c, 't>(self, context: &'c MlirContext<'t>) -> Result<TypeRef<'c, 't>, Error>;
-
-    /// Builds a splatted dense elements attribute holding `factor` converted to this data type. Boolean splats hold
-    /// `factor != 0.0`, integer splats truncate `factor`, and float splats round `factor` to the nearest representable
-    /// value of the element type, for every float format that [`DataTypeLoweringExtension::lower`] supports (e.g., the
-    /// `f8`, `f6`, and `f4` families). [`DataType::Zero`] admits only a zero factor, lowered as its `i1` carrier.
-    /// Integer attributes use the MLIR element type from [`DataTypeLoweringExtension::lower`], including signless
-    /// `i1` for `U1`.
-    fn lower_f64_scalar_elements_attribute<'c, 't>(
-        self,
-        tensor_type: TensorTypeRef<'c, 't>,
-        factor: f64,
-        context: &'c MlirContext<'t>,
-    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error>;
-
-    /// Builds a splatted dense elements attribute holding `integer_value` converted to this data type. Integer splats
-    /// hold the exact `i64` value, and every other data type routes through
-    /// [`DataTypeLoweringExtension::lower_f64_scalar_elements_attribute`] after a widening of `integer_value` to `f64`.
-    /// Integer attributes use the MLIR element type from [`DataTypeLoweringExtension::lower`], including signless
-    /// `i1` for `U1`.
-    fn lower_constant_elements_attribute<'c, 't>(
-        self,
-        tensor_type: TensorTypeRef<'c, 't>,
-        integer_value: i64,
-        context: &'c MlirContext<'t>,
-    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error>;
-}
-
-impl DataTypeLoweringExtension for DataType {
-    fn lower<'c, 't>(self, context: &'c MlirContext<'t>) -> Result<TypeRef<'c, 't>, Error> {
-        Ok(match self {
-            DataType::Token => {
-                return Err(Error::Lowering(LoweringError::UnsupportedElementType {
-                    data_type: self,
-                    context: "tensor element representation".to_string(),
-                }));
-            }
-            // StableHLO has no element type that carries zero information. Use an `i1` tensor as an unobservable
-            // physical carrier while retaining the logical `DataType::Zero` in the lowered and compiled metadata of
-            // Ryft.
-            DataType::Zero => context.signless_integer_type(1).as_ref(),
-            DataType::Boolean => context.signless_integer_type(1).as_ref(),
-            DataType::I1 => context.signless_integer_type(1).as_ref(),
-            DataType::I2 => context.signless_integer_type(2).as_ref(),
-            DataType::I4 => context.signless_integer_type(4).as_ref(),
-            DataType::I8 => context.signless_integer_type(8).as_ref(),
-            DataType::I16 => context.signless_integer_type(16).as_ref(),
-            DataType::I32 => context.signless_integer_type(32).as_ref(),
-            DataType::I64 => context.signless_integer_type(64).as_ref(),
-            // StableHLO admits signless `i1` as its Boolean and one-bit carrier but rejects `ui1`. The unsigned
-            // semantics of `U1` remain selected by Ryft operation metadata (e.g., comparison direction), while its sole
-            // bit is unchanged.
-            DataType::U1 => context.signless_integer_type(1).as_ref(),
-            DataType::U2 => context.unsigned_integer_type(2).as_ref(),
-            DataType::U4 => context.unsigned_integer_type(4).as_ref(),
-            DataType::U8 => context.unsigned_integer_type(8).as_ref(),
-            DataType::U16 => context.unsigned_integer_type(16).as_ref(),
-            DataType::U32 => context.unsigned_integer_type(32).as_ref(),
-            DataType::U64 => context.unsigned_integer_type(64).as_ref(),
-            DataType::BF16 => context.bfloat16_type().as_ref(),
-            DataType::F16 => context.float16_type().as_ref(),
-            DataType::F32 => context.float32_type().as_ref(),
-            DataType::F64 => context.float64_type().as_ref(),
-            DataType::F4E2M1FN => context.float4e2m1fn_type().as_ref(),
-            DataType::F6E2M3FN => context.float6e2m3fn_type().as_ref(),
-            DataType::F6E3M2FN => context.float6e3m2fn_type().as_ref(),
-            DataType::F8E3M4 => context.float8e3m4_type().as_ref(),
-            DataType::F8E4M3 => context.float8e4m3_type().as_ref(),
-            DataType::F8E4M3FN => context.float8e4m3fn_type().as_ref(),
-            DataType::F8E4M3FNUZ => context.float8e4m3fnuz_type().as_ref(),
-            DataType::F8E4M3B11FNUZ => context.float8e4m3b11fnuz_type().as_ref(),
-            DataType::F8E5M2 => context.float8e5m2_type().as_ref(),
-            DataType::F8E5M2FNUZ => context.float8e5m2fnuz_type().as_ref(),
-            DataType::F8E8M0FNU => context.float8e8m0fnu_type().as_ref(),
-            DataType::C64 => context.complex_type(context.float32_type()).as_ref(),
-            DataType::C128 => context.complex_type(context.float64_type()).as_ref(),
-        })
-    }
-
-    fn lower_f64_scalar_elements_attribute<'c, 't>(
-        self,
-        tensor_type: TensorTypeRef<'c, 't>,
-        factor: f64,
-        context: &'c MlirContext<'t>,
-    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
-        match self {
-            DataType::Zero if factor == 0.0 => context
-                .splatted_dense_attribute_elements_attribute(tensor_type, context.boolean_attribute(false))
-                .map_err(Error::from),
-            DataType::Zero => Err(Error::Lowering(LoweringError::UnsupportedElementType {
-                data_type: self,
-                context: "floating-point splat constant".to_string(),
-            })),
-            DataType::Boolean => context
-                .splatted_dense_attribute_elements_attribute(tensor_type, context.boolean_attribute(factor != 0.0))
-                .map_err(Error::from),
-            DataType::I1
-            | DataType::I2
-            | DataType::I4
-            | DataType::I8
-            | DataType::I16
-            | DataType::I32
-            | DataType::I64 => context
-                .splatted_dense_attribute_elements_attribute(
-                    tensor_type,
-                    context
-                        .integer_attribute(context.signless_integer_type(signed_integer_width(self)?), factor as i64),
-                )
-                .map_err(Error::from),
-            DataType::U1
-            | DataType::U2
-            | DataType::U4
-            | DataType::U8
-            | DataType::U16
-            | DataType::U32
-            | DataType::U64 => context
-                .splatted_dense_attribute_elements_attribute(
-                    tensor_type,
-                    context.integer_attribute(self.lower(context)?.cast::<IntegerTypeRef>().unwrap(), factor as i64),
-                )
-                .map_err(Error::from),
-            DataType::BF16
-            | DataType::F16
-            | DataType::F32
-            | DataType::F64
-            | DataType::F4E2M1FN
-            | DataType::F6E2M3FN
-            | DataType::F6E3M2FN
-            | DataType::F8E3M4
-            | DataType::F8E4M3
-            | DataType::F8E4M3FN
-            | DataType::F8E4M3FNUZ
-            | DataType::F8E4M3B11FNUZ
-            | DataType::F8E5M2
-            | DataType::F8E5M2FNUZ
-            | DataType::F8E8M0FNU => {
-                let element_type = self.lower(context)?.cast::<FloatTypeRef>().unwrap();
-                context
-                    .splatted_dense_attribute_elements_attribute(
-                        tensor_type,
-                        context.float_attribute(element_type, factor),
-                    )
-                    .map_err(Error::from)
-            }
-            DataType::Token | DataType::C64 | DataType::C128 => {
-                Err(Error::Lowering(LoweringError::UnsupportedElementType {
-                    data_type: self,
-                    context: "floating-point splat constant".to_string(),
-                }))
-            }
-        }
-    }
-
-    fn lower_constant_elements_attribute<'c, 't>(
-        self,
-        tensor_type: TensorTypeRef<'c, 't>,
-        integer_value: i64,
-        context: &'c MlirContext<'t>,
-    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
-        match self {
-            DataType::I1
-            | DataType::I2
-            | DataType::I4
-            | DataType::I8
-            | DataType::I16
-            | DataType::I32
-            | DataType::I64 => context
-                .splatted_dense_attribute_elements_attribute(
-                    tensor_type,
-                    context
-                        .integer_attribute(context.signless_integer_type(signed_integer_width(self)?), integer_value),
-                )
-                .map_err(Error::from),
-            DataType::U1
-            | DataType::U2
-            | DataType::U4
-            | DataType::U8
-            | DataType::U16
-            | DataType::U32
-            | DataType::U64 => context
-                .splatted_dense_attribute_elements_attribute(
-                    tensor_type,
-                    context.integer_attribute(self.lower(context)?.cast::<IntegerTypeRef>().unwrap(), integer_value),
-                )
-                .map_err(Error::from),
-            _ => self.lower_f64_scalar_elements_attribute(tensor_type, integer_value as f64, context),
-        }
-    }
-}
-
 /// Lowers an arbitrary `f64` factor into a splatted scalar StableHLO constant whose element type matches
 /// `output_type`, then broadcasts that scalar to the full output shape. It is used when synthesizing zeros, ones, and
 /// padding values and when lowering literal constants.
@@ -815,7 +742,7 @@ where
 {
     let data_type = output_type.data_type();
     let scalar_tensor_type = context.tensor_type(data_type.lower(context)?, &[], None, location)?;
-    let elements = data_type.lower_f64_scalar_elements_attribute(scalar_tensor_type, factor, context)?;
+    let elements = data_type.lower_f64_splat_attribute(scalar_tensor_type, factor, context)?;
     let scalar_constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
     if output_type.shape().dimensions().is_empty() {
         return Ok(scalar_constant.result(0).unwrap().as_ref());
@@ -827,44 +754,6 @@ where
         location,
     )?)?;
     Ok(broadcast.result(0).unwrap().as_ref())
-}
-
-/// Returns the bit width of a signed integer [`DataType`].
-pub(crate) fn signed_integer_width(data_type: DataType) -> Result<usize, Error> {
-    Ok(match data_type {
-        DataType::I1 => 1,
-        DataType::I2 => 2,
-        DataType::I4 => 4,
-        DataType::I8 => 8,
-        DataType::I16 => 16,
-        DataType::I32 => 32,
-        DataType::I64 => 64,
-        _ => {
-            return Err(Error::Lowering(LoweringError::UnsupportedElementType {
-                data_type,
-                context: "signed integer width".to_string(),
-            }));
-        }
-    })
-}
-
-/// Returns the bit width of an unsigned integer [`DataType`].
-pub(crate) fn unsigned_integer_width(data_type: DataType) -> Result<usize, Error> {
-    Ok(match data_type {
-        DataType::U1 => 1,
-        DataType::U2 => 2,
-        DataType::U4 => 4,
-        DataType::U8 => 8,
-        DataType::U16 => 16,
-        DataType::U32 => 32,
-        DataType::U64 => 64,
-        _ => {
-            return Err(Error::Lowering(LoweringError::UnsupportedElementType {
-                data_type,
-                context: "unsigned integer width".to_string(),
-            }));
-        }
-    })
 }
 
 /// Lowering of an array IR [`Type`] to StableHLO.
@@ -1370,20 +1259,20 @@ mod tests {
         }
         assert!(matches!(
             DataType::Token.lower(&context),
-            Err(Error::Lowering(LoweringError::UnsupportedElementType { data_type: DataType::Token, context }))
+            Err(Error::Lowering(LoweringError::UnsupportedDataType { data_type: DataType::Token, context }))
                 if context == "tensor element representation",
         ));
     }
 
     #[test]
-    fn test_data_type_lower_f64_scalar_elements_attribute() {
-        // Boolean splats hold whether the factor is nonzero, integer splats truncate it, and float splats round it to
+    fn test_data_type_lower_f64_splat_attribute() {
+        // Boolean splats hold whether the value is nonzero, integer splats truncate it, and float splats round it to
         // the nearest value of their element type.
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let lower = |data_type: DataType, factor: f64| {
+        let lower = |data_type: DataType, value: f64| {
             let tensor_type = ArrayType::scalar(data_type).lower(&context, location).unwrap();
-            let attribute = data_type.lower_f64_scalar_elements_attribute(tensor_type, factor, &context);
+            let attribute = data_type.lower_f64_splat_attribute(tensor_type, value, &context);
             attribute.map(|attribute| attribute.to_string())
         };
         assert_eq!(lower(DataType::Boolean, 0.5).unwrap(), "dense<true> : tensor<i1>");
@@ -1391,56 +1280,50 @@ mod tests {
         assert_eq!(lower(DataType::F16, 0.1).unwrap(), "dense<9.997550e-02> : tensor<f16>");
         assert_eq!(lower(DataType::Zero, 0.0).unwrap(), "dense<false> : tensor<i1>");
 
-        // Zero admits only a zero factor, and complex values have no real splat.
-        for (data_type, factor) in [(DataType::Zero, 1.0), (DataType::C64, 1.0)] {
+        // Zero admits only a zero value, and complex values have no real splat.
+        for (data_type, value) in [(DataType::Zero, 1.0), (DataType::C64, 1.0)] {
             assert!(matches!(
-                lower(data_type, factor),
-                Err(Error::Lowering(LoweringError::UnsupportedElementType { data_type: actual, context }))
+                lower(data_type, value),
+                Err(Error::Lowering(LoweringError::UnsupportedDataType { data_type: actual, context }))
                     if actual == data_type && context == "floating-point splat constant",
             ));
         }
     }
 
     #[test]
-    fn test_data_type_lower_constant_elements_attribute() {
+    fn test_data_type_lower_i64_splat_attribute() {
         // Integer splats hold the exact value, which a conversion to `f64` would round.
         let context = MlirContext::new();
         let location = context.unknown_location();
-        let lower = |data_type: DataType, integer_value: i64| {
+        let lower = |data_type: DataType, value: i64| {
             let tensor_type = ArrayType::scalar(data_type).lower(&context, location).unwrap();
-            data_type
-                .lower_constant_elements_attribute(tensor_type, integer_value, &context)
-                .unwrap()
-                .to_string()
+            data_type.lower_i64_splat_attribute(tensor_type, value, &context).unwrap().to_string()
         };
         assert_eq!(lower(DataType::I64, i64::MAX), "dense<9223372036854775807> : tensor<i64>");
         assert_eq!(lower(DataType::F32, 3), "dense<3.000000e+00> : tensor<f32>");
     }
 
     #[test]
-    fn test_data_type_lower_constant_elements_attribute_with_unsigned_types() {
+    fn test_data_type_lower_i64_splat_attribute_with_unsigned_types() {
         // Unsigned splats use the physical carrier of their element type, so `U1` keeps only the lowest bit, and the
-        // `f64` splat truncates its factor to the same integer.
+        // `f64` splat truncates its value to the same integer.
         let context = MlirContext::new();
         let location = context.unknown_location();
         for data_type in [DataType::U1, DataType::U8] {
             let tensor_type = ArrayType::scalar(data_type).lower(&context, location).unwrap();
-            for integer_value in [0, 1, 2, 3] {
+            for value in [0, 1, 2, 3] {
                 let expected = match data_type {
-                    DataType::U1 => format!("dense<{}> : tensor<i1>", integer_value & 1 != 0),
-                    DataType::U8 => format!("dense<{integer_value}> : tensor<ui8>"),
+                    DataType::U1 => format!("dense<{}> : tensor<i1>", value & 1 != 0),
+                    DataType::U8 => format!("dense<{value}> : tensor<ui8>"),
                     _ => unreachable!(),
                 };
                 assert_eq!(
-                    data_type
-                        .lower_constant_elements_attribute(tensor_type, integer_value, &context)
-                        .unwrap()
-                        .to_string(),
+                    data_type.lower_i64_splat_attribute(tensor_type, value, &context).unwrap().to_string(),
                     expected,
                 );
                 assert_eq!(
                     data_type
-                        .lower_f64_scalar_elements_attribute(tensor_type, integer_value as f64 + 0.75, &context)
+                        .lower_f64_splat_attribute(tensor_type, value as f64 + 0.75, &context)
                         .unwrap()
                         .to_string(),
                     expected,

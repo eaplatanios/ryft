@@ -1825,9 +1825,7 @@ impl Array {
                 Ok(Some(Arc::clone(converted.shards()[0].buffer().unwrap())))
             }
             Err(
-                Error::Lowering(
-                    LoweringError::UnsupportedOperation { .. } | LoweringError::UnsupportedElementType { .. },
-                )
+                Error::Lowering(LoweringError::UnsupportedOperation { .. } | LoweringError::UnsupportedDataType { .. })
                 | Error::Compilation(CompilationError::ExecutableMemoryKindMismatch { .. })
                 | Error::Pjrt(PjrtError::Unimplemented { .. } | PjrtError::MissingFunction { .. }),
             ) => Ok(None),

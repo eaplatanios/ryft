@@ -13,7 +13,7 @@ use ryft_mlir::{
 
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_f64_constant_splat, lower_signed_one_bit_to_mlir,
-    lower_unplaced_constant_output, physical_bound_type, signed_integer_width, unsigned_integer_width,
+    lower_unplaced_constant_output, physical_bound_type,
 };
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
@@ -282,7 +282,7 @@ pub(crate) fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
             ReductionKind::Max => f64::NEG_INFINITY,
             ReductionKind::Min => f64::INFINITY,
             ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All => {
-                return Err(Error::Lowering(LoweringError::UnsupportedElementType {
+                return Err(Error::Lowering(LoweringError::UnsupportedDataType {
                     data_type: element_type,
                     context: format!("{kind} reduction identity"),
                 }));
@@ -595,7 +595,7 @@ fn lower_total_order_extremum_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         let scalar_type = ArrayType::scalar(keys.data_type).lower(context, location)?;
-        let elements = keys.data_type.lower_constant_elements_attribute(scalar_type, value, context)?;
+        let elements = keys.data_type.lower_i64_splat_attribute(scalar_type, value, context)?;
         let scalar = block.append_operation(stable_hlo::constant(elements, location)?)?;
         let scalar = scalar.result(0).unwrap().as_ref();
         let splat = block.append_operation(stable_hlo::clamp(scalar, like, scalar, location)?)?;
@@ -661,7 +661,7 @@ fn lower_total_order_extremum_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
 
     let kind = if maximum { ReductionKind::Max } else { ReductionKind::Min };
     let scalar_keys_type = ArrayType::scalar(keys.data_type).lower(context, location)?;
-    let identity = keys.data_type.lower_constant_elements_attribute(scalar_keys_type, identity_key, context)?;
+    let identity = keys.data_type.lower_i64_splat_attribute(scalar_keys_type, identity_key, context)?;
     let identity = block.append_operation(stable_hlo::constant(identity, location)?)?;
     let identity = identity.result(0).unwrap().as_ref();
     let body_region = build_reduce_body_region(kind, keys.data_type, FloatExtremumForm::TotalOrder, context, location)?;
@@ -696,7 +696,7 @@ fn lower_total_order_extremum_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
 /// type. `Sum` and `Mean` use zero, `Product` uses one, and `Max` and `Min` use the bounds returned by
 /// [`float_reduction_identity_bounds`] at float element types and the bounds returned by
 /// [`integer_reduction_identity_bounds`] at integer element types. Boolean `Any`/`Max` use `false`, while Boolean
-/// `All`/`Min` use `true`. Every other combination fails with [`LoweringError::UnsupportedElementType`].
+/// `All`/`Min` use `true`. Every other combination fails with [`LoweringError::UnsupportedDataType`].
 fn build_reduction_identity_attribute<'c, 't>(
     kind: ReductionKind,
     element_type: DataType,
@@ -714,13 +714,13 @@ fn build_reduction_identity_attribute<'c, 't>(
             | ReductionKind::LogSumExp
             | ReductionKind::Any
             | ReductionKind::All => {
-                return Err(Error::Lowering(LoweringError::UnsupportedElementType {
+                return Err(Error::Lowering(LoweringError::UnsupportedDataType {
                     data_type: element_type,
                     context: format!("{kind} reduction identity"),
                 }));
             }
         };
-        return element_type.lower_f64_scalar_elements_attribute(tensor_type, identity, context);
+        return element_type.lower_f64_splat_attribute(tensor_type, identity, context);
     }
     if let Some((minimum, maximum)) = integer_reduction_identity_bounds(element_type) {
         let identity = match kind {
@@ -729,13 +729,13 @@ fn build_reduction_identity_attribute<'c, 't>(
             ReductionKind::Max => minimum,
             ReductionKind::Min => maximum,
             ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All => {
-                return Err(Error::Lowering(LoweringError::UnsupportedElementType {
+                return Err(Error::Lowering(LoweringError::UnsupportedDataType {
                     data_type: element_type,
                     context: format!("{kind} reduction identity"),
                 }));
             }
         };
-        return element_type.lower_constant_elements_attribute(tensor_type, identity, context);
+        return element_type.lower_i64_splat_attribute(tensor_type, identity, context);
     }
     match (kind, element_type) {
         (ReductionKind::Any | ReductionKind::Max, DataType::Boolean) => Ok(context
@@ -746,7 +746,7 @@ fn build_reduction_identity_attribute<'c, 't>(
             .dense_bool_elements_attribute(tensor_type, &[true])?
             .cast::<DenseElementsAttributeRef>()
             .unwrap()),
-        _ => Err(Error::Lowering(LoweringError::UnsupportedElementType {
+        _ => Err(Error::Lowering(LoweringError::UnsupportedDataType {
             data_type: element_type,
             context: format!("{kind} reduction identity"),
         })),
@@ -779,15 +779,14 @@ fn float_reduction_identity_bounds(data_type: DataType) -> Option<(f64, f64)> {
 
 /// Returns the `(minimum, maximum)` values representable by the given integer data type, used as the `Max` and `Min`
 /// reduction identities. The values are raw `i64` payloads for
-/// [`DataTypeLoweringExtension::lower_constant_elements_attribute`], which encodes them at the type's width and
+/// [`DataTypeLoweringExtension::lower_i64_splat_attribute`], which encodes them at the type's width and
 /// signedness. [`DataType::U64`]'s maximum therefore wraps to `-1`, whose two's complement bits are exactly `u64::MAX`.
 /// Returns `None` for non-integer data types.
 fn integer_reduction_identity_bounds(data_type: DataType) -> Option<(i64, i64)> {
+    let width = data_type.bit_width();
     if data_type.is_signed() {
-        let width = signed_integer_width(data_type).unwrap();
         Some((i64::MIN >> (64 - width), i64::MAX >> (64 - width)))
     } else if data_type.is_unsigned() {
-        let width = unsigned_integer_width(data_type).unwrap();
         Some((0, (u64::MAX >> (64 - width)) as i64))
     } else {
         None
@@ -1089,7 +1088,7 @@ mod tests {
         for kind in [ReductionKind::Any, ReductionKind::All, ReductionKind::LogSumExp] {
             assert!(matches!(
                 build_reduction_identity_constant(kind, DataType::C64, &mut block, &context, location),
-                Err(Error::Lowering(LoweringError::UnsupportedElementType { data_type: DataType::C64, context }))
+                Err(Error::Lowering(LoweringError::UnsupportedDataType { data_type: DataType::C64, context }))
                     if context == format!("{kind} reduction identity"),
             ));
         }
@@ -1644,7 +1643,7 @@ mod tests {
     fn test_reduce_operation_lower_f8e8m0fnu_supports_extrema_but_rejects_sum() {
         assert!(matches!(
             lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Sum, vec![0], vec![4]).unwrap_err(),
-            Error::Lowering(LoweringError::UnsupportedElementType { data_type: DataType::F8E8M0FNU, context })
+            Error::Lowering(LoweringError::UnsupportedDataType { data_type: DataType::F8E8M0FNU, context })
                 if context == "sum reduction identity",
         ));
         let maximum = lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Max, vec![0], vec![0]).unwrap();

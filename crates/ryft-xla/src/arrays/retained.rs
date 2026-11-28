@@ -781,6 +781,14 @@ mod tests {
         assert_eq!(retained, retained.clone());
         assert_eq!(retained, RetainedArray::new(&first));
         assert_ne!(retained, RetainedArray::new(&second));
+
+        // The declared type is part of the identity, so retentions of one array declared with the same type are equal
+        // and retentions declared with different types are not.
+        let other_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let other_type = first.r#type().into_owned().with_sharding(Sharding::replicated(other_mesh, 0)).unwrap();
+        let declared = retained.with_declared_type(other_type.clone());
+        assert_eq!(declared, RetainedArray::new(&first).with_declared_type(other_type));
+        assert_ne!(declared, retained);
         assert_ne!(retained, RetainedArray::new(&first.with_committed(true)));
     }
 

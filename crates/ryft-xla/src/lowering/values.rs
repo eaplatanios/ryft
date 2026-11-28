@@ -59,11 +59,11 @@ impl ArrayLiteralLoweringExtension for Array {
         // This host literal lowering is used by `ConstantOperation` and by MLIR snapshot tooling.
         let data_type = self.r#type().data_type();
         if data_type == DataType::Zero {
-            return data_type.lower_f64_scalar_elements_attribute(tensor_type, 0.0, context);
+            return data_type.lower_f64_splat_attribute(tensor_type, 0.0, context);
         }
 
         if data_type == DataType::Token {
-            return Err(Error::Lowering(LoweringError::UnsupportedElementType {
+            return Err(Error::Lowering(LoweringError::UnsupportedDataType {
                 data_type,
                 context: "dense literal materialization".to_string(),
             }));
@@ -164,7 +164,7 @@ impl DimensionValueLoweringExtension for DimensionValue {
     {
         let tensor_type = ArrayType::scalar(DataType::I64).lower(context, location)?;
         let extent = dimension_extent_i64(self.extent())?;
-        let elements = DataType::I64.lower_constant_elements_attribute(tensor_type, extent, context)?;
+        let elements = DataType::I64.lower_i64_splat_attribute(tensor_type, extent, context)?;
         let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
         Ok(constant.result(0)?.as_ref())
     }
@@ -418,7 +418,7 @@ mod tests {
         let token = Array::from_logical_bytes(ArrayType::new_static(DataType::Token, [2]), &[]).unwrap();
         assert_eq!(
             token.lower_attribute(tensor_type, &context).err(),
-            Some(Error::Lowering(LoweringError::UnsupportedElementType {
+            Some(Error::Lowering(LoweringError::UnsupportedDataType {
                 data_type: DataType::Token,
                 context: "dense literal materialization".to_string(),
             })),

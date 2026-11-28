@@ -49,7 +49,7 @@ impl LowerableOperation for DimensionSizeOperation {
                     value: extent,
                     maximum: i64::MAX as usize,
                 })?;
-                let elements = DataType::I64.lower_constant_elements_attribute(output_type, extent, context)?;
+                let elements = DataType::I64.lower_i64_splat_attribute(output_type, extent, context)?;
                 let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
                 Ok(vec![constant.result(0).unwrap().as_ref()])
             }
@@ -346,7 +346,7 @@ impl DimensionOperationLoweringExtension for DimensionOperation<DimensionValue> 
                 let difference = block.append_operation(stable_hlo::subtract(*left, *right, location)?)?;
                 let difference = difference.result(0).unwrap().as_ref();
                 let tensor_type = ArrayType::scalar(DataType::I64).lower(context, location)?;
-                let elements = DataType::I64.lower_constant_elements_attribute(tensor_type, 0i64, context)?;
+                let elements = DataType::I64.lower_i64_splat_attribute(tensor_type, 0i64, context)?;
                 let zero = block.append_operation(stable_hlo::constant(elements, location)?)?;
                 let zero = zero.result(0).unwrap().as_ref();
                 block.append_operation(stable_hlo::maximum(difference, zero, location)?)?
