@@ -113,6 +113,9 @@ impl MlirProgram {
 /// each materialized leaf and `None` for each erased leaf. Dynamically shaped [`DataType::Zero`] leaves deliberately
 /// retain private `i1` carriers because the current executable ABI has no independent shape transport. Current XLA
 /// compilation may impose stricter limits on dynamic tensors than this projection layer.
+///
+/// The constructor uses the logical types to compute slot indices and hidden extents. Callers supply the types and
+/// sharding annotations separately when projecting them into executable order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MlirProgramSignature {
     /// Executable slot index for each flattened logical input, or `None` for an erased input.
@@ -1306,9 +1309,10 @@ pub(crate) struct ProgramBoundary {
 
 // TODO(eaplatanios): Review this.
 impl ProgramBoundary {
-    /// Returns a map from executable input indices to the output indices with which they may share buffers.
-    /// The aliases of `reference_states` are validated and paired first. Each donated input then gets an output that
-    /// no earlier input is paired with. The first `capture_count` logical inputs are captures.
+    /// Returns a map from executable input indices to the output indices with which they may share buffers. The aliases
+    /// of `reference_states` are validated and paired first. Each donated input then gets an output that no earlier
+    /// input is paired with. The type and sharding slices are in logical boundary order, with the first
+    /// `capture_count` input entries describing captures.
     ///
     /// # Errors
     ///
@@ -1321,10 +1325,10 @@ impl ProgramBoundary {
         donated_inputs: &[bool],
         open_outputs: &[bool],
         capture_count: usize,
-        logical_input_types: &[ArrayType],
-        global_output_types: &[ArrayType],
         signature: &MlirProgramSignature,
-        logical_input_shardings: &[Option<Sharding>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+        input_shardings: &[Option<Sharding>],
         output_shardings: &[Option<Sharding>],
     ) -> Result<HashMap<usize, usize>, Error> {
         let mut aliases = HashMap::with_capacity(reference_states.len());
@@ -1337,7 +1341,7 @@ impl ProgramBoundary {
                     message: format!("logical state input {logical_input_index} appears more than once"),
                 }));
             }
-            let input_type = logical_input_types.get(logical_input_index).ok_or_else(|| {
+            let input_type = input_types.get(logical_input_index).ok_or_else(|| {
                 Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                     message: format!("logical input index {logical_input_index} is out of range"),
                 })
@@ -1350,7 +1354,7 @@ impl ProgramBoundary {
                 })
             })?;
             if let Some(logical_output_index) = state.output_index() {
-                let output_type = global_output_types.get(logical_output_index).ok_or_else(|| {
+                let output_type = output_types.get(logical_output_index).ok_or_else(|| {
                     Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                         message: format!("logical output index {logical_output_index} is out of range"),
                     })
@@ -1386,7 +1390,7 @@ impl ProgramBoundary {
                         ),
                     }));
                 }
-                match (&logical_input_shardings[logical_input_index], &output_shardings[logical_output_index]) {
+                match (&input_shardings[logical_input_index], &output_shardings[logical_output_index]) {
                     (Some(input_sharding), Some(output_sharding)) if input_sharding != output_sharding => {
                         return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                             message: format!(
@@ -1414,9 +1418,9 @@ impl ProgramBoundary {
                 aliases.insert(executable_input_index, executable_output_index);
             }
         }
-        if !donated_inputs.is_empty() && donated_inputs.len() != logical_input_types.len() - capture_count {
+        if !donated_inputs.is_empty() && donated_inputs.len() != input_types.len() - capture_count {
             return Err(Error::Execution(ExecutionError::DonationFlagCountMismatch {
-                expected_count: logical_input_types.len() - capture_count,
+                expected_count: input_types.len() - capture_count,
                 actual_count: donated_inputs.len(),
             }));
         }
@@ -1429,7 +1433,7 @@ impl ProgramBoundary {
         for same_sharding in [true, false] {
             for (input_index, _) in donated_inputs.iter().enumerate().filter(|(_, donated)| **donated) {
                 let logical_input_index = capture_count + input_index;
-                let input_type = &logical_input_types[logical_input_index];
+                let input_type = &input_types[logical_input_index];
                 let Some(executable_input_index) = signature.input_mapping()[logical_input_index] else { continue };
                 if state_inputs.contains(&logical_input_index)
                     || aliases.contains_key(&executable_input_index)
@@ -1438,14 +1442,14 @@ impl ProgramBoundary {
                 {
                     continue;
                 }
-                let input_sharding = &logical_input_shardings[logical_input_index];
+                let input_sharding = &input_shardings[logical_input_index];
                 // The compiler places an open output itself, and only on a single device is that placement certain to
                 // be the placement of the input.
                 let has_single_device = input_sharding.as_ref().is_none_or(|sharding| {
                     sharding.mesh().axes().iter().map(|axis| axis.size()).product::<usize>() == 1
                 });
                 let executable_output_index =
-                    global_output_types.iter().enumerate().find_map(|(logical_output_index, output_type)| {
+                    output_types.iter().enumerate().find_map(|(logical_output_index, output_type)| {
                         let executable_output_index = signature.output_mapping()[logical_output_index]?;
                         let is_open = open_outputs.get(logical_output_index).copied().unwrap_or(false);
                         let output_sharding = &output_shardings[logical_output_index];
@@ -1510,6 +1514,7 @@ impl ProgramBoundary {
     }
 
     /// Returns the MLIR types and attributes of the entry function arguments and results in executable order.
+    /// `input_shardings` and `output_shardings` follow logical boundary order, with captures first on the input side.
     /// The attributes declare the sharding, memory kind, layout, and aliased output of each value.
     ///
     /// # Errors
@@ -1518,7 +1523,7 @@ impl ProgramBoundary {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn lower_attributes<'c, 't>(
         &self,
-        logical_input_shardings: &[Option<Sharding>],
+        input_shardings: &[Option<Sharding>],
         output_shardings: &[Option<Sharding>],
         open_outputs: &[bool],
         supports_shardy: bool,
@@ -1542,7 +1547,7 @@ impl ProgramBoundary {
             result_types.push(context.stable_hlo_token_type()?.as_ref());
         }
         let mut argument_sharding_attributes = signature
-            .executable_optional_input_shardings(logical_input_shardings)?
+            .executable_optional_input_shardings(input_shardings)?
             .iter()
             .map(|sharding| {
                 sharding.as_ref().map(|sharding| sharding.lower(OpenDimensions::None, location)).transpose()
@@ -1651,13 +1656,13 @@ impl ProgramBoundary {
 
     /// Lowers the entry function body into `function_block`. It reconstructs the logical inputs from the executable
     /// arguments, completes pending input reductions, lowers `program`, and emits `func.return` with the executable
-    /// results. The first `capture_count` logical inputs are captures.
+    /// results. `input_shardings` follows logical input order, with the `capture_count` captures first.
     #[allow(clippy::too_many_arguments)]
     fn lower_body<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
         &self,
         program: &Program<Constant, O, ProgramInput, ProgramOutput>,
         capture_count: usize,
-        logical_input_shardings: &[Option<Sharding>],
+        input_shardings: &[Option<Sharding>],
         supports_shardy: bool,
         function_block: &'b DetachedBlock<'c, 't>,
         nested_functions: &Rc<CallFunctionMap<O>>,
@@ -1738,7 +1743,7 @@ impl ProgramBoundary {
                             != sharding.dimensions_with_unconstrained_replicated()
                     })
             };
-            let value = match &logical_input_shardings[logical_index] {
+            let value = match &input_shardings[logical_index] {
                 Some(sharding)
                     if supports_shardy
                         && (sharding
@@ -2285,9 +2290,9 @@ where
             donated_inputs,
             open_outputs,
             capture_types.len(),
+            &signature,
             &logical_input_types,
             output_types,
-            &signature,
             logical_input_shardings,
             output_shardings,
         )?;
@@ -3744,9 +3749,9 @@ mod tests {
                 donated_inputs,
                 &[],
                 1,
+                &signature,
                 &input_types,
                 &output_types,
-                &signature,
                 &shardings,
                 &shardings,
             )

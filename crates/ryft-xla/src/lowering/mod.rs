@@ -51,7 +51,8 @@ use crate::lowering::reductions::{
 use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::lowering::states::ProgramLoweringContext;
 use crate::operations::call::CallFunctionMap;
-use crate::{Constant, Error, Operation, RuntimeRequirement, Type};
+use crate::operations::composites::NamedCompositionKey;
+use crate::{Constant, Error, Operation, RuntimeRequirement, Session, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -441,6 +442,31 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     /// the mesh that the module already refers to, including in order.
     pub fn require_mesh(&mut self, mesh: &LogicalMesh) -> Result<(), Error> {
         self.lowering_context.require_mesh(mesh)
+    }
+
+    /// Returns the symbol of the private function of the module that holds the decomposition of the named
+    /// composition `key`, and declares that this emitted operation refers to that function (e.g., as the
+    /// decomposition of a `stablehlo.composite` that it emits, or as the callee of a `func.call`).
+    ///
+    /// A module holds one such function for each key, which every nested lowering scope shares, and it holds the
+    /// function only when an emitted operation requests it here. The first request for a key calls `program`, which
+    /// returns the decomposition as a program whose inputs and outputs are those of the boundary of `key`, and every
+    /// later request returns the same symbol without calling it. The symbol is the name of the composite of `key`,
+    /// with a numeric suffix when another key of the module has that name already.
+    ///
+    /// The decomposition is lowered outside any manual region, into a function without an effect token or hidden
+    /// inputs. It must therefore have no effects when it is lowered and import no array, which this function does
+    /// not check.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `program` when it fails, in which case nothing is recorded for `key`.
+    pub fn require_named_composition<F: FnOnce() -> Result<FlatProgram<Session>, Error>>(
+        &mut self,
+        key: NamedCompositionKey,
+        program: F,
+    ) -> Result<Rc<str>, Error> {
+        self.lowering_context.require_named_composition(key, program)
     }
 
     /// Returns the StableHLO tensor type that represents values of `array_type`.

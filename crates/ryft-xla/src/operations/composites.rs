@@ -308,9 +308,11 @@ pub(crate) fn named_composition_input_types(input_types: &[ArrayType]) -> Result
         .collect()
 }
 
-/// Identity of one generated decomposition of a named composition at a concrete typed boundary.
+/// Identity of one generated decomposition of a named composition at a concrete typed boundary. The lowering of an
+/// operation requests the private function that holds such a decomposition through
+/// [`Lowerer::require_named_composition`], and requests with equal keys share one function.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct NamedCompositionKey {
+pub struct NamedCompositionKey {
     /// Semantic identity of the composition, whose name also names the emitted private function.
     composite: CompositeKey,
 
@@ -323,7 +325,7 @@ pub(crate) struct NamedCompositionKey {
 
 impl NamedCompositionKey {
     /// Creates the key of the decomposition of `composite` at the boundary with the provided logical types.
-    pub(crate) fn new(composite: CompositeKey, input_types: Vec<ArrayType>, output_types: Vec<ArrayType>) -> Self {
+    pub fn new(composite: CompositeKey, input_types: Vec<ArrayType>, output_types: Vec<ArrayType>) -> Self {
         Self { composite, input_types, output_types }
     }
 }

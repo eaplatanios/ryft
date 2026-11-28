@@ -136,6 +136,7 @@ pub(crate) mod tagging;
 pub(crate) mod trigonometric;
 
 pub use comparisons::ComparisonDirectionLoweringExtension;
+pub use composites::NamedCompositionKey;
 pub use debugging::{
     PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE, ensure_print_handler_registered, with_captured_prints,
 };
