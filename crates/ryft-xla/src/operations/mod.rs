@@ -50,7 +50,7 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::emissions::{RegionLoweringExtension, emitted_capture_reads};
+use crate::lowering::programs::RegionLoweringExtension;
 use crate::lowering::types::{ArrayTypeLoweringExtension, physical_bound_type};
 use crate::lowering::{unsupported_data_derived_dimensions, validate_local_output_placement};
 use crate::operations::composites::NamedCompositeImplementation;
@@ -1176,19 +1176,19 @@ impl Transform<CoreRegion<Constant, Operation>> for UnreadLiftedCapturesAnalysis
 
 /// Returns, for each input of `callee`, the callee of a call whose first `capture_count` inputs are its lifted
 /// captures, whether it is a capture that an executable of the callee has no physical input for (i.e., an array of a
-/// static shape that no region which lowering emits for `target_platform` reads, refer to [`emitted_capture_reads`] and
-/// `ProgramLoweringExtension::to_mlir`), or [`None`] when the callee has no such
-/// capture. An eager application of the call (refer to `CallEagerExtension::eager_decision`) requires nothing of such a
-/// capture, as an execution of the callee requires nothing of it. The flags depend on the callee, the number of its
-/// captures, and the platform alone, so they are derived once for each of them and retained with the callee, and
-/// repeated applications only look them up.
+/// static shape that no region which lowering emits for `target_platform` reads, refer to
+/// [`RegionLoweringExtension::used_captures`] and `ProgramLoweringExtension::to_mlir`), or [`None`] when the callee
+/// has no such capture. An eager application of the call (refer to `CallEagerExtension::eager_decision`) requires
+/// nothing of such a capture, as an execution of the callee requires nothing of it. The flags depend on the callee,
+/// the number of its captures, and the platform alone, so they are derived once for each of them and retained with
+/// the callee, and repeated applications only look them up.
 pub(crate) fn unread_lifted_captures(
     callee: RegionRef<'_, Constant, Operation>,
     capture_count: usize,
     target_platform: Option<&str>,
 ) -> Option<Arc<[bool]>> {
     let derive = |callee: RegionRef<'_, Constant, Operation>| -> Result<_, Infallible> {
-        let is_read = emitted_capture_reads(callee, capture_count, true, target_platform);
+        let is_read = callee.used_captures(capture_count, true, target_platform);
         let input_types = callee.interface().input_types();
         let mut unread = vec![false; input_types.len()];
         for (index, is_read) in is_read.into_iter().enumerate() {

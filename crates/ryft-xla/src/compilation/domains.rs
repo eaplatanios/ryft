@@ -31,13 +31,11 @@ use crate::compilation::programs::{
     SessionConstantBinding,
 };
 use crate::execution::{ExecutionPlan, validate_capture_reduction};
-use crate::lowering::emissions::{
-    CallTraversal, RegionLoweringExtension, emitted_capture_reads, partition_region_session_constants,
-    unread_entry_inputs,
-};
+use crate::lowering::emissions::partition_region_session_constants;
 use crate::lowering::programs::{
-    OutputShardingSource, ProgramLoweringAnalysisExtension, ProgramLoweringExtension, ProgramLoweringOptions,
-    entry_output_shardings, entry_outputs_with_compiler_chosen_placement,
+    CallTraversal, OutputShardingSource, ProgramLoweringAnalysisExtension, ProgramLoweringExtension,
+    ProgramLoweringOptions, RegionLoweringExtension, entry_output_shardings,
+    entry_outputs_with_compiler_chosen_placement,
 };
 use crate::{
     Array, Constant, Error, ExecutionError, LowerableOperation, LoweringError, OpShardingExtension, Operation,
@@ -162,10 +160,10 @@ impl Session {
         // Staging already pruned the captures that the function does not use, which are therefore never checked. A
         // capture that only regions which lowering omits read (e.g., the body of a scan that admits no iteration) is
         // not checked either, because the executable never reads it, and lowering erases its input through the same
-        // decision (refer to `emitted_capture_reads`).
+        // decision (refer to `used_captures`).
         let target_platform = Some(self.target()?.platform_name());
         let entry = staged.source_program().program().entry_region_ref();
-        let is_read = emitted_capture_reads(entry, capture_count, false, target_platform);
+        let is_read = entry.used_captures(capture_count, false, target_platform);
         let capture_placements = staged
             .source_program()
             .captures()
@@ -649,12 +647,11 @@ impl Session {
         // auto mesh axes that their types never record. A runtime placement drops a pending reduction over those axes,
         // which no value of the program can carry, whereas an input override, which states the placement with which
         // the input arrives, keeps it (refer to `receivable_input_sharding`). An input that the executable never reads
-        // has no executable slot (refer to `unread_entry_inputs`), so its placement is neither resolved nor validated,
+        // has no executable slot (refer to `unread_logical_inputs`), so its placement is neither resolved nor validated,
         // whatever its runtime array is (e.g., split unevenly, or of another client), and it is annotated replicated,
         // which disappears from the signature with that input.
         let source_capture_count = lowered_capture_count - session_constants.len();
-        let unread_logical_inputs = unread_entry_inputs(
-            program,
+        let unread_logical_inputs = program.unread_logical_inputs(
             &effective_input_types,
             lowered_capture_count,
             session_constants.len(),
@@ -6253,7 +6250,7 @@ mod tests {
     fn test_session_lower_staged_program_skips_captures_that_only_omitted_regions_read() {
         // A split capture that only the body of a scan imports is checked when the scan admits an iteration, and not
         // when its length is zero, because lowering then emits nothing of that body and the executable has no
-        // input for the capture (refer to `emitted_capture_reads`). This holds for a populated capture of another
+        // input for the capture (refer to `used_captures`). This holds for a populated capture of another
         // client, whose admission rejects it, and for a capture of this client without buffers, which only an
         // execution rejects. At length zero both compile and run through the executable. It holds alike for a capture
         // of another client of the zero data type, which has no buffer either, and for a capture of this client that

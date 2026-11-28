@@ -46,8 +46,10 @@ use crate::compilation::domains::{commits_public_outputs, relocated_input_type};
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::EffectTokens;
 use crate::lowering::contexts::ProgramLoweringContext;
-use crate::lowering::emissions::{CallTraversal, RegionLoweringExtension, partition_region_session_constants};
-use crate::lowering::programs::{ProgramInlineLoweringExtension, RegionPlacementRequestsExtension};
+use crate::lowering::emissions::partition_region_session_constants;
+use crate::lowering::programs::{
+    CallTraversal, ProgramInlineLoweringExtension, RegionLoweringExtension, RegionPlacementRequestsExtension,
+};
 use crate::lowering::reductions::validate_declared_pending_reduction;
 use crate::lowering::types::{TypeLoweringExtension, lower_unplaced_constant_output};
 use crate::operations::control_flow::lowered_effect_classes;
@@ -2588,7 +2590,7 @@ mod tests {
     #[test]
     fn test_call_operation_interpret_binds_the_captures_that_nested_regions_read() {
         // The body of a scan in the callee of a call reads a capture of the callee through a capture constant (refer to
-        // `emitted_capture_reads`), which the lowering of the whole callee binds to the input that the call receives
+        // `used_captures`), which the lowering of the whole callee binds to the input that the call receives
         // for the capture. The interpretation rule of the call returns what `.call` and an execution of the callee
         // return, on the same devices and with the same commitment, also for a capture that lives on another mesh of
         // the same devices in the opposite order.

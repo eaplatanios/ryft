@@ -642,7 +642,7 @@ impl Session {
             }));
         }
         // An input that the executable never reads has no physical input, and the boundary mapping records it as unread
-        // (refer to `unread_entry_inputs`), so it is neither checked, nor required to hold buffers, nor waited for,
+        // (refer to `unread_logical_inputs`), so it is neither checked, nor required to hold buffers, nor waited for,
         // whatever its data type. An erased input of the zero data type that the executable reads is not unread, and
         // its producer is still observed below.
         let is_unread = |index: usize| program.boundary_mapping().is_unread_input(index);

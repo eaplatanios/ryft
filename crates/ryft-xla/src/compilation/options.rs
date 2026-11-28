@@ -315,7 +315,7 @@ impl Options {
 
     /// Records which flat public inputs the program never reads, one flag for each public input. Such an input with a
     /// static shape has no executable input, like a capture that no emitted region reads (refer to
-    /// `emitted_capture_reads`). The program of an eager call states its inputs that are captures which the callee
+    /// `used_captures`). The program of an eager call states its inputs that are captures which the callee
     /// never reads, so that the call requires of them what an execution of the callee requires, which is nothing.
     #[inline]
     pub(crate) fn with_unread_inputs(mut self, unread_inputs: Arc<[bool]>) -> Self {

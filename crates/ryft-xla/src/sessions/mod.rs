@@ -126,8 +126,10 @@ use crate::arrays::statistics::ArrayTracker;
 use crate::compilation::domains::{captured_type, placed_constant};
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
 use crate::compilation::programs::EagerDispatchProgram;
-use crate::lowering::emissions::{CallTraversal, RegionLoweringExtension, partition_region_session_constants};
-use crate::lowering::programs::{RegionPlacementRequestsExtension, merge_requested_placement};
+use crate::lowering::emissions::partition_region_session_constants;
+use crate::lowering::programs::{
+    CallTraversal, RegionLoweringExtension, RegionPlacementRequestsExtension, merge_requested_placement,
+};
 use crate::operations::call::{CallEagerExtension, EagerCallDecision};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::sessions::effects::{EffectReservation, EffectScope, ensure_effect_dispatch_is_allowed};

@@ -33,7 +33,7 @@ use crate::kernels::{
     CompiledKernel, KernelEmbeddingError, KernelOutputEmbedding, placed_custom_call, unbound_kernel_axis_message,
     validate_kernel_sharding,
 };
-use crate::lowering::emissions::{CallTraversal, RegionLoweringExtension};
+use crate::lowering::programs::{CallTraversal, RegionLoweringExtension};
 use crate::{
     Constant, Error, LowerableOperation, Lowerer, LoweringError, Operation, ProgramLoweringOperation, Session, Target,
     Type,

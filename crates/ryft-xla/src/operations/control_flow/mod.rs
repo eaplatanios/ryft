@@ -14,8 +14,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::contexts::ProgramLoweringContext;
-use crate::lowering::emissions::{CallTraversal, RegionLoweringExtension};
-use crate::lowering::programs::ProgramInlineLoweringExtension;
+use crate::lowering::programs::{CallTraversal, ProgramInlineLoweringExtension, RegionLoweringExtension};
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, dimension_extent_i64, lower_unplaced_constant_output, physical_bound_type,

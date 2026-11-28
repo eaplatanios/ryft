@@ -6,10 +6,10 @@ use std::sync::Arc;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, AtomId, BroadcastOperation, CallOperation, DataType, DeviceMesh, Dimension, EagerContext, EffectClass,
-    ExternalReferenceBinding, FlatProgram, LogicalMesh, Memory, MeshAxisType, Parameterized, PlaceOperation,
-    PlacementRequest, Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RequestedPlacement, Shape,
-    Sharding, ShardingDimension, StopGradientOperation, TagOperation, TransferToMemoryOperation, Type as CoreType,
-    Typed, TypedProgram, Value,
+    ExternalReferenceBinding, FlatProgram, Instruction, LogicalMesh, Memory, MeshAxisType, Parameterized,
+    PlaceOperation, PlacementRequest, Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RegionRole,
+    RequestedPlacement, Shape, Sharding, ShardingDimension, StopGradientOperation, TagOperation,
+    TransferToMemoryOperation, Type as CoreType, Typed, TypedProgram, Value,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -21,9 +21,7 @@ use ryft_mlir::{
 use crate::arrays::host::ReductionChange;
 use crate::devices::MemoryExtension;
 use crate::lowering::contexts::ProgramLoweringContext;
-use crate::lowering::emissions::{
-    CallTraversal, RegionLoweringExtension, partition_region_session_constants, unread_entry_inputs,
-};
+use crate::lowering::emissions::partition_region_session_constants;
 use crate::lowering::reductions::{
     ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
     validate_pending_reduction_change,
@@ -1926,7 +1924,7 @@ impl ProgramBoundary {
     }
 }
 
-/// Prepares XLA programs for lowering and analyzes their effects, references, and placements.
+/// Prepares XLA programs for lowering and analyzes their input use, effects, references, and placements.
 pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
     /// Operation family of the program.
     type Operation: ProgramLoweringOperation;
@@ -2012,6 +2010,23 @@ pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
         output_count: usize,
         constant_sharding: F,
     ) -> Vec<Option<OutputShardingSource>>;
+
+    /// Returns one flag per logical input, set when the executable can omit that input because it is unread. The first
+    /// `capture_count` inputs are captures, ending with `session_constant_count` session constants. For the preceding
+    /// captures, [`RegionLoweringExtension::used_captures`] determines which the emitted regions read. This mask treats
+    /// session constants as read. The caller supplies `unread_public_inputs` for the public inputs that follow the
+    /// captures. Only statically shaped inputs outside `reference_state_inputs` can be omitted this way. Compilation
+    /// uses these flags for input admission and placement, and the executable records them in
+    /// [`MlirProgramBoundaryMapping::unread_inputs`].
+    fn unread_logical_inputs(
+        &self,
+        logical_input_types: &[ArrayType],
+        capture_count: usize,
+        session_constant_count: usize,
+        unread_public_inputs: &[bool],
+        reference_state_inputs: &[usize],
+        target_platform: Option<&str>,
+    ) -> Vec<bool>;
 
     /// Validates the entry boundary of this program and returns its [`ProgramBoundary`], without emitting anything.
     ///
@@ -2257,6 +2272,31 @@ where
             .to_vec()
     }
 
+    fn unread_logical_inputs(
+        &self,
+        logical_input_types: &[ArrayType],
+        capture_count: usize,
+        session_constant_count: usize,
+        unread_public_inputs: &[bool],
+        reference_state_inputs: &[usize],
+        target_platform: Option<&str>,
+    ) -> Vec<bool> {
+        let lifted = self.input_count() + session_constant_count == logical_input_types.len();
+        let source_capture_count = capture_count.saturating_sub(session_constant_count);
+        let used_captures = self.entry_region_ref().used_captures(source_capture_count, lifted, target_platform);
+        logical_input_types
+            .iter()
+            .enumerate()
+            .map(|(index, r#type)| {
+                let is_read = match index.checked_sub(capture_count) {
+                    Some(public_index) => !unread_public_inputs.get(public_index).copied().unwrap_or(false),
+                    None => used_captures.get(index).copied().unwrap_or(true),
+                };
+                !is_read && r#type.static_shape().is_some() && !reference_state_inputs.contains(&index)
+            })
+            .collect()
+    }
+
     fn entry_boundary(
         &self,
         function_name: &str,
@@ -2324,8 +2364,7 @@ where
             .iter()
             .filter_map(|state| state.source().flat_input_index(capture_types.len()).ok())
             .collect::<Vec<_>>();
-        let unread_logical_inputs = unread_entry_inputs(
-            self,
+        let unread_logical_inputs = self.unread_logical_inputs(
             &logical_input_types,
             capture_types.len(),
             session_count,
@@ -2514,6 +2553,120 @@ where
     }
 }
 
+/// Analyzes instruction boundaries, emitted computations, and capture use in an XLA program region.
+pub(crate) trait RegionLoweringExtension<O: ProgramLoweringOperation>: Sized {
+    /// Returns the input and output types of an instruction in this region, in operand and result order.
+    fn instruction_boundary_types(self, instruction: &Instruction<O>) -> (Vec<Type>, Vec<Type>);
+
+    /// Visits this region and its emitted computation descendants once each, in the
+    /// order of [`RegionRef::computation_regions`]. Dormant rules and bodies omitted by
+    /// [`ProgramLoweringOperation::omits_regions`] are skipped. Use [`CallTraversal::Enter`] for
+    /// whole-program analyses and [`CallTraversal::Skip`] when resolving captures in this region's scope.
+    fn emitted_regions(self, target_platform: Option<&str>, calls: CallTraversal) -> impl Iterator<Item = Self>;
+
+    /// Returns one flag per capture, set when lowering reads that capture in this region or an emitted descendant in
+    /// the same capture scope. A captured constant names its position through [`Value::capture_index`]. When `lifted`
+    /// is set, the first `capture_count` entry inputs also name the captures in order. Callees have their own capture
+    /// indices. At each call, [`Self::visit_atom_reads`] checks the forwarded operands against the callee's unread
+    /// captures. Compilation and lowering use these flags so that a capture read only inside an omitted body, such
+    /// as a zero-length scan, can be skipped at the executable boundary.
+    fn used_captures(self, capture_count: usize, lifted: bool, target_platform: Option<&str>) -> Vec<bool>;
+
+    /// Visits each instruction input and each output of this region, passing its atom ID and whether the read
+    /// is live. Outputs are always live. When a call forwards a lifted capture that the operation family marks
+    /// [`unread`](super::LowerableOperation::unread_captures) on `target_platform`, its operand is dead and lowering
+    /// supplies a bufferless value. Capture analysis and session constant partitioning use this same decision.
+    fn visit_atom_reads<F: FnMut(AtomId, bool)>(self, target_platform: Option<&str>, visit: F);
+}
+
+impl<O: ProgramLoweringOperation> RegionLoweringExtension<O> for RegionRef<'_, Constant, O> {
+    fn instruction_boundary_types(self, instruction: &Instruction<O>) -> (Vec<Type>, Vec<Type>) {
+        let types =
+            |atoms: &[AtomId]| atoms.iter().map(|atom| self.atoms()[atom.index()].r#type().into_owned()).collect();
+        (types(instruction.inputs()), types(instruction.outputs()))
+    }
+
+    fn emitted_regions(self, target_platform: Option<&str>, calls: CallTraversal) -> impl Iterator<Item = Self> {
+        let mut visited = vec![false; self.arena().len()];
+        let mut pending = vec![self.id()];
+        std::iter::from_fn(move || {
+            while let Some(id) = pending.pop() {
+                if std::mem::replace(&mut visited[id.index()], true) {
+                    continue;
+                }
+
+                // Every pending identifier is this region or an attachment in the same arena.
+                let region = self.with_id(id).unwrap();
+                for instruction in region.instructions() {
+                    let operation = instruction.operation();
+                    if operation.omits_regions(target_platform, || region.instruction_boundary_types(instruction))
+                        || (calls == CallTraversal::Skip
+                            && operation.projected_payload::<CallOperation<Type>>().is_some())
+                    {
+                        continue;
+                    }
+
+                    pending.extend(instruction.regions().iter().copied().enumerate().filter_map(|(index, id)| {
+                        (operation.region_role(index) == Some(RegionRole::Computation)).then_some(id)
+                    }));
+                }
+
+                return Some(region);
+            }
+
+            None
+        })
+    }
+
+    fn used_captures(self, capture_count: usize, lifted: bool, target_platform: Option<&str>) -> Vec<bool> {
+        let mut is_read = vec![false; capture_count];
+        for region in self.emitted_regions(target_platform, CallTraversal::Skip) {
+            let mut lifted_captures = HashMap::new();
+            if lifted && region.id() == self.id() {
+                let inputs = region.input_ids().iter().take(capture_count);
+                lifted_captures.extend(inputs.enumerate().map(|(index, id)| (*id, index)));
+            }
+
+            region.visit_atom_reads(target_platform, |id, is_live| {
+                if !is_live {
+                    return;
+                }
+
+                let index = lifted_captures.get(&id).copied().or_else(|| {
+                    region.atoms().get(id.index()).and_then(|atom| atom.as_constant()).and_then(Value::capture_index)
+                });
+
+                if let Some(index) = index.filter(|index| *index < capture_count) {
+                    is_read[index] = true;
+                }
+            });
+        }
+
+        is_read
+    }
+
+    fn visit_atom_reads<F: FnMut(AtomId, bool)>(self, target_platform: Option<&str>, mut visit: F) {
+        for instruction in self.instructions() {
+            let unread = instruction
+                .operation()
+                .projected_payload::<CallOperation<Type>>()
+                .filter(|call| call.capture_count() != 0)
+                .and_then(|call| {
+                    let callee = self.with_id(*instruction.regions().first()?).ok()?;
+                    O::unread_captures(callee, call.capture_count(), target_platform)
+                });
+
+            for (index, id) in instruction.inputs().iter().enumerate() {
+                visit(*id, !unread.as_deref().is_some_and(|unread| unread.get(index).copied().unwrap_or(false)));
+            }
+        }
+
+        for id in self.output_ids() {
+            visit(*id, true);
+        }
+    }
+}
+
 /// Derives the [`RegionPlacementRequests`] of the program that lowering emits for a region, and the devices that its
 /// placement requests name.
 pub(crate) trait RegionPlacementRequestsExtension: Sized {
@@ -2523,10 +2676,10 @@ pub(crate) trait RegionPlacementRequestsExtension: Sized {
     /// (refer to [`RegionPlacementRequests::for_target`]), and [`None`] analyzes the program for no target (refer to
     /// [`RegionPlacementRequests::new`]). The summary is derived once for each region and platform and retained with
     /// the region.
-    fn for_lowering<V, O>(region: RegionRef<'_, V, O>, target_platform: Option<&str>) -> Self
-    where
-        V: 'static + Value<Type = Type>,
-        O: 'static + ProgramLoweringOperation;
+    fn for_lowering<O: 'static + ProgramLoweringOperation>(
+        region: RegionRef<'_, Constant, O>,
+        target_platform: Option<&str>,
+    ) -> Self;
 
     /// Returns the devices that the placement requests of the program name (refer to
     /// [`RegionPlacementRequests::requests`]), as the mesh of a request that names devices together with the name
@@ -2544,11 +2697,10 @@ pub(crate) trait RegionPlacementRequestsExtension: Sized {
 
 impl RegionPlacementRequestsExtension for RegionPlacementRequests {
     #[inline]
-    fn for_lowering<V, O>(region: RegionRef<'_, V, O>, target_platform: Option<&str>) -> Self
-    where
-        V: 'static + Value<Type = Type>,
-        O: 'static + ProgramLoweringOperation,
-    {
+    fn for_lowering<O: 'static + ProgramLoweringOperation>(
+        region: RegionRef<'_, Constant, O>,
+        target_platform: Option<&str>,
+    ) -> Self {
         match target_platform {
             None => Self::new(region),
             Some(target_platform) => Self::for_target(region, target_platform, |region, instruction| {
@@ -2569,6 +2721,16 @@ impl RegionPlacementRequestsExtension for RegionPlacementRequests {
         }
         Ok(requested.map(|(mesh, operation)| (mesh.into_owned(), operation)))
     }
+}
+
+/// Whether a traversal follows a [`CallOperation`] into its callee.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CallTraversal {
+    /// Visit the computations that execute across call boundaries.
+    Enter,
+
+    /// Stay in the current capture scope. A callee's capture indices refer to its own inputs.
+    Skip,
 }
 
 /// Source of the sharding of one output of a program, as [`ProgramLoweringAnalysisExtension::output_sharding_sources`]
@@ -2830,8 +2992,8 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
-        dynamic_dimension, linear_call_program, scalar_linear_region, shard_map_module, test_manual_mesh,
-        test_matrix_type, test_sharding, test_vector_type,
+        add_call, dynamic_dimension, linear_call_program, neg_branch, scalar_linear_region, shard_map_module,
+        test_manual_mesh, test_matrix_type, test_sharding, test_vector_type, unproject_plain_program,
     };
     use crate::lowering::token_threaded_effects;
     use crate::sessions::tests::{domain_mesh, two_device_mesh};
@@ -5457,6 +5619,30 @@ mod tests {
             ),
         ));
         assert!(block.is_empty());
+    }
+
+    #[test]
+    fn test_region_ref_emitted_regions() {
+        let vector = test_vector_type(4);
+        let callee = Arc::new(unproject_plain_program(neg_branch(vector.clone())));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(vector.into());
+        let first = add_call(&mut builder, &callee, vec![input]);
+        let second = add_call(&mut builder, &callee, vec![first]);
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![second], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let entry = program.entry_region_ref();
+        let shared = entry.instructions()[0].regions()[0];
+        assert_eq!(entry.instructions()[1].regions(), &[shared]);
+        assert_eq!(
+            entry.emitted_regions(None, CallTraversal::Enter).map(RegionRef::id).collect::<Vec<_>>(),
+            vec![entry.id(), shared],
+        );
+        assert_eq!(
+            entry.emitted_regions(None, CallTraversal::Skip).map(RegionRef::id).collect::<Vec<_>>(),
+            vec![entry.id()],
+        );
     }
 
     #[test]
