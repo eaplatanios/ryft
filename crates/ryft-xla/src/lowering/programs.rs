@@ -887,9 +887,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Is the way in which we're handling multi-platform support with a platform index input argument
-//  the same as the way in which JAX handles multi-platform support?
-
 /// Lowers the module of a program whose entry function has the provided `boundary`, for the provided `variants` of
 /// the program, each of which is the program as it is lowered for one target platform (i.e., pruned for it) together
 /// with that platform. The shardings and open output flags follow logical boundary order, with the `capture_count`
@@ -1565,18 +1562,8 @@ impl ProgramLoweringOptions {
         self.prune
     }
 
-    /// Returns the case-sensitive PJRT platform name used for lowering, if exactly one was supplied.
-    #[inline]
-    pub fn target_platform(&self) -> Option<&str> {
-        // TODO(eaplatanios): Isn't it weird to just return `None` when there are multiple? Do we actually need
-        //  `target_platform` as a function or should we just drop it? What value does it add?
-        match self.target_platforms.as_slice() {
-            [target_platform] => Some(target_platform),
-            _ => None,
-        }
-    }
-
-    /// Returns the case-sensitive PJRT platform names used for lowering, in the order of the platform index.
+    /// Returns the case-sensitive PJRT platform names used for lowering, in the order of the platform index, or
+    /// none when the program is lowered without a target platform.
     #[inline]
     pub fn target_platforms(&self) -> &[String] {
         &self.target_platforms
@@ -6873,7 +6860,6 @@ mod tests {
         assert_eq!(options.exact_input_shardings(), None);
         assert_eq!(options.exact_output_shardings(), None);
         assert!(options.prunes());
-        assert_eq!(options.target_platform(), None);
         assert_eq!(options.target_platforms(), &[] as &[String]);
         assert!(options.supports_shardy());
         assert_eq!(options.reference_bindings(), &[]);
@@ -6956,21 +6942,18 @@ mod tests {
     #[test]
     fn test_program_lowering_options_with_target_platform() {
         let options = ProgramLoweringOptions::new().with_target_platform(Some("cpu"));
-        assert_eq!(options.target_platform(), Some("cpu"));
-        assert_eq!(options.with_target_platform(None).target_platform(), None);
+        assert_eq!(options.target_platforms(), ["cpu".to_string()]);
+        assert_eq!(options.with_target_platform(None).target_platforms(), &[] as &[String]);
     }
 
     #[test]
     fn test_program_lowering_options_with_target_platforms() {
-        // Repeated platforms are kept once, in the order of their first occurrence, and several platforms are no
-        // single target platform.
+        // Repeated platforms are kept once, in the order of their first occurrence, and the platforms replace the ones
+        // that the options held.
         let options = ProgramLoweringOptions::new().with_target_platforms(["cuda", "cpu", "cuda"]);
         assert_eq!(options.target_platforms(), ["cuda".to_string(), "cpu".to_string()]);
-        assert_eq!(options.target_platform(), None);
         let options = options.with_target_platforms(["cpu"]);
         assert_eq!(options.target_platforms(), ["cpu".to_string()]);
-        assert_eq!(options.target_platform(), Some("cpu"));
-        assert_eq!(options.with_target_platform(None).target_platforms(), &[] as &[String]);
     }
 
     #[test]
