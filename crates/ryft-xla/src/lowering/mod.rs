@@ -136,20 +136,17 @@ pub enum RaggedDotLoweringStrategy {
     Instruction,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Operations that can be lowered to StableHLO for XLA compilation.
-///
-/// In [`Self::lower`], `Self` is the operation being lowered. Its [`CoreOperation`](ryft_core::Operation) contract
-/// determines `Self::Type`, the type of its input and output descriptors. For example, an array operation receives
-/// [`ArrayType`] descriptors, and a first-class dimension operation receives [`DimensionType`](ryft_core::DimensionType)
-/// descriptors. `O` is the enclosing program's operation family, which [`Lowerer`] uses to lower attached regions.
-/// Both kinds of operation can be lowered inside a program whose family uses [`Type`].
+/// Operations that can be lowered to StableHLO for XLA compilation. In [`Self::lower`], `Self` is the operation being
+/// lowered. Its [`CoreOperation`](ryft_core::Operation) contract determines `Self::Type`, the type of its input and
+/// output descriptors. For example, an array operation receives [`ArrayType`] descriptors, and a first-class dimension
+/// operation receives [`DimensionType`](ryft_core::DimensionType) descriptors. `0` is the enclosing program's operation
+/// family, which [`Lowerer`] uses to lower attached regions. Both kinds of operation can be lowered inside a program
+/// whose family uses [`Type`].
 ///
 /// Families such as [`ArrayOperation`](ryft_core::ArrayOperation) and [`Operation`] implement this trait by dispatching
-/// each variant to its payload through [`lower_operation_variants`](crate::lower_operation_variants), which also handles
-/// projected and mixed members. Downstream families that meet the bounds of [`ProgramLoweringOperation`] can lower whole
-/// programs through [`ProgramLoweringExtension`].
+/// each variant to its payload through [`lower_operation_variants`](crate::lower_operation_variants), which also
+/// handles projected and mixed members. Downstream families that meet the bounds of [`ProgramLoweringOperation`] can
+/// lower whole programs through [`ProgramLoweringExtension`].
 ///
 /// Operations lower attached regions through methods such as [`Lowerer::lower_region_inline`]. This keeps the bounds of
 /// a family's lowering implementation from depending recursively on its own lowering rules.
@@ -159,7 +156,8 @@ pub trait LowerableOperation: CoreOperation {
     ///
     /// # Parameters
     ///
-    ///   - `lowerer`: Lowering state of the instruction applying this operation, with access to attached regions of `O`.
+    ///   - `lowerer`: Lowering state of the instruction applying this operation, with access to attached regions of the
+    ///     enclosing program's operation family, `O`.
     ///   - `input_values`: Lowered MLIR values of the instruction inputs, one per input.
     ///   - `input_types`: Declared types of the instruction inputs, in input order.
     ///   - `output_types`: Declared types of the instruction outputs, in output order.
@@ -173,14 +171,13 @@ pub trait LowerableOperation: CoreOperation {
 }
 
 /// Operations whose own type universe is a member universe of an enclosing operation family that lowers them at the
-/// family's parent universe `T` (e.g., [`ZeroOperation<ArrayType>`](ryft_core::ZeroOperation) stored in an
-/// [`Type`] family receives first-class dimension inputs that size its dynamic output axes).
-///
-/// This is the lowering counterpart of [`MemberOperation`](ryft_core::MemberOperation), and families dispatch their
-/// mixed member variants to it through [`lower_operation_variants`](crate::lower_operation_variants).
+/// family's parent universe `T` (e.g., [`ZeroOperation<ArrayType>`](ryft_core::ZeroOperation) stored in an [`Type`]
+/// family receives first-class dimension inputs that size its dynamic output axes). This is the lowering counterpart
+/// of [`MemberOperation`](ryft_core::MemberOperation), and families dispatch their mixed member variants to it through
+/// [`lower_operation_variants`](crate::lower_operation_variants).
 pub trait MemberLowerableOperation<T: CoreType>: CoreOperation {
-    /// Lowers this operation, applied by an instruction of the parent universe `T`, to one or more StableHLO
-    /// operations emitted into the block of `lowerer`, returning one MLIR value per output.
+    /// Lowers this operation, applied by an instruction of the parent universe `T`, to one or more StableHLO operations
+    /// emitted into the block of `lowerer`, returning one MLIR value per output.
     ///
     /// # Parameters
     ///
@@ -197,27 +194,25 @@ pub trait MemberLowerableOperation<T: CoreType>: CoreOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
 
-/// Enclosing operation families for programs lowered by [`ProgramLoweringExtension`].
-///
-/// This is the bound on `O` in [`LowerableOperation::lower`]. The family lowers program instructions at [`Type`]
-/// and exposes its payloads through [`OperationPayloadProjection`] so that lowering passes can recognize operations
-/// inside the family, for example when deduplicating calls or deciding which regions to emit. Calls of named composites
-/// are recognized through [`NamedCompositeOperation`], because their payloads name the family that holds them.
+/// Enclosing operation families for programs lowered by [`ProgramLoweringExtension`]. This is the bound on `O` in
+/// [`LowerableOperation::lower`]. The family lowers program instructions at [`Type`] and exposes its payloads through
+/// [`OperationPayloadProjection`] so that lowering passes can recognize operations inside the family, for example when
+/// deduplicating calls or deciding which regions to emit. Calls of named composites are recognized through
+/// [`NamedCompositeOperation`], because their payloads name the family that holds them.
 ///
 /// The blanket implementation covers every type that meets these bounds, including downstream operation families.
 /// A downstream family that holds another family in a variant (e.g., one that wraps [`Operation`]) must declare
-/// `#[ryft(family)]` on that variant, so that payload projection and [`NamedCompositeOperation`] reach the operations
-/// of the nested family. Lowering passes would otherwise not see its calls and named composites.
+/// `#[ryft(family)]` on that variant, so that payload projection and [`NamedCompositeOperation`] reach the
+/// operations of the nested family. Lowering passes would otherwise not see its calls and named composites.
 pub trait ProgramLoweringOperation:
     LowerableOperation<Type = Type> + OperationPayloadProjection + NamedCompositeOperation
 {
-    /// Returns whether lowering skips the bodies of this operation's attached regions on `target_platform`.
-    /// A scan with zero iterations omits its body on every platform, though lowering still reads the body interface
-    /// to type the results. A call of a named composite omits its body when a backend implementation replaces it for
-    /// its key and boundary types (refer to `NamedCompositeImplementation::select`), which is the selection that the
-    /// lowering of the call makes as well.
-    /// Only that lookup evaluates `boundary_types`, which returns the input types followed by the output types.
-    /// Staged lowering and eager dispatch use this decision to skip captures and placements in omitted regions.
+    /// Returns whether lowering skips the bodies of this operation's attached regions on `target_platform`. A scan with
+    /// zero iterations omits its body on every platform, though lowering still reads the body interface to type the
+    /// results. A call of a named composite omits its body when a backend implementation replaces it for its key and
+    /// boundary types, which is the selection that the lowering of the call makes as well. Only that lookup evaluates
+    /// `boundary_types`, which returns the input types followed by the output types. Staged lowering and eager dispatch
+    /// use this decision to skip captures and placements in omitted regions.
     fn omits_regions(
         &self,
         target_platform: Option<&str>,
@@ -226,9 +221,11 @@ pub trait ProgramLoweringOperation:
         if self.projected_payload::<ScanOperation<Type>>().is_some_and(ScanOperation::has_zero_iterations) {
             return true;
         }
+
         let Some(key) = self.composite_key() else {
             return false;
         };
+
         let (input_types, output_types) = boundary_types();
         NamedCompositeImplementation::select(key, &input_types, &output_types, target_platform).is_some()
     }
@@ -238,6 +235,8 @@ impl<O: LowerableOperation<Type = Type> + OperationPayloadProjection + NamedComp
     for O
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Per-instruction StableHLO lowering state passed to [`LowerableOperation::lower`] while lowering a program of the
 /// operation family `O`.
@@ -558,46 +557,6 @@ impl<'b, 'c: 'b, 't: 'c> dyn InstructionLowerer<'b, 'c, 't> + '_ {
     }
 }
 
-/// Lowering of the instructions of one operation that replaces the lowering of their operation family for one
-/// module (refer to [`ProgramLoweringOptions::with_lowering_rule`]). A rule sees an instruction through an
-/// [`InstructionLowerer`], so it applies to the instructions of every program that the module lowers, whatever
-/// their operation family is, including the bodies of the private functions of the module.
-pub trait LoweringRule {
-    /// Lowers `instruction` to one or more StableHLO operations emitted into its block, and returns one MLIR value
-    /// per output.
-    fn lower<'b, 'c: 'b, 't: 'c>(
-        &self,
-        instruction: &mut dyn InstructionLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
-}
-
-/// [`LoweringRule`]s of one module, by the name of the operation whose instructions they lower.
-#[derive(Clone, Default)]
-pub(crate) struct LoweringRules(Rc<HashMap<String, Rc<dyn LoweringRule>>>);
-
-impl LoweringRules {
-    /// Returns these rules with `rule` lowering the instructions of the operation named `operation_name`, in place
-    /// of any rule that they held for that operation.
-    pub(crate) fn with_rule(mut self, operation_name: String, rule: Rc<dyn LoweringRule>) -> Self {
-        Rc::make_mut(&mut self.0).insert(operation_name, rule);
-        self
-    }
-
-    /// Returns the rule that lowers the instructions of the operation named `operation_name`, if any.
-    #[inline]
-    pub(crate) fn get(&self, operation_name: &str) -> Option<&Rc<dyn LoweringRule>> {
-        if self.0.is_empty() { None } else { self.0.get(operation_name) }
-    }
-}
-
-impl Debug for LoweringRules {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut operation_names = self.0.keys().collect::<Vec<_>>();
-        operation_names.sort();
-        formatter.debug_set().entries(operation_names).finish()
-    }
-}
-
 /// [`InstructionLowerer`] of an instruction of the operation family `O`, which pairs the [`Lowerer`] of the
 /// instruction with its operation and its boundary.
 pub(crate) struct FamilyInstructionLowerer<'l, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> {
@@ -692,6 +651,46 @@ impl<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> InstructionLowerer<'b, 'c,
     #[inline]
     fn lower_default(&mut self) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         self.operation.lower(self.lowerer, self.input_values, self.input_types, self.output_types)
+    }
+}
+
+/// Lowering of the instructions of one operation that replaces the lowering of their operation family for one
+/// module (refer to [`ProgramLoweringOptions::with_lowering_rule`]). A rule sees an instruction through an
+/// [`InstructionLowerer`], so it applies to the instructions of every program that the module lowers, whatever
+/// their operation family is, including the bodies of the private functions of the module.
+pub trait LoweringRule {
+    /// Lowers `instruction` to one or more StableHLO operations emitted into its block, and returns one MLIR value
+    /// per output.
+    fn lower<'b, 'c: 'b, 't: 'c>(
+        &self,
+        instruction: &mut dyn InstructionLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+/// [`LoweringRule`]s of one module, by the name of the operation whose instructions they lower.
+#[derive(Clone, Default)]
+pub(crate) struct LoweringRules(Rc<HashMap<String, Rc<dyn LoweringRule>>>);
+
+impl LoweringRules {
+    /// Returns these rules with `rule` lowering the instructions of the operation named `operation_name`, in place
+    /// of any rule that they held for that operation.
+    pub(crate) fn with_rule(mut self, operation_name: String, rule: Rc<dyn LoweringRule>) -> Self {
+        Rc::make_mut(&mut self.0).insert(operation_name, rule);
+        self
+    }
+
+    /// Returns the rule that lowers the instructions of the operation named `operation_name`, if any.
+    #[inline]
+    pub(crate) fn get(&self, operation_name: &str) -> Option<&Rc<dyn LoweringRule>> {
+        if self.0.is_empty() { None } else { self.0.get(operation_name) }
+    }
+}
+
+impl Debug for LoweringRules {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut operation_names = self.0.keys().collect::<Vec<_>>();
+        operation_names.sort();
+        formatter.debug_set().entries(operation_names).finish()
     }
 }
 
