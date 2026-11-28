@@ -11,7 +11,7 @@ use ryft_mlir::{
 
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::states::ProgramLoweringContext;
-use crate::lowering::values::MlirLowerableValue;
+use crate::lowering::values::ArrayLiteralLoweringExtension;
 use crate::lowering::{
     ArrayTypeLoweringExtension, MemoryLoweringExtension, lower_constant_output, physical_bound_type,
     stable_hlo_dynamic_dimension_bound,
@@ -214,9 +214,7 @@ impl LowerableOperation for ConstantOperation<Array> {
         let _ = input_types;
         check_count!("input", input_values, 0, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let constant_value =
-            self.value()
-                .lower_constant(&[], &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+        let constant_value = self.value().lower_constant(&mut lowerer.block(), lowerer.context(), lowerer.location())?;
         Ok(vec![constant_value])
     }
 }
@@ -236,9 +234,7 @@ impl LowerableOperation for FillLikeOperation<ArrayType> {
         // statically shaped physical allocation, like the static `fill`.
         let physical_type = physical_bound_type(&output_types[0])?;
         let physical_tensor_type = lowerer.lower_tensor_type(&physical_type)?;
-        let value =
-            self.value()
-                .lower_constant(&[], &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+        let value = self.value().lower_constant(&mut lowerer.block(), lowerer.context(), lowerer.location())?;
         let result = lowerer.block().append_operation(stable_hlo::broadcast(
             value,
             physical_tensor_type,

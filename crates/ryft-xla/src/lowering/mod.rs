@@ -977,7 +977,7 @@ pub(crate) mod tests {
 
     use crate::lowering::states::ProgramLoweringContext;
     use crate::lowering::types::ArrayTypeLoweringExtension;
-    use crate::lowering::values::MlirLowerableValue;
+    use crate::lowering::values::ArrayLiteralLoweringExtension;
     use crate::operations::assertions::ensure_assertion_handler_registered;
 
     use crate::tests::{cpu_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes};
@@ -1003,7 +1003,7 @@ pub(crate) mod tests {
         lowering_context: &ProgramLoweringContext,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
     where
-        V: MlirLowerableValue,
+        V: ArrayLiteralLoweringExtension,
         O: LowerableOperation<Type = ArrayType>,
         Input: Parameterized<V>,
         Output: Parameterized<V>,
@@ -1016,7 +1016,7 @@ pub(crate) mod tests {
         let instruction_block = *block;
         program.interpret_with(
             input_values,
-            |_, value| value.lower_literal(block, context, location),
+            |_, value| value.lower_constant(block, context, location),
             |instruction, inputs| {
                 let input_types = instruction
                     .inputs()
@@ -1059,7 +1059,7 @@ pub(crate) mod tests {
 
     /// Lowers a plain traced [`Program`] to a textual StableHLO MLIR module.
     pub(crate) fn to_rendered_mlir_for_plain_program<
-        V: MlirLowerableValue,
+        V: ArrayLiteralLoweringExtension,
         Input: Parameterized<V>,
         Output: Parameterized<V>,
         O: LowerableOperation<Type = ArrayType>,
@@ -1078,7 +1078,7 @@ pub(crate) mod tests {
     /// Lowers a plain traced program like [`to_rendered_mlir_for_plain_program`], but with an explicit
     /// [`RaggedDotLoweringStrategy`].
     pub(crate) fn to_rendered_mlir_for_plain_program_with_ragged_dot_lowering_strategy<
-        V: MlirLowerableValue,
+        V: ArrayLiteralLoweringExtension,
         Input: Parameterized<V>,
         Output: Parameterized<V>,
         O: LowerableOperation<Type = ArrayType>,

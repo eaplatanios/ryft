@@ -1000,7 +1000,7 @@ mod tests {
         );
 
         // The dynamic slice pullback scatters the cotangent at the captured index factors, which materialize as
-        // integer constants through `MlirLowerableValue::lower_literal`.
+        // integer constants through `ArrayLiteralLoweringExtension::lower_constant`.
         let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
             .vjp(
                 |x, ()| {

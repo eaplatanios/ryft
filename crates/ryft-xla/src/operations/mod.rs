@@ -53,7 +53,6 @@ use ryft_mlir::{
 use crate::lowering::DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked, XlaZeroPadded};
 use crate::lowering::emissions::{emitted_capture_reads, omits_regions};
 use crate::lowering::types::{ArrayTypeLoweringExtension, physical_bound_type};
-use crate::lowering::values::MlirLowerableValue;
 use crate::lowering::{DataDependentPaddingDiscipline, validate_local_output_placement};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
@@ -709,7 +708,7 @@ impl_array_ir_operation_conversion!(StopGradientOperation<Type>);
 impl_array_ir_operation_conversion!(TagOperation<Type>);
 impl_array_ir_operation_conversion!(PrintOperation<Type>);
 
-impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
+impl<V: Value<Type = ArrayType>> LowerableOperation for ArrayOperation<V> {
     fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,

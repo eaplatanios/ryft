@@ -10,7 +10,7 @@ use crate::lowering::types::{
     ArrayTypeLoweringExtension, lower_explicit_shape, lower_runtime_dimension_size_i64, lower_static_index_constants,
     lower_unplaced_constant_output, physical_bound_type,
 };
-use crate::lowering::values::MlirLowerableValue;
+use crate::lowering::values::ArrayLiteralLoweringExtension;
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::build_reduce_body_region;
@@ -242,7 +242,7 @@ impl GatherOperationLoweringExtension for GatherOperation {
         let fill = self.options().resolved_fill_value(output_types[0].data_type())?;
         let scalar_type = (ArrayType::scalar(output_types[0].data_type())).lower(context, location)?;
         let fill = block
-            .append_operation(stable_hlo::constant(fill.to_dense_elements_attribute(scalar_type, context)?, location)?)?
+            .append_operation(stable_hlo::constant(fill.lower_attribute(scalar_type, context)?, location)?)?
             .result(0)
             .unwrap()
             .as_ref();
