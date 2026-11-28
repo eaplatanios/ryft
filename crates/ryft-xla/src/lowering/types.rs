@@ -416,6 +416,33 @@ impl ArrayTypeLoweringExtension for ArrayType {
     }
 }
 
+/// Provides lowering support of [`Type`]s to StableHLO.
+pub trait TypeLoweringExtension {
+    /// Lowers a [`Type`] to its StableHLO tensor representation.
+    fn lower<'c, 't, L: Location<'c, 't>>(
+        &self,
+        context: &'c MlirContext<'t>,
+        location: L,
+    ) -> Result<TensorTypeRef<'c, 't>, Error>;
+}
+
+impl TypeLoweringExtension for Type {
+    #[inline]
+    fn lower<'c, 't, L: Location<'c, 't>>(
+        &self,
+        context: &'c MlirContext<'t>,
+        location: L,
+    ) -> Result<TensorTypeRef<'c, 't>, Error> {
+        match self {
+            Type::Array(array_type) => array_type.lower(context, location),
+            Type::Dimension(_) => ArrayType::scalar(DataType::I64).lower(context, location),
+            Type::Reference(_) => {
+                Err(Error::Lowering(LoweringError::UnresolvedReference { construct: self.to_string() }))
+            }
+        }
+    }
+}
+
 /// Value used by [`ArrayTypeLoweringExtension::lower_padded_physical_storage`] for elements outside the runtime shape.
 #[derive(Copy, Clone, Debug)]
 pub enum PhysicalStoragePadding<'b, 'c: 'b, 't: 'c> {
@@ -637,32 +664,6 @@ where
         location,
     )?)?;
     Ok(broadcast.result(0).unwrap().as_ref())
-}
-
-/// Lowering of an array IR [`Type`] to StableHLO.
-pub trait TypeLoweringExtension {
-    /// Lowers an array IR type to its StableHLO tensor representation.
-    fn lower<'c, 't, L: Location<'c, 't>>(
-        &self,
-        context: &'c MlirContext<'t>,
-        location: L,
-    ) -> Result<TensorTypeRef<'c, 't>, Error>;
-}
-
-impl TypeLoweringExtension for Type {
-    fn lower<'c, 't, L: Location<'c, 't>>(
-        &self,
-        context: &'c MlirContext<'t>,
-        location: L,
-    ) -> Result<TensorTypeRef<'c, 't>, Error> {
-        match self {
-            Type::Array(array_type) => array_type.lower(context, location),
-            Type::Dimension(_) => ArrayType::scalar(DataType::I64).lower(context, location),
-            Type::Reference(_) => {
-                Err(Error::Lowering(LoweringError::UnresolvedReference { construct: self.to_string() }))
-            }
-        }
-    }
 }
 
 /// Packs scalar first-class dimension operands into the rank-1 `i64` shape tensor consumed by dynamic StableHLO
