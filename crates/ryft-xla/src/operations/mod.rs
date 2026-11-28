@@ -1347,12 +1347,11 @@ mod tests {
         Abs, Accuracy, AddOperation, AndOperation, Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy,
         ArrayIrOperation, ArrayIrOperations, ArrayIrValue, ArrayOperation, ArrayOperations, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, Assert, AssertOperation, Atan2, Atan2Operation,
-        AttentionConfiguration, AttentionImplementation, AttentionInputs, BatchableOperation,
-        BatchingContext, CallOperation, CaptureReference, CapturingContext, Compare, CompareOperation,
-        ComparisonDirection, CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, Concatenate,
-        ConditionOperation, Context, Cos, CumulativeKind, CustomRuleDefinition, CustomRuleRegistration, DataType,
-        DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds, DimensionDivOperation,
-        DimensionFromScalarOperation,
+        AttentionConfiguration, AttentionImplementation, AttentionInputs, BatchableOperation, BatchingContext,
+        CallOperation, CaptureReference, CapturingContext, Compare, CompareOperation, ComparisonDirection,
+        CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, Concatenate, ConditionOperation, Context,
+        Cos, CumulativeKind, CustomRuleDefinition, CustomRuleRegistration, DataType, DeviceMesh, DifferentiableType,
+        Differentiate, Dimension, DimensionBounds, DimensionDivOperation, DimensionFromScalarOperation,
         DimensionOperation, DimensionOperations, DimensionType, DimensionValue, DimensionVariable, DivOperation,
         DomainTracingContext, DotDimensionNumbers, DotsSavable, DotsWithNoBatchDimensionsSavable,
         DynamicBroadcastOperation, EffectClass, EffectClasses, EmptyRegionDriver, ErasedOperation, EverythingSavable,
@@ -1365,21 +1364,20 @@ mod tests {
         RematerializationOptimizationBarrier, RematerializeOperation, ResidualPolicy, ResidualPolicyReference,
         ResidualZeroProvider, Rsqrt, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
         ScanOperation, SelectOperation, Shape, Sign, Sin, SinOperation, Sqrt, StagingContext, StaticShape,
-        TagOperation, Tanh,
-        Tolerance, Tracer as CoreTracer, TracingContext, TransferToMemoryOperation, TransposedProgramCotangent, Typed,
-        TypedProgram, UnreducedKind, ValueProjection, ValueResolution, WhileOperation, XorOperation, ZeroOperation,
-        differentiable_dot_product_attention, rematerialize,
+        TagOperation, Tanh, Tolerance, Tracer as CoreTracer, TracingContext, TransferToMemoryOperation,
+        TransposedProgramCotangent, Typed, TypedProgram, UnreducedKind, ValueProjection, ValueResolution,
+        WhileOperation, XorOperation, ZeroOperation, differentiable_dot_product_attention, rematerialize,
     };
     use ryft_pjrt::Client;
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
 
+    #[cfg(feature = "cuda-13")]
+    use crate::Platform;
     use crate::lowering::tests::{
         ProgramBuilder as PlainProgramBuilder, UnreducedApplication, UnreducedInput, lower_unreduced_application,
         lowered_unary_module, unproject_plain_program,
     };
-    #[cfg(feature = "cuda-13")]
-    use crate::Platform;
     use crate::sessions::tests::{domain_mesh, read_booleans, read_first_shard, replicated_scalar_type};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_to_bytes, vector_type};
     use crate::{
@@ -3251,8 +3249,7 @@ mod tests {
 
         let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
-        let execute =
-            |size: i64| execute_like_eager(&session, client, &program, &compiled, &size_type, &mesh, size);
+        let execute = |size: i64| execute_like_eager(&session, client, &program, &compiled, &size_type, &mesh, size);
 
         let small = execute(2);
         assert_eq!(small[0].shape(), StaticShape::new(vec![2]));
@@ -3345,8 +3342,7 @@ mod tests {
         assert!(lowered.stable_hlo().contains("stablehlo.composite \"xla.scaled_dot\""));
         assert!(!lowered.stable_hlo().contains("__cudnn$fmha"));
         let compiled = session.compile_program(&lowered).unwrap();
-        let execute =
-            |size: i64| execute_like_eager(&session, client, &program, &compiled, &size_type, &mesh, size);
+        let execute = |size: i64| execute_like_eager(&session, client, &program, &compiled, &size_type, &mesh, size);
 
         let small = execute(2);
         assert_eq!(small[0].shape(), StaticShape::new(vec![2, 1]));
