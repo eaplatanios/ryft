@@ -126,9 +126,9 @@ use crate::arrays::statistics::ArrayTracker;
 use crate::compilation::domains::{captured_type, placed_constant};
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
 use crate::compilation::programs::EagerDispatchProgram;
-use crate::lowering::emissions::partition_region_session_constants;
 use crate::lowering::programs::{
-    CallTraversal, RegionLoweringExtension, RegionPlacementRequestsExtension, merge_requested_placement,
+    CallTraversal, ProgramSessionConstants, RegionLoweringExtension, RegionPlacementRequestsExtension,
+    merge_requested_placement,
 };
 use crate::operations::call::{CallEagerExtension, EagerCallDecision};
 use crate::operations::composites::NamedCompositeImplementation;
@@ -1629,7 +1629,7 @@ impl Context for Session {
                                 let entry = pruned.as_ref().unwrap_or(&program).entry_region_ref();
                                 let target_platform = target_platform.as_deref();
                                 let regions = entry.emitted_regions(target_platform, CallTraversal::Skip);
-                                Arc::from(partition_region_session_constants(regions, target_platform).0)
+                                Arc::from(ProgramSessionConstants::from_regions(regions, target_platform).into_inputs())
                             } else {
                                 Arc::from([])
                             };

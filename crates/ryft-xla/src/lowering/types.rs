@@ -1,5 +1,5 @@
 use ryft_core::macros::check_count;
-use ryft_core::{ArrayType, DataType, Dimension, DimensionError, Layout, Memory, ProgramError, Shape};
+use ryft_core::{ArrayType, DataType, Dimension, DimensionError, DimensionValue, Layout, Memory, ProgramError, Shape};
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::CustomCallApiVersion;
 use ryft_mlir::{
@@ -12,32 +12,10 @@ use crate::devices::MemoryExtension;
 use crate::lowering::LoweringError;
 use crate::{ArrayError, Error, ToPjrt, Type};
 
-// TODO(eaplatanios): Review this module.
-
-/// Validates that a program compiled for `target_platform` can take its inputs from `memory` and return its outputs
-/// in it.
-///
-/// XLA's CUDA compiler does not place values in unpinned host memory, although its plugin can hold buffers there. It
-/// reads an input that is declared in that memory from device memory, and it returns an output that is declared in that
-/// memory in device memory or, after a transfer, in pinned host memory. A program with such a boundary would therefore
-/// reject its actual inputs and mislabel its outputs, so it is rejected here instead. Values inside a program are not
-/// affected, because the compiler treats pinned and unpinned host memory alike there.
-///
-/// # Errors
-///
-/// Returns [`LoweringError::UnsupportedBoundaryMemory`] if `memory` is unpinned host memory and `target_platform` is
-/// CUDA.
-pub(crate) fn validate_boundary_memory(memory: Memory, target_platform: Option<&str>) -> Result<(), Error> {
-    if memory == (Memory::Host { pinned: false }) && target_platform == Some("cuda") {
-        return Err(LoweringError::UnsupportedBoundaryMemory { memory, platform: "cuda".to_string() }.into());
-    }
-    Ok(())
-}
-
-/// Lowering of transfers to a [`Memory`] to StableHLO.
+/// Provides lowering support transfers to a [`Memory`] to StableHLO.
 pub trait MemoryLoweringExtension {
-    /// Lowers one staged [`TransferToMemoryOperation`](ryft_core::TransferToMemoryOperation) to the
-    /// `stablehlo.custom_call @annotate_device_placement` annotation that the XLA
+    /// Lowers one staged [`TransferToMemoryOperation`](ryft_core::TransferToMemoryOperation)
+    /// to the `stablehlo.custom_call @annotate_device_placement` annotation that the XLA
     /// `ConvertMemoryPlacementToInternalAnnotations` and
     /// [`HostOffloader`](https://openxla.org/xla/tools_and_passes/host_offloading) passes legalize into copies
     /// annotated with memory spaces. The annotation uses API version 1, `has_side_effect = true`, an empty
@@ -92,8 +70,32 @@ impl MemoryLoweringExtension for Memory {
             )]),
         );
         let operation = block.append_operation(operation)?;
-        Ok(vec![operation.result(0).unwrap().as_ref()])
+        Ok(vec![operation.result(0)?.as_ref()])
     }
+}
+
+// TODO(eaplatanios): Review from here onwards.
+
+/// Rejects known unsupported input and output memory placements at the executable boundary for `target_platform`.
+///
+/// The bundled CUDA and ROCm plugins share XLA's [StreamExecutor executable memory handling]. It supports pinned
+/// host memory at executable boundaries. The plugins can also allocate unpinned host buffers for transfers, so
+/// device memory discovery alone cannot validate an executable signature. For other targets, compilation through a
+/// [`Session`](crate::Session) checks the input and output memory kinds that the compiled executable reports, when
+/// the plugin provides them.
+///
+/// # Errors
+///
+/// Returns [`LoweringError::UnsupportedBoundaryMemory`] for unpinned host memory at a CUDA or ROCm boundary.
+///
+/// [StreamExecutor executable memory handling]: https://github.com/openxla/xla/blob/aaed3e0327d520ee375451ca42dd239ee40a50e6/xla/pjrt/se/stream_executor_executable.cc#L258-L341
+pub(crate) fn validate_boundary_memory(memory: Memory, target_platform: Option<&str>) -> Result<(), Error> {
+    if memory == (Memory::Host { pinned: false })
+        && let Some(platform @ ("cuda" | "rocm")) = target_platform
+    {
+        return Err(LoweringError::UnsupportedBoundaryMemory { memory, platform: platform.to_string() }.into());
+    }
+    Ok(())
 }
 
 /// Widens a logical signed one-bit integer to `i8`, recovering `-1` from StableHLO's predicate carrier.
@@ -112,8 +114,8 @@ where
     let signed_type =
         context.tensor_type(context.signless_integer_type(8), &dimensions, input_type.encoding()?, location)?;
     let widened = block.append_operation(stable_hlo::convert(input, signed_type, location)?)?;
-    let signed = block.append_operation(stable_hlo::negate(widened.result(0).unwrap().as_ref(), location)?)?;
-    Ok(signed.result(0).unwrap().as_ref())
+    let signed = block.append_operation(stable_hlo::negate(widened.result(0)?.as_ref(), location)?)?;
+    Ok(signed.result(0)?.as_ref())
 }
 
 /// Reads one runtime tensor dimension and widens StableHLO's `i32` size result to Ryft's `i64` dimension ABI.
@@ -125,10 +127,10 @@ pub fn lower_runtime_dimension_size_i64<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let size = block.append_operation(stable_hlo::get_dimension_size(input, axis, location)?)?;
-    let size = size.result(0).unwrap().as_ref();
+    let size = size.result(0)?.as_ref();
     let i64_scalar = context.tensor_type(context.signless_integer_type(64), &[], None, location)?;
     let size = block.append_operation(stable_hlo::convert(size, i64_scalar, location)?)?;
-    Ok(size.result(0).unwrap().as_ref())
+    Ok(size.result(0)?.as_ref())
 }
 
 /// Returns the statically shaped carrier type of one bounded dynamic array type, in which every dynamic dimension is
@@ -1016,23 +1018,29 @@ mod tests {
 
     #[test]
     fn test_validate_boundary_memory() {
-        // Only unpinned host memory at the boundary of a program compiled for CUDA is rejected.
-        for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
-            assert!(validate_boundary_memory(memory, None).is_ok());
-            assert!(validate_boundary_memory(memory, Some("cpu")).is_ok());
+        let unpinned = Memory::Host { pinned: false };
+        for target_platform in [None, Some("cpu"), Some("custom-plugin")] {
+            for memory in [Memory::Device, Memory::Host { pinned: true }, unpinned] {
+                assert_eq!(validate_boundary_memory(memory, target_platform), Ok(()));
+            }
         }
-        assert!(validate_boundary_memory(Memory::Device, Some("cuda")).is_ok());
-        assert!(validate_boundary_memory(Memory::Host { pinned: true }, Some("cuda")).is_ok());
-        let error = validate_boundary_memory(Memory::Host { pinned: false }, Some("cuda")).unwrap_err();
-        assert!(matches!(
-            &error,
-            Error::Lowering(LoweringError::UnsupportedBoundaryMemory { memory, platform })
-                if *memory == (Memory::Host { pinned: false }) && platform == "cuda",
-        ));
-        assert_eq!(
-            error.to_string(),
-            "programs compiled for platform `cuda` cannot take or return values in `Host[Unpinned]` memory",
-        );
+        for target_platform in ["cuda", "rocm"] {
+            assert_eq!(validate_boundary_memory(Memory::Device, Some(target_platform)), Ok(()));
+            assert_eq!(validate_boundary_memory(Memory::Host { pinned: true }, Some(target_platform)), Ok(()));
+            let error = validate_boundary_memory(unpinned, Some(target_platform)).unwrap_err();
+            assert!(matches!(
+                &error,
+                Error::Lowering(LoweringError::UnsupportedBoundaryMemory { memory, platform })
+                    if *memory == unpinned && platform == target_platform,
+            ));
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "programs compiled for platform `{target_platform}` cannot take or return values in \
+                         `Host[Unpinned]` memory"
+                ),
+            );
+        }
     }
 
     #[test]

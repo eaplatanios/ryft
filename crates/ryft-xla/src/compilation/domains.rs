@@ -31,10 +31,9 @@ use crate::compilation::programs::{
     SessionConstantBinding,
 };
 use crate::execution::{ExecutionPlan, validate_capture_reduction};
-use crate::lowering::emissions::partition_region_session_constants;
 use crate::lowering::programs::{
     CallTraversal, OutputShardingSource, ProgramLoweringAnalysisExtension, ProgramLoweringExtension,
-    ProgramLoweringOptions, RegionLoweringExtension, entry_output_shardings,
+    ProgramLoweringOptions, ProgramSessionConstants, RegionLoweringExtension, entry_output_shardings,
     entry_outputs_with_compiler_chosen_placement,
 };
 use crate::{
@@ -556,8 +555,8 @@ impl Session {
         }
         // Assign hidden input slots from the original constants in the program that lowering emits for the target.
         // Each constant supplies its declared type, and its placed array supplies buffers and runtime sharding.
-        let (sources, _) = partition_region_session_constants(regions.into_iter(), target_platform);
-        let session_constants = sources
+        let session_constants = ProgramSessionConstants::from_regions(regions, target_platform)
+            .into_inputs()
             .into_iter()
             .map(|source| {
                 let input = placed_constant(self, &source, options.mesh())?.unwrap_or_else(|| source.clone());

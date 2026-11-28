@@ -13,20 +13,19 @@ use crate::lowering::{LoweringError, RaggedDotLoweringStrategy};
 use crate::operations::composites::{NamedCompositionFunction, NamedCompositionFunctionMap, NamedCompositionKey};
 use crate::{Error, RetainedArray, RuntimeRequirement, Session, normalize_runtime_requirements};
 
-// TODO(eaplatanios): Review this module.
-
-/// Context for lowering a program in the current scope of its MLIR module. Each instruction lowerer holds a clone
-/// of this handle, sharing the module resources and the current scope's bindings through one [`Rc`].
-///
+/// Context for lowering a program in the current scope of its MLIR module. Each instruction lowerer holds
+/// a clone of this handle, sharing the module resources and the current scope's bindings through one [`Rc`].
 /// [`enter_manual_region`](Self::enter_manual_region) derives a context for the body of an `sdy.manual_computation`.
 /// Its manual axes and reachable session constants belong to that scope. The child inherits the module's target and
 /// lowering policy, looks up the same named compositions, and continues to allocate channels and record module
 /// requirements alongside the enclosing context.
 #[derive(Clone)]
 pub(crate) struct ProgramLoweringContext {
-    /// Module resources and copy-on-write scope bindings.
+    /// Underlying [`ProgramLoweringContextState`].
     state: Rc<ProgramLoweringContextState>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl ProgramLoweringContext {
     /// Creates a context for one module, outside any manual region and without target information.
@@ -62,8 +61,15 @@ impl ProgramLoweringContext {
 
     /// Binds `session_constants` in the order their values appear at the end of the capture table. Hidden entry inputs
     /// come first, followed by placeholders for arrays passed to callees that never read them.
-    pub(crate) fn with_session_constants(mut self, session_constants: &[RetainedArray]) -> Self {
-        let indices = session_constants.iter().enumerate().map(|(index, constant)| (constant.clone(), index)).collect();
+    pub(crate) fn with_session_constants<'a>(
+        mut self,
+        session_constants: impl IntoIterator<Item = &'a RetainedArray>,
+    ) -> Self {
+        let indices = session_constants
+            .into_iter()
+            .enumerate()
+            .map(|(index, constant)| (constant.clone(), index))
+            .collect();
         Rc::make_mut(&mut self.state).session_constant_indices = Rc::new(indices);
         self
     }
@@ -79,13 +85,31 @@ impl ProgramLoweringContext {
         self.state.ragged_dot_lowering_strategy
     }
 
-    /// Returns the suffix of `captured_values` that holds the values of the session constants reachable in this scope.
-    /// A scope whose `captured_values` table cannot hold them (e.g., a shared private function) has no such values.
-    pub(crate) fn session_constant_values<'o, V>(&self, captured_values: &'o [V]) -> &'o [V] {
-        captured_values
-            .len()
-            .checked_sub(self.state.session_constant_indices.len())
-            .map_or(&[], |start| &captured_values[start..])
+    /// Returns the decomposition at position `index` among those that lowering has requested for this module so far,
+    /// in the order of their first requests, or [`None`] when fewer were requested. The module emits them after its
+    /// other functions, and it asks by position because lowering one decomposition can request another.
+    pub(super) fn named_composition(&self, index: usize) -> Option<NamedCompositionFunction> {
+        self.state.named_compositions.borrow().functions().nth(index).cloned()
+    }
+
+    /// Returns the mesh that lowering has recorded for this module so far (refer to
+    /// [`require_mesh`](Self::require_mesh)), which is the mesh that the module declares, or [`None`] when nothing
+    /// that lowering has emitted refers to a mesh.
+    #[inline]
+    pub(super) fn mesh(&self) -> Option<LogicalMesh> {
+        self.state.mesh.get().cloned()
+    }
+
+    /// Returns whether this module requires the runtime assertion handler.
+    #[inline]
+    pub(super) fn requires_assertion_handler(&self) -> bool {
+        self.state.requires_assertion_handler.get()
+    }
+
+    /// Returns the runtime requirements that lowering has recorded for this module so far.
+    #[inline]
+    pub(super) fn runtime_requirements(&self) -> Vec<RuntimeRequirement> {
+        self.state.runtime_requirements.borrow().clone()
     }
 
     /// Returns the innermost enclosing manual region's [`ShardMapBoundary`], or `None` outside manual regions.
@@ -103,24 +127,19 @@ impl ProgramLoweringContext {
             .map(Rc::as_ref)
     }
 
-    /// Returns whether this module requires the runtime assertion handler.
+    /// Returns the axes bound by any enclosing manual region, excluded from shard-local placement constraints.
     #[inline]
-    pub(super) fn requires_assertion_handler(&self) -> bool {
-        self.state.requires_assertion_handler.get()
+    pub(crate) fn bound_manual_axes(&self) -> &[String] {
+        &self.state.bound_manual_axes
     }
 
-    /// Returns the runtime requirements that lowering has recorded for this module so far.
-    #[inline]
-    pub(super) fn runtime_requirements(&self) -> Vec<RuntimeRequirement> {
-        self.state.runtime_requirements.borrow().clone()
-    }
-
-    /// Returns the mesh that lowering has recorded for this module so far (refer to
-    /// [`require_mesh`](Self::require_mesh)), which is the mesh that the module declares, or [`None`] when nothing
-    /// that lowering has emitted refers to a mesh.
-    #[inline]
-    pub(super) fn mesh(&self) -> Option<LogicalMesh> {
-        self.state.mesh.get().cloned()
+    /// Returns the suffix of `captured_values` that holds the values of the session constants reachable in this scope.
+    /// A scope whose `captured_values` table cannot hold them (e.g., a shared private function) has no such values.
+    pub(crate) fn session_constant_values<'o, V>(&self, captured_values: &'o [V]) -> &'o [V] {
+        captured_values
+            .len()
+            .checked_sub(self.state.session_constant_indices.len())
+            .map_or(&[], |start| &captured_values[start..])
     }
 
     /// Records that this module requires the runtime assertion handler.
@@ -166,12 +185,6 @@ impl ProgramLoweringContext {
         }
     }
 
-    /// Returns the axes bound by any enclosing manual region, excluded from shard-local placement constraints.
-    #[inline]
-    pub(crate) fn bound_manual_axes(&self) -> &[String] {
-        &self.state.bound_manual_axes
-    }
-
     /// Returns the symbol of the private function of this module that holds the decomposition of the named
     /// composition `key`, and records that the module needs that function. The first request for a key traces
     /// `program`, which must not lower anything itself, and every later request shares its function (refer to
@@ -189,13 +202,6 @@ impl ProgramLoweringContext {
     ) -> Result<Rc<str>, Error> {
         let mut named_compositions = self.state.named_compositions.borrow_mut();
         Ok(named_compositions.require(key, program)?.symbol().into())
-    }
-
-    /// Returns the decomposition at position `index` among those that lowering has requested for this module so far,
-    /// in the order of their first requests, or [`None`] when fewer were requested. The module emits them after its
-    /// other functions, and it asks by position because lowering one decomposition can request another.
-    pub(super) fn named_composition(&self, index: usize) -> Option<NamedCompositionFunction> {
-        self.state.named_compositions.borrow().functions().nth(index).cloned()
     }
 
     /// Returns a fresh module-unique channel id for one channeled collective.

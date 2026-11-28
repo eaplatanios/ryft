@@ -46,7 +46,6 @@ use crate::compilation::domains::{commits_public_outputs, relocated_input_type};
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::EffectTokens;
 use crate::lowering::contexts::ProgramLoweringContext;
-use crate::lowering::emissions::partition_region_session_constants;
 use crate::lowering::programs::{
     CallTraversal, ProgramInlineLoweringExtension, RegionLoweringExtension, RegionPlacementRequestsExtension,
 };
@@ -254,11 +253,12 @@ where
         // includes the entry guards that lowering synthesizes for the callee's nested control flow. Callees that
         // reference session constants also inline, because only the entry function receives their hidden arguments
         // and binds the arrays that are only passed on to calls that never read them.
-        if count < 2 || !lowered_effect_classes(&program)?.is_empty() || {
-            let regions = program.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter);
-            let (session_constants, passed_on) = partition_region_session_constants(regions, target_platform);
-            !session_constants.is_empty() || !passed_on.is_empty()
-        } {
+        if count < 2
+            || !lowered_effect_classes(&program)?.is_empty()
+            || program.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter).any(|region| {
+                region.atoms().iter().any(|atom| matches!(atom.as_constant(), Some(Constant::Session(_))))
+            })
+        {
             continue;
         }
         let symbol = match names.get(&key) {

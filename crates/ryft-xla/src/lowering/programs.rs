@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, AtomId, BroadcastOperation, CallOperation, DataType, DeviceMesh, Dimension, EagerContext, EffectClass,
-    ExternalReferenceBinding, FlatProgram, Instruction, LogicalMesh, Memory, MeshAxisType, Parameterized,
+    ArrayType, Atom, AtomId, BroadcastOperation, CallOperation, DataType, DeviceMesh, Dimension, EagerContext,
+    EffectClass, ExternalReferenceBinding, FlatProgram, Instruction, LogicalMesh, Memory, MeshAxisType, Parameterized,
     PlaceOperation, PlacementRequest, Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RegionRole,
     RequestedPlacement, Shape, Sharding, ShardingDimension, StopGradientOperation, TagOperation,
     TransferToMemoryOperation, Type as CoreType, Typed, TypedProgram, Value,
@@ -21,7 +21,6 @@ use ryft_mlir::{
 use crate::arrays::host::ReductionChange;
 use crate::devices::MemoryExtension;
 use crate::lowering::contexts::ProgramLoweringContext;
-use crate::lowering::emissions::partition_region_session_constants;
 use crate::lowering::reductions::{
     ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
     validate_pending_reduction_change,
@@ -669,18 +668,11 @@ where
 
         // Arrays that session constants refer to enter the module as hidden inputs that precede the public inputs,
         // which are annotated as their runtime arrays are placed, as compilation for a `Session` passes them.
-        let session_constants = match &options.capture_types {
-            Some(_) => None,
-            None => {
-                let regions = program.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter);
-                Some(partition_region_session_constants(regions, target_platform).0)
-            }
-        };
-        let capture_types = match (&options.capture_types, &session_constants) {
-            (Some(capture_types), _) => capture_types.clone(),
-            (None, Some(constants)) => constants.iter().map(|constant| constant.r#type().into_owned()).collect(),
-            (None, None) => Vec::new(),
-        };
+        let regions = program.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter);
+        let session_constants = ProgramSessionConstants::from_regions(regions, target_platform);
+        let capture_types = options.capture_types.clone().unwrap_or_else(|| {
+            session_constants.inputs.iter().map(|constant| constant.r#type().into_owned()).collect()
+        });
         let exact_input_shardings = match &options.exact_input_shardings {
             Some(EntryShardingOverride::Values(shardings)) => Some(shardings.clone()),
             Some(EntryShardingOverride::Unannotated) => Some(vec![None; capture_types.len() + input_types.len()]),
@@ -696,7 +688,7 @@ where
         // array that it imports keeps its own type, which names the mesh of the array, and a signature over a mesh of
         // another topology cannot hold it. This is reported with its cause and the way forward, rather than as the
         // disagreement of the meshes that lowering would find.
-        if let Some(session_constants) = &session_constants {
+        if options.capture_types.is_none() {
             let mesh = input_shardings
                 .iter()
                 .flatten()
@@ -705,7 +697,7 @@ where
                 .map(Sharding::mesh)
                 .next();
             if let Some(mesh) = mesh {
-                for constant in session_constants {
+                for constant in &session_constants.inputs {
                     let declared_type = constant.r#type();
                     if let Some(sharding) = declared_type.sharding()
                         && !sharding.mesh().has_same_topology(mesh)
@@ -728,9 +720,10 @@ where
         let logical_input_shardings = match exact_input_shardings {
             Some(shardings) => shardings,
             None => {
-                let capture_shardings: Vec<Option<Sharding>> = match &session_constants {
-                    Some(constants) => constants.iter().map(|constant| Some(constant.sharding().clone())).collect(),
-                    None => capture_types.iter().map(|r#type| r#type.sharding().cloned()).collect(),
+                let capture_shardings: Vec<Option<Sharding>> = if options.capture_types.is_some() {
+                    capture_types.iter().map(|r#type| r#type.sharding().cloned()).collect()
+                } else {
+                    session_constants.inputs.iter().map(|constant| Some(constant.sharding().clone())).collect()
                 };
                 capture_shardings
                     .iter()
@@ -769,6 +762,7 @@ where
         let ragged_dot_lowering_strategy = options.ragged_dot_lowering_strategy();
         let boundary = program.entry_boundary(
             function_name,
+            session_constants,
             capture_types,
             input_types,
             output_types,
@@ -790,7 +784,7 @@ where
             .with_target_platform(target_platform)
             .with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy)
             .with_session_constants(
-                &[boundary.session_constants.as_slice(), boundary.passed_on_constants.as_slice()].concat(),
+                boundary.session_constants.inputs.iter().chain(&boundary.session_constants.forwarded),
             );
 
         // The module declares the mesh that the lowered shardings refer to, which is recorded as they are lowered
@@ -1292,12 +1286,8 @@ pub(crate) struct ProgramBoundary {
     /// Mapping from the program's logical inputs and outputs to executable slots.
     boundary_mapping: MlirProgramBoundaryMapping,
 
-    /// Session constants of the program, which the entry function receives as its trailing captures.
-    session_constants: Vec<RetainedArray>,
-
-    /// Arrays that the program only passes on to calls that never read them, which the entry function binds to values
-    /// that require no buffer.
-    passed_on_constants: Vec<RetainedArray>,
+    /// Session constants bound by the entry function.
+    session_constants: ProgramSessionConstants,
 
     /// Types of the logical inputs (i.e., of the captures followed by the public inputs).
     logical_input_types: Vec<ArrayType>,
@@ -1714,16 +1704,9 @@ impl ProgramBoundary {
         ProgramInput: Parameterized<Constant>,
         ProgramOutput: Parameterized<Constant>,
     {
-        let Self {
-            boundary_mapping,
-            session_constants,
-            passed_on_constants,
-            logical_input_types,
-            executable_input_types,
-            ..
-        } = self;
+        let Self { boundary_mapping, session_constants, logical_input_types, executable_input_types, .. } = self;
 
-        let session_count = session_constants.len();
+        let session_count = session_constants.inputs.len();
         let mut function_block_ref = function_block.as_ref();
         let mut logical_input_values = Vec::with_capacity(logical_input_types.len());
         for (logical_index, array_type) in logical_input_types.iter().enumerate() {
@@ -1851,7 +1834,7 @@ impl ProgramBoundary {
         // The arrays that the program only passes on to calls that never read them are bound like unread inputs,
         // after the session constants.
         let mut captured_values = Cow::Borrowed(capture_values);
-        for constant in passed_on_constants {
+        for constant in &session_constants.forwarded {
             let r#type = constant.r#type();
             let values = lower_unplaced_constant_output(
                 std::slice::from_ref(r#type.as_ref()),
@@ -1921,6 +1904,81 @@ impl ProgramBoundary {
         function_block_ref.append_operation(func::r#return(executable_outputs.as_slice(), location)?)?;
 
         Ok(())
+    }
+}
+
+/// Distinct session constants bound by a lowered program's entry function. Each group preserves the order in which
+/// the constants first appear among the emitted region atoms, so every process assigns the same input slots.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ProgramSessionConstants {
+    /// Arrays supplied as hidden entry inputs after the lifted captures.
+    inputs: Vec<RetainedArray>,
+
+    /// Arrays passed only to unread callee captures. Lowering binds them to values that require no buffer.
+    forwarded: Vec<RetainedArray>,
+}
+
+impl ProgramSessionConstants {
+    /// Classifies the session constants of the supplied regions on `target_platform`. Callers select the regions with
+    /// [`RegionLoweringExtension::emitted_regions`], entering callees for the whole program or skipping them for eager
+    /// placement within a single capture scope. A live read anywhere makes a constant an input. A constant with no
+    /// reads also remains an input when the caller lowers an unpruned program.
+    pub(crate) fn from_regions<'r, O: 'r + ProgramLoweringOperation>(
+        regions: impl IntoIterator<Item = RegionRef<'r, Constant, O>>,
+        target_platform: Option<&str>,
+    ) -> Self {
+        /// Strongest use observed across all occurrences of a retained array.
+        enum Usage {
+            Unused,
+            Forwarded,
+            Read,
+        }
+
+        let mut indices = HashMap::new();
+        let mut constants = Vec::new();
+        for region in regions {
+            let mut has_session_constants = false;
+            for atom in region.atoms() {
+                if let Atom::Constant(Constant::Session(constant)) = atom {
+                    has_session_constants = true;
+                    indices.entry(constant.identity_key()).or_insert_with(|| {
+                        let index = constants.len();
+                        constants.push((constant, Usage::Unused));
+                        index
+                    });
+                }
+            }
+
+            if has_session_constants {
+                region.visit_atom_reads(target_platform, |id, is_live| {
+                    if let Some(Atom::Constant(Constant::Session(constant))) = region.atoms().get(id.index()) {
+                        let usage = &mut constants[indices[&constant.identity_key()]].1;
+                        if is_live {
+                            *usage = Usage::Read;
+                        } else if matches!(usage, Usage::Unused) {
+                            *usage = Usage::Forwarded;
+                        }
+                    }
+                });
+            }
+        }
+
+        let mut inputs = Vec::new();
+        let mut forwarded = Vec::new();
+        for (constant, usage) in constants {
+            match usage {
+                Usage::Unused | Usage::Read => inputs.push(constant.clone()),
+                Usage::Forwarded => forwarded.push(constant.clone()),
+            }
+        }
+
+        Self { inputs, forwarded }
+    }
+
+    /// Returns the arrays to supply as hidden inputs, in first-occurrence order.
+    #[inline]
+    pub(crate) fn into_inputs(self) -> Vec<RetainedArray> {
+        self.inputs
     }
 }
 
@@ -2033,6 +2091,7 @@ pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
     /// # Parameters
     ///
     ///   - `function_name`: Symbol name of the entry function.
+    ///   - `session_constants`: Constants of the emitted regions, in the order used to infer hidden inputs.
     ///   - `capture_types`: Types of the hidden capture inputs that precede the public inputs, which end with the
     ///     types of the session constants of this program.
     ///   - `input_types`: Global types of the inputs.
@@ -2055,6 +2114,7 @@ pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
     fn entry_boundary(
         &self,
         function_name: &str,
+        session_constants: ProgramSessionConstants,
         capture_types: &[ArrayType],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -2300,6 +2360,7 @@ where
     fn entry_boundary(
         &self,
         function_name: &str,
+        session_constants: ProgramSessionConstants,
         capture_types: &[ArrayType],
         input_types: &[ArrayType],
         output_types: &[ArrayType],
@@ -2334,16 +2395,12 @@ where
 
         // Session constants are carried by hidden inputs that form the suffix of the capture inputs. The caller
         // declares them through the trailing `capture_types`, in order of first occurrence in the emitted regions.
-        let regions = self.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter);
-        let (session_constants, passed_on_constants) = partition_region_session_constants(regions, target_platform);
-        let session_count = session_constants.len();
-        if session_count > 0
-            && (capture_types.len() < session_count
-                || !capture_types[capture_types.len() - session_count..].iter().eq(session_constants
-                    .iter()
-                    .map(|constant| constant.r#type().into_owned())
-                    .collect::<Vec<_>>()
-                    .iter()))
+        let session_count = session_constants.inputs.len();
+        if capture_types.len() < session_count
+            || !capture_types[capture_types.len() - session_count..]
+                .iter()
+                .zip(&session_constants.inputs)
+                .all(|(capture_type, constant)| capture_type == constant.r#type().as_ref())
         {
             return Err(ProgramError::MalformedProgram(format!(
                 "the trailing capture types of the entry function must be the types of its {session_count} session \
@@ -2446,7 +2503,6 @@ where
             function_name: function_name.to_string(),
             boundary_mapping,
             session_constants,
-            passed_on_constants,
             logical_input_types,
             executable_input_types,
             executable_output_types,
@@ -2989,19 +3045,25 @@ mod tests {
     };
     use ryft_kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
     use ryft_mlir::Size as MlirSize;
-    use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
+    use ryft_pjrt::{
+        BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
+        load_cpu_plugin,
+    };
 
     use crate::lowering::tests::{
         add_call, dynamic_dimension, linear_call_program, neg_branch, scalar_linear_region, shard_map_module,
         test_manual_mesh, test_matrix_type, test_sharding, test_vector_type, unproject_plain_program,
     };
     use crate::lowering::token_threaded_effects;
-    use crate::sessions::tests::{domain_mesh, two_device_mesh};
-    use crate::tests::{cpu_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes};
+    use crate::sessions::tests::{domain_mesh, f32_scalar, two_device_mesh};
+    use crate::tests::{
+        cpu_client, peer_devices, replicated_array, session_with_remote_devices, test_compilation_options,
+        values_from_bytes, values_to_bytes,
+    };
     use crate::{
-        Array, ArrayConstant, ArrayTracer, CompilationError, CompileTracer, CompiledFunction, Constant, Operation,
-        Options, Session, StagedFunction, ThroughSession, TracedProgram, Tracer, Type, Value, compile,
-        ensure_print_handler_registered, stage, trace, trace_with_context, with_captured_prints,
+        Array, ArrayConstant, ArrayTracer, CompilationError, CompileTracer, CompiledFunction, Constant, FromPjrt,
+        Operation, Options, PlacementOptions, Session, StagedFunction, ThroughSession, TracedProgram, Tracer, Type,
+        Value, compile, ensure_print_handler_registered, stage, trace, trace_with_context, with_captured_prints,
     };
 
     use super::*;
@@ -5191,6 +5253,202 @@ mod tests {
         }
         lines.sort();
         assert_eq!(lines, vec!["body: [1.5, 2.5]".to_string(), "body: [3.5, 4.5]".to_string()]);
+    }
+
+    #[test]
+    fn test_program_session_constants_from_regions() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let [first, mixed, unreferenced, last] =
+            [1.0, 2.0, 3.0, 4.0].map(|value| RetainedArray::new(&f32_scalar(&session, &mesh, value)));
+
+        // The callee ignores its lifted captures, but independently returns the same array as the middle capture.
+        let mut callee = ProgramBuilder::<Constant, Operation>::new();
+        for _ in 0..3 {
+            callee.add_input(Type::Array(mixed.r#type().into_owned()));
+        }
+        let output = callee.add_constant(Constant::Session(mixed.clone()));
+        let callee = Arc::new(callee.build(vec![output], vec![Placeholder; 3], vec![Placeholder]).unwrap());
+
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let [first_id, mixed_id, _, last_id] =
+            [&first, &mixed, &unreferenced, &last].map(|value| builder.add_constant(Constant::Session(value.clone())));
+        let region = builder.intern_callee(&callee, None).unwrap();
+        let output = builder
+            .add_instruction(
+                Operation::Call(CallOperation::new(3)),
+                vec![region],
+                vec![last_id, mixed_id, first_id],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![], vec![Placeholder]).unwrap();
+        let entry = program.entry_region_ref();
+
+        // Both groups follow first occurrence in the atom table, even though the call passes its inputs in reverse.
+        // A constant with no reads remains a hidden input when the program has not been pruned.
+        let local = ProgramSessionConstants::from_regions(entry.emitted_regions(None, CallTraversal::Skip), None);
+        assert_eq!(local.inputs, vec![unreferenced.clone()]);
+        assert_eq!(local.forwarded, vec![first.clone(), mixed.clone(), last.clone()]);
+
+        let whole = ProgramSessionConstants::from_regions(entry.emitted_regions(None, CallTraversal::Enter), None);
+        assert_eq!(whole.inputs, vec![mixed, unreferenced]);
+        assert_eq!(whole.forwarded, vec![first, last]);
+    }
+
+    #[test]
+    fn test_program_session_constants_from_regions_assigns_the_same_inputs_on_every_process() {
+        // Two single-device clients stand for two processes. Each independently places its default scalar on global
+        // device 0 twice. Only the owner can reuse the original device buffer.
+        let clients = [0, 1].map(|process| {
+            let options = CpuClientOptions { device_count: Some(1), process_id: Some(process) };
+            let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(options)).unwrap();
+            let client: &'static ryft_pjrt::Client<'static> = Box::leak(Box::new(client));
+            client
+        });
+        let first_device = Device::from_pjrt(&clients[0].addressable_devices().unwrap()[0]).unwrap();
+        let modules = clients.map(|client| {
+            let session = session_with_remote_devices(client, peer_devices(client, &clients));
+            let scalar = session.place(4f32, PlacementOptions::default()).unwrap();
+            let first = session.place(scalar.clone(), PlacementOptions::to(first_device)).unwrap();
+            let second = session.place(scalar.clone(), PlacementOptions::to(first_device)).unwrap();
+            let copy = session.place(first.clone(), PlacementOptions::default().with_may_alias(false)).unwrap();
+            if client.process_index().unwrap() == 0 {
+                let buffer = scalar.shards()[0].buffer().unwrap();
+                assert!(Arc::ptr_eq(first.shards()[0].buffer().unwrap(), buffer));
+                assert!(Arc::ptr_eq(second.shards()[0].buffer().unwrap(), buffer));
+            } else {
+                assert_eq!(first.addressable_shards().count(), 0);
+                assert_eq!(second.addressable_shards().count(), 0);
+            }
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let first_clone = first.clone();
+            let outputs = [&scalar, &first, &second, &first_clone, &copy]
+                .map(|array| builder.add_constant(Constant::Session(RetainedArray::new(array))))
+                .to_vec();
+            let program = builder.build::<Vec<Constant>, Vec<Constant>>(outputs, vec![], vec![Placeholder; 5]).unwrap();
+            let regions = program.entry_region_ref().emitted_regions(None, CallTraversal::Enter);
+            let constants = ProgramSessionConstants::from_regions(regions, None);
+            assert_eq!(constants.inputs, [&scalar, &first, &second, &copy].map(RetainedArray::new));
+            assert!(constants.forwarded.is_empty());
+
+            // One array declared with one type twice is one constant, and declared with two types (e.g., by a function
+            // compiled for a mesh of another topology, refer to `imported_constant`) two, on the process that holds its
+            // buffers and on the one that holds none alike.
+            let other_mesh = LogicalMesh::new(vec![MeshAxis::new("other", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+            let other_type = first.r#type().into_owned().with_sharding(Sharding::replicated(other_mesh, 0)).unwrap();
+            let declared = RetainedArray::new(&first).with_declared_type(other_type.clone());
+            assert_eq!(declared, RetainedArray::new(&first).with_declared_type(other_type));
+            assert_ne!(declared, RetainedArray::new(&first));
+            let mut declared_builder = ProgramBuilder::<Constant, Operation>::new();
+            let declared_outputs = [declared.clone(), RetainedArray::new(&first), declared.clone()]
+                .map(|constant| declared_builder.add_constant(Constant::Session(constant)))
+                .to_vec();
+            let declared_program = declared_builder
+                .build::<Vec<Constant>, Vec<Constant>>(declared_outputs, vec![], vec![Placeholder; 3])
+                .unwrap();
+            let regions = declared_program.entry_region_ref().emitted_regions(None, CallTraversal::Enter);
+            assert_eq!(
+                ProgramSessionConstants::from_regions(regions, None),
+                ProgramSessionConstants { inputs: vec![declared, RetainedArray::new(&first)], forwarded: vec![] },
+            );
+
+            let captures = constants.inputs.iter().map(|constant| constant.r#type().into_owned()).collect::<Vec<_>>();
+            let output_types = vec![scalar.r#type().into_owned(); 5];
+            program
+                .to_rendered_mlir(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_capture_types(captures)
+                        .with_input_types(&())
+                        .with_output_types(&output_types)
+                        .without_boundary_shardings(),
+                )
+                .unwrap()
+        });
+
+        assert_eq!(modules[0], modules[1]);
+        assert_eq!(
+            modules[0],
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<f32>, %arg2: tensor<f32>, %arg3: tensor<f32>) -> (tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>) {
+                    return %arg0, %arg1, %arg2, %arg1, %arg3 : tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>, tensor<f32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_session_constants_from_regions_ignores_dormant_regions() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let constant = RetainedArray::new(&f32_scalar(&session, &domain_mesh(client, "x", 1), 2.0));
+        let scalar_type = constant.r#type().into_owned();
+        let with_constant = |extended| {
+            scalar_linear_region(&scalar_type, extended, |builder, _, value| {
+                let constant = builder.add_constant(Constant::Session(constant.clone()));
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![value, constant], None).unwrap()[0]
+            })
+        };
+
+        // A session constant that only the dormant transpose region of a `linear_call` refers to is never lowered, so
+        // it does not become a hidden input of the entry function, unlike one that its forward region refers to.
+        let plain_region = with_constant(false);
+        let constant_region = with_constant(true);
+        let dormant = linear_call_program(&plain_region, &constant_region);
+        let regions = dormant.entry_region_ref().emitted_regions(None, CallTraversal::Enter);
+        assert_eq!(
+            ProgramSessionConstants::from_regions(regions, None),
+            ProgramSessionConstants { inputs: vec![], forwarded: vec![] }
+        );
+
+        let live = linear_call_program(&constant_region, &plain_region);
+        let regions = live.entry_region_ref().emitted_regions(None, CallTraversal::Enter);
+        assert_eq!(
+            ProgramSessionConstants::from_regions(regions, None),
+            ProgramSessionConstants { inputs: vec![constant], forwarded: vec![] }
+        );
+    }
+
+    #[test]
+    fn test_program_session_constants_from_regions_skips_bodies_that_the_target_replaces() {
+        // A session constant that only the body of a named composite call refers to becomes a hidden input where
+        // lowering emits the body, and not on a target whose backend implementation replaces the whole call
+        // (`ryft.tests.xla_named_square` version 1 on CUDA, refer to `omits_regions`), which never lowers the body,
+        // as the collection of the module mesh and the validation of placements skip it.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let constant = RetainedArray::new(&f32_scalar(&session, &domain_mesh(client, "x", 1), 2.0));
+        let scalar_type = Type::Array(constant.r#type().into_owned());
+        let body = {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let input = builder.add_input(scalar_type.clone());
+            let constant = builder.add_constant(Constant::Session(constant.clone()));
+            let output =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
+            Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
+        };
+        let key = CompositeKey::new("ryft.tests.xla_named_square".to_string(), 1);
+        let named = NamedComposite::new(key, |types: &[Type]| Ok(types.to_vec()), |inputs| Ok(vec![inputs[0].clone()]));
+        let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("adding").with_named_composite(named));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(scalar_type);
+        let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
+        let regions = vec![builder.intern_callee(&body, None).unwrap()];
+        let output = builder.add_instruction(operation, regions, vec![input], None).unwrap()[0];
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder]);
+        let program = program.unwrap();
+        for (platform, expected) in [("cuda", vec![]), ("cpu", vec![constant])] {
+            let regions = program.entry_region_ref().emitted_regions(Some(platform), CallTraversal::Enter);
+            assert_eq!(
+                ProgramSessionConstants::from_regions(regions, Some(platform)),
+                ProgramSessionConstants { inputs: expected, forwarded: vec![] }
+            );
+        }
     }
 
     #[test]

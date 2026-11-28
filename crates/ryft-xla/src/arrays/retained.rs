@@ -199,6 +199,13 @@ impl RetainedArray {
         self.locally_assigned
     }
 
+    /// Borrows the immutable identity used by [`Eq`] and [`Hash`]. The weak handle keeps the storage address
+    /// reserved for the lifetime of the retained array, even when this process holds no buffers.
+    #[inline]
+    pub(crate) fn identity_key(&self) -> impl '_ + Eq + Hash {
+        (self.identity.as_ptr(), &self.declared_type, self.committed)
+    }
+
     /// Returns a new [`Array`] that refers to the device buffers of this retained array and belongs to `session`.
     /// The array keeps the commitment and the local assignment of this retained array.
     ///
@@ -522,10 +529,7 @@ impl Display for RetainedArray {
 impl PartialEq for RetainedArray {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        // The weak handle keeps the storage address reserved for the lifetime of the constant.
-        Weak::ptr_eq(&self.identity, &other.identity)
-            && self.declared_type == other.declared_type
-            && self.committed == other.committed
+        self.identity_key() == other.identity_key()
     }
 }
 
@@ -534,9 +538,7 @@ impl Eq for RetainedArray {}
 impl Hash for RetainedArray {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.identity.as_ptr().hash(state);
-        self.declared_type.hash(state);
-        self.committed.hash(state);
+        self.identity_key().hash(state);
     }
 }
 

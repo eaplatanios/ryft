@@ -97,6 +97,7 @@ mod tests {
     #[test]
     fn test_transfer_to_memory_operation_lower_round_trip() {
         let client = execution_client();
+        let target_platform = client.platform_name().unwrap();
         let devices = client.addressable_devices().unwrap();
         let device = &devices[0];
         let device_kind = device.default_memory().unwrap().kind().unwrap().into_owned();
@@ -141,11 +142,9 @@ mod tests {
                 values,
             );
 
-            // XLA's CUDA compiler places no program input or output in unpinned host memory, although its plugin
-            // can hold buffers there, so a program with such a boundary is rejected when it is lowered.
-            if client.platform_name().unwrap().eq_ignore_ascii_case("cuda")
-                && memory == (Memory::Host { pinned: false })
-            {
+            // CUDA and ROCm can hold unpinned host buffers, but their StreamExecutor executables require pinned
+            // host memory at program boundaries.
+            if matches!(target_platform.as_ref(), "cuda" | "rocm") && memory == (Memory::Host { pinned: false }) {
                 let to_host: Result<CompiledFunction<ArrayType, ArrayType>, Error> = compile(
                     |input| input.transfer_to_memory(memory).unwrap(),
                     input_type.clone(),
@@ -155,14 +154,14 @@ mod tests {
                 assert!(matches!(
                     to_host,
                     Err(Error::Lowering(LoweringError::UnsupportedBoundaryMemory { memory: actual, platform }))
-                        if actual == memory && platform == "cuda",
+                        if actual == memory && platform == target_platform.as_ref(),
                 ));
                 let identity: Result<CompiledFunction<ArrayType, ArrayType>, Error> =
                     compile(|input| input, host_type, &engine, mesh.clone());
                 assert!(matches!(
                     identity,
                     Err(Error::Lowering(LoweringError::UnsupportedBoundaryMemory { memory: actual, platform }))
-                        if actual == memory && platform == "cuda",
+                        if actual == memory && platform == target_platform.as_ref(),
                 ));
                 continue;
             }
@@ -214,9 +213,9 @@ mod tests {
         for (memory, kind) in
             [(Memory::Host { pinned: true }, "pinned_host"), (Memory::Host { pinned: false }, "unpinned_host")]
         {
-            let r#type = ArrayType::new_static(DataType::I64, [2]).with_memory(memory);
+            let input_type = ArrayType::new_static(DataType::I64, [2]);
             let mut builder = ProgramBuilder::new();
-            let input = builder.add_input(r#type.clone());
+            let input = builder.add_input(input_type.clone().with_memory(memory));
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
                 .unwrap();
@@ -230,16 +229,22 @@ mod tests {
             let program = program.into_unprojected::<Constant, Operation>().unwrap();
             assert_eq!(program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(), expected,);
 
-            // A program compiled for CUDA can place its boundary in pinned host memory only.
-            let lowered = program.to_mlir("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda")));
-            if memory == (Memory::Host { pinned: true }) {
-                assert_eq!(lowered.unwrap().into_stable_hlo(), expected);
-            } else {
-                assert!(matches!(
-                    lowered,
-                    Err(Error::Lowering(LoweringError::UnsupportedBoundaryMemory { memory: actual, platform }))
-                        if actual == memory && platform == "cuda",
-                ));
+            // An explicit transfer isolates the output check because the input stays in device memory.
+            let to_host =
+                trace_with_context(|_, input: ArrayTracer| input.transfer_to_memory(memory), input_type).unwrap();
+            for platform in ["cuda", "rocm"] {
+                let options = ProgramLoweringOptions::new().with_target_platform(Some(platform));
+                let lowered = program.to_rendered_mlir("main", &options);
+                if memory == (Memory::Host { pinned: true }) {
+                    assert_eq!(lowered.unwrap(), expected);
+                } else {
+                    let error = Err(Error::Lowering(LoweringError::UnsupportedBoundaryMemory {
+                        memory,
+                        platform: platform.to_string(),
+                    }));
+                    assert_eq!(lowered, error);
+                    assert_eq!(to_host.to_rendered_mlir("main", &options), error);
+                }
             }
         }
     }

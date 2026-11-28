@@ -2339,8 +2339,7 @@ mod tests {
     use crate::compilation::CompilationError;
     use crate::compilation::options::Options;
     use crate::compilation::profile_guided::AdaptiveProfileGuidedOptions;
-    use crate::lowering::emissions::partition_region_session_constants;
-    use crate::lowering::programs::{CallTraversal, RegionLoweringExtension};
+    use crate::lowering::programs::{CallTraversal, ProgramSessionConstants, RegionLoweringExtension};
     use crate::sessions::tests::{
         domain_mesh, read_first_shard, read_sharded_f32_array, replicated_scalar_type, replicated_vector_type,
         two_device_mesh,
@@ -2367,7 +2366,7 @@ mod tests {
     {
         let program = function.source_program().to_program_with_lifted_captures().unwrap();
         let regions = program.entry_region_ref().emitted_regions(None, CallTraversal::Enter);
-        let (session_constants, _) = partition_region_session_constants(regions, None);
+        let session_constants = ProgramSessionConstants::from_regions(regions, None).into_inputs();
         (function.source_program().captures().len(), session_constants.len())
     }
 

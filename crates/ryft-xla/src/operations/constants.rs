@@ -1134,21 +1134,20 @@ mod tests {
     #[test]
     fn test_fill_materializes_scalar_literal_then_broadcasts_over_a_default_mesh() {
         let client = execution_client();
+        let target_platform = client.platform_name().unwrap();
         let domain = ProjectedContext::<Session, ArrayType>::new(Session::builder().client(client).build().unwrap());
 
         for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
             let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).with_memory(memory);
 
-            // The fill literal is uploaded to the requested memory, but XLA's CUDA compiler cannot take it from
-            // unpinned host memory as the input of the program that broadcasts it.
-            if client.platform_name().unwrap().eq_ignore_ascii_case("cuda")
-                && memory == (Memory::Host { pinned: false })
-            {
+            // A fill uploads its literal to the requested memory. CUDA and ROCm require pinned host memory for the
+            // input of the executable that broadcasts it.
+            if matches!(target_platform.as_ref(), "cuda" | "rocm") && memory == (Memory::Host { pinned: false }) {
                 assert!(matches!(
                     domain.fill(&r#type, 2.5f64),
                     Err(ProgramError::InvalidArgument { message })
-                        if message == "programs compiled for platform `cuda` cannot take or return values in \
-                                       `Host[Unpinned]` memory",
+                        if message == format!("programs compiled for platform `{target_platform}` cannot take or \
+                                               return values in `Host[Unpinned]` memory"),
                 ));
                 continue;
             }
