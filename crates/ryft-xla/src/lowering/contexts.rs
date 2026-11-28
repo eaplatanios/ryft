@@ -273,10 +273,9 @@ impl ProgramLoweringContext {
     /// closed, including dimensions split along auto axes. Unconstrained dimensions become replicated. Leaving a
     /// dimension open lets Shardy reduce the operands before the operation and then recreate a pending reduction on
     /// its result. For example, doubling contributions of 1 and 2 can then yield a global sum of 12 instead of 6.
-    /// [Intermediate values](crate::lowering::sharding::constrain_unreduced_intermediates) retain their known splits
-    /// along auto axes, so closing these dimensions preserves their placement. As with
-    /// [`Self::lower_sharding_constraint`], the module records the mesh and enclosing
-    /// manual axes are excluded.
+    /// [Inline lowering](crate::lowering::programs::ProgramInlineLoweringExtension::lower_inline) retains known
+    /// splits along auto axes for intermediate values, so closing these dimensions preserves their placement.
+    /// As with [`Self::lower_sharding_constraint`], the module records the mesh and excludes enclosing manual axes.
     pub(super) fn lower_pending_reduction_constraint<'b, 'c: 'b, 't: 'c>(
         &self,
         sharding: &Sharding,

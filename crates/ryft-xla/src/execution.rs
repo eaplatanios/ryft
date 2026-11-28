@@ -15,6 +15,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use ryft_core::macros::check_count;
@@ -491,7 +492,7 @@ impl ExecutionArguments {
     }
 }
 
-impl std::fmt::Debug for ExecutionArguments {
+impl Debug for ExecutionArguments {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let input_counts = self.inputs_by_device.iter().map(Vec::len).collect::<Vec<_>>();
         formatter

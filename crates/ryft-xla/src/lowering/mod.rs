@@ -45,7 +45,6 @@ use ryft_mlir::{
 
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::programs::ProgramInlineLoweringExtension;
-use crate::lowering::sharding::{constrain_unreduced_intermediates, constrain_unreduced_outputs};
 use crate::operations::call::CallFunctionMap;
 use crate::{Constant, Error, Operation, RuntimeRequirement, Session, Type};
 
@@ -834,80 +833,6 @@ pub(crate) fn current_or_new_token<'b, 'c: 'b, 't: 'c>(
     let created = created.result(0).unwrap().as_ref();
     effect_tokens.set(effect_class, created);
     Ok(created)
-}
-
-/// Lowers `operation`, applied by one instruction to `input_values` of `input_types` with outputs of `output_types`,
-/// with `lowerer`, and constrains every emitted value that carries a pending reduction over a mesh axis that no
-/// enclosing manual region binds. [`ProgramInlineLoweringExtension::lower_inline`] applies these constraints to the
-/// instructions of both entry functions and nested regions.
-///
-/// Shardy rejects an operation whose result drops an unreduced axis of its operands, unless a blessed operation (e.g.,
-/// `sdy.sharding_constraint`) performs that transition, and its propagation does not carry unreduced axes through most
-/// operations (e.g., `stablehlo.add` or `stablehlo.broadcast_in_dim`). JAX constrains the result of every operation
-/// on a mesh with explicit axes for that reason. Here, the values that the lowering of an instruction emits are
-/// constrained in two steps:
-///
-///   - Intermediate values, with [`constrain_unreduced_intermediates`]. The reduction state of each emitted value
-///     follows the dataflow of the emitted operations from the inputs of the instruction, and is never copied from its
-///     output types, because a value that is replicated in fact (e.g., a constant, an iota, or a broadcast of a
-///     replicated operand) and declared unreduced would be counted once per device when the reduction completes.
-///   - Outputs, with [`constrain_unreduced_outputs`], which constrains each output to the tracked sharding of its type,
-///     with the placement along auto mesh axes that dataflow gives it (refer to [`constrain_unreduced_intermediates`]).
-///
-/// Only an instruction with an input that carries a pending reduction can emit an intermediate value with one, so any
-/// other instruction pays one scan of its input types and of its output types, without allocating or walking the
-/// emitted operations. Lowering emits the constraints for every target and removes them with
-/// [`ryft_mlir::Module::remove_shardy_operations`] when the target lacks the Shardy dialect.
-fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
-    operation: &O,
-    lowerer: &mut Lowerer<'b, 'c, 't, O>,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[Type],
-    output_types: &[Type],
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let mut block = lowerer.block();
-    let location = lowerer.location();
-    let bound_manual_axes = lowerer.lowering_context().bound_manual_axes();
-    let has_pending_reduction = input_types.iter().any(|input_type| match input_type {
-        Type::Array(input_type) => input_type.unreduced_axes().iter().any(|axis| !bound_manual_axes.contains(axis)),
-        Type::Dimension(_) | Type::Reference(_) => false,
-    });
-    // The lowering only appends operations to the block, so the operations that follow an anchor appended before the
-    // lowering are those that the lowering emits into this block, which are found without walking the operations of
-    // the block that precede them. The anchor is a `stablehlo.after_all` without operands, whose result nothing uses,
-    // and it is removed once they are constrained.
-    let anchor = if has_pending_reduction {
-        Some(block.append_operation(stable_hlo::after_all::<ValueRef<'b, 'c, 't>, _>(&[], location)?)?)
-    } else {
-        None
-    };
-    let mut outputs = operation.lower(lowerer, input_values, input_types, output_types)?;
-    let lowering_context = lowerer.lowering_context();
-    let mut output_dimensions = Vec::new();
-    if let Some(anchor) = anchor {
-        output_dimensions = constrain_unreduced_intermediates(
-            anchor,
-            input_values,
-            input_types,
-            &outputs,
-            output_types,
-            lowering_context,
-            &mut block,
-            location,
-        )?;
-        // SAFETY: nothing uses the result of the anchor, so removing it from the block and dropping the detached
-        // operation that `remove_operation` returns destroys it without leaving a dangling use.
-        unsafe { block.remove_operation(anchor)? };
-    }
-    constrain_unreduced_outputs(
-        &mut outputs,
-        output_types,
-        &output_dimensions,
-        lowering_context,
-        &mut block,
-        location,
-    )?;
-    Ok(outputs)
 }
 
 /// Returns the error with which [`LowerableOperation::validate_data_derived_dimensions`] rejects the operation named
