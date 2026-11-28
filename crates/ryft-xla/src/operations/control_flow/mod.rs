@@ -16,7 +16,7 @@ use ryft_mlir::{
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::programs::{CallTraversal, ProgramInlineLoweringExtension, RegionLoweringExtension};
 use crate::lowering::sharding::OpenDimensions;
-use crate::lowering::types::{ArrayTypeLoweringExtension, dimension_extent_i64, lower_unplaced_constant_output};
+use crate::lowering::types::{ArrayTypeLoweringExtension, dimension_extent_to_i64, lower_unplaced_constant_output};
 use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::call::CallFunctionMap;
@@ -249,7 +249,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
             (Dimension::Dynamic(_), Dimension::Static(extent)) => Some(
                 lower_unplaced_constant_output(
                     &[ArrayType::scalar(DataType::I32)],
-                    dimension_extent_i64(*extent)?,
+                    dimension_extent_to_i64(*extent)?,
                     block,
                     context,
                     location,
@@ -275,7 +275,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
         .iter()
         .zip(physical_input_type.shape().dimensions())
         .map(|(bound, extent)| {
-            Ok(dimension_extent_i64(bound.value().unwrap())? - dimension_extent_i64(extent.value().unwrap())?)
+            Ok(dimension_extent_to_i64(bound.value().unwrap())? - dimension_extent_to_i64(extent.value().unwrap())?)
         })
         .collect::<Result<Vec<_>, Error>>()?;
     let padding_value =

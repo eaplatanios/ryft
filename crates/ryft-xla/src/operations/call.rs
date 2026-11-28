@@ -45,7 +45,7 @@ use ryft_mlir::{
 use crate::compilation::domains::{commits_public_outputs, relocated_input_type};
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::EffectTokens;
-use crate::lowering::contexts::ProgramLoweringContext;
+use crate::lowering::contexts::{PrivateFunction, PrivateFunctionBody, ProgramLoweringContext};
 use crate::lowering::programs::{
     CallTraversal, ProgramInlineLoweringExtension, RegionLoweringExtension, RegionPlacementRequestsExtension,
     UnreadLiftedCaptures,
@@ -92,163 +92,43 @@ pub(crate) struct CallProgramKey {
     calls: Vec<CallOperation<Type>>,
 }
 
-/// One deduplicated callee emitted as a shared private `func.func`.
-pub(crate) struct CallFunction<O: CoreOperation<Type = Type> = Operation> {
-    /// Symbol name of the emitted private function.
-    symbol: String,
-
-    /// Representative callee program for this key (materialized from its callee region), lowered once as the
-    /// function body.
-    program: FlatProgram<EagerContext<Constant, O>>,
-
-    /// Flat input types of the callee, also the emitted function's argument types.
-    input_types: Vec<Type>,
-
-    /// Flat output types of the callee, also the emitted function's result types.
-    output_types: Vec<Type>,
-}
-
-impl<O: CoreOperation<Type = Type>> CallFunction<O> {
-    /// Returns the symbol name of the emitted private function.
-    #[inline]
-    pub(crate) fn symbol(&self) -> &str {
-        &self.symbol
-    }
-
-    /// Returns the representative callee program, which is lowered once as the function body.
-    #[inline]
-    pub(crate) fn program(&self) -> &FlatProgram<EagerContext<Constant, O>> {
-        &self.program
-    }
-
-    /// Returns the flat input types of the callee, also the emitted function's argument types.
-    #[inline]
-    pub(crate) fn input_types(&self) -> &[Type] {
-        &self.input_types
-    }
-
-    /// Returns the flat output types of the callee, also the emitted function's result types.
-    #[inline]
-    pub(crate) fn output_types(&self) -> &[Type] {
-        &self.output_types
-    }
-}
-
-/// Shared private functions emitted for `call` callees that occur more than once in a module.
+/// Plans the shared private functions of the `call`s of `program`, which is the program that a module is lowered from,
+/// by registering a function with `lowering_context` (refer to [`ProgramLoweringContext::require_function`]) for
+/// every `call` callee that occurs at least twice (per [`CallProgramKey`] identity), and for every named composite
+/// body that no backend implementation replaces on the target platform and that occurs at least twice.
+/// Single-occurrence callees are left to inline, so modules without repeated calls lower without private functions.
+/// At each `call` lowering site, a callee whose function is registered is emitted as a `func.call` of that function
+/// instead of being inlined (refer to [`shared_call_function`]).
 ///
-/// Built once by [`collect_call_functions`] before a module is lowered and threaded read-only through the
-/// lowering pass. At each `call` lowering site, a callee whose key is present is emitted as a `func.call` to the
-/// shared function instead of being inlined, and absent callees inline.
-pub(crate) struct CallFunctionMap<O: CoreOperation<Type = Type> = Operation> {
-    /// Shared functions keyed by callee identity.
-    functions: HashMap<CallProgramKey, CallFunction<O>>,
-
-    /// Keys in first-occurrence order, so emitted symbol names and module layout are deterministic.
-    order: Vec<CallProgramKey>,
-
-    /// Shared functions that implement the bodies of named composite calls, indexed by the calls' semantic identity
-    /// and then by their boundary, so that lowering a call finds its function without rendering or hashing its body.
-    named: HashMap<CompositeKey, Vec<NamedFunction>>,
-}
-
-impl<O: CoreOperation<Type = Type>> Default for CallFunctionMap<O> {
-    fn default() -> Self {
-        Self { functions: HashMap::new(), order: Vec::new(), named: HashMap::new() }
-    }
-}
-
-impl<O: ProgramLoweringOperation> CallFunctionMap<O> {
-    /// Returns the shared function for `program`, if one was emitted for its identity.
-    pub(crate) fn get(&self, program: &FlatProgram<EagerContext<Constant, O>>) -> Option<&CallFunction<O>> {
-        self.functions.get(&call_program_key(program)?)
-    }
-
-    /// Returns the shared function that implements the body of the named composite calls of `key` at the provided
-    /// boundary, if one was emitted for them.
-    ///
-    /// The index assumes that named composite calls with equal keys and equal boundaries carry equal bodies, which
-    /// the contract of [`NamedComposite`](ryft_core::NamedComposite) requires but cannot verify (and which does not
-    /// hold across definitions with equal keys under different named axes, or in different operation families).
-    /// [`collect_call_functions`] enforces it by leaving out of the index any key and boundary whose calls carry
-    /// different bodies, so those calls look up their shared function by their own body (refer to [`Self::get`]).
-    pub(crate) fn named(
-        &self,
-        key: &CompositeKey,
-        input_types: &[Type],
-        output_types: &[Type],
-    ) -> Option<&NamedFunction> {
-        self.named
-            .get(key)?
-            .iter()
-            .find(|function| function.input_types == input_types && function.output_types == output_types)
-    }
-
-    /// Returns the shared functions in the order of the first occurrence of their callees, which is the order in
-    /// which a module emits them, so that the layout of the module is deterministic.
-    #[inline]
-    pub(crate) fn functions(&self) -> impl Iterator<Item = &CallFunction<O>> {
-        self.order.iter().map(|key| &self.functions[key])
-    }
-}
-
-/// Shared function that implements the body of the named composite calls with one boundary.
-pub(crate) struct NamedFunction {
-    /// Input types of the calls.
-    input_types: Vec<Type>,
-
-    /// Output types of the calls, which are also the results of the function.
-    output_types: Vec<Type>,
-
-    /// Symbol of the function.
-    symbol: String,
-}
-
-impl NamedFunction {
-    /// Returns the output types of the calls, which are also the results of the function.
-    #[inline]
-    pub(crate) fn output_types(&self) -> &[Type] {
-        &self.output_types
-    }
-
-    /// Returns the symbol of the function.
-    #[inline]
-    pub(crate) fn symbol(&self) -> &str {
-        &self.symbol
-    }
-}
-
-/// Builds the [`CallFunctionMap`] for a module by emitting a shared private function for every `call` callee
-/// that occurs at least twice (per [`CallProgramKey`] identity), and for every named composite body that no
-/// backend implementation replaces on `target_platform` and that occurs at least twice. Single-occurrence callees are
-/// left to inline, so modules without repeated calls lower exactly as before. A shared function that named composite
-/// calls reach is named after the name and version of the first such definition (e.g., `ryft.example.v1`, with a
-/// numeric suffix for other specializations), even when a `call` also reaches it, and no `callee_N` or
-/// named-composition function name can match such a name. A named composite boundary is indexed only when it equals
-/// the boundary of its shared function, so that the emitted call signature matches the function.
+/// A function that named composite calls reach is named after the name and version of the first such definition (e.g.,
+/// `ryft.example.v1`, with a numeric suffix for other specializations), even when a `call` also reaches it, and the
+/// other functions are named `callee_N`, where `N` counts the functions that were planned before them. The calls of a
+/// named composite also find their function by their key and boundary (refer to [`NamedFunctionKey`]), but only when
+/// that boundary equals the boundary of the function, so that the emitted call signature matches the function.
 ///
 /// # Errors
 ///
 /// Returns an error when the effects that lowering a callee introduces cannot be determined (refer to
 /// [`lowered_effect_classes`]).
-pub(crate) fn collect_call_functions<Input, Output, O: ProgramLoweringOperation>(
+pub(crate) fn plan_call_functions<Input, Output, O: ProgramLoweringOperation>(
     program: &Program<Constant, O, Input, Output>,
-    target_platform: Option<&str>,
-) -> Result<CallFunctionMap<O>, Error>
+    lowering_context: &ProgramLoweringContext,
+) -> Result<(), Error>
 where
     Input: Parameterized<Constant>,
     Output: Parameterized<Constant>,
 {
-    let mut counts: HashMap<CallProgramKey, (usize, FlatProgram<EagerContext<Constant, O>>)> = HashMap::new();
+    let target_platform = lowering_context.target_platform();
+    let mut counts = HashMap::new();
     let mut order: Vec<CallProgramKey> = Vec::new();
     let mut memo: HashMap<RegionId, Option<CallProgramKey>> = HashMap::new();
     let mut named = HashMap::new();
     let mut names = HashMap::new();
     count_calls(program, target_platform, &mut counts, &mut order, &mut memo, &mut named, &mut names)?;
 
-    let mut map = CallFunctionMap::default();
-    let mut name_counts = HashMap::<String, usize>::new();
+    let mut boundaries = HashMap::<CallProgramKey, (Vec<Type>, Vec<Type>)>::new();
     for key in order {
-        let (count, program) = counts.remove(&key).unwrap();
+        let (count, region, program) = counts.remove(&key).unwrap();
         // Effectful callees always inline (even when repeated) so their effectful instructions chain onto the
         // caller's effect token in program order, which a shared token-free function could not preserve. That
         // includes the entry guards that lowering synthesizes for the callee's nested control flow. Callees that
@@ -262,34 +142,34 @@ where
         {
             continue;
         }
-        let symbol = match names.get(&key) {
-            Some(name) => {
-                let count = name_counts.entry(name.clone()).or_default();
-                *count += 1;
-                if *count == 1 { name.clone() } else { format!("{name}_{}", *count - 1) }
-            }
-            None => format!("callee_{}", map.order.len()),
+        let name = match names.get(&key) {
+            Some(name) => Cow::Borrowed(name.as_str()),
+            None => Cow::Owned(format!("callee_{}", boundaries.len())),
         };
-        let input_types = program.input_types().into_owned();
-        let output_types = program.output_types().into_owned();
-        map.functions.insert(key.clone(), CallFunction { symbol, program, input_types, output_types });
-        map.order.push(key);
+        lowering_context.require_function(key.clone(), &name, || Ok(PrivateFunctionBody::Region(region)))?;
+        boundaries.insert(key, (program.input_types().into_owned(), program.output_types().into_owned()));
     }
     for (named_key, key) in named {
-        let Some(function) = key.and_then(|key| map.functions.get(&key)) else {
+        let Some((key, (input_types, output_types))) =
+            key.and_then(|key| boundaries.get(&key).map(|boundary| (key, boundary)))
+        else {
             continue;
         };
-        if function.input_types != named_key.input_types || function.output_types != named_key.output_types {
-            continue;
+        if *input_types == named_key.input_types && *output_types == named_key.output_types {
+            lowering_context.alias_function(named_key, &key);
         }
-        let NamedFunctionKey { key: composite_key, input_types, output_types } = named_key;
-        let symbol = function.symbol.clone();
-        map.named
-            .entry(composite_key)
-            .or_default()
-            .push(NamedFunction { input_types, output_types, symbol });
     }
-    Ok(map)
+    Ok(())
+}
+
+/// Returns the shared private function that the module of `lowering_context` holds for calls of `callee`, if it plans
+/// one for the identity of `callee` (refer to [`plan_call_functions`]) and the scope of `lowering_context` does not
+/// inline its calls.
+pub(crate) fn shared_call_function<O: ProgramLoweringOperation>(
+    callee: &FlatProgram<EagerContext<Constant, O>>,
+    lowering_context: &ProgramLoweringContext,
+) -> Option<PrivateFunction> {
+    lowering_context.shared_function(&call_program_key(callee)?)
 }
 
 /// Calls the shared private `func.func` named `symbol` with the provided operands, which must match its inputs, and
@@ -867,8 +747,7 @@ impl LowerableOperation for CallOperation<Type> {
             .collect::<Result<Vec<_>, Error>>()?;
         let output_values = {
             let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-            let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
-                lowerer.split_effect_tokens();
+            let (effect_tokens, regions, captured_values, lowering_context) = lowerer.split_effect_tokens();
             let [callee] = regions else { unreachable!("validated call region count") };
 
             // An input whose type refines the callee input type (e.g., with a static extent for a bounded dynamic one)
@@ -894,7 +773,6 @@ impl LowerableOperation for CallOperation<Type> {
                 &mut block,
                 context,
                 location,
-                nested_functions,
                 lowering_context,
                 effect_tokens,
             )?;
@@ -919,9 +797,17 @@ impl LowerableOperation for CallOperation<Type> {
     }
 }
 
-/// Semantic identity and boundary of the named composite calls that one shared function implements.
+/// Semantic identity and boundary of the named composite calls that one shared function implements, by which those
+/// calls find their function without rendering or hashing their body.
+///
+/// The lookup assumes that named composite calls with equal keys and equal boundaries carry equal bodies, which the
+/// contract of [`NamedComposite`](ryft_core::NamedComposite) requires but cannot verify (and which does not hold
+/// across definitions with equal keys under different named axes, or in different operation families).
+/// [`plan_call_functions`] enforces it by registering no function under a key and boundary whose calls carry
+/// different bodies, so those calls look up their shared function by their own body (refer to
+/// [`shared_call_function`]).
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct NamedFunctionKey {
+pub(crate) struct NamedFunctionKey {
     /// Semantic identity of the calls.
     key: CompositeKey,
 
@@ -930,6 +816,14 @@ struct NamedFunctionKey {
 
     /// Output types of the calls.
     output_types: Vec<Type>,
+}
+
+impl NamedFunctionKey {
+    /// Creates the key of the named composite calls of `key` at the boundary with the provided types.
+    #[inline]
+    pub(crate) fn new(key: CompositeKey, input_types: Vec<Type>, output_types: Vec<Type>) -> Self {
+        Self { key, input_types, output_types }
+    }
 }
 
 /// Named composite calls found by [`count_calls`], grouped by the interned body region, the key, and the boundary
@@ -1060,13 +954,14 @@ fn structural_key<O: ProgramLoweringOperation>(program: &FlatProgram<EagerContex
 /// region per specialization, so each body is rendered once. `named` records the semantic identity and boundary
 /// of the calls that each counted body implements, and `names` the name of their definition.
 ///
-/// `counts` accumulates the occurrence count and a representative materialized program per identity, `order` records
+/// `counts` accumulates the occurrence count and a representative callee region, with its materialized program, per
+/// identity, `order` records
 /// keys in first-occurrence order, and `memo` caches the (possibly expensive) key computation per callee root
 /// [`RegionId`]. Interned shared callees repeat their root region id, so each shared callee is rendered once.
 fn count_calls<Input, Output, O: ProgramLoweringOperation>(
     program: &Program<Constant, O, Input, Output>,
     target_platform: Option<&str>,
-    counts: &mut HashMap<CallProgramKey, (usize, FlatProgram<EagerContext<Constant, O>>)>,
+    counts: &mut HashMap<CallProgramKey, (usize, RegionId, FlatProgram<EagerContext<Constant, O>>)>,
     order: &mut Vec<CallProgramKey>,
     memo: &mut HashMap<RegionId, Option<CallProgramKey>>,
     named: &mut HashMap<NamedFunctionKey, Option<CallProgramKey>>,
@@ -1081,7 +976,7 @@ where
         program: &Program<Constant, O, Input, Output>,
         region: RegionId,
         target_platform: Option<&str>,
-        counts: &mut HashMap<CallProgramKey, (usize, FlatProgram<EagerContext<Constant, O>>)>,
+        counts: &mut HashMap<CallProgramKey, (usize, RegionId, FlatProgram<EagerContext<Constant, O>>)>,
         order: &mut Vec<CallProgramKey>,
         memo: &mut HashMap<RegionId, Option<CallProgramKey>>,
         named_calls: &mut NamedRegionCalls,
@@ -1172,7 +1067,7 @@ where
                 };
                 let entry = counts.entry(key.clone()).or_insert_with(|| {
                     order.push(key.clone());
-                    (0, program.region_ref(callee_region).unwrap().to_program())
+                    (0, callee_region, program.region_ref(callee_region).unwrap().to_program())
                 });
                 entry.0 += 1;
             }
@@ -1199,7 +1094,7 @@ where
         };
         let entry = counts.entry(key.clone()).or_insert_with(|| {
             order.push(key.clone());
-            (0, program.region_ref(call.region).unwrap().to_program())
+            (0, call.region, program.region_ref(call.region).unwrap().to_program())
         });
         entry.0 += call.count;
         names
@@ -1241,7 +1136,6 @@ trait CallProgramLoweringExtension<O: ProgramLoweringOperation> {
         block: &mut BlockRef<'b, 'c, 't>,
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
-        nested_functions: Option<&Rc<CallFunctionMap<O>>>,
         lowering_context: &ProgramLoweringContext,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
@@ -1257,22 +1151,20 @@ impl<O: ProgramLoweringOperation> CallProgramLoweringExtension<O> for FlatProgra
         block: &mut BlockRef<'b, 'c, 't>,
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
-        nested_functions: Option<&Rc<CallFunctionMap<O>>>,
         lowering_context: &ProgramLoweringContext,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        // Only pure callees are ever deduplicated (`collect_call_functions` skips effectful programs), so the shared
+        // Only pure callees are ever deduplicated (`plan_call_functions` skips effectful programs), so the shared
         // function path below never interacts with the caller's effect tokens. Effectful callees always take the inline
         // path, which threads the caller's per-class tokens through the callee body in program order.
-        if let Some(map) = nested_functions
-            && let Some(function) = map.get(self)
-        {
+        if let Some(function) = shared_call_function(self, lowering_context) {
             // The `call` operation's type inference already pins its inputs to the callee input types, so a
             // matching arity is the only guard needed before emitting the symbol call. Anything else inlines.
-            if input_values.len() == function.input_types.len() {
+            if input_values.len() == self.input_count() {
+                let output_types = self.output_types();
                 return lower_shared_function_call(
-                    &function.symbol,
-                    &function.output_types,
+                    function.symbol(),
+                    &output_types,
                     input_values,
                     block,
                     context,
@@ -1290,7 +1182,6 @@ impl<O: ProgramLoweringOperation> CallProgramLoweringExtension<O> for FlatProgra
         self.lower_inline(
             captured_values.as_slice(),
             input_values,
-            nested_functions,
             lowering_context,
             effect_tokens,
             *block,

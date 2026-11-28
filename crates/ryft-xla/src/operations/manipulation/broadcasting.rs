@@ -8,7 +8,7 @@ use ryft_mlir::{Block, Operation as MlirOperation, Type as MlirType, Value as Ml
 
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_i64, lower_explicit_shape,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_to_i64, lower_explicit_shape,
     lower_static_index_constants,
 };
 use crate::operations::constants::{
@@ -60,7 +60,7 @@ impl LowerableOperation for BroadcastOperation {
                 .enumerate()
                 .map(|(axis, dimension)| {
                     if let Dimension::Static(extent) = dimension {
-                        dimension_extent_i64(*extent)?;
+                        dimension_extent_to_i64(*extent)?;
                         Ok(lower_static_index_constants(&[*extent], block, context, location)?.remove(0))
                     } else {
                         let input_axis =

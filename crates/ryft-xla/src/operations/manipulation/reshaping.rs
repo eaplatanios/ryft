@@ -12,16 +12,16 @@ use crate::lowering::EffectTokens;
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, dimension_extent_i32, dimension_extent_i64, lower_explicit_reshape_shape,
-    lower_static_index_constants, stable_hlo_dynamic_dimension_bound, static_dimensions,
+    ArrayTypeLoweringExtension, dimension_extent_to_i32, dimension_extent_to_i64, lower_explicit_reshape_shape,
+    lower_static_index_constants,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE, ASSERT_RESHAPE_KIND,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
 use crate::{
-    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type,
-    ValueRefExtension,
+    ArrayTypeExtension, DimensionExtension, Error, LowerableOperation, Lowerer, LoweringError,
+    ProgramLoweringOperation, Type, ValueRefExtension,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -125,10 +125,9 @@ impl LowerableOperation for DynamicReshapeOperation {
             )?;
         }
         let input = *input;
-        let result = if output_type.static_shape().is_some() {
-            let output_shape = static_dimensions(output_type)?;
+        let result = if let Some(output_shape) = output_type.static_dimensions() {
             for dimension in &output_shape {
-                dimension_extent_i64(*dimension)?;
+                dimension_extent_to_i64(*dimension)?;
             }
             let reshape = block.append_operation(stable_hlo::reshape(input, output_shape.as_slice(), location)?)?;
             reshape.result(0).unwrap().as_ref()
@@ -140,11 +139,11 @@ impl LowerableOperation for DynamicReshapeOperation {
                 .iter()
                 .map(|dimension| match dimension {
                     Dimension::Static(extent) => Some(*extent),
-                    Dimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(dimension),
+                    Dimension::Dynamic(_) => dimension.stable_hlo_dynamic_bound(),
                 })
                 .collect::<Vec<_>>();
             for bound in output_bounds.iter().flatten() {
-                dimension_extent_i32(*bound)?;
+                dimension_extent_to_i32(*bound)?;
             }
             let reshape =
                 block.append_operation(stable_hlo::dynamic_reshape(input, shape, &output_bounds, location)?)?;
@@ -200,11 +199,10 @@ impl ReshapeOperationLoweringExtension for ReshapeOperation {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let input = input_values[0];
-        let result = if output_types[0].static_shape().is_none() {
-            if input_type.shape() == output_types[0].shape() {
-                // The dynamic target is exactly the input shape, so the input already has the required output type.
-                input
-            } else {
+        let result = match output_types[0].static_dimensions() {
+            // A dynamic target with the same shape as the input already has the required output type.
+            None if input_type.shape() == output_types[0].shape() => input,
+            None => {
                 // Core type inference admits a dynamic target only when it keeps the dynamic dimensions of the input in
                 // order and regroups the static dimensions between them, so every dynamic output axis corresponds in
                 // order to a dynamic input axis whose runtime size is read back, and every static output axis is a
@@ -244,11 +242,11 @@ impl ReshapeOperationLoweringExtension for ReshapeOperation {
                     .iter()
                     .map(|dimension| match dimension {
                         Dimension::Static(extent) => Some(*extent),
-                        Dimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(dimension),
+                        Dimension::Dynamic(_) => dimension.stable_hlo_dynamic_bound(),
                     })
                     .collect::<Vec<_>>();
                 for bound in output_bounds.iter().flatten() {
-                    dimension_extent_i32(*bound)?;
+                    dimension_extent_to_i32(*bound)?;
                 }
                 let reshape =
                     block.append_operation(stable_hlo::dynamic_reshape(input, shape, &output_bounds, location)?)?;
@@ -261,13 +259,13 @@ impl ReshapeOperationLoweringExtension for ReshapeOperation {
                     cast.result(0).unwrap().as_ref()
                 }
             }
-        } else {
-            let output_shape = static_dimensions(&output_types[0])?;
-            for dimension in &output_shape {
-                dimension_extent_i64(*dimension)?;
+            Some(output_shape) => {
+                for dimension in &output_shape {
+                    dimension_extent_to_i64(*dimension)?;
+                }
+                let reshape = block.append_operation(stable_hlo::reshape(input, output_shape.as_slice(), location)?)?;
+                reshape.result(0).unwrap().as_ref()
             }
-            let reshape = block.append_operation(stable_hlo::reshape(input, output_shape.as_slice(), location)?)?;
-            reshape.result(0).unwrap().as_ref()
         };
         let result = if self.output_sharding().is_some() {
             let output_sharding = output_types[0].sharding().unwrap();

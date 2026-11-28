@@ -12,7 +12,6 @@ use ryft_mlir::{
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat, lower_unplaced_constant_output,
-    static_dimensions,
 };
 use crate::operations::assertions::{lower_dependency_barrier, lower_type_relationship_checks};
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
@@ -850,7 +849,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         // Split into two-bit groups first, because every supported numeric encoding wider than one bit has an even
         // width, including six-bit floats. Expanding each group to two predicates avoids treating each predicate as
         // eight bits.
-        let mut shape = static_dimensions(&physical_output_type)?;
+        let mut shape = physical_output_type.static_dimensions().unwrap();
         let width = shape.pop().unwrap();
         if width > 2 {
             shape.push(width / 2);
@@ -893,13 +892,13 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         )?)?;
         let result = block.append_operation(stable_hlo::reshape(
             bits.result(0).unwrap().as_ref(),
-            &static_dimensions(&physical_output_type)?,
+            &physical_output_type.static_dimensions().unwrap(),
             location,
         )?)?;
         result.result(0).unwrap().as_ref()
     } else if input_one_bit {
         // Pack neighboring predicates into two-bit groups with disjoint shifts, so their sum is their bitwise union.
-        let mut shape = static_dimensions(&physical_input_type)?;
+        let mut shape = physical_input_type.static_dimensions().unwrap();
         let width = shape.pop().unwrap();
         if width > 2 {
             shape.push(width / 2);

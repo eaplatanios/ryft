@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 
 use ryft_core::{
-    Array, ArrayType, CaptureReference, DataType, DimensionValue, Memory, ProgramError, Type as CoreType, Typed, Value,
+    Array, ArrayType, CaptureReference, DataType, Dimension, DimensionValue, Memory, ProgramError, Type as CoreType,
+    Typed, Value,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -12,7 +13,7 @@ use ryft_mlir::{
 use crate::lowering::LoweringError;
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, DataTypeLoweringExtension, MemoryLoweringExtension, dimension_extent_i64,
+    ArrayTypeLoweringExtension, DataTypeLoweringExtension, MemoryLoweringExtension, dimension_extent_to_i64,
 };
 use crate::{ArrayConstant, Constant, Error};
 
@@ -234,10 +235,24 @@ impl DimensionValueLoweringExtension for DimensionValue {
         L: Copy + Location<'c, 't>,
     {
         let tensor_type = ArrayType::scalar(DataType::I64).lower(context, location)?;
-        let extent = dimension_extent_i64(self.extent())?;
+        let extent = dimension_extent_to_i64(self.extent())?;
         let elements = DataType::I64.lower_i64_splat_attribute(tensor_type, extent, context)?;
         let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
         Ok(constant.result(0)?.as_ref())
+    }
+}
+
+/// Extends [`Dimension`] with its StableHLO bounds encoding.
+pub trait DimensionExtension {
+    /// Returns the inclusive upper bound StableHLO records for a bounded dynamic dimension, one less than Ryft's
+    /// exclusive upper bound. Static dimensions and unbounded dynamic dimensions have no bound in this encoding.
+    fn stable_hlo_dynamic_bound(&self) -> Option<usize>;
+}
+
+impl DimensionExtension for Dimension {
+    #[inline]
+    fn stable_hlo_dynamic_bound(&self) -> Option<usize> {
+        self.variable()?.bounds().upper()?.checked_sub(1)
     }
 }
 
@@ -663,6 +678,14 @@ mod tests {
             operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
             vec!["%c = stablehlo.constant dense<3> : tensor<i64>"],
         );
+    }
+
+    #[test]
+    fn test_dimension_stable_hlo_dynamic_bound() {
+        assert_eq!(Dimension::Static(4).stable_hlo_dynamic_bound(), None);
+        assert_eq!(dynamic_dimension("unbounded", None).stable_hlo_dynamic_bound(), None);
+        assert_eq!(dynamic_dimension("bounded", Some(6)).stable_hlo_dynamic_bound(), Some(5));
+        assert_eq!(dynamic_dimension("zero", Some(1)).stable_hlo_dynamic_bound(), Some(0));
     }
 
     #[test]

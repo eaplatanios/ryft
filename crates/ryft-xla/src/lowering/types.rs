@@ -10,7 +10,8 @@ use ryft_mlir::{
 
 use crate::devices::MemoryExtension;
 use crate::lowering::LoweringError;
-use crate::{ArrayError, ArrayTypeExtension, Error, Type};
+use crate::lowering::values::DimensionExtension;
+use crate::{ArrayTypeExtension, Error, Type};
 
 /// Provides lowering support transfers to a [`Memory`] to StableHLO.
 pub trait MemoryLoweringExtension {
@@ -259,7 +260,7 @@ impl ArrayTypeLoweringExtension for ArrayType {
                 Dimension::Dynamic(_) => MlirSize::Dynamic,
             })
             .collect::<Vec<_>>();
-        let bounds = self.shape().dimensions().iter().map(stable_hlo_dynamic_dimension_bound).collect::<Vec<_>>();
+        let bounds = self.shape().dimensions().iter().map(Dimension::stable_hlo_dynamic_bound).collect::<Vec<_>>();
         let encoding = bounds
             .iter()
             .any(Option::is_some)
@@ -286,7 +287,7 @@ impl ArrayTypeLoweringExtension for ArrayType {
             let bound = physical_type.shape().dimensions()[axis].value().unwrap();
             let size = lower_unplaced_constant_output(
                 &[ArrayType::scalar(DataType::I32)],
-                i64::from(dimension_extent_i32(bound)?),
+                i64::from(dimension_extent_to_i32(bound)?),
                 block,
                 context,
                 location,
@@ -453,19 +454,29 @@ pub enum PhysicalStoragePadding<'b, 'c: 'b, 't: 'c> {
     Scalar(ValueRef<'b, 'c, 't>),
 }
 
+/// Converts `extent` to StableHLO's signed 64-bit shape representation.
+///
+/// # Errors
+///
+/// Returns [`DimensionError::ExtentExceedsBackendWidth`] if `extent` exceeds [`i64::MAX`].
+#[inline]
+pub fn dimension_extent_to_i64(extent: usize) -> Result<i64, Error> {
+    i64::try_from(extent)
+        .map_err(|_| DimensionError::ExtentExceedsBackendWidth { value: extent, maximum: i64::MAX as usize }.into())
+}
+
+/// Converts `extent` to the signed 32-bit representation required by dynamic StableHLO shape operations.
+///
+/// # Errors
+///
+/// Returns [`DimensionError::ExtentExceedsBackendWidth`] if `extent` exceeds [`i32::MAX`].
+#[inline]
+pub fn dimension_extent_to_i32(extent: usize) -> Result<i32, Error> {
+    i32::try_from(extent)
+        .map_err(|_| DimensionError::ExtentExceedsBackendWidth { value: extent, maximum: i32::MAX as usize }.into())
+}
+
 // TODO(eaplatanios): Review from here onwards.
-
-/// Converts one dimension extent to StableHLO's signed 64-bit shape representation.
-pub fn dimension_extent_i64(value: usize) -> Result<i64, Error> {
-    i64::try_from(value)
-        .map_err(|_| DimensionError::ExtentExceedsBackendWidth { value, maximum: i64::MAX as usize }.into())
-}
-
-/// Converts one dimension extent to the signed 32-bit representation required by dynamic StableHLO shape operations.
-pub fn dimension_extent_i32(value: usize) -> Result<i32, Error> {
-    i32::try_from(value)
-        .map_err(|_| DimensionError::ExtentExceedsBackendWidth { value, maximum: i32::MAX as usize }.into())
-}
 
 /// Lowers static start indices to scalar `i64` StableHLO constants, as consumed by the index operands of
 /// `stablehlo.dynamic_update_slice` when lowering the statically indexed `update_slice` operation, because StableHLO
@@ -564,19 +575,6 @@ pub fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy +
     }
 }
 
-/// Returns the static dimensions for one tensor type.
-pub fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, Error> {
-    array_type
-        .shape()
-        .dimensions()
-        .iter()
-        .map(|size| match size {
-            Dimension::Static(value) => Ok(*value),
-            Dimension::Dynamic(_) => Err(Error::from(ArrayError::DynamicShape { shape: array_type.shape().clone() })),
-        })
-        .collect()
-}
-
 /// Lowers a scalar `u64` constant. It is shared by the group interval arithmetic of ragged dots, the device shard and
 /// batch item arithmetic of `parallel_ragged_all_to_all`, and the coordinate arithmetic of
 /// [`AxisIndexOperation`](ryft_core::AxisIndexOperation).
@@ -590,14 +588,6 @@ pub fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c>(
     let attribute = context.dense_u64_elements_attribute(tensor_type, &[value])?;
     let constant = block.append_operation(stable_hlo::constant(attribute, location)?)?;
     Ok(constant.result(0)?.as_ref())
-}
-
-/// Converts a Ryft exclusive dynamic dimension bound to StableHLO's inclusive maximum dimension size.
-pub fn stable_hlo_dynamic_dimension_bound(size: &Dimension) -> Option<usize> {
-    match size {
-        Dimension::Static(_) => None,
-        Dimension::Dynamic(variable) => variable.bounds().upper().and_then(|upper| upper.checked_sub(1)),
-    }
 }
 
 /// Lowers an arbitrary `f64` factor into a splatted scalar StableHLO constant whose element type matches
@@ -698,10 +688,7 @@ pub(crate) fn lower_explicit_reshape_shape<'b, 'c: 'b, 't: 'c>(
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{
-        DimensionBounds, DimensionType, DimensionVariable, Error as CoreError, Placeholder, ReferenceType,
-        ZeroOperation,
-    };
+    use ryft_core::{DimensionBounds, DimensionType, Error as CoreError, Placeholder, ReferenceType, ZeroOperation};
 
     use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, test_vector_type, unproject_plain_program};
     use crate::{ArrayConstant, ProgramLoweringExtension, ProgramLoweringOptions};
@@ -796,44 +783,33 @@ mod tests {
     }
 
     #[test]
-    fn test_dimension_extent_i64() {
-        if usize::MAX <= i64::MAX as usize {
-            return;
-        }
-
-        let error = dimension_extent_i64(usize::MAX).unwrap_err();
+    fn test_dimension_extent_to_i64() {
+        assert_eq!(dimension_extent_to_i64(0), Ok(0));
+        let maximum = i64::MAX as usize;
+        assert_eq!(dimension_extent_to_i64(maximum), Ok(maximum as i64));
+        let Some(extent) = maximum.checked_add(1) else { return };
+        let error = dimension_extent_to_i64(extent).unwrap_err();
         let Error::Core(core_error) = error else { unreachable!() };
         let CoreError::Type(error) = *core_error else { unreachable!() };
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
-            Some(&DimensionError::ExtentExceedsBackendWidth { value: usize::MAX, maximum: i64::MAX as usize }),
+            Some(&DimensionError::ExtentExceedsBackendWidth { value: extent, maximum }),
         );
     }
 
     #[test]
-    fn test_dimension_extent_i32() {
-        let value = i32::MAX as usize + 1;
-        let error = dimension_extent_i32(value).unwrap_err();
+    fn test_dimension_extent_to_i32() {
+        assert_eq!(dimension_extent_to_i32(0), Ok(0));
+        let maximum = i32::MAX as usize;
+        assert_eq!(dimension_extent_to_i32(maximum), Ok(i32::MAX));
+        let extent = maximum + 1;
+        let error = dimension_extent_to_i32(extent).unwrap_err();
         let Error::Core(core_error) = error else { unreachable!() };
         let CoreError::Type(error) = *core_error else { unreachable!() };
         assert_eq!(
             error.downcast_custom::<DimensionError>(),
-            Some(&DimensionError::ExtentExceedsBackendWidth { value, maximum: i32::MAX as usize }),
+            Some(&DimensionError::ExtentExceedsBackendWidth { value: extent, maximum }),
         );
-    }
-
-    #[test]
-    fn test_static_dimensions() {
-        let static_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        assert_eq!(static_dimensions(&static_type).unwrap(), vec![2, 3]);
-        let dimension = DimensionVariable::new("size", DimensionBounds::unbounded());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.into()]));
-        assert!(matches!(
-            static_dimensions(&dynamic_type),
-            Err(Error::Array(error)) if matches!(error.as_ref(),
-                ArrayError::DynamicShape { shape } if shape == dynamic_type.shape(),
-            ),
-        ));
     }
 
     #[test]
@@ -1015,13 +991,6 @@ mod tests {
                 CoreError::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
             ),
         ));
-    }
-
-    #[test]
-    fn test_stable_hlo_dynamic_dimension_bound() {
-        assert_eq!(stable_hlo_dynamic_dimension_bound(&Dimension::Static(4)), None);
-        assert_eq!(stable_hlo_dynamic_dimension_bound(&dynamic_dimension("unbounded", None)), None);
-        assert_eq!(stable_hlo_dynamic_dimension_bound(&dynamic_dimension("bounded", Some(6))), Some(5));
     }
 
     #[test]

@@ -20,9 +20,7 @@ use ryft_mlir::{
     ValueRef,
 };
 
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat, static_dimensions,
-};
+use crate::lowering::types::{ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
@@ -450,10 +448,8 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 physical_inputs[index] =
                     normalize_fused_attention_operand(physical_inputs[index], &physical_type, block, location)?;
             }
-            let score_type = attention_array_type(
-                data_type,
-                &[physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
-            );
+            let score_dimensions = [physical_batch, heads, physical_query_sequence, physical_key_value_sequence];
+            let score_type = attention_array_type(data_type, &score_dimensions);
             let bias = prepare_fused_attention_bias(
                 &indices,
                 physical_inputs.as_slice(),
@@ -495,7 +491,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
             let element_type = if data_type == DataType::BF16 { "BF16" } else { "F16" };
             let backend_config = fused_attention_backend_config(
                 element_type,
-                [physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
+                score_dimensions,
                 self.scale_for(head_dimension),
                 fused_attention_mask_type(fused_attention_is_causal(self), sequence_lengths.is_some()),
                 FMHA_BACKWARD_DOT_DIMENSION_NUMBERS,
@@ -574,7 +570,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 let transposed = transposed.result(0).unwrap().as_ref();
                 let mut transposed = transposed;
                 if input_types[index].rank() == 3 {
-                    let dimensions = static_dimensions(&output_types[index].physical_bound_type()?)?;
+                    let dimensions = output_types[index].physical_bound_type()?.static_dimensions().unwrap();
                     let reshaped =
                         block.append_operation(stable_hlo::reshape(transposed, dimensions.as_slice(), location)?)?;
                     transposed = reshaped.result(0).unwrap().as_ref();
@@ -594,9 +590,8 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
             {
                 let bias_type = &input_types[bias_index];
                 let physical_bias_type = bias_type.physical_bound_type()?;
-                let mut normalized_bias_dimensions = static_dimensions(&physical_bias_type)?;
+                let mut normalized_bias_dimensions = physical_bias_type.static_dimensions().unwrap();
                 normalized_bias_dimensions.splice(0..0, std::iter::repeat_n(1, 4 - bias_type.rank()));
-                let score_dimensions = static_dimensions(&score_type)?;
                 let reduced_axes = normalized_bias_dimensions
                     .iter()
                     .zip(&score_dimensions)
@@ -626,7 +621,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 bias_cotangent = block
                     .append_operation(stable_hlo::reshape(
                         bias_cotangent,
-                        static_dimensions(&physical_bias_type)?.as_slice(),
+                        physical_bias_type.static_dimensions().unwrap().as_slice(),
                         location,
                     )?)?
                     .result(0)
@@ -858,7 +853,7 @@ fn normalize_fused_attention_operand<'b, 'c: 'b, 't: 'c>(
         return Ok(value);
     }
     let mut dimensions = vec![1];
-    dimensions.extend(static_dimensions(r#type)?);
+    dimensions.extend(r#type.static_dimensions().unwrap());
     let normalized = block.append_operation(stable_hlo::reshape(value, dimensions.as_slice(), location)?)?;
     Ok(normalized.result(0).unwrap().as_ref())
 }
@@ -873,7 +868,7 @@ fn broadcast_fused_attention_score_operand<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let mut dimensions = vec![1; 4 - r#type.rank()];
-    dimensions.extend(static_dimensions(r#type)?);
+    dimensions.extend(r#type.static_dimensions().unwrap());
     let value = if r#type.rank() == 4 {
         value
     } else {

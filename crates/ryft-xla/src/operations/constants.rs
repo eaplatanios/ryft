@@ -12,13 +12,11 @@ use ryft_mlir::{
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::values::ArrayLiteralLoweringExtension;
-use crate::lowering::{
-    ArrayTypeLoweringExtension, MemoryLoweringExtension, lower_constant_output, stable_hlo_dynamic_dimension_bound,
-};
+use crate::lowering::{ArrayTypeLoweringExtension, MemoryLoweringExtension, lower_constant_output};
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{
-    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, MemberLowerableOperation,
-    ProgramLoweringOperation, Type,
+    ArrayTypeExtension, DimensionExtension, Error, LowerableOperation, Lowerer, LoweringError,
+    MemberLowerableOperation, ProgramLoweringOperation, Type,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -112,7 +110,7 @@ pub(crate) fn dynamic_constructor_types(
         .map(|dimension| match dimension {
             Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
             Dimension::Dynamic(variable) => {
-                let bound = stable_hlo_dynamic_dimension_bound(dimension).ok_or_else(|| {
+                let bound = dimension.stable_hlo_dynamic_bound().ok_or_else(|| {
                     Error::Lowering(LoweringError::UnsupportedOperation {
                         operation: name.to_string(),
                         reason: format!(

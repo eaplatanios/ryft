@@ -10,15 +10,15 @@ use ryft_mlir::{
 
 use crate::lowering::EffectTokens;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_i32, lower_constant_output,
-    lower_static_index_constants, lower_unplaced_constant_output, static_dimensions,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_to_i32, lower_constant_output,
+    lower_static_index_constants, lower_unplaced_constant_output,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_KIND_ATTRIBUTE,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
 use crate::{
-    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type,
+    ArrayError, ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type,
     ValueRefExtension,
 };
 
@@ -64,7 +64,7 @@ impl LowerableOperation for SliceOperation {
             if physical_dimensions[axis] == *dimension {
                 continue;
             }
-            let extent = dimension_extent_i32(dimension.value().unwrap())?;
+            let extent = dimension_extent_to_i32(dimension.value().unwrap())?;
             let elements = context.dense_i32_elements_attribute(size_type, &[extent])?;
             let size = block.append_operation(stable_hlo::constant(elements, location)?)?.result(0).unwrap().as_ref();
             physical_dimensions[axis] = dimension.clone();
@@ -170,7 +170,9 @@ impl LowerableOperation for DynamicUpdateSliceOperation {
         check_count!("output", output_types, 1, ProgramError);
         check_count!("input", input_values, output_types[0].rank() + 2, ProgramError);
         check_count!("input", input_types, output_types[0].rank() + 2, ProgramError);
-        let sizes = static_dimensions(&input_types[1])?;
+        let sizes = input_types[1]
+            .static_dimensions()
+            .ok_or_else(|| ArrayError::DynamicShape { shape: input_types[1].shape().clone() })?;
         let starts = lower_slice_start_indices(
             input_values[0],
             &input_types[0],
@@ -451,7 +453,7 @@ impl DynamicSliceAxisPlan {
                 reason: format!("`{DYNAMIC_SLICE_OPERATION_NAME}` padded input size overflows on axis {axis}"),
             })
         })?;
-        dimension_extent_i32(padded_size)?;
+        dimension_extent_to_i32(padded_size)?;
         let bounds_prove_runtime_in_bounds = start_type
             .bounds()
             .upper()

@@ -10,7 +10,7 @@ use ryft_mlir::{
 
 use crate::lowering::EffectTokens;
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_i32, dimension_extent_i64,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_to_i32, dimension_extent_to_i64,
     lower_constant_output, lower_static_index_constants,
 };
 use crate::operations::assertions::{
@@ -114,7 +114,7 @@ impl LowerableOperation for ConcatenateOperation<Type> {
             let inferred_type = output_type.clone().with_shape(Shape::new(inferred_dimensions));
             let physical_input_type = inferred_type.physical_bound_type()?;
             let physical_output_type = output_type.physical_bound_type()?;
-            dimension_extent_i32(physical_output_type.dimension(self.axis()).value().unwrap())?;
+            dimension_extent_to_i32(physical_output_type.dimension(self.axis()).value().unwrap())?;
             let logical_result = result;
             // Concatenate has already packed logical input extents contiguously. Expose its bounded storage,
             // resize only its trailing padding, then restore the logical dimensions. Reshape cannot change an
@@ -129,8 +129,8 @@ impl LowerableOperation for ConcatenateOperation<Type> {
             )?;
             let mut high_padding = vec![0; output_type.rank()];
             high_padding[self.axis()] =
-                dimension_extent_i64(physical_output_type.dimension(self.axis()).value().unwrap())?
-                    - dimension_extent_i64(physical_input_type.dimension(self.axis()).value().unwrap())?;
+                dimension_extent_to_i64(physical_output_type.dimension(self.axis()).value().unwrap())?
+                    - dimension_extent_to_i64(physical_input_type.dimension(self.axis()).value().unwrap())?;
             if high_padding[self.axis()] != 0 {
                 // Padding is outside the logical extent, so choose a representable value even for the float format
                 // that only has exponent bits, which has no zero encoding.

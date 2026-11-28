@@ -275,13 +275,14 @@ impl ArrayType {
     /// reference to cached shape metadata.
     #[inline]
     pub fn static_shape(&self) -> Option<StaticShape> {
-        self.payload
-            .shape
-            .dimensions()
-            .iter()
-            .map(Dimension::value)
-            .collect::<Option<Vec<_>>>()
-            .map(StaticShape::new)
+        self.static_dimensions().map(StaticShape::new)
+    }
+
+    /// Returns the extents in axis order, or [`None`] if any dimension is dynamic. A scalar has an empty vector
+    /// of extents.
+    #[inline]
+    pub fn static_dimensions(&self) -> Option<Vec<usize>> {
+        self.shape().dimensions().iter().map(Dimension::value).collect()
     }
 
     /// Returns the rank (i.e., the number of dimensions) of this [`ArrayType`].
@@ -1422,6 +1423,16 @@ mod tests {
         assert_eq!(scalar.static_shape(), Some(StaticShape::scalar()));
         assert_eq!(static_array_type.static_shape(), Some(StaticShape::new(vec![42, 4, 2])));
         assert_eq!(dynamic_array_type.static_shape(), None);
+    }
+
+    #[test]
+    fn test_array_type_static_dimensions() {
+        assert_eq!(ArrayType::scalar(F32).static_dimensions(), Some(vec![]));
+        assert_eq!(ArrayType::new_static(F32, [2, 0, 3]).static_dimensions(), Some(vec![2, 0, 3]));
+
+        let dimension = DimensionVariable::new("n", DimensionBounds::new(2, Some(3)).unwrap());
+        let dynamic_type = ArrayType::new(F32, Shape::new(vec![2.into(), dimension.into()]));
+        assert_eq!(dynamic_type.static_dimensions(), None);
     }
 
     #[test]

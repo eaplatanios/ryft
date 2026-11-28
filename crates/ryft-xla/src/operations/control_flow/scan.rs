@@ -36,7 +36,6 @@ use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, TypeLoweringExtension, lower_constant_output, lower_static_index_constants,
-    stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 use crate::operations::call::CallFunctionMap;
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
@@ -45,7 +44,10 @@ use crate::operations::control_flow::{
     lower_refined_region_outputs, lower_region_guard, lowered_effect_classes, set_threaded_effect_tokens,
     threaded_effect_token_values, validate_unthreaded_effect_tokens,
 };
-use crate::{Constant, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
+use crate::{
+    ArrayError, Constant, DimensionExtension, Error, LowerableOperation, Lowerer, LoweringError,
+    ProgramLoweringOperation, Type,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -150,7 +152,7 @@ impl LowerableOperation for ScanOperation<Type> {
         // Only a dynamic length without an upper bound can leave a factor whose iteration offsets the `i64` counter
         // cannot hold.
         let unroll = static_length
-            .or_else(|| stable_hlo_dynamic_dimension_bound(length))
+            .or_else(|| length.stable_hlo_dynamic_bound())
             .map_or(self.unroll(), |maximum_length| self.unroll().min(maximum_length.max(1)));
         if unroll > i64::MAX as usize {
             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
@@ -359,7 +361,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> ScanLoopInputs<'o, 'b,
             let length = &physical_dimensions[0];
             let physical_length = match length {
                 Dimension::Static(length) => *length,
-                Dimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| {
+                Dimension::Dynamic(_) => length.stable_hlo_dynamic_bound().ok_or_else(|| {
                     Error::Lowering(LoweringError::UnsupportedOperation {
                         operation: SCAN_OPERATION_NAME.to_string(),
                         reason: format!(
@@ -591,7 +593,9 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> ScanLoopInputs<'o, 'b,
         iteration_inputs.push(index_value);
         iteration_inputs.extend(carries);
         for (stacked_input, stacked_input_slice_type) in stacked_inputs.iter().zip(&self.stacked_input_slice_types) {
-            let slice_dimensions = static_dimensions(stacked_input_slice_type)?;
+            let slice_dimensions = stacked_input_slice_type
+                .static_dimensions()
+                .ok_or_else(|| ArrayError::DynamicShape { shape: stacked_input_slice_type.shape().clone() })?;
             let mut sizes = vec![1];
             sizes.extend(slice_dimensions.iter().copied());
             let mut start_values = vec![index_value];
@@ -624,7 +628,9 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> ScanLoopInputs<'o, 'b,
         for ((stacked_output, stacked_output_slice_type), stacked_output_accumulator) in
             stacked_outputs.into_iter().zip(&self.stacked_output_slice_types).zip(stacked_output_accumulators)
         {
-            let slice_dimensions = static_dimensions(stacked_output_slice_type)?;
+            let slice_dimensions = stacked_output_slice_type
+                .static_dimensions()
+                .ok_or_else(|| ArrayError::DynamicShape { shape: stacked_output_slice_type.shape().clone() })?;
             let mut expanded_dimensions = vec![1];
             expanded_dimensions.extend(slice_dimensions.iter().copied());
             let expanded = block.append_operation(stable_hlo::reshape(

@@ -61,11 +61,11 @@ pub use sharding::{
 };
 pub use types::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, MemoryLoweringExtension, PhysicalStoragePadding,
-    TypeLoweringExtension, dimension_extent_i32, dimension_extent_i64, lower_constant_output, lower_explicit_shape,
-    lower_f64_constant_splat, lower_static_index_constants, lower_u64_scalar_constant, lower_unplaced_constant_output,
-    stable_hlo_dynamic_dimension_bound, static_dimensions,
+    TypeLoweringExtension, dimension_extent_to_i32, dimension_extent_to_i64, lower_constant_output,
+    lower_explicit_shape, lower_f64_constant_splat, lower_static_index_constants, lower_u64_scalar_constant,
+    lower_unplaced_constant_output,
 };
-pub use values::ValueRefExtension;
+pub use values::{DimensionExtension, ValueRefExtension};
 
 /// Represents errors produced while validating a program for XLA lowering, constructing its StableHLO
 /// representation, or verifying the result.
