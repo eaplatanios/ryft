@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -9,13 +9,14 @@ use ryft_core::{
     EffectClass, ExternalReferenceBinding, FlatProgram, Instruction, LogicalMesh, Memory, MeshAxisType, Parameterized,
     PlaceOperation, PlacementRequest, Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RegionRole,
     RequestedPlacement, Shape, Sharding, ShardingDimension, StopGradientOperation, TagOperation,
-    TransferToMemoryOperation, Type as CoreType, Typed, TypedProgram, Value,
+    TransferToMemoryOperation, Type as CoreType, Typed, TypedProgram, UnreducedKind, Value,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, DetachedBlock, Error as MlirError, Location, LocationRef,
-    Operation as MlirOperation, OperationPrintingFlags, Region, SymbolVisibility, Type as MlirType, TypeAndAttributes,
-    Value as MlirValue, ValueRef, WalkOrder, WalkResult,
+    OpRef, Operation as MlirOperation, OperationPrintingFlags, OperationRef, OperationResultRef, Region,
+    SymbolVisibility, TensorTypeRef, Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueRef, WalkOrder,
+    WalkResult,
 };
 
 use crate::arrays::host::ReductionChange;
@@ -28,10 +29,7 @@ use crate::lowering::sharding::{
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, TypeLoweringExtension, lower_runtime_dimension_size_i64, lower_unplaced_constant_output,
 };
-use crate::lowering::{
-    EffectTokens, Lowerer, LoweringError, ProgramLoweringOperation, RaggedDotLoweringStrategy,
-    lower_instruction_operation,
-};
+use crate::lowering::{EffectTokens, Lowerer, LoweringError, ProgramLoweringOperation, RaggedDotLoweringStrategy};
 use crate::operations::call::{CallFunctionMap, collect_call_functions};
 use crate::{
     CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement, Type,
@@ -2536,6 +2534,12 @@ pub(crate) trait ProgramInlineLoweringExtension {
     /// the final token of each chain after the body returns. An instruction that uses the assertion token marks the
     /// module as requiring the runtime assertion handler.
     ///
+    /// Shardy needs explicit constraints to preserve pending reductions across most operations. Intermediate values
+    /// inherit pending reductions through the emitted operations, since marking a replicated intermediate unreduced
+    /// would count it once per device. Outputs take the tracked sharding of their types and retain known splits
+    /// along auto mesh axes. [`ryft_mlir::Module::remove_shardy_operations`] removes these constraints when the
+    /// target lacks the Shardy dialect.
+    ///
     /// # Errors
     ///
     /// Returns [`ProgramError::InvalidInputCount`] before emitting any operations when the input count differs from
@@ -2571,52 +2575,461 @@ where
         block: BlockRef<'b, 'c, 't>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        /// How the emitted operation relates its operand and result shardings.
+        #[derive(Copy, Clone, PartialEq, Eq)]
+        enum Propagation {
+            ShardingConstraint,
+            DeclaredElsewhere,
+            While,
+            OptimizationBarrier,
+            Elementwise,
+            Other,
+        }
+
         let region = self.entry_region_ref();
         let context = block.context();
         let target_platform = lowering_context.target_platform();
         let mut constant_block = block;
+        let lower_instruction = |instruction: &Instruction<O>, input_values: &[ValueRef<'b, 'c, 't>]| {
+            let (input_types, output_types) = region.instruction_boundary_types(instruction);
+
+            // All operations emitted for this instruction inherit its provenance on top of the ambient location.
+            let location = lowering_context.lower_provenance(context, instruction.provenance(), location);
+            let operation = instruction.operation();
+
+            // A named composite with a backend implementation or a shared function needs no copy of its body.
+            let regions = if operation.composite_key().is_some_and(|key| {
+                O::has_composite_implementation(key, &input_types, &output_types, target_platform)
+                    || nested_functions
+                        .is_some_and(|functions| functions.named(key, &input_types, &output_types).is_some())
+            }) {
+                Vec::new()
+            } else {
+                instruction
+                    .regions()
+                    .iter()
+                    .map(|attached| RegionRef::new(region.arena(), *attached).map(RegionRef::to_program))
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+
+            let mut lowerer = Lowerer::new(block, context, location, lowering_context.clone())
+                .with_regions(regions)
+                .with_nested_functions(nested_functions.cloned())
+                .with_captured_values(captured_values)
+                .with_effect_tokens(*effect_tokens);
+
+            let mut block = block;
+            let bound_manual_axes = lowering_context.bound_manual_axes();
+
+            // Every placed value in the program uses the same mesh. An unreduced input names that mesh and means
+            // the operations emitted for this instruction can carry a pending reduction outside manual regions.
+            let pending_reduction_mesh = input_types.iter().find_map(|input_type| {
+                let Type::Array(input_type) = input_type else { return None };
+                input_type
+                    .sharding()
+                    .filter(|sharding| sharding.unreduced_axes().iter().any(|axis| !bound_manual_axes.contains(axis)))
+                    .map(Sharding::mesh)
+            });
+
+            // Lowering appends operations to the block. A temporary, unused token marks where this instruction's
+            // operations begin so we can scan only those operations before removing the token.
+            let intermediate_anchor = if let Some(mesh) = pending_reduction_mesh {
+                let anchor =
+                    block.append_operation(stable_hlo::after_all::<ValueRef<'b, 'c, 't>, _>(&[], location)?)?;
+                Some((mesh, anchor))
+            } else {
+                None
+            };
+
+            let mut outputs = operation.lower(&mut lowerer, input_values, &input_types, &output_types)?;
+
+            let output_dimensions = if let Some((mesh, anchor)) = intermediate_anchor {
+                let mut pending_reductions = input_values
+                    .iter()
+                    .zip(&input_types)
+                    .filter_map(|(value, r#type)| Some((*value, PendingReduction::of_type(r#type, bound_manual_axes)?)))
+                    .collect::<Vec<_>>();
+
+                // Collect only the operations emitted into this block, before inserting constraints. Values inside
+                // nested operations are handled by their own lowering or have no independent sharding, like a
+                // reduction's scalar arguments. Calls, branches, and Shardy operations already declare their own
+                // placements.
+                let operations = block
+                    .operations_after(&anchor)?
+                    .map(|operation| {
+                        let operation = operation?;
+                        let name = operation.name();
+                        let propagation = match name
+                            .as_str()
+                            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?
+                        {
+                            "sdy.sharding_constraint" => Propagation::ShardingConstraint,
+                            "stablehlo.while" => Propagation::While,
+                            "stablehlo.optimization_barrier" => Propagation::OptimizationBarrier,
+                            "func.call" | "stablehlo.case" | "stablehlo.if" => Propagation::DeclaredElsewhere,
+                            name if name.starts_with("sdy.") => Propagation::DeclaredElsewhere,
+                            name if ELEMENTWISE_OPERATIONS.contains(&name) => Propagation::Elementwise,
+                            _ => Propagation::Other,
+                        };
+                        Ok((operation, propagation))
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+
+                let find = |value: ValueRef<'b, 'c, 't>,
+                            dimensions: &[(ValueRef<'b, 'c, 't>, Rc<[ShardingDimension]>)]| {
+                    dimensions
+                        .iter()
+                        .find(|(candidate, _)| *candidate == value)
+                        .map(|(_, dimensions)| Rc::clone(dimensions))
+                };
+
+                // Track input placements forward and output placements backward before any constraint replaces a use.
+                // An input keeps the splits along auto mesh axes that `constrained_dimensions` reads from its
+                // constraint. Its type cannot record these splits.
+                let mut forward_dimensions = Vec::new();
+                for (value, r#type) in input_values.iter().zip(&input_types) {
+                    if let Type::Array(r#type) = r#type
+                        && let Some(sharding) = r#type.sharding()
+                        && pending_reductions.iter().any(|(candidate, _)| candidate == value)
+                    {
+                        let dimensions = dimensions_along_auto_axes(
+                            constrained_dimensions(*value)?,
+                            sharding.dimensions_with_unconstrained_replicated().into(),
+                            mesh,
+                        );
+                        forward_dimensions.push((*value, dimensions));
+                    }
+                }
+
+                let mut backward_dimensions = outputs
+                    .iter()
+                    .zip(&output_types)
+                    .filter_map(|(value, r#type)| match r#type {
+                        Type::Array(r#type) => r#type
+                            .sharding()
+                            .map(|sharding| (*value, sharding.dimensions_with_unconstrained_replicated().into())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+
+                // Propagate known output placements backward through same-shape elementwise operations, such as
+                // a mean's division, and between corresponding barrier values. Other operations may change which
+                // dimensions are split.
+                for &(operation, propagation) in operations.iter().rev() {
+                    if propagation == Propagation::OptimizationBarrier {
+                        for (index, operand) in operation.operand_values().enumerate() {
+                            let operand = operand?;
+                            if let Some(dimensions) = find(operation.result(index)?.as_ref(), &backward_dimensions)
+                                && find(operand, &backward_dimensions).is_none()
+                            {
+                                backward_dimensions.push((operand, dimensions));
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    if propagation != Propagation::Elementwise || operation.result_count() != 1 {
+                        continue;
+                    }
+
+                    let result = operation.result(0)?.as_ref();
+                    let Some(dimensions) = find(result, &backward_dimensions) else { continue };
+                    let shape = result.tensor_shape()?;
+                    for operand in operation.operand_values() {
+                        let operand = operand?;
+                        if find(operand, &backward_dimensions).is_none() && operand.tensor_shape()? == shape {
+                            backward_dimensions.push((operand, Rc::clone(&dimensions)));
+                        }
+                    }
+                }
+
+                // Follow reduction state forward in block order. A constraint declares its own reduction state,
+                // while a loop carry or barrier result takes it from the matching operand. Each device computes other
+                // operations on its local contributions, so all their tensor results inherit the union of the operands'
+                // unreduced axes, even if the element type changes. Shardy requires a common reduction kind.
+                for (operation, propagation) in operations {
+                    let result_reductions = match propagation {
+                        Propagation::ShardingConstraint => vec![PendingReduction::of_constraint(operation)?],
+                        Propagation::DeclaredElsewhere => continue,
+                        Propagation::While | Propagation::OptimizationBarrier => {
+                            let reductions = operation
+                                .operand_values()
+                                .map(|operand| {
+                                    let operand = operand?;
+                                    Ok(pending_reductions
+                                        .iter()
+                                        .find(|(candidate, _)| *candidate == operand)
+                                        .map(|(_, reduction)| reduction.clone()))
+                                })
+                                .collect::<Result<Vec<_>, Error>>()?;
+
+                            if propagation == Propagation::OptimizationBarrier {
+                                let mut kinds = reductions.iter().flatten().map(|reduction| reduction.kind);
+                                if let Some(first) = kinds.next()
+                                    && let Some(other) = kinds.find(|kind| *kind != first)
+                                {
+                                    return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                                        operation: operation.name().to_string(),
+                                        reason: format!(
+                                            "Shardy cannot represent pending reductions of different kinds `{first}` \
+                                             and `{other}` on the results of one optimization barrier",
+                                        ),
+                                    }));
+                                }
+                            }
+
+                            reductions
+                        }
+                        Propagation::Elementwise | Propagation::Other => {
+                            let mut merged = None::<PendingReduction>;
+                            for operand in operation.operand_values() {
+                                let operand = operand?;
+                                let Some(reduction) = pending_reductions
+                                    .iter()
+                                    .find(|(candidate, _)| *candidate == operand)
+                                    .map(|(_, reduction)| reduction.clone())
+                                else {
+                                    continue;
+                                };
+
+                                match &mut merged {
+                                    None => merged = Some(reduction),
+                                    Some(merged) if merged.kind == reduction.kind => merged.axes.extend(reduction.axes),
+                                    Some(merged) => {
+                                        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                                            operation: operation.name().to_string(),
+                                            reason: format!(
+                                                "operands with pending reductions of different kinds `{}` and `{}`",
+                                                merged.kind, reduction.kind,
+                                            ),
+                                        }));
+                                    }
+                                }
+                            }
+
+                            if merged.is_none() {
+                                continue;
+                            }
+
+                            vec![merged; operation.result_count()]
+                        }
+                    };
+
+                    let constrains = propagation != Propagation::ShardingConstraint;
+                    let mut anchor = operation;
+                    for (index, reduction) in result_reductions.into_iter().enumerate() {
+                        let Some(reduction) = reduction else {
+                            continue;
+                        };
+
+                        let result = operation.result(index)?.as_ref();
+
+                        // An effect token orders uses of tensor values and carries no sharding of its own.
+                        let Some(tensor_type) = result.r#type()?.cast::<TensorTypeRef>() else { continue };
+                        let mut dimensions = None;
+                        if propagation == Propagation::Elementwise {
+                            let shape = result.tensor_shape()?;
+                            let mut operand_dimensions = Vec::new();
+                            for operand in operation.operand_values() {
+                                let operand = operand?;
+                                if let Some(dimensions) = find(operand, &forward_dimensions)
+                                    && operand.tensor_shape()? == shape
+                                {
+                                    operand_dimensions.push(dimensions);
+                                }
+                            }
+
+                            dimensions = match operand_dimensions.as_slice() {
+                                [] => None,
+                                [first] => Some(Rc::clone(first)),
+                                [first, ..] => {
+                                    // Each dimension takes the split specified by the operands that split it. Unsplit
+                                    // operands are sliced locally. Conflicting splits retain only the non-auto axes,
+                                    // where the types agree.
+                                    let dimensions = (0..first.len())
+                                        .map(|index| {
+                                            let mut splits = operand_dimensions.iter().filter_map(|dimensions| {
+                                                match dimensions.get(index) {
+                                                    Some(ShardingDimension::Sharded(axes)) => Some(axes),
+                                                    _ => None,
+                                                }
+                                            });
+
+                                            let Some(split) = splits.next() else { return first[index].clone() };
+
+                                            if splits.all(|other| other == split) {
+                                                return ShardingDimension::Sharded(split.clone());
+                                            }
+
+                                            let axes = split
+                                                .iter()
+                                                .filter(|axis| mesh.axis_type(axis) != Some(MeshAxisType::Auto))
+                                                .cloned()
+                                                .collect::<Vec<_>>();
+                                            if axes.is_empty() {
+                                                ShardingDimension::Replicated
+                                            } else {
+                                                ShardingDimension::Sharded(axes)
+                                            }
+                                        })
+                                        .collect::<Vec<_>>();
+
+                                    // An axis that operands use to split different dimensions splits none of them
+                                    // in the result. The operands are resharded to that placement regardless of their
+                                    // order.
+                                    let crossed = dimensions
+                                        .iter()
+                                        .flat_map(|dimension| match dimension {
+                                            ShardingDimension::Sharded(axes) => axes
+                                                .iter()
+                                                .filter(|axis| {
+                                                    dimensions
+                                                        .iter()
+                                                        .filter(|dimension| match dimension {
+                                                            ShardingDimension::Sharded(dimension_axes) => {
+                                                                dimension_axes.contains(axis)
+                                                            }
+                                                            _ => false,
+                                                        })
+                                                        .count()
+                                                        > 1
+                                                })
+                                                .cloned()
+                                                .collect(),
+                                            _ => Vec::new(),
+                                        })
+                                        .collect::<Vec<_>>();
+
+                                    Some(if crossed.is_empty() {
+                                        dimensions.into()
+                                    } else {
+                                        dimensions
+                                            .into_iter()
+                                            .map(|dimension| match dimension {
+                                                ShardingDimension::Sharded(axes) => {
+                                                    let axes = axes
+                                                        .into_iter()
+                                                        .filter(|axis| !crossed.contains(axis))
+                                                        .collect::<Vec<_>>();
+                                                    if axes.is_empty() {
+                                                        ShardingDimension::Replicated
+                                                    } else {
+                                                        ShardingDimension::Sharded(axes)
+                                                    }
+                                                }
+                                                dimension => dimension,
+                                            })
+                                            .collect()
+                                    })
+                                }
+                            };
+                        } else if matches!(propagation, Propagation::While | Propagation::OptimizationBarrier) {
+                            dimensions = find(operation.operand_value(index)?, &forward_dimensions);
+                        } else if propagation == Propagation::ShardingConstraint {
+                            dimensions = constrained_dimensions(result)?;
+                        }
+
+                        let dimensions = dimensions.or_else(|| find(result, &backward_dimensions));
+                        let mut needs_constraint = constrains && !outputs.contains(&result);
+
+                        // Nested regions inlined into this block already constrain their own intermediate values.
+                        if needs_constraint {
+                            for operand in result.uses()? {
+                                if operand?.operation()?.name().as_str() == Ok("sdy.sharding_constraint") {
+                                    needs_constraint = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !needs_constraint {
+                            if let Some(dimensions) = dimensions {
+                                forward_dimensions.push((result, dimensions));
+                            }
+                            pending_reductions.push((result, reduction));
+                            continue;
+                        }
+
+                        // Keep known splits to avoid gathering partitioned values. Unknown placements replicate,
+                        // and every dimension is closed so Shardy cannot reduce the operand and recreate the pending
+                        // reduction.
+                        let sharding = reduction.sharding(mesh, tensor_type.rank(), dimensions.as_deref())?;
+                        let constrained = lowering_context
+                            .lower_pending_reduction_constraint(&sharding, result, &mut block, location)?;
+                        let constraint = constrained.cast::<OperationResultRef>().unwrap().operation()?;
+
+                        // The constraint is appended to the block, and moved right after the operation that produces
+                        // its operand (or after the constraint of the previous result), so that it dominates every
+                        // later use of that operand.
+                        anchor = unsafe { constraint.move_after(&anchor) };
+                        result.replace_uses_except(constrained, &[&anchor]);
+
+                        if let Some(dimensions) = dimensions {
+                            forward_dimensions.push((constrained, dimensions));
+                        }
+
+                        pending_reductions.push((constrained, reduction));
+                    }
+                }
+
+                // Keep the output placements that propagated forward, such as auto-axis splits that `x + x` inherits
+                // from `x`.
+                let output_dimensions =
+                    outputs.iter().map(|output| find(*output, &forward_dimensions)).collect::<Vec<_>>();
+
+                // SAFETY: nothing uses the result of the anchor, so removing it from the block and dropping the
+                // detached operation that `remove_operation` returns destroys it without leaving a dangling use.
+                unsafe { block.remove_operation(anchor)? };
+
+                output_dimensions
+            } else {
+                Vec::new()
+            };
+
+            // Constrain outputs to their tracked sharding outside manual axes, retaining any known splits
+            // along auto axes. Outputs of Shardy operations already declare their sharding.
+            for (index, (output, output_type)) in outputs.iter_mut().zip(&output_types).enumerate() {
+                if let Type::Array(output_type) = output_type
+                    && let Some(sharding) = output_type.sharding()
+                    && sharding.unreduced_axes().iter().any(|axis| !bound_manual_axes.contains(axis))
+                    && !output
+                        .cast::<OperationResultRef>()
+                        .and_then(|result| result.operation().ok())
+                        .is_some_and(|operation| operation.name().as_str().is_ok_and(|name| name.starts_with("sdy.")))
+                {
+                    let dimensions = output_dimensions.get(index).cloned().flatten();
+                    let placed;
+                    let sharding = match dimensions_along_auto_axes(
+                        dimensions,
+                        sharding.dimensions_with_unconstrained_replicated().into(),
+                        sharding.mesh(),
+                    ) {
+                        dimensions if *dimensions != *sharding.dimensions_with_unconstrained_replicated() => {
+                            placed = sharding
+                                .with_dimensions(dimensions.to_vec())
+                                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+                            &placed
+                        }
+                        _ => sharding,
+                    };
+                    *output =
+                        lowering_context.lower_pending_reduction_constraint(sharding, *output, &mut block, location)?;
+                }
+            }
+
+            if lowerer.effect_tokens.ordered_assertion.is_some() {
+                lowering_context.require_assertion_handler();
+            }
+
+            *effect_tokens = lowerer.effect_tokens;
+
+            Ok(outputs)
+        };
+
         region.interpret_with(
             input_values.to_vec(),
             |_, value| value.lower(captured_values, lowering_context, &mut constant_block, context, location),
-            |instruction, inputs| {
-                let (input_types, output_types) = region.instruction_boundary_types(instruction);
-
-                // All operations emitted for this instruction inherit its provenance on top of the ambient location.
-                let location = lowering_context.lower_provenance(context, instruction.provenance(), location);
-                let operation = instruction.operation();
-
-                // A named composite with a backend implementation or a shared function needs no copy of its body.
-                let regions = if operation.composite_key().is_some_and(|key| {
-                    O::has_composite_implementation(key, &input_types, &output_types, target_platform)
-                        || nested_functions
-                            .is_some_and(|functions| functions.named(key, &input_types, &output_types).is_some())
-                }) {
-                    Vec::new()
-                } else {
-                    instruction
-                        .regions()
-                        .iter()
-                        .map(|attached| RegionRef::new(region.arena(), *attached).map(RegionRef::to_program))
-                        .collect::<Result<Vec<_>, _>>()?
-                };
-
-                let mut lowerer = Lowerer::new(block, context, location, lowering_context.clone())
-                    .with_regions(regions)
-                    .with_nested_functions(nested_functions.cloned())
-                    .with_captured_values(captured_values)
-                    .with_effect_tokens(*effect_tokens);
-
-                let outputs =
-                    lower_instruction_operation(operation, &mut lowerer, inputs, &input_types, &output_types)?;
-
-                if lowerer.effect_tokens.ordered_assertion.is_some() {
-                    lowering_context.require_assertion_handler();
-                }
-
-                *effect_tokens = lowerer.effect_tokens;
-
-                Ok(outputs)
-            },
+            lower_instruction,
         )
     }
 }
@@ -2967,6 +3380,142 @@ pub(crate) fn entry_outputs_with_compiler_chosen_placement(
         .collect()
 }
 
+/// A reduction that still needs to combine a value's per-device contributions.
+#[derive(Clone)]
+struct PendingReduction {
+    /// Non-empty set of mesh axes along which devices hold separate contributions. Axes bound by enclosing manual
+    /// regions are excluded.
+    axes: BTreeSet<String>,
+
+    /// Operation that combines the contributions across all of these axes, such as a sum or maximum.
+    kind: UnreducedKind,
+}
+
+impl PendingReduction {
+    /// Returns the pending reduction of a value of type `r#type`, if it has one over an axis that is not one of the
+    /// `bound_manual_axes`.
+    fn of_type(r#type: &Type, bound_manual_axes: &[String]) -> Option<Self> {
+        let Type::Array(r#type) = r#type else {
+            return None;
+        };
+        let axes = r#type
+            .unreduced_axes()
+            .iter()
+            .filter(|axis| !bound_manual_axes.contains(axis))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        (!axes.is_empty()).then(|| Self { axes, kind: r#type.unreduced_kind() })
+    }
+
+    /// Returns the pending reduction that a `sdy.sharding_constraint` operation declares for its result, if any.
+    fn of_constraint<'o, 'c: 'o, 't: 'c>(operation: OperationRef<'o, 'c, 't>) -> Result<Option<Self>, Error> {
+        let Some(constraint) = (unsafe { operation.cast::<shardy::ShardingConstraintOperationRef>() }) else {
+            return Ok(None);
+        };
+        let sharding = shardy::ShardingConstraintOperation::sharding(&constraint)?;
+        let axes = sharding
+            .unreduced_axes()
+            .iter()
+            .map(|axis| axis.name().as_str().map(str::to_string))
+            .collect::<Result<BTreeSet<_>, _>>()
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        let kind = match sharding.reduction_operation()? {
+            shardy::ReductionOperation::Sum => UnreducedKind::Sum,
+            shardy::ReductionOperation::Max => UnreducedKind::Max,
+            shardy::ReductionOperation::Min => UnreducedKind::Min,
+        };
+        Ok((!axes.is_empty()).then_some(Self { axes, kind }))
+    }
+
+    /// Returns the sharding of rank `rank` over `mesh` that declares this pending reduction for a value whose
+    /// dimensions are partitioned as `dimensions`, if known, and are otherwise replicated. Replication is also
+    /// the fallback when `dimensions` partitions a dimension along an axis of the pending reduction.
+    fn sharding(
+        &self,
+        mesh: &LogicalMesh,
+        rank: usize,
+        dimensions: Option<&[ShardingDimension]>,
+    ) -> Result<Sharding, Error> {
+        let declare = |sharding: Sharding| {
+            sharding
+                .with_unreduced_axes(self.axes.iter().cloned())
+                .and_then(|sharding| sharding.with_unreduced_kind(self.kind))
+        };
+        let partitioned = dimensions
+            .filter(|dimensions| dimensions.len() == rank)
+            .and_then(|dimensions| Sharding::new(mesh.clone(), dimensions.to_vec()).and_then(declare).ok());
+        match partitioned {
+            Some(sharding) => Ok(sharding),
+            None => declare(Sharding::replicated(mesh.clone(), rank))
+                .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() }.into()),
+        }
+    }
+}
+
+// TODO(eaplatanios): Expose Shardy's `sdy::isElementwise` on the next `ryft-xla-sys` update and replace this list.
+/// StableHLO operations that the pinned
+/// [`sdy::isElementwise`](https://github.com/openxla/shardy/blob/57fffc23dfdf139b80013ad681701cee59c22f96/shardy/dialect/sdy/transforms/common/op_properties.cc#L30-L45)
+/// recognizes. In addition to operations with the elementwise or broadcasting-elementwise trait, Shardy recognizes
+/// `map` and shape-preserving `bitcast_convert`. [Inline lowering](ProgramInlineLoweringExtension::lower_inline)
+/// checks each operand's shape against the result's before propagating dimension shardings. This excludes
+/// shape-changing bitcasts and broadcast scalars. Shape equality alone would also admit a square transpose,
+/// which swaps the dimensions.
+const ELEMENTWISE_OPERATIONS: &[&str] = &[
+    "stablehlo.abs",
+    "stablehlo.add",
+    "stablehlo.and",
+    "stablehlo.atan2",
+    "stablehlo.bitcast_convert",
+    "stablehlo.cbrt",
+    "stablehlo.ceil",
+    "stablehlo.clamp",
+    "stablehlo.compare",
+    "stablehlo.complex",
+    "stablehlo.convert",
+    "stablehlo.cosine",
+    "stablehlo.count_leading_zeros",
+    "stablehlo.divide",
+    "stablehlo.exp2",
+    "stablehlo.exponential",
+    "stablehlo.exponential_minus_one",
+    "stablehlo.floor",
+    "stablehlo.fma",
+    "stablehlo.imag",
+    "stablehlo.is_finite",
+    "stablehlo.log",
+    "stablehlo.log2",
+    "stablehlo.log_plus_one",
+    "stablehlo.logistic",
+    "stablehlo.map",
+    "stablehlo.maximum",
+    "stablehlo.minimum",
+    "stablehlo.multiply",
+    "stablehlo.negate",
+    "stablehlo.not",
+    "stablehlo.or",
+    "stablehlo.popcnt",
+    "stablehlo.power",
+    "stablehlo.real",
+    "stablehlo.reduce_precision",
+    "stablehlo.remainder",
+    "stablehlo.round_nearest_afz",
+    "stablehlo.round_nearest_even",
+    "stablehlo.rsqrt",
+    "stablehlo.select",
+    "stablehlo.shift_left",
+    "stablehlo.shift_right_arithmetic",
+    "stablehlo.shift_right_logical",
+    "stablehlo.sign",
+    "stablehlo.sine",
+    "stablehlo.sqrt",
+    "stablehlo.subtract",
+    "stablehlo.tan",
+    "stablehlo.tanh",
+    "stablehlo.uniform_dequantize",
+    "stablehlo.uniform_quantize",
+    "stablehlo.xor",
+];
+
 /// Returns the private `func.func` named `symbol`, whose body is the lowering of `program`, for a module to hold.
 /// The function takes the inputs of `program` and returns its outputs, without attributes. The repeated `call`s of
 /// `program` lower to calls of the shared functions in `nested_functions`, if any, and inline otherwise. The body is
@@ -3030,6 +3579,87 @@ fn lower_private_function<'c, 't: 'c, O: ProgramLoweringOperation>(
         function_region,
         location,
     )?)
+}
+
+/// Returns the dimension shardings that the `sdy.sharding_constraint` that produces `value` declares, including
+/// along auto mesh axes, which no type records, or [`None`] when `value` is not the result of such a constraint or the
+/// constraint partitions a dimension along a part of an axis. An empty dimension is replicated when it is closed and
+/// unconstrained when it is open.
+/// [Constraints for pending reductions](ProgramLoweringContext::lower_pending_reduction_constraint) record a value's
+/// placement along auto mesh axes, so the placement of an input or earlier result can be read directly from the
+/// program.
+fn constrained_dimensions(value: ValueRef<'_, '_, '_>) -> Result<Option<Rc<[ShardingDimension]>>, Error> {
+    let Some(result) = value.cast::<OperationResultRef>() else {
+        return Ok(None);
+    };
+
+    let operation = result.operation()?;
+    if operation.name().as_str() != Ok("sdy.sharding_constraint") {
+        return Ok(None);
+    }
+
+    let Some(constraint) = (unsafe { operation.cast::<shardy::ShardingConstraintOperationRef>() }) else {
+        return Ok(None);
+    };
+
+    let sharding = shardy::ShardingConstraintOperation::sharding(&constraint)?;
+    let mut dimensions = Vec::new();
+    for dimension in sharding.dim_shardings() {
+        let mut axes = Vec::new();
+        for axis in dimension.axes() {
+            if axis.sub_axis_info()?.is_some() {
+                return Ok(None);
+            }
+
+            let name = axis.name();
+            let name = name.as_str().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+            axes.push(name.to_string());
+        }
+
+        dimensions.push(if !axes.is_empty() {
+            ShardingDimension::Sharded(axes)
+        } else if dimension.is_closed() {
+            ShardingDimension::Replicated
+        } else {
+            ShardingDimension::Unconstrained
+        });
+    }
+
+    Ok(Some(dimensions.into()))
+}
+
+/// Returns `dimensions`, dimension shardings over `mesh` that the program states for a value (e.g., with
+/// [`constrained_dimensions`]), if they agree with `stated`, the closed dimension shardings of the type of that value
+/// (refer to [`Sharding::dimensions_with_unconstrained_replicated`]), along every mesh axis that is not an auto axis,
+/// which is all that a type records, and `stated` otherwise. A value whose type tracks a placement is placed as its
+/// type says along those axes, so the program can only add the placement along auto mesh axes, which its type cannot
+/// record.
+fn dimensions_along_auto_axes(
+    dimensions: Option<Rc<[ShardingDimension]>>,
+    stated: Rc<[ShardingDimension]>,
+    mesh: &LogicalMesh,
+) -> Rc<[ShardingDimension]> {
+    let without_auto_axes = |dimension: &ShardingDimension| match dimension {
+        ShardingDimension::Sharded(axes) => {
+            let axes = axes
+                .iter()
+                .filter(|axis| mesh.axis_type(axis) != Some(MeshAxisType::Auto))
+                .cloned()
+                .collect::<Vec<_>>();
+            if axes.is_empty() { ShardingDimension::Replicated } else { ShardingDimension::Sharded(axes) }
+        }
+        ShardingDimension::Replicated | ShardingDimension::Unconstrained => ShardingDimension::Replicated,
+    };
+
+    match dimensions {
+        Some(dimensions)
+            if dimensions.len() == stated.len()
+                && dimensions.iter().map(without_auto_axes).eq(stated.iter().cloned()) =>
+        {
+            dimensions
+        }
+        _ => stated,
+    }
 }
 
 // TODO(eaplatanios): Can you make a pass over the tests in @here making sure that all the test code complies with our
