@@ -258,7 +258,7 @@ pub(crate) fn validate_declared_pending_reduction(
         .filter(|axis| {
             !bound_manual_axes.contains(axis)
                 && !carried
-                    .is_some_and(|carried| carried.unreduced_kind() == kind && carried.unreduced_axes().contains(axis))
+                    .is_some_and(|carried| carried.unreduced_kind() == kind && carried.unreduced_axes().contains(*axis))
         })
         .collect::<Vec<_>>();
     if kind != UnreducedKind::Sum && !introduced.is_empty() {
@@ -1220,6 +1220,7 @@ pub(crate) mod tests {
                 }
             }
         }
+
         // A `while`, a `condition`, and a `scan` cannot carry such a value on the mixed mesh, whose auto axis no type
         // records (refer to `validate_pending_reductions_across_regions`), so they are rejected with the ways forward,
         // where they returned double the value of a split value and Shardy rejected a replicated one. The gathers on the

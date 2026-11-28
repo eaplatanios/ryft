@@ -897,9 +897,9 @@ impl TypeLoweringExtension for Type {
 /// shape operations.
 pub fn lower_explicit_shape<'b, 'c: 'b, 't: 'c>(
     extents: &[ValueRef<'b, 'c, 't>],
-    block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
-    location: ryft_mlir::LocationRef<'c, 't>,
+    location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let shape_type =
         context.tensor_type(context.signless_integer_type(64), &[MlirSize::Static(extents.len())], None, location)?;
@@ -927,9 +927,9 @@ pub fn lower_explicit_shape<'b, 'c: 'b, 't: 'c>(
 /// `stablehlo.dynamic_reshape`.
 pub(crate) fn lower_explicit_reshape_shape<'b, 'c: 'b, 't: 'c>(
     extents: &[ValueRef<'b, 'c, 't>],
-    block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
-    location: ryft_mlir::LocationRef<'c, 't>,
+    location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
     let shape_type =
