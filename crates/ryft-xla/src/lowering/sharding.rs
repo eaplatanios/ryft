@@ -234,16 +234,17 @@ impl ShardingExtension for Sharding {
     }
 }
 
-// TODO(eaplatanios): Review this.
-/// Pending reduction of a value: the mesh axes, excluding those that an enclosing manual region binds, along which the
-/// value holds one contribution per device, and the kind of the reduction that combines those contributions.
+/// A reduction that still needs to combine a value's per-device contributions.
 #[derive(Clone)]
 struct PendingReduction {
+    /// Non-empty set of mesh axes along which devices hold separate contributions. Axes bound by enclosing manual
+    /// regions are excluded.
     axes: BTreeSet<String>,
+
+    /// Operation that combines the contributions across all of these axes, such as a sum or maximum.
     kind: UnreducedKind,
 }
 
-// TODO(eaplatanios): Review this.
 impl PendingReduction {
     /// Returns the pending reduction of a value of type `r#type`, if it has one over an axis that is not one of the
     /// `bound_manual_axes`.
@@ -281,8 +282,8 @@ impl PendingReduction {
     }
 
     /// Returns the sharding of rank `rank` over `mesh` that declares this pending reduction for a value whose
-    /// dimensions are partitioned as `dimensions`, if known, and are otherwise replicated. Replication is also the
-    /// fallback when `dimensions` partitions a dimension along an axis of the pending reduction.
+    /// dimensions are partitioned as `dimensions`, if known, and are otherwise replicated. Replication is also
+    /// the fallback when `dimensions` partitions a dimension along an axis of the pending reduction.
     fn sharding(
         &self,
         mesh: &LogicalMesh,
@@ -305,9 +306,11 @@ impl PendingReduction {
     }
 }
 
-// TODO(eaplatanios): Review this.
-/// Names of the elementwise StableHLO operations whose results are partitioned like their operands of the same shape,
-/// along which [`constrain_unreduced_intermediates`] carries the dimension shardings of the values that it constrains.
+/// StableHLO operations through which [`constrain_unreduced_intermediates`] can copy dimension shardings between
+/// an operand and a result of the same shape. Shape equality alone is insufficient because transposing a square matrix
+/// preserves its shape while swapping its dimensions. This list covers a subset of the operations that Shardy's
+/// [`sdy::isElementwise`](https://github.com/openxla/shardy/blob/57fffc23dfdf139b80013ad681701cee59c22f96/shardy/dialect/sdy/transforms/common/op_properties.cc#L30-L45)
+/// recognizes. The Rust bindings do not expose that predicate.
 const ELEMENTWISE_OPERATIONS: &[&str] = &[
     "stablehlo.abs",
     "stablehlo.add",
