@@ -417,7 +417,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     ///
     /// Returns an error when this declaration conflicts with an earlier requirement for the same identifier.
     pub fn require_runtime(&mut self, requirement: RuntimeRequirement) -> Result<(), Error> {
-        self.lowering_context.require_runtime(requirement)
+        self.lowering_context.require_runtime_requirement(requirement)
     }
 
     /// Declares `mesh` as the mesh that this emitted operation refers to (e.g., through the Shardy attribute of a

@@ -25,10 +25,10 @@ pub(crate) struct ProgramLoweringContext {
     state: Rc<ProgramLoweringContextState>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ProgramLoweringContext {
-    /// Creates a context for one module, outside any manual region and without target information.
+    /// Creates a new [`ProgramLoweringContext`] for one program, outside any manual region and without target
+    /// information.
+    #[inline]
     pub(crate) fn new() -> Self {
         Self {
             state: Rc::new(ProgramLoweringContextState {
@@ -48,12 +48,14 @@ impl ProgramLoweringContext {
     }
 
     /// Returns this context carrying the PJRT platform name of the compilation target.
+    #[inline]
     pub(crate) fn with_target_platform(mut self, target_platform: Option<&str>) -> Self {
         Rc::make_mut(&mut self.state).target_platform = target_platform.map(Rc::from);
         self
     }
 
     /// Returns this context carrying the [`RaggedDotLoweringStrategy`] of the module.
+    #[inline]
     pub(crate) fn with_ragged_dot_lowering_strategy(mut self, strategy: RaggedDotLoweringStrategy) -> Self {
         Rc::make_mut(&mut self.state).ragged_dot_lowering_strategy = strategy;
         self
@@ -61,6 +63,7 @@ impl ProgramLoweringContext {
 
     /// Binds `session_constants` in the order their values appear at the end of the capture table. Hidden entry inputs
     /// come first, followed by placeholders for arrays passed to callees that never read them.
+    #[inline]
     pub(crate) fn with_session_constants<'a>(
         mut self,
         session_constants: impl IntoIterator<Item = &'a RetainedArray>,
@@ -76,11 +79,13 @@ impl ProgramLoweringContext {
 
     /// Returns the PJRT platform name of the compilation target, or `None` when the lowering has no target
     /// information.
+    #[inline]
     pub(crate) fn target_platform(&self) -> Option<&str> {
         self.state.target_platform.as_deref()
     }
 
     /// Returns the ragged dot lowering strategy for this module.
+    #[inline]
     pub(crate) fn ragged_dot_lowering_strategy(&self) -> RaggedDotLoweringStrategy {
         self.state.ragged_dot_lowering_strategy
     }
@@ -88,13 +93,13 @@ impl ProgramLoweringContext {
     /// Returns the decomposition at position `index` among those that lowering has requested for this module so far,
     /// in the order of their first requests, or [`None`] when fewer were requested. The module emits them after its
     /// other functions, and it asks by position because lowering one decomposition can request another.
+    #[inline]
     pub(super) fn named_composition(&self, index: usize) -> Option<NamedCompositionFunction> {
         self.state.named_compositions.borrow().functions().nth(index).cloned()
     }
 
-    /// Returns the mesh that lowering has recorded for this module so far (refer to
-    /// [`require_mesh`](Self::require_mesh)), which is the mesh that the module declares, or [`None`] when nothing
-    /// that lowering has emitted refers to a mesh.
+    /// Returns the mesh that lowering has recorded for this module so far, which is the mesh that the module declares,
+    /// or [`None`] when nothing that lowering has emitted refers to a mesh.
     #[inline]
     pub(super) fn mesh(&self) -> Option<LogicalMesh> {
         self.state.mesh.get().cloned()
@@ -113,11 +118,13 @@ impl ProgramLoweringContext {
     }
 
     /// Returns the innermost enclosing manual region's [`ShardMapBoundary`], or `None` outside manual regions.
+    #[inline]
     pub(crate) fn manual_shard_map(&self) -> Option<&ShardMapBoundary> {
         self.state.manual_regions.last().map(Rc::as_ref)
     }
 
     /// Returns the nearest enclosing region binding `axis_name`.
+    #[inline]
     pub(crate) fn manual_axis_region(&self, axis_name: &str) -> Option<&ShardMapBoundary> {
         self.state
             .manual_regions
@@ -135,6 +142,7 @@ impl ProgramLoweringContext {
 
     /// Returns the suffix of `captured_values` that holds the values of the session constants reachable in this scope.
     /// A scope whose `captured_values` table cannot hold them (e.g., a shared private function) has no such values.
+    #[inline]
     pub(crate) fn session_constant_values<'o, V>(&self, captured_values: &'o [V]) -> &'o [V] {
         captured_values
             .len()
@@ -142,55 +150,11 @@ impl ProgramLoweringContext {
             .map_or(&[], |start| &captured_values[start..])
     }
 
-    /// Records that this module requires the runtime assertion handler.
-    #[inline]
-    pub(super) fn require_assertion_handler(&self) {
-        self.state.requires_assertion_handler.set(true);
-    }
-
-    /// Records `requirement` as a runtime requirement of this module.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of `normalize_runtime_requirements` when `requirement` conflicts with a requirement that is
-    /// already recorded.
-    pub(super) fn require_runtime(&self, requirement: RuntimeRequirement) -> Result<(), Error> {
-        let mut requirements = self.state.runtime_requirements.borrow_mut();
-        let mut updated = requirements.clone();
-        updated.push(requirement);
-        *requirements = normalize_runtime_requirements(updated)?;
-        Ok(())
-    }
-
-    /// Records `mesh` as the mesh that this module declares, which everything that lowering emits over a mesh (i.e.,
-    /// the sharding of a signature value, of a constraint, or of the boundary of a manual computation) refers to by
-    /// one symbol. Whatever lowers a sharding records its mesh here, so the module declares a mesh exactly when
-    /// something that lowering emitted refers to one, rather than when an analysis of the program predicts that. The
-    /// module keeps the first mesh that is recorded, including its axis types, because the emitted `sdy.mesh` records
-    /// only axis names and sizes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LoweringError::MismatchedMeshTopology`] when the axis names or sizes of `mesh` differ from those of
-    /// the recorded mesh, including in order.
-    pub(crate) fn require_mesh(&self, mesh: &LogicalMesh) -> Result<(), Error> {
-        let recorded = self.state.mesh.get_or_init(|| mesh.clone());
-        if recorded.has_same_topology(mesh) {
-            Ok(())
-        } else {
-            Err(Error::Lowering(LoweringError::MismatchedMeshTopology {
-                expected: recorded.clone(),
-                actual: mesh.clone(),
-            }))
-        }
-    }
-
     /// Returns the symbol of the private function of this module that holds the decomposition of the named
     /// composition `key`, and records that the module needs that function. The first request for a key traces
-    /// `program`, which must not lower anything itself, and every later request shares its function (refer to
-    /// [`NamedCompositionFunctionMap::require`]). Whatever lowers a named composition requests its decomposition
-    /// here, so the module holds a decomposition exactly when something that lowering emitted refers to it, rather
-    /// than when an analysis of the program predicts that.
+    /// `program`, which must not lower anything itself, and every later request shares its function. Whatever lowers
+    /// a named composition requests its decomposition here, so the module holds a decomposition exactly when something
+    /// that lowering emitted refers to it, rather than when an analysis of the program predicts that.
     ///
     /// # Errors
     ///
@@ -203,6 +167,52 @@ impl ProgramLoweringContext {
         let mut named_compositions = self.state.named_compositions.borrow_mut();
         Ok(named_compositions.require(key, program)?.symbol().into())
     }
+
+    /// Records `mesh` as the mesh that this module declares, which everything that lowering emits over a mesh (i.e.,
+    /// the sharding of a signature value, of a constraint, or of the boundary of a manual computation) refers to by
+    /// one symbol. Whatever lowers a sharding records its mesh here, so the module declares a mesh exactly when
+    /// something that lowering emitted refers to one, rather than when an analysis of the program predicts that.
+    /// The module keeps the first mesh that is recorded, including its axis types, because the emitted `sdy.mesh`
+    /// records only axis names and sizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoweringError::MismatchedMeshTopology`] when the axis names or sizes of `mesh` differ from those
+    /// of the recorded mesh, including in order.
+    pub(crate) fn require_mesh(&self, mesh: &LogicalMesh) -> Result<(), Error> {
+        let recorded = self.state.mesh.get_or_init(|| mesh.clone());
+        if recorded.has_same_topology(mesh) {
+            Ok(())
+        } else {
+            Err(Error::Lowering(LoweringError::MismatchedMeshTopology {
+                expected: recorded.clone(),
+                actual: mesh.clone(),
+            }))
+        }
+    }
+
+    /// Records that this module requires the runtime assertion handler.
+    #[inline]
+    pub(super) fn require_assertion_handler(&self) {
+        self.state.requires_assertion_handler.set(true);
+    }
+
+    /// Records `requirement` as a runtime requirement of this module.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of `normalize_runtime_requirements` when `requirement` conflicts with a requirement
+    /// that is already recorded.
+    #[inline]
+    pub(super) fn require_runtime_requirement(&self, requirement: RuntimeRequirement) -> Result<(), Error> {
+        let mut requirements = self.state.runtime_requirements.borrow_mut();
+        let mut updated = requirements.clone();
+        updated.push(requirement);
+        *requirements = normalize_runtime_requirements(updated)?;
+        Ok(())
+    }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns a fresh module-unique channel id for one channeled collective.
     pub(crate) fn allocate_channel_id(&self) -> usize {
@@ -363,8 +373,8 @@ struct ProgramLoweringContextState {
     mesh: Rc<OnceCell<LogicalMesh>>,
 
     /// Flag of the module recording whether any recursive lowering path constructed a location specific to an
-    /// instruction (i.e., not the base location) from a known [`Provenance`]. It selects the module serialization mode
-    /// after lowering completes. Only a module that actually carries provenance locations is printed with debug
+    /// instruction (i.e., not the base location) from a known [`Provenance`]. It selects the module serialization
+    /// mode after lowering completes. Only a module that actually carries provenance locations is printed with debug
     /// information, so modules without provenance keep their existing StableHLO text and cache keys byte for byte.
     has_provenance: Rc<Cell<bool>>,
 
@@ -380,9 +390,9 @@ struct ProgramLoweringContextState {
     /// Axes bound by any enclosing manual region, excluded from shard-local placement constraints.
     bound_manual_axes: Vec<String>,
 
-    /// Position of each retained array within the session constant suffix of `captured_values`. The suffix holds
-    /// hidden entry inputs followed by bufferless placeholders for arrays that the program only passes to callees that
-    /// never read them. Entering an `sdy.manual_computation` clears these bindings because its body is isolated.
+    /// Position of each retained array within the session constant suffix of `captured_values`. The suffix holds hidden
+    /// entry inputs followed by bufferless placeholders for arrays that the program only passes to callees that never
+    /// read them. Entering an `sdy.manual_computation` clears these bindings because its body is isolated.
     session_constant_indices: Rc<HashMap<RetainedArray, usize>>,
 }
 
@@ -575,7 +585,7 @@ mod tests {
         inner.require_mesh(&mesh).unwrap();
         assert_eq!(root.mesh(), Some(mesh));
         let requirement = RuntimeRequirement::new("ryft.tests.nested", 1).unwrap();
-        sibling.require_runtime(requirement.clone()).unwrap();
+        sibling.require_runtime_requirement(requirement.clone()).unwrap();
         assert_eq!(inner.runtime_requirements(), vec![requirement]);
         inner.require_assertion_handler();
         assert!(root.requires_assertion_handler());
