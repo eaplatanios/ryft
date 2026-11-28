@@ -7,31 +7,34 @@ use std::sync::Arc;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, Atom, AtomId, BroadcastOperation, CallOperation, DataType, DeviceMesh, Dimension, EagerContext,
-    EffectClass, ErasedOperation, ExternalReferenceBinding, FlatProgram, Instruction, Layout, LogicalMesh, Memory,
-    MeshAxisType, Parameterized, PlaceOperation, PlacementRequest, Program, ProgramError, Region as CoreRegion,
-    RegionId, RegionPlacementRequests, RegionRef, RegionRole, RequestedPlacement, Shape, Sharding, ShardingDimension,
-    StopGradientOperation, TagOperation, TransferToMemoryOperation, Type as CoreType, Typed, TypedProgram,
-    UnreducedKind, Value,
+    EffectClass, EffectClasses, ErasedOperation, ExternalReferenceBinding, FlatProgram, Instruction, Layout,
+    LogicalMesh, Memory, MeshAxisType, Parameterized, PlaceOperation, PlacementRequest, Program, ProgramError,
+    Region as CoreRegion, RegionId, RegionPlacementRequests, RegionRef, RegionRole, RequestedPlacement, Shape,
+    Sharding, ShardingDimension, StopGradientOperation, TagOperation, TransferToMemoryOperation, Type as CoreType,
+    Typed, TypedProgram, UnreducedKind, Value,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, DetachedBlock, Error as MlirError, Location, LocationRef,
     OpRef, Operation as MlirOperation, OperationPrintingFlags, OperationRef, OperationResultRef, Region,
     StringAttributeRef, SymbolVisibility, TensorTypeRef, Type as MlirType, TypeAndAttributes, Value as MlirValue,
-    ValueRef, WalkOrder, WalkResult,
+    ValueAndAttributes, ValueRef, WalkOrder, WalkResult,
 };
 
 use crate::arrays::host::ReductionChange;
 use crate::devices::MemoryExtension;
-use crate::lowering::contexts::ProgramLoweringContext;
+use crate::lowering::contexts::{PrivateFunction, PrivateFunctionBody, PrivateFunctionProgram, ProgramLoweringContext};
 use crate::lowering::sharding::{
     LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension,
     validate_declared_pending_reduction, validate_partial_completion, validate_pending_reduction_change,
 };
-use crate::lowering::types::{ArrayTypeLoweringExtension, TypeLoweringExtension, lower_unplaced_constant_output};
+use crate::lowering::types::{ArrayTypeLoweringExtension, TypeLoweringExtension};
 use crate::lowering::values::ValueRefExtension;
-use crate::lowering::{EffectTokens, Lowerer, LoweringError, ProgramLoweringOperation, RaggedDotLoweringStrategy};
-use crate::operations::call::{CallFunctionMap, collect_call_functions};
+use crate::lowering::{
+    EffectTokens, FamilyInstructionLowerer, Lowerer, LoweringError, LoweringRule, LoweringRules,
+    ProgramLoweringOperation, RaggedDotLoweringStrategy,
+};
+use crate::operations::call::{NamedFunctionKey, plan_call_functions};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::{
     CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement, ToPjrt, Type,
@@ -52,19 +55,24 @@ pub struct MlirProgram {
     /// Module mesh that every sharding and `shard_map` boundary of the module refers to, or `None` when the module
     /// declares no mesh. Compilation checks it against the topology of the device mesh that it targets.
     mesh: Option<LogicalMesh>,
+
+    /// Target platforms that the module was lowered for, in the order of the platform index, or none when it was
+    /// lowered without a target platform.
+    platforms: Arc<[String]>,
 }
 
 impl MlirProgram {
     /// Pairs the rendered `stable_hlo` module with the entry function's `boundary_mapping`, its canonical
-    /// `runtime_requirements`, and its module `mesh`.
+    /// `runtime_requirements`, its module `mesh`, and the target `platforms` that it was lowered for.
     #[inline]
     fn new(
         stable_hlo: String,
         boundary_mapping: MlirProgramBoundaryMapping,
         runtime_requirements: Arc<[RuntimeRequirement]>,
         mesh: Option<LogicalMesh>,
+        platforms: Arc<[String]>,
     ) -> Self {
-        Self { stable_hlo, boundary_mapping, runtime_requirements, mesh }
+        Self { stable_hlo, boundary_mapping, runtime_requirements, mesh, platforms }
     }
 
     /// Returns the rendered StableHLO module of this [`MlirProgram`].
@@ -84,6 +92,15 @@ impl MlirProgram {
     #[inline]
     pub fn mesh(&self) -> Option<&LogicalMesh> {
         self.mesh.as_ref()
+    }
+
+    /// Returns the target platforms that the module was lowered for, or none when it was lowered without a target
+    /// platform. The entry function of a module for several platforms takes a platform index as its last input (refer
+    /// to [`MlirProgramBoundaryMapping::platform_index_input_index`]), whose value is the position of the platform
+    /// that executes the module in these platforms.
+    #[inline]
+    pub fn platforms(&self) -> &[String] {
+        &self.platforms
     }
 
     /// Returns the rendered StableHLO module of this lowering, consuming it.
@@ -140,6 +157,10 @@ pub struct MlirProgramBoundaryMapping {
 
     /// Whether lowering emitted a runtime assertion, including synthesized checks.
     requires_assertion_handler: bool,
+
+    /// Whether the executable takes the platform index as its last input, which a module that is lowered for several
+    /// target platforms does.
+    platform_index: bool,
 }
 
 impl MlirProgramBoundaryMapping {
@@ -206,7 +227,15 @@ impl MlirProgramBoundaryMapping {
             device_ordered_io: false,
             unordered_io: false,
             requires_assertion_handler: false,
+            platform_index: false,
         }
+    }
+
+    /// Returns this mapping for an executable that takes the platform index as its last input.
+    #[inline]
+    pub(crate) fn with_platform_index(mut self) -> Self {
+        self.platform_index = true;
+        self
     }
 
     /// Erases the logical inputs that `unread_inputs` flags (i.e., one flag per logical input), which the executable
@@ -348,6 +377,15 @@ impl MlirProgramBoundaryMapping {
         self.ordered_io.then(|| self.output_mapping.iter().flatten().count() + self.output_dimensions.len())
     }
 
+    /// Returns the ordinal of the platform index input, which follows every other input, or [`None`] when the
+    /// executable takes none. The platform index is a scalar `i32` that selects the target platform that the
+    /// executable runs on, among the platforms that its module was lowered for (refer to
+    /// [`MlirProgram::platforms`]).
+    #[inline]
+    pub fn platform_index_input_index(&self) -> Option<usize> {
+        self.platform_index.then(|| self.input_array_count() + usize::from(self.ordered_io))
+    }
+
     /// Returns the number of array inputs, including hidden extent scalars but excluding tokens.
     #[inline]
     pub fn input_array_count(&self) -> usize {
@@ -360,11 +398,11 @@ impl MlirProgramBoundaryMapping {
         self.output_mapping.iter().flatten().count() + self.output_dimensions.len()
     }
 
-    /// Returns the total number of executable inputs, including hidden extent scalars and the ordered I/O token
-    /// when present.
+    /// Returns the total number of executable inputs, including hidden extent scalars, the ordered I/O token, and
+    /// the platform index when present.
     #[inline]
     pub fn executable_input_count(&self) -> usize {
-        self.input_mapping.iter().flatten().count() + self.input_dimensions.len() + usize::from(self.ordered_io)
+        self.input_array_count() + usize::from(self.ordered_io) + usize::from(self.platform_index)
     }
 
     /// Returns the total number of executable outputs, including hidden extent scalars and the ordered I/O token
@@ -609,7 +647,9 @@ pub trait ProgramLoweringExtension {
     /// it where it runs instead). Lowering failures use the corresponding [`Error`] variants (e.g.,
     /// [`LoweringError::UnresolvedReference`] or [`LoweringError::UnresolvedState`] for undischarged references or
     /// state, [`LoweringError::InvalidFunctionName`] for an invalid function name, mismatched signature shardings,
-    /// or operations that the backend cannot lower).
+    /// or operations that the backend cannot lower). Returns [`CompilationError::InvalidOptions`] when the options
+    /// name several target platforms and the program places its outputs differently on two of them, because the
+    /// entry function annotates its outputs once.
     fn to_mlir<S: AsRef<str>>(&self, function_name: S, options: &ProgramLoweringOptions) -> Result<MlirProgram, Error>;
 
     /// Renders a full StableHLO/Shardy MLIR module for this program according to `options`.
@@ -639,14 +679,27 @@ where
     Output: Parameterized<Constant>,
 {
     fn to_mlir<S: AsRef<str>>(&self, function_name: S, options: &ProgramLoweringOptions) -> Result<MlirProgram, Error> {
-        let target_platform = options.target_platform();
-        let pruned;
-        let program = if options.prune {
-            pruned = self.pruned_for_lowering(target_platform)?;
-            &pruned
-        } else {
-            self
+        // A module is lowered for each of its target platforms as a whole, because the platform already decides what
+        // lowering emits (i.e., how the program is pruned, which regions are emitted, and which inputs are read).
+        // Without a target platform the module is lowered once, with no target information.
+        let platforms = match options.target_platforms() {
+            [] => vec![None],
+            platforms => platforms.iter().map(|platform| Some(platform.as_str())).collect::<Vec<_>>(),
         };
+
+        let pruned = match options.prune {
+            true => platforms
+                .iter()
+                .map(|platform| self.pruned_for_lowering(*platform))
+                .collect::<Result<Vec<_>, _>>()?,
+            false => Vec::new(),
+        };
+
+        let variants = platforms
+            .iter()
+            .enumerate()
+            .map(|(index, platform)| (*platform, pruned.get(index).unwrap_or(self)))
+            .collect::<Vec<_>>();
 
         // Only arrays cross the boundary of an executable, so the types that the program provides must be arrays.
         let as_array_types = |types: Vec<Type>| {
@@ -665,9 +718,12 @@ where
         };
 
         // Arrays that session constants refer to enter the module as hidden inputs that precede the public inputs,
-        // which are annotated as their runtime arrays are placed, as compilation for a `Session` passes them.
-        let regions = program.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter);
-        let session_constants = ProgramSessionConstants::from_regions(regions, target_platform);
+        // which are annotated as their runtime arrays are placed, as compilation for a `Session` passes them. The
+        // module receives the arrays that the program reads on any of its platforms.
+        let session_constants = ProgramSessionConstants::union(variants.iter().map(|(platform, program)| {
+            let regions = program.entry_region_ref().emitted_regions(*platform, CallTraversal::Enter);
+            ProgramSessionConstants::from_regions(regions, *platform)
+        }));
         let capture_types = options.capture_types.clone().unwrap_or_else(|| {
             session_constants.inputs.iter().map(|constant| constant.r#type().into_owned()).collect()
         });
@@ -739,15 +795,37 @@ where
                 (vec![None; output_types.len()], options.open_outputs.clone().unwrap_or_default())
             }
             None => {
+                // The entry function annotates its outputs once, so the program must place them alike on every
+                // platform that the module is lowered for.
                 let explicit = options.output_shardings.as_deref();
-                let sources =
-                    program.output_sharding_sources(output_types.len(), |constant| constant.sharding().clone());
-                let shardings = entry_output_shardings(&output_types, explicit, &sources, &input_shardings)?;
-                let open_outputs = match &options.open_outputs {
-                    Some(open_outputs) => open_outputs.clone(),
-                    None => entry_outputs_with_compiler_chosen_placement(&output_types, explicit, &sources, &shardings),
-                };
-                (shardings, open_outputs)
+                let mut resolved: Option<(Vec<Option<Sharding>>, Vec<bool>)> = None;
+                for (platform, program) in &variants {
+                    let sources =
+                        program.output_sharding_sources(output_types.len(), |constant| constant.sharding().clone());
+                    let shardings = entry_output_shardings(&output_types, explicit, &sources, &input_shardings)?;
+                    let open_outputs = match &options.open_outputs {
+                        Some(open_outputs) => open_outputs.clone(),
+                        None => {
+                            entry_outputs_with_compiler_chosen_placement(&output_types, explicit, &sources, &shardings)
+                        }
+                    };
+                    match &resolved {
+                        None => resolved = Some((shardings, open_outputs)),
+                        Some((first_shardings, first_open_outputs))
+                            if *first_shardings == shardings && *first_open_outputs == open_outputs => {}
+                        Some(_) => {
+                            return Err(Error::Compilation(CompilationError::InvalidOptions {
+                                reason: format!(
+                                    "the program places its outputs differently on the target platform `{}` than on \
+                                     the target platform `{}`, so one module cannot be lowered for both",
+                                    platform.unwrap_or_default(),
+                                    platforms[0].unwrap_or_default(),
+                                ),
+                            }));
+                        }
+                    }
+                }
+                resolved.unwrap_or_default()
             }
         };
 
@@ -756,9 +834,8 @@ where
             (capture_types.as_slice(), input_types.as_slice(), output_types.as_slice());
         let (logical_input_shardings, output_shardings, open_outputs) =
             (logical_input_shardings.as_slice(), output_shardings.as_slice(), open_outputs.as_slice());
-        let supports_shardy = options.supports_shardy();
-        let ragged_dot_lowering_strategy = options.ragged_dot_lowering_strategy();
-        let boundary = program.entry_boundary(
+        let mut boundary = Self::entry_boundary(
+            &variants,
             function_name,
             session_constants,
             capture_types,
@@ -769,179 +846,387 @@ where
             open_outputs,
             options,
         )?;
+        let lower = |boundary: &ProgramBoundary, variants: &[(Option<&str>, &Self)], dispatch: &[usize]| {
+            lower_module(
+                boundary,
+                variants,
+                dispatch,
+                capture_types.len(),
+                logical_input_shardings,
+                output_shardings,
+                open_outputs,
+                options,
+            )
+        };
 
-        let context = MlirContext::new();
-        let location = context.unknown_location();
-        let mut module = context.module(location)?;
-
-        // Module-scoped lowering context, shared between the entry function body and private functions below so channel
-        // ids stay unique and target, representation policy, named compositions, and provenance state reach nested
-        // bodies. The arrays that the program only passes on to calls that never read them follow the session
-        // constants in the table, and the entry function binds them to values that require no buffer.
-        let lowering_context = ProgramLoweringContext::new()
-            .with_target_platform(target_platform)
-            .with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy)
-            .with_session_constants(
-                boundary.session_constants.inputs.iter().chain(&boundary.session_constants.forwarded),
-            );
-
-        // The module declares the mesh that the lowered shardings refer to, which is recorded as they are lowered
-        // (refer to `ProgramLoweringContext::require_mesh`). The signature shardings are recorded first, so that the
-        // module mesh keeps their axis types.
-        for sharding in logical_input_shardings.iter().chain(output_shardings).flatten() {
-            lowering_context.require_mesh(sharding.mesh())?;
+        if variants.len() == 1 {
+            return lower(&boundary, &variants, &[0]);
         }
+
+        // The entry function of a module for several platforms takes the platform index as its last input. Platforms
+        // on which the program lowers to the same module share one body, which is found by lowering the module for
+        // each platform alone. With one distinct body, that module is the module for all of them.
+        boundary.boundary_mapping = boundary.boundary_mapping.with_platform_index();
+        let mut distinct: Vec<(MlirProgram, usize)> = Vec::new();
+        let mut dispatch = Vec::with_capacity(variants.len());
+        for (index, variant) in variants.iter().enumerate() {
+            let lowered = lower(&boundary, std::slice::from_ref(variant), &[0])?;
+            match distinct.iter().position(|(module, _)| module.stable_hlo == lowered.stable_hlo) {
+                Some(position) => dispatch.push(position),
+                None => {
+                    dispatch.push(distinct.len());
+                    distinct.push((lowered, index));
+                }
+            }
+        }
+        if distinct.len() == 1 {
+            return Ok(distinct.remove(0).0);
+        }
+        let representatives = distinct.iter().map(|(_, index)| variants[*index]).collect::<Vec<_>>();
+        lower(&boundary, &representatives, &dispatch)
+    }
+}
+
+// TODO(eaplatanios): Inline this function.
+/// Lowers the module of a program whose entry function has the provided `boundary`, for the provided `variants` of
+/// the program, each of which is the program as it is lowered for one target platform (i.e., pruned for it) together
+/// with that platform. The shardings and open output flags follow logical boundary order, with the `capture_count`
+/// captures first on the input side.
+///
+/// With one variant, the entry function holds the body of that variant. With several, each variant is a private
+/// function named after the entry function and its platform, which takes the executable inputs and returns the
+/// executable outputs, and the entry function calls the variant that `dispatch` gives for its last input, the
+/// platform index. `dispatch` holds the position in `variants` of the variant of each target platform of `options`.
+///
+/// The variants share the module (i.e., its mesh, channels, runtime requirements, and assertion handler), and each
+/// one lowers the private functions that it requests for its own platform.
+#[allow(clippy::too_many_arguments)]
+fn lower_module<O, Input, Output>(
+    boundary: &ProgramBoundary,
+    variants: &[(Option<&str>, &Program<Constant, O, Input, Output>)],
+    dispatch: &[usize],
+    capture_count: usize,
+    logical_input_shardings: &[Option<Sharding>],
+    output_shardings: &[Option<Sharding>],
+    open_outputs: &[bool],
+    options: &ProgramLoweringOptions,
+) -> Result<MlirProgram, Error>
+where
+    O: ProgramLoweringOperation,
+    Input: Parameterized<Constant>,
+    Output: Parameterized<Constant>,
+{
+    /// Lowers the body of `variant` into `body_block`, whose arguments are the executable inputs of `boundary`, and
+    /// inserts the private functions that the variant plans and requests into `module_block`, at
+    /// `private_function_count`, which counts the private functions that the module holds.
+    /// `registered_function_count` counts the functions of the registry of `module_context` that the module holds,
+    /// which are fewer when the module also holds the bodies of other variants as private functions.
+    ///
+    /// The planned functions are lowered before the body and the functions that lowering requests are lowered after
+    /// it, and lowering a function can request further functions, which is why they are read by position. The
+    /// functions refer to each other by symbol, so the order of emission does not matter.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_variant<'b, 'm, 'c: 'b + 'm, 't: 'c, O, Input, Output>(
+        boundary: &ProgramBoundary,
+        variant: &(Option<&str>, &Program<Constant, O, Input, Output>),
+        capture_count: usize,
+        logical_input_shardings: &[Option<Sharding>],
+        supports_shardy: bool,
+        body_block: &'b DetachedBlock<'c, 't>,
+        module_block: &mut BlockRef<'m, 'c, 't>,
+        private_function_count: &mut usize,
+        registered_function_count: &mut usize,
+        module_context: &ProgramLoweringContext,
+        mlir_context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<(), Error>
+    where
+        O: ProgramLoweringOperation,
+        Input: Parameterized<Constant>,
+        Output: Parameterized<Constant>,
+    {
+        let (target_platform, program) = *variant;
+        let lowering_context = module_context.clone().with_target_platform(target_platform);
 
         // Deduplicate `call` callees that occur more than once into shared private `func.func`s, so repeated nested
         // programs (e.g., identical transformer blocks or the per-block primal and pullback programs of `grad`) lower
-        // to one function plus N `func.call`s instead of N inlined copies. The map is empty for modules without
-        // repeated calls, in which case every `call` inlines exactly as before.
-        let nested_functions = Rc::new(collect_call_functions(program, target_platform)?);
+        // to one function plus N `func.call`s instead of N inlined copies. Nothing is planned for programs without
+        // repeated calls, in which case every `call` inlines.
+        plan_call_functions(program, &lowering_context)?;
 
-        // Each shared callee is emitted as a private function ahead of the entry function. Its own repeated `call`s
-        // lower to calls of the other shared functions, which are referred to by symbol, so the order of emission
-        // does not matter.
-        let mut module_block = module.body()?;
-        let location_ref = location.as_ref();
-        for function in nested_functions.functions() {
-            let (symbol, program) = (function.symbol(), function.program());
-            let functions = Some(&nested_functions);
-            let function =
-                lower_private_function(symbol, program, functions, &lowering_context, &context, location_ref)?;
-            module_block.append_operation(function)?;
+        let lower_function = |function: PrivateFunction| {
+            let symbol = function.symbol();
+            match function.body() {
+                PrivateFunctionBody::Region { region, capture_count } => {
+                    let program = program.region_ref(*region)?.to_program();
+                    lower_private_function(symbol, &program, *capture_count, &lowering_context, mlir_context, location)
+                }
+                PrivateFunctionBody::Program(program) => {
+                    program.lower_private_function(symbol, &lowering_context, mlir_context, location)
+                }
+            }
+        };
+        while let Some(function) = lowering_context.function(*registered_function_count) {
+            module_block.insert_operation(lower_function(function)?, *private_function_count)?;
+            *private_function_count += 1;
+            *registered_function_count += 1;
         }
-
-        let (function_arguments, function_results) = boundary.lower_attributes(
+        boundary.lower_body(
+            program,
+            capture_count,
             logical_input_shardings,
-            output_shardings,
-            open_outputs,
             supports_shardy,
-            &context,
-            location.as_ref(),
+            body_block,
+            &lowering_context,
+            mlir_context,
+            location,
         )?;
 
-        module_block.append_operation({
-            let argument_types =
-                function_arguments.iter().map(|argument| (argument.r#type, location)).collect::<Vec<_>>();
-            let function_block = context.block(argument_types.as_slice());
-            boundary.lower_body(
-                program,
-                capture_types.len(),
+        // The functions that lowering the body requested (e.g., the decompositions of the named compositions that it
+        // emitted) are recorded as it requests them.
+        while let Some(function) = lowering_context.function(*registered_function_count) {
+            module_block.insert_operation(lower_function(function)?, *private_function_count)?;
+            *private_function_count += 1;
+            *registered_function_count += 1;
+        }
+        Ok(())
+    }
+
+    let supports_shardy = options.supports_shardy();
+    let context = MlirContext::new();
+    let location = context.unknown_location();
+    let location_ref = location.as_ref();
+    let mut module = context.module(location)?;
+
+    // Module-scoped lowering context, shared between the bodies of the variants and the private functions so that
+    // channel ids stay unique and representation policy, lowering rules, private functions, and provenance state reach
+    // nested bodies. The arrays that the program only passes on to calls that never read them follow the session
+    // constants in the table, and the entry function binds them to values that require no buffer.
+    let module_context = ProgramLoweringContext::new()
+        .with_ragged_dot_lowering_strategy(options.ragged_dot_lowering_strategy())
+        .with_lowering_rules(options.lowering_rules.clone())
+        .with_session_constants(boundary.session_constants.inputs.iter().chain(&boundary.session_constants.forwarded));
+
+    // The module declares the mesh that the lowered shardings refer to, which is recorded as they are lowered
+    // (refer to `ProgramLoweringContext::require_mesh`). The signature shardings are recorded first, so that the
+    // module mesh keeps their axis types.
+    for sharding in logical_input_shardings.iter().chain(output_shardings).flatten() {
+        module_context.require_mesh(sharding.mesh())?;
+    }
+
+    // The module holds its private functions ahead of the entry function, in the order in which they were registered
+    // (refer to `ProgramLoweringContext::require_function`).
+    let mut module_block = module.body()?;
+    let (mut private_function_count, mut registered_function_count) = (0, 0);
+    let (function_arguments, function_results) = boundary.lower_attributes(
+        logical_input_shardings,
+        output_shardings,
+        open_outputs,
+        supports_shardy,
+        &context,
+        location_ref,
+    )?;
+    let argument_types = function_arguments.iter().map(|argument| (argument.r#type, location)).collect::<Vec<_>>();
+    let function_block = context.block(argument_types.as_slice());
+    if let [variant] = variants {
+        lower_variant(
+            boundary,
+            variant,
+            capture_count,
+            logical_input_shardings,
+            supports_shardy,
+            &function_block,
+            &mut module_block,
+            &mut private_function_count,
+            &mut registered_function_count,
+            &module_context,
+            &context,
+            location_ref,
+        )?;
+    } else {
+        // Each variant is a private function over the executable boundary, without the platform index and without
+        // attributes, which the entry function states for all of them.
+        let platform_index = boundary.boundary_mapping.platform_index_input_index().ok_or_else(|| {
+            ProgramError::MalformedProgram("a module for several platforms takes a platform index".to_string())
+        })?;
+        let mut symbols = Vec::with_capacity(variants.len());
+        for variant in variants {
+            let body_block = context.block(&argument_types[..platform_index]);
+            lower_variant(
+                boundary,
+                variant,
+                capture_count,
                 logical_input_shardings,
                 supports_shardy,
-                &function_block,
-                &nested_functions,
-                &lowering_context,
+                &body_block,
+                &mut module_block,
+                &mut private_function_count,
+                &mut registered_function_count,
+                &module_context,
                 &context,
-                location.as_ref(),
+                location_ref,
             )?;
-            let mut function_region = context.region();
-            function_region.append_block(function_block)?;
-            func::func(
-                boundary.function_name.as_str(),
-                func::FuncAttributes { arguments: function_arguments, results: function_results, ..Default::default() },
-                function_region,
+            let symbol = format!("{}.{}", boundary.function_name, variant.0.unwrap_or_default());
+            let mut body_region = context.region();
+            body_region.append_block(body_block)?;
+            let function = func::func(
+                symbol.as_str(),
+                func::FuncAttributes {
+                    arguments: function_arguments[..platform_index]
+                        .iter()
+                        .map(|argument| TypeAndAttributes { r#type: argument.r#type, attributes: None })
+                        .collect(),
+                    results: function_results
+                        .iter()
+                        .map(|result| TypeAndAttributes { r#type: result.r#type, attributes: None })
+                        .collect(),
+                    visibility: SymbolVisibility::Private,
+                    ..Default::default()
+                },
+                body_region,
                 location,
-            )?
-        })?;
-
-        // The decompositions of the named compositions that lowering emitted are recorded as it requests them (refer
-        // to `ProgramLoweringContext::require_named_composition`). Each one is emitted as a private function ahead of
-        // the other functions of the module, in the order of the requests. A decomposition is traced independently of
-        // the lowered program, so it contains no shared `call`, and lowering it can request further decompositions,
-        // which is why they are read by position.
-        let mut index = 0;
-        while let Some(function) = lowering_context.named_composition(index) {
-            let (symbol, program) = (function.symbol(), function.program());
-            let function = lower_private_function(symbol, program, None, &lowering_context, &context, location_ref)?;
-            module_block.insert_operation(function, index)?;
-            index += 1;
+            )?;
+            module_block.insert_operation(function, private_function_count)?;
+            private_function_count += 1;
+            symbols.push(symbol);
         }
 
-        let mut boundary_mapping = boundary.boundary_mapping;
-
-        // Everything that lowering emitted over a mesh refers to the recorded one, which is declared ahead of the
-        // functions that refer to it.
-        let mesh = lowering_context.mesh();
-        if let Some(mesh) = &mesh {
-            module_block.insert_operation(mesh.lower(location)?, 0)?;
-        }
-
-        // On a single device each sharding holds the whole value, so a target without Shardy can drop its mesh and
-        // sharding constraints. If another Shardy operation prevents removal, name it in the lowering diagnostic.
-        if !supports_shardy && let Err(error) = module.remove_shardy_operations() {
-            let mut unsupported = None;
-            module.as_operation()?.walk(WalkOrder::PreOrder, |operation| match operation.name().as_str() {
-                Ok(name) if name.starts_with("sdy.") && name != "sdy.sharding_constraint" && name != "sdy.mesh" => {
-                    unsupported = Some(name.to_string());
-                    WalkResult::Interrupt
-                }
-                _ => WalkResult::Advance,
-            });
-            return Err(match unsupported {
-                Some(operation) => Error::Lowering(LoweringError::UnsupportedOperation {
-                    operation,
-                    reason: "the target plugin cannot compile with Shardy".to_string(),
-                }),
-                None => error.into(),
-            });
-        }
-
-        module.remove_unused_stable_hlo_constants()?;
-
-        // The verifier reports why a module is invalid through the diagnostics of the context, so they are collected
-        // while it runs and carried by the error. Handling them here also keeps them from being printed.
-        let diagnostics = Rc::new(RefCell::new(Vec::new()));
-        let handler = context.attach_diagnostics_handler({
-            let diagnostics = Rc::clone(&diagnostics);
-            move |diagnostic| {
-                diagnostics.borrow_mut().push(diagnostic.to_string());
-                true
-            }
-        });
-        let verified = module.verify();
-        context.detach_diagnostics_handler(handler);
-        if !verified? {
-            return Err(Error::Lowering(LoweringError::ModuleVerificationFailed {
-                diagnostic: diagnostics.borrow().join("; "),
-            }));
-        }
-
-        if lowering_context.requires_assertion_handler() {
-            boundary_mapping.require_assertion_handler();
-        }
-
-        let mut runtime_requirements = lowering_context.runtime_requirements();
-        if boundary_mapping.requires_assertion_handler() {
-            runtime_requirements.push(RuntimeRequirement::builtin("ryft.assert"));
-        }
-
-        if boundary_mapping.has_ordered_io() {
-            runtime_requirements.push(RuntimeRequirement::builtin("ryft.ordered-io"));
-        }
-
-        let runtime_requirements = normalize_runtime_requirements(runtime_requirements)?.into();
-
-        // The StableHLO text is part of the compilation cache key. Use plain text for modules without provenance.
-        // Otherwise, include parsable locations and complete constants so the cached artifact retains both.
-        // Programs that differ only in provenance can therefore have distinct cache entries.
-        let stable_hlo = if lowering_context.has_provenance() {
-            module
-                .as_operation()?
-                .to_string_with_flags(OperationPrintingFlags {
-                    elements_attribute_size_threshold: None,
-                    resource_string_size_threshold: None,
-                    enable_debug_information: true,
-                    pretty_print_debug_information: false,
-                    ..OperationPrintingFlags::default()
-                })
-                .map_err(|error| MlirError::internal(format!("serialized module is not valid UTF-8: {error}")))?
-        } else {
-            module.to_string()
-        };
-
-        Ok(MlirProgram::new(stable_hlo, boundary_mapping, runtime_requirements, mesh))
+        // The entry function calls the variant of the platform that its platform index selects, with every other
+        // input, and returns what that variant returns.
+        let mut function_block_ref = function_block.as_ref();
+        let arguments = (0..platform_index)
+            .map(|index| function_block.argument(index).unwrap().as_ref())
+            .collect::<Vec<ValueRef<'_, '_, '_>>>();
+        let branches = dispatch
+            .iter()
+            .map(|position| {
+                let mut branch_block = context.block_with_no_arguments();
+                let call = branch_block.append_operation(func::call(
+                    symbols[*position].as_str(),
+                    func::CallProperties {
+                        arguments: arguments
+                            .iter()
+                            .map(|value| ValueAndAttributes { value: *value, attributes: None })
+                            .collect(),
+                        results: function_results
+                            .iter()
+                            .map(|result| TypeAndAttributes { r#type: result.r#type, attributes: None })
+                            .collect(),
+                        no_inline: false,
+                    },
+                    location,
+                )?)?;
+                let results = (0..function_results.len())
+                    .map(|index| call.result(index).unwrap().as_ref())
+                    .collect::<Vec<ValueRef<'_, '_, '_>>>();
+                branch_block.append_operation(stable_hlo::r#return(results.as_slice(), location)?)?;
+                let mut branch_region = context.region();
+                branch_region.append_block(branch_block)?;
+                Ok(branch_region)
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let index = function_block.argument(platform_index).unwrap().as_ref();
+        let case = function_block_ref.append_operation(stable_hlo::case(index, branches, location)?)?;
+        let results = (0..function_results.len())
+            .map(|index| case.result(index).unwrap().as_ref())
+            .collect::<Vec<ValueRef<'_, '_, '_>>>();
+        function_block_ref.append_operation(func::r#return(results.as_slice(), location)?)?;
     }
+    module_block.append_operation({
+        let mut function_region = context.region();
+        function_region.append_block(function_block)?;
+        func::func(
+            boundary.function_name.as_str(),
+            func::FuncAttributes { arguments: function_arguments, results: function_results, ..Default::default() },
+            function_region,
+            location,
+        )?
+    })?;
+
+    let mut boundary_mapping = boundary.boundary_mapping.clone();
+
+    // Everything that lowering emitted over a mesh refers to the recorded one, which is declared ahead of the
+    // functions that refer to it.
+    let mesh = module_context.mesh();
+    if let Some(mesh) = &mesh {
+        module_block.insert_operation(mesh.lower(location)?, 0)?;
+    }
+
+    // On a single device each sharding holds the whole value, so a target without Shardy can drop its mesh and
+    // sharding constraints. If another Shardy operation prevents removal, name it in the lowering diagnostic.
+    if !supports_shardy && let Err(error) = module.remove_shardy_operations() {
+        let mut unsupported = None;
+        module.as_operation()?.walk(WalkOrder::PreOrder, |operation| match operation.name().as_str() {
+            Ok(name) if name.starts_with("sdy.") && name != "sdy.sharding_constraint" && name != "sdy.mesh" => {
+                unsupported = Some(name.to_string());
+                WalkResult::Interrupt
+            }
+            _ => WalkResult::Advance,
+        });
+        return Err(match unsupported {
+            Some(operation) => Error::Lowering(LoweringError::UnsupportedOperation {
+                operation,
+                reason: "the target plugin cannot compile with Shardy".to_string(),
+            }),
+            None => error.into(),
+        });
+    }
+
+    module.remove_unused_stable_hlo_constants()?;
+
+    // The verifier reports why a module is invalid through the diagnostics of the context, so they are collected
+    // while it runs and carried by the error. Handling them here also keeps them from being printed.
+    let diagnostics = Rc::new(RefCell::new(Vec::new()));
+    let handler = context.attach_diagnostics_handler({
+        let diagnostics = Rc::clone(&diagnostics);
+        move |diagnostic| {
+            diagnostics.borrow_mut().push(diagnostic.to_string());
+            true
+        }
+    });
+    let verified = module.verify();
+    context.detach_diagnostics_handler(handler);
+    if !verified? {
+        return Err(Error::Lowering(LoweringError::ModuleVerificationFailed {
+            diagnostic: diagnostics.borrow().join("; "),
+        }));
+    }
+
+    if module_context.requires_assertion_handler() {
+        boundary_mapping.require_assertion_handler();
+    }
+
+    let mut runtime_requirements = module_context.runtime_requirements();
+    if boundary_mapping.requires_assertion_handler() {
+        runtime_requirements.push(RuntimeRequirement::builtin("ryft.assert"));
+    }
+
+    if boundary_mapping.has_ordered_io() {
+        runtime_requirements.push(RuntimeRequirement::builtin("ryft.ordered-io"));
+    }
+
+    let runtime_requirements = normalize_runtime_requirements(runtime_requirements)?.into();
+
+    // The StableHLO text is part of the compilation cache key. Use plain text for modules without provenance.
+    // Otherwise, include parsable locations and complete constants so the cached artifact retains both.
+    // Programs that differ only in provenance can therefore have distinct cache entries.
+    let stable_hlo = if module_context.has_provenance() {
+        module
+            .as_operation()?
+            .to_string_with_flags(OperationPrintingFlags {
+                elements_attribute_size_threshold: None,
+                resource_string_size_threshold: None,
+                enable_debug_information: true,
+                pretty_print_debug_information: false,
+                ..OperationPrintingFlags::default()
+            })
+            .map_err(|error| MlirError::internal(format!("serialized module is not valid UTF-8: {error}")))?
+    } else {
+        module.to_string()
+    };
+
+    let platforms = options.target_platforms().into();
+    Ok(MlirProgram::new(stable_hlo, boundary_mapping, runtime_requirements, mesh, platforms))
 }
 
 /// Options for lowering a staged [`Program`] with [`ProgramLoweringExtension`]. By default, the entry signature is
@@ -987,8 +1272,8 @@ pub struct ProgramLoweringOptions {
     /// Whether the program is pruned and simplified before it is lowered.
     prune: bool,
 
-    /// Platform that the program is lowered for.
-    target_platform: Option<String>,
+    /// Platforms that the program is lowered for.
+    target_platforms: Vec<String>,
 
     /// Whether the target supports the Shardy dialect.
     supports_shardy: bool,
@@ -1008,6 +1293,9 @@ pub struct ProgramLoweringOptions {
     /// Representation of ragged dots.
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
 
+    /// Rules that lower the instructions of some operations in place of the lowering of their operation family.
+    lowering_rules: LoweringRules,
+
     /// Outputs that are lowered open over auto mesh axes, or [`None`] to use the output sharding defaults.
     open_outputs: Option<Vec<bool>>,
 }
@@ -1025,13 +1313,14 @@ impl ProgramLoweringOptions {
             exact_input_shardings: None,
             exact_output_shardings: None,
             prune: true,
-            target_platform: None,
+            target_platforms: Vec::new(),
             supports_shardy: true,
             reference_bindings: Vec::new(),
             donated_inputs: Vec::new(),
             unread_inputs: Vec::new(),
             export_effects: false,
             ragged_dot_lowering_strategy: RaggedDotLoweringStrategy::default(),
+            lowering_rules: LoweringRules::default(),
             open_outputs: None,
         }
     }
@@ -1120,7 +1409,26 @@ impl ProgramLoweringOptions {
     /// use a [`Session`](crate::Session).
     #[inline]
     pub fn with_target_platform(mut self, target_platform: Option<&str>) -> Self {
-        self.target_platform = target_platform.map(str::to_string);
+        self.target_platforms = target_platform.map(str::to_string).into_iter().collect();
+        self
+    }
+
+    /// Returns these options with one module lowered for all of `target_platforms`, which are case-sensitive PJRT
+    /// platform names like the one that [`Self::with_target_platform`] takes. Repeated names are kept once. The entry
+    /// function of a module for more than one platform takes a platform index as its last input, a scalar `i32` that
+    /// selects the platform that executes the module by its position in `target_platforms`. The program is lowered for
+    /// each platform as a whole, and platforms on which it lowers to the same module share one body. The inputs and the
+    /// effects of the module are those of every platform together, so an input is unread only when no platform reads
+    /// it. This corresponds to exporting a JAX function for several platforms.
+    #[inline]
+    pub fn with_target_platforms<P: Into<String>>(mut self, target_platforms: impl IntoIterator<Item = P>) -> Self {
+        self.target_platforms.clear();
+        for platform in target_platforms {
+            let platform = platform.into();
+            if !self.target_platforms.contains(&platform) {
+                self.target_platforms.push(platform);
+            }
+        }
         self
     }
 
@@ -1178,6 +1486,17 @@ impl ProgramLoweringOptions {
     #[inline]
     pub fn with_ragged_dot_lowering_strategy(mut self, strategy: RaggedDotLoweringStrategy) -> Self {
         self.ragged_dot_lowering_strategy = strategy;
+        self
+    }
+
+    /// Returns these options with `rule` lowering the instructions of the operation named `operation_name` (i.e.,
+    /// the name that [`Operation::name`](ryft_core::Operation::name) returns for it), in place of the lowering of
+    /// their operation family and of any rule that these options held for that operation. The rule applies to every
+    /// such instruction that the module lowers, in every region and private function, and it can still emit the
+    /// lowering of the family.
+    #[inline]
+    pub fn with_lowering_rule<R: LoweringRule + 'static>(mut self, operation_name: impl Into<String>, rule: R) -> Self {
+        self.lowering_rules = self.lowering_rules.with_rule(operation_name.into(), Rc::new(rule));
         self
     }
 
@@ -1239,10 +1558,21 @@ impl ProgramLoweringOptions {
         self.prune
     }
 
-    /// Returns the case-sensitive PJRT platform name used for lowering, if supplied.
+    /// Returns the case-sensitive PJRT platform name used for lowering, if exactly one was supplied.
     #[inline]
     pub fn target_platform(&self) -> Option<&str> {
-        self.target_platform.as_deref()
+        // TODO(eaplatanios): Isn't it weird to just return `None` when there are multiple? Do we actually need
+        //  `target_platform` as a function or should we just drop it? What value does it add?
+        match self.target_platforms.as_slice() {
+            [target_platform] => Some(target_platform),
+            _ => None,
+        }
+    }
+
+    /// Returns the case-sensitive PJRT platform names used for lowering, in the order of the platform index.
+    #[inline]
+    pub fn target_platforms(&self) -> &[String] {
+        &self.target_platforms
     }
 
     /// Returns whether the target supports the Shardy dialect.
@@ -1279,6 +1609,12 @@ impl ProgramLoweringOptions {
     #[inline]
     pub fn ragged_dot_lowering_strategy(&self) -> RaggedDotLoweringStrategy {
         self.ragged_dot_lowering_strategy
+    }
+
+    /// Returns whether these options hold a rule that lowers the instructions of the operation named `operation_name`.
+    #[inline]
+    pub fn has_lowering_rule(&self, operation_name: &str) -> bool {
+        self.lowering_rules.get(operation_name).is_some()
     }
 
     /// Returns the output flags for openness over auto mesh axes, or [`None`] to use the output sharding defaults.
@@ -1571,26 +1907,30 @@ impl ProgramBoundary {
         output_shardings: &[Option<Sharding>],
         open_outputs: &[bool],
         supports_shardy: bool,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<(Vec<TypeAndAttributes<'c, 't, 'static>>, Vec<TypeAndAttributes<'c, 't, 'static>>), Error> {
         let Self { boundary_mapping, executable_input_types, executable_output_types, aliases, .. } = self;
         let mut argument_types = executable_input_types
             .iter()
-            .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
+            .map(|array_type| array_type.lower(mlir_context, location).map(|r#type| r#type.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
 
         if boundary_mapping.has_ordered_io() {
-            argument_types.push(context.stable_hlo_token_type()?.as_ref());
+            argument_types.push(mlir_context.stable_hlo_token_type()?.as_ref());
+        }
+
+        if boundary_mapping.platform_index_input_index().is_some() {
+            argument_types.push(ArrayType::scalar(DataType::I32).lower(mlir_context, location)?.as_ref());
         }
 
         let mut result_types = executable_output_types
             .iter()
-            .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
+            .map(|array_type| array_type.lower(mlir_context, location).map(|r#type| r#type.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
 
         if boundary_mapping.has_ordered_io() {
-            result_types.push(context.stable_hlo_token_type()?.as_ref());
+            result_types.push(mlir_context.stable_hlo_token_type()?.as_ref());
         }
 
         let mut argument_sharding_attributes = boundary_mapping
@@ -1618,8 +1958,8 @@ impl ProgramBoundary {
         // The effect token of a signature side is annotated when any value of that side is, as each device threads its
         // own token.
         if boundary_mapping.has_ordered_io() {
-            let token_sharding = context.shardy_tensor_sharding(
-                context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME),
+            let token_sharding = mlir_context.shardy_tensor_sharding(
+                mlir_context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME),
                 &[],
                 &[],
                 &[],
@@ -1654,19 +1994,22 @@ impl ProgramBoundary {
                 {
                     attributes.insert(
                         "mhlo.memory_kind".into(),
-                        context.string_attribute(r#type.memory().placement_kind()).as_ref(),
+                        mlir_context.string_attribute(r#type.memory().placement_kind()).as_ref(),
                     );
                 }
 
                 if let Some(output_index) = aliases.get(&index) {
                     attributes.insert(
                         "tf.aliasing_output".into(),
-                        context.integer_attribute(context.signless_integer_type(64), *output_index as i64).as_ref(),
+                        mlir_context
+                            .integer_attribute(mlir_context.signless_integer_type(64), *output_index as i64)
+                            .as_ref(),
                     );
                 }
 
                 if let Some(array_type) = executable_input_types.get(index)
-                    && let Some(layout) = Self::lower_layout_attribute(array_type, ProgramBoundarySide::Input, context)?
+                    && let Some(layout) =
+                        Self::lower_layout_attribute(array_type, ProgramBoundarySide::Input, mlir_context)?
                 {
                     attributes.insert("mhlo.layout_mode".into(), layout.as_ref());
                 }
@@ -1692,13 +2035,13 @@ impl ProgramBoundary {
                 {
                     attributes.insert(
                         "mhlo.memory_kind".into(),
-                        context.string_attribute(r#type.memory().placement_kind()).as_ref(),
+                        mlir_context.string_attribute(r#type.memory().placement_kind()).as_ref(),
                     );
                 }
 
                 if let Some(array_type) = executable_output_types.get(index)
                     && let Some(layout) =
-                        Self::lower_layout_attribute(array_type, ProgramBoundarySide::Output, context)?
+                        Self::lower_layout_attribute(array_type, ProgramBoundarySide::Output, mlir_context)?
                 {
                     attributes.insert("mhlo.layout_mode".into(), layout.as_ref());
                 }
@@ -1722,7 +2065,7 @@ impl ProgramBoundary {
     fn lower_layout_attribute<'c, 't>(
         array_type: &ArrayType,
         side: ProgramBoundarySide,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
     ) -> Result<Option<StringAttributeRef<'c, 't>>, Error> {
         let Some(layout) = array_type.layout() else {
             return Ok(None);
@@ -1750,7 +2093,7 @@ impl ProgramBoundary {
             }));
         }
 
-        Ok(Some(context.string_attribute(tiled.to_pjrt().map_err(ProgramError::custom)?.to_string().as_str())))
+        Ok(Some(mlir_context.string_attribute(tiled.to_pjrt().map_err(ProgramError::custom)?.to_string().as_str())))
     }
 
     /// Lowers the entry function body into `function_block`. It reconstructs the logical inputs from the executable
@@ -1764,9 +2107,8 @@ impl ProgramBoundary {
         input_shardings: &[Option<Sharding>],
         supports_shardy: bool,
         function_block: &'b DetachedBlock<'c, 't>,
-        nested_functions: &Rc<CallFunctionMap<O>>,
         lowering_context: &ProgramLoweringContext,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<(), Error>
     where
@@ -1796,7 +2138,7 @@ impl ProgramBoundary {
                         let operation = function_block_ref.append_operation(stable_hlo::set_dimension_size(
                             value,
                             size,
-                            refined_type.lower(context, location)?,
+                            refined_type.lower(mlir_context, location)?,
                             input_dimension.axis(),
                             location,
                         )?)?;
@@ -1805,16 +2147,7 @@ impl ProgramBoundary {
                     value
                 }
                 None => {
-                    let value = lower_unplaced_constant_output(
-                        std::slice::from_ref(array_type),
-                        0,
-                        &mut function_block_ref,
-                        context,
-                        location.as_ref(),
-                    )?
-                    .into_iter()
-                    .next()
-                    .unwrap();
+                    let value = array_type.lower_i64_splat(0, &mut function_block_ref, location.as_ref())?;
 
                     // An unread input (refer to `unread_logical_inputs` above) is a placeholder that no emitted region
                     // reads and that XLA removes, so its sharding is not applied either.
@@ -1826,7 +2159,7 @@ impl ProgramBoundary {
                 }
             };
 
-            debug_assert_eq!(value.r#type()?, array_type.lower(context, location)?.as_ref());
+            debug_assert_eq!(value.r#type()?, array_type.lower(mlir_context, location)?.as_ref());
 
             // An input that arrives with a pending reduction that its type does not record (i.e., over auto mesh axes,
             // which an input sharding override states and types never record) is reduced where it enters, because no
@@ -1904,15 +2237,8 @@ impl ProgramBoundary {
         // after the session constants.
         let mut captured_values = Cow::Borrowed(capture_values);
         for constant in &session_constants.forwarded {
-            let r#type = constant.r#type();
-            let values = lower_unplaced_constant_output(
-                std::slice::from_ref(r#type.as_ref()),
-                0,
-                &mut function_block_ref,
-                context,
-                location.as_ref(),
-            )?;
-            captured_values.to_mut().extend(values);
+            let value = constant.r#type().lower_i64_splat(0, &mut function_block_ref, location.as_ref())?;
+            captured_values.to_mut().push(value);
         }
 
         let mut effect_tokens = EffectTokens::default();
@@ -1923,7 +2249,6 @@ impl ProgramBoundary {
         let logical_outputs = program.lower_inline(
             &captured_values,
             input_values,
-            Some(nested_functions),
             lowering_context,
             &mut effect_tokens,
             function_block_ref,
@@ -2053,6 +2378,26 @@ impl ProgramSessionConstants {
         Self { inputs, forwarded }
     }
 
+    /// Returns the session constants of a module that binds all of `constants` (e.g., those of a program on each of
+    /// the platforms that the module is lowered for). An array that is a hidden input anywhere is a hidden input, and
+    /// the arrays that are only passed on everywhere stay so. Each group keeps the order of first occurrence.
+    pub(crate) fn union(constants: impl IntoIterator<Item = Self>) -> Self {
+        let constants = constants.into_iter().collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        let mut distinct = |arrays: &[RetainedArray]| {
+            arrays.iter().filter(|array| seen.insert((*array).clone())).cloned().collect::<Vec<_>>()
+        };
+        let inputs = constants.iter().flat_map(|constants| distinct(&constants.inputs)).collect();
+        let forwarded = constants.iter().flat_map(|constants| distinct(&constants.forwarded)).collect();
+        Self { inputs, forwarded }
+    }
+
+    /// Returns the arrays to supply as hidden inputs, in first-occurrence order.
+    #[inline]
+    pub(crate) fn inputs(&self) -> &[RetainedArray] {
+        &self.inputs
+    }
+
     /// Returns the arrays to supply as hidden inputs, in first-occurrence order.
     #[inline]
     pub(crate) fn into_inputs(self) -> Vec<RetainedArray> {
@@ -2171,6 +2516,9 @@ pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
     ///
     /// # Parameters
     ///
+    ///   - `variants`: This program as it is lowered for each target platform of the module, with that platform. The
+    ///     boundary is the boundary of all of them, so an input is unread only when no variant reads it, and the
+    ///     effects are those of every variant.
     ///   - `function_name`: Symbol name of the entry function.
     ///   - `session_constants`: Constants of the emitted regions, in the order used to infer hidden inputs.
     ///   - `capture_types`: Types of the hidden capture inputs that precede the public inputs, which end with the
@@ -2181,8 +2529,8 @@ pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
     ///   - `output_shardings`: Optional sharding of each output.
     ///   - `open_outputs`: Whether each output is lowered open over auto mesh axes, so that the compiler chooses its
     ///     placement over those axes (i.e., one flag per output, or none at all).
-    ///   - `options`: Options that provide the target platform, the reference states, the donated and unread inputs,
-    ///     and whether the entry function exports its ordered I/O token chain.
+    ///   - `options`: Options that provide the reference states, the donated and unread inputs, and whether the entry
+    ///     function exports its ordered I/O token chain.
     ///
     /// # Errors
     ///
@@ -2193,7 +2541,7 @@ pub(crate) trait ProgramLoweringAnalysisExtension: Sized {
     /// they describe a boundary that the executable cannot have.
     #[allow(clippy::too_many_arguments)]
     fn entry_boundary(
-        &self,
+        variants: &[(Option<&str>, &Self)],
         function_name: &str,
         session_constants: ProgramSessionConstants,
         capture_types: &[ArrayType],
@@ -2513,7 +2861,7 @@ where
     }
 
     fn entry_boundary(
-        &self,
+        variants: &[(Option<&str>, &Self)],
         function_name: &str,
         session_constants: ProgramSessionConstants,
         capture_types: &[ArrayType],
@@ -2524,18 +2872,17 @@ where
         open_outputs: &[bool],
         options: &ProgramLoweringOptions,
     ) -> Result<ProgramBoundary, Error> {
-        let target_platform = options.target_platform();
         let reference_states = options.reference_bindings();
         let (donated_inputs, unread_inputs) = (options.donated_inputs(), options.unread_inputs());
         let export_effects = options.exports_effects();
 
         // XLA has no references or ordered state, so both must have been discharged from the program. References are
         // checked first, because a program with both gets the more precise diagnostic that way.
-        if self.contains_unresolved_references() {
+        if variants.iter().any(|(_, program)| program.contains_unresolved_references()) {
             return Err(Error::Lowering(LoweringError::UnresolvedReference { construct: "program".to_string() }));
         }
 
-        if self.contains_unresolved_state() {
+        if variants.iter().any(|(_, program)| program.contains_unresolved_state()) {
             return Err(Error::Lowering(LoweringError::UnresolvedState { construct: "program".to_string() }));
         }
 
@@ -2567,7 +2914,9 @@ where
         // The logical inputs are the captures followed by the public inputs. The boundary mapping assigns them and the
         // logical outputs to executable slots.
         let logical_input_types = capture_types.iter().cloned().chain(input_types.iter().cloned()).collect::<Vec<_>>();
-        let effects = self.effects().classes();
+        let effects = variants
+            .iter()
+            .fold(EffectClasses::NONE, |effects, (_, program)| effects.union(program.effects().classes()));
         let ordered_io = effects.contains(EffectClass::OrderedIo) || effects.contains(EffectClass::DeviceOrderedIo);
 
         // An input that the executable never reads has no executable slot, so that executions neither admit, require,
@@ -2576,14 +2925,22 @@ where
             .iter()
             .filter_map(|state| state.source().flat_input_index(capture_types.len()).ok())
             .collect::<Vec<_>>();
-        let unread_logical_inputs = self.unread_logical_inputs(
-            &logical_input_types,
-            capture_types.len(),
-            session_count,
-            unread_inputs,
-            &reference_state_inputs,
-            target_platform,
-        );
+        let mut unread_logical_inputs: Option<Vec<bool>> = None;
+        for (target_platform, program) in variants {
+            let unread = program.unread_logical_inputs(
+                &logical_input_types,
+                capture_types.len(),
+                session_count,
+                unread_inputs,
+                &reference_state_inputs,
+                *target_platform,
+            );
+            unread_logical_inputs = Some(match unread_logical_inputs {
+                Some(all) => all.iter().zip(&unread).map(|(all, unread)| *all && *unread).collect(),
+                None => unread,
+            });
+        }
+        let unread_logical_inputs = unread_logical_inputs.unwrap_or_default();
 
         // The ordered I/O token chain crosses the boundary only when the options export it. Its ordering is per device
         // unless some effect of the program is ordered across all devices.
@@ -2673,7 +3030,9 @@ pub(crate) trait ProgramInlineLoweringExtension {
 
     /// Appends the program body to `block` and returns its flat outputs. Captured constants resolve against
     /// `captured_values` and the program's input atoms bind to `input_values`. Each instruction inherits its
-    /// location from `location` and its provenance. Calls may use private functions registered in `nested_functions`.
+    /// location from `location` and its provenance. Calls may use the private functions that the module of
+    /// `lowering_context` plans for their callees. Refer to [`ProgramLoweringContext::shared_function`]
+    /// for more information.
     ///
     /// Ordered effects consume and update the caller's `effect_tokens` in program order. The caller continues from
     /// the final token of each chain after the body returns. An instruction that uses the assertion token marks the
@@ -2694,7 +3053,6 @@ pub(crate) trait ProgramInlineLoweringExtension {
         &self,
         captured_values: &[ValueRef<'b, 'c, 't>],
         input_values: &[ValueRef<'b, 'c, 't>],
-        nested_functions: Option<&Rc<CallFunctionMap<Self::Operation>>>,
         lowering_context: &ProgramLoweringContext,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
         block: BlockRef<'b, 'c, 't>,
@@ -2714,7 +3072,6 @@ where
         &self,
         captured_values: &[ValueRef<'b, 'c, 't>],
         input_values: &[ValueRef<'b, 'c, 't>],
-        nested_functions: Option<&Rc<CallFunctionMap<O>>>,
         lowering_context: &ProgramLoweringContext,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
         block: BlockRef<'b, 'c, 't>,
@@ -2748,8 +3105,13 @@ where
                 // A named composite with a backend implementation or a shared function needs no copy of its body.
                 let regions = if operation.composite_key().is_some_and(|key| {
                     NamedCompositeImplementation::select(key, &input_types, &output_types, target_platform).is_some()
-                        || nested_functions
-                            .is_some_and(|functions| functions.named(key, &input_types, &output_types).is_some())
+                        || lowering_context
+                            .shared_function(&NamedFunctionKey::new(
+                                key.clone(),
+                                input_types.clone(),
+                                output_types.clone(),
+                            ))
+                            .is_some()
                 }) {
                     Vec::new()
                 } else {
@@ -2762,7 +3124,6 @@ where
 
                 let mut lowerer = Lowerer::new(block, context, location, lowering_context.clone())
                     .with_regions(regions)
-                    .with_nested_functions(nested_functions.cloned())
                     .with_captured_values(captured_values)
                     .with_effect_tokens(*effect_tokens);
 
@@ -2791,7 +3152,18 @@ where
                     None
                 };
 
-                let mut outputs = operation.lower(&mut lowerer, input_values, &input_types, &output_types)?;
+                // A rule of the module lowers the instruction in place of its operation family (refer to
+                // `ProgramLoweringOptions::with_lowering_rule`).
+                let mut outputs = match lowering_context.lowering_rule(operation.name()) {
+                    Some(rule) => rule.lower(&mut FamilyInstructionLowerer {
+                        operation,
+                        lowerer: &mut lowerer,
+                        input_values,
+                        input_types: &input_types,
+                        output_types: &output_types,
+                    })?,
+                    None => operation.lower(&mut lowerer, input_values, &input_types, &output_types)?,
+                };
 
                 let output_dimensions = if let Some((mesh, anchor)) = intermediate_anchor {
                     let mut pending_reductions = input_values
@@ -3669,6 +4041,20 @@ impl PendingReduction {
     }
 }
 
+// TODO(eaplatanios): Move this higher up maybe?
+impl<O: ProgramLoweringOperation> PrivateFunctionProgram for Program<Constant, O, Vec<Constant>, Vec<Constant>> {
+    #[inline]
+    fn lower_private_function<'c, 't: 'c>(
+        &self,
+        symbol: &str,
+        lowering_context: &ProgramLoweringContext,
+        mlir_context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<func::DetachedFuncOperation<'c, 't>, Error> {
+        lower_private_function(symbol, self, 0, lowering_context, mlir_context, location)
+    }
+}
+
 // TODO(eaplatanios): Expose Shardy's `sdy::isElementwise` on the next `ryft-xla-sys` update and replace this list.
 /// StableHLO operations that the pinned
 /// [`sdy::isElementwise`](https://github.com/openxla/shardy/blob/57fffc23dfdf139b80013ad681701cee59c22f96/shardy/dialect/sdy/transforms/common/op_properties.cc#L30-L45)
@@ -3734,50 +4120,82 @@ const ELEMENTWISE_OPERATIONS: &[&str] = &[
 ];
 
 /// Returns the private `func.func` named `symbol`, whose body is the lowering of `program`, for a module to hold.
-/// The function takes the inputs of `program` and returns its outputs, without attributes. The repeated `call`s of
-/// `program` lower to calls of the shared functions in `nested_functions`, if any, and inline otherwise. The body is
-/// lowered outside any manual region and with the `lowering_context` of the module, so that it shares the channel
-/// allocator, the mesh, and the target platform of the entry function. `program` must have no effects when it is
-/// lowered (e.g., `collect_call_functions` leaves out callees whose lowering has effects, including synthesized
-/// entry guards), because the function threads no effect token. It must also read no session constant, because
-/// only the entry function receives the hidden inputs that carry them.
+/// The function returns the outputs of `program`, without attributes. It takes the inputs of `program`, followed by
+/// one input for each session constant that a region which lowering emits for `program` reads, callees included, in
+/// the order of [`ProgramSessionConstants::inputs`]. Whatever calls the function passes the values that its own scope
+/// binds for those constants (refer to `lower_shared_call`), because only the entry function of a module receives
+/// the hidden inputs that carry them. The arrays that `program` only passes on to captures that are never read are
+/// bound to values that require no buffer, as the entry function binds them. The first `capture_count` inputs of
+/// `program` are its lifted captures, which its captured constants refer to.
+///
+/// The repeated `call`s of `program` lower to calls of the shared functions that the module of `lowering_context`
+/// plans for them, if any, and inline otherwise. The body is lowered outside any manual region and with the
+/// `lowering_context` of the module, so that it shares the channel allocator, the mesh, and the target platform of the
+/// entry function. `program` must have no effects when it is lowered (e.g., `plan_call_functions` leaves out callees
+/// whose lowering has effects, including synthesized entry guards), because the function threads no effect token.
+///
+/// # Errors
+///
+/// Returns [`LoweringError::MissingCapturedConstant`] when `program` has fewer than `capture_count` inputs.
 fn lower_private_function<'c, 't: 'c, O: ProgramLoweringOperation>(
     symbol: &str,
     program: &FlatProgram<EagerContext<Constant, O>>,
-    nested_functions: Option<&Rc<CallFunctionMap<O>>>,
+    capture_count: usize,
     lowering_context: &ProgramLoweringContext,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<func::DetachedFuncOperation<'c, 't>, Error> {
+    let input_count = program.input_count();
+    if input_count < capture_count {
+        return Err(Error::Lowering(LoweringError::MissingCapturedConstant { index: input_count }));
+    }
+
+    let target_platform = lowering_context.target_platform();
+    let regions = program.entry_region_ref().emitted_regions(target_platform, CallTraversal::Enter);
+    let session_constants = ProgramSessionConstants::from_regions(regions, target_platform);
+    let session_constant_types =
+        session_constants.inputs.iter().map(|constant| Type::Array(constant.r#type().into_owned()));
     let input_tensor_types = program
         .input_types()
         .iter()
-        .map(|r#type| r#type.lower(context, location))
+        .cloned()
+        .chain(session_constant_types)
+        .map(|r#type| r#type.lower(mlir_context, location))
         .collect::<Result<Vec<_>, _>>()?;
     let output_tensor_types = program
         .output_types()
         .iter()
-        .map(|r#type| r#type.lower(context, location))
+        .map(|r#type| r#type.lower(mlir_context, location))
         .collect::<Result<Vec<_>, _>>()?;
     let argument_types = input_tensor_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
-    let function_block = context.block(argument_types.as_slice());
-    let input_values = (0..input_tensor_types.len())
+    let function_block = mlir_context.block(argument_types.as_slice());
+    let argument_values = (0..input_tensor_types.len())
         .map(|index| function_block.argument(index).unwrap().as_ref())
         .collect::<Vec<_>>();
+    let (input_values, session_constant_values) = argument_values.split_at(input_count);
 
+    // The capture table of the function holds its lifted captures, then the session constants that it receives,
+    // and then the arrays that it only passes on, as the capture table of the entry function does.
     let mut function_block_ref = function_block.as_ref();
+    let mut captured_values = input_values[..capture_count].to_vec();
+    captured_values.extend_from_slice(session_constant_values);
+    for constant in &session_constants.forwarded {
+        captured_values.push(constant.r#type().lower_i64_splat(0, &mut function_block_ref, location)?);
+    }
+    let lowering_context = lowering_context
+        .clone()
+        .with_session_constants(session_constants.inputs.iter().chain(&session_constants.forwarded));
     let outputs = program.lower_inline(
-        &[],
-        input_values.as_slice(),
-        nested_functions,
-        lowering_context,
+        captured_values.as_slice(),
+        input_values,
+        &lowering_context,
         &mut EffectTokens::default(),
         function_block_ref,
         location,
     )?;
 
     function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
-    let mut function_region = context.region();
+    let mut function_region = mlir_context.region();
     function_region.append_block(function_block)?;
     Ok(func::func(
         symbol,
@@ -3891,9 +4309,9 @@ mod tests {
         CompositeOperation, ConditionOperation, ConstrainSharding, Context, Cos, CustomRuleDefinition,
         CustomRuleRegistration, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionToScalarOperation,
         DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, Dot, DotDimensionNumbers, EffectClass,
-        FlatProgram, ImportingContext, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite, OneLike,
-        PLACE_OPERATION_NAME, Place, PlaceOperation, Placeholder, Placement, PlacementRequest, Print, PrintOperation,
-        ProgramBuilder, Provenance, ProvenanceScope, ReferenceFreezeOperation, ReferenceNewOperation,
+        FlatProgram, ImportingContext, LogicalMesh, Max, MaxOperation, Memory, MeshAxis, MeshAxisType, NamedComposite,
+        OneLike, PLACE_OPERATION_NAME, Place, PlaceOperation, Placeholder, Placement, PlacementRequest, Print,
+        PrintOperation, ProgramBuilder, Provenance, ProvenanceScope, ReferenceFreezeOperation, ReferenceNewOperation,
         ReferenceReadOperation, ReferenceSource, ReferenceType, ReferenceWriteOperation, ReshapeOperation, Reshard,
         ScaledDotOperation, ScanOperation, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin, StopGradient,
         StridedLayout, Tag, TiledLayout, TransferToMemory, Transpose, TypeError, Typed, ValueProjection, ZeroLike,
@@ -3906,8 +4324,8 @@ mod tests {
     };
 
     use crate::lowering::tests::{
-        add_call, dynamic_dimension, linear_call_program, neg_branch, scalar_linear_region, shard_map_module,
-        test_manual_mesh, test_matrix_type, test_sharding, test_vector_type, unproject_plain_program,
+        DefaultLoweringRule, add_call, dynamic_dimension, linear_call_program, neg_branch, scalar_linear_region,
+        shard_map_module, test_manual_mesh, test_matrix_type, test_sharding, test_vector_type, unproject_plain_program,
     };
     use crate::sessions::tests::{domain_mesh, f32_scalar, two_device_mesh};
     use crate::tests::{
@@ -3921,6 +4339,32 @@ mod tests {
     };
 
     use super::*;
+
+    /// Returns a program that calls the named composite `ryft.tests.xla_named_square` version 1 once, with a body
+    /// that adds `constant` to its input. A backend implementation replaces the call on CUDA (refer to
+    /// `omits_regions`), so the body, and with it `constant`, is only lowered for other platforms.
+    fn named_square_program_with_session_constant(constant: &RetainedArray) -> FlatProgram<Session> {
+        let scalar_type = Type::Array(constant.r#type().into_owned());
+        let body = {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let input = builder.add_input(scalar_type.clone());
+            let constant = builder.add_constant(Constant::Session(constant.clone()));
+            let output =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
+            Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
+        };
+        let key = CompositeKey::new("ryft.tests.xla_named_square".to_string(), 1);
+        let named = NamedComposite::new(key, |types: &[Type]| Ok(types.to_vec()), |inputs| Ok(vec![inputs[0].clone()]));
+        let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("adding").with_named_composite(named));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(scalar_type);
+        let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
+        let regions = vec![builder.intern_callee(&body, None).unwrap()];
+        let output = builder.add_instruction(operation, regions, vec![input], None).unwrap()[0];
+        builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+    }
 
     /// Computes `f(x, y) = x * y + sin(x)` for the pair `inputs` of `(x, y)`.
     fn scalar_bilinear_sin<T>(inputs: (T, T)) -> T
@@ -4047,6 +4491,22 @@ mod tests {
         assert!(!boundary_mapping.is_unread_input(5));
         assert_eq!(boundary_mapping.input_dimensions()[0].executable_input_index(), 2);
         assert_eq!(boundary_mapping.executable_input_count(), 3);
+    }
+
+    #[test]
+    fn test_mlir_program_boundary_mapping_with_platform_index() {
+        // The platform index follows every other executable input, including the ordered I/O token.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(&[scalar_type.clone(), scalar_type], &[]);
+        assert_eq!(boundary_mapping.platform_index_input_index(), None);
+        assert_eq!(boundary_mapping.executable_input_count(), 2);
+        let boundary_mapping = boundary_mapping.with_platform_index();
+        assert_eq!(boundary_mapping.platform_index_input_index(), Some(2));
+        assert_eq!(boundary_mapping.executable_input_count(), 3);
+        let boundary_mapping = boundary_mapping.with_effects(true, false, false, false);
+        assert_eq!(boundary_mapping.ordered_io_input_index(), Some(2));
+        assert_eq!(boundary_mapping.platform_index_input_index(), Some(3));
+        assert_eq!(boundary_mapping.executable_input_count(), 4);
     }
 
     #[test]
@@ -4242,6 +4702,7 @@ mod tests {
             trace(move |x: ArrayTracer| x.sin().unwrap().reshard(&sharding).unwrap(), test_vector_type(8)).unwrap();
         let lowered = traced.to_mlir("main", &ProgramLoweringOptions::new()).unwrap();
         assert_eq!(lowered.mesh(), Some(&mesh));
+        assert_eq!(lowered.platforms(), &[] as &[String]);
         let (stable_hlo, boundary_mapping, runtime_requirements) = lowered.into_parts();
         assert_eq!(
             stable_hlo,
@@ -5099,6 +5560,239 @@ mod tests {
             .map(|line| line.split('(').next().unwrap().to_string())
             .collect::<Vec<_>>();
         assert_eq!(private_functions, vec!["xla.scaled_dot".to_string()]);
+    }
+
+    #[test]
+    fn test_program_to_mlir_shares_one_body_between_platforms_with_one_lowering() {
+        // The program lowers to the same module on both platforms, so the entry function holds its body directly. A
+        // module for several platforms still takes the platform index as its last input, whatever its bodies are.
+        let traced: TracedProgram<ArrayType, ArrayType> =
+            trace(|x: ArrayTracer| x.sin().unwrap(), test_vector_type(4)).unwrap();
+        let options = ProgramLoweringOptions::new().with_target_platforms(["cpu", "cuda"]);
+        let lowered = traced.to_mlir("main", &options).unwrap();
+        assert_eq!(lowered.platforms(), ["cpu".to_string(), "cuda".to_string()]);
+        assert_eq!(lowered.boundary_mapping().platform_index_input_index(), Some(1));
+        assert_eq!(lowered.boundary_mapping().executable_input_count(), 2);
+        assert_eq!(
+            lowered.into_stable_hlo(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<i32>) -> tensor<4xf32> {
+                    %0 = stablehlo.sine %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+
+        // A module for one platform takes no platform index.
+        let lowered = traced.to_mlir("main", &options.with_target_platforms(["cuda"])).unwrap();
+        assert_eq!(lowered.platforms(), ["cuda".to_string()]);
+        assert_eq!(lowered.boundary_mapping().platform_index_input_index(), None);
+    }
+
+    #[test]
+    fn test_program_to_mlir_dispatches_between_platforms_with_different_lowerings() {
+        // A floating-point maximum lowers to the native operation on CUDA and to arithmetic elsewhere, so the first and
+        // the last platform share one body and CUDA has a body of its own. The entry function calls the body of the
+        // platform that its last input selects, and each body is a private function over the same boundary.
+        let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> =
+            trace(|(x, y): (ArrayTracer, ArrayTracer)| x.max(&y).unwrap(), (test_vector_type(4), test_vector_type(4)))
+                .unwrap();
+        let options = ProgramLoweringOptions::new().with_target_platforms(["cpu", "cuda", "rocm"]);
+        let lowered = traced.to_mlir("main", &options).unwrap();
+        assert_eq!(lowered.platforms(), ["cpu".to_string(), "cuda".to_string(), "rocm".to_string()]);
+        assert_eq!(lowered.boundary_mapping().platform_index_input_index(), Some(2));
+        let module = lowered.into_stable_hlo();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func private @main.cpu(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.compare GT, %arg0, %arg1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %1 = stablehlo.select %0, %arg0, %arg1 : tensor<4xi1>, tensor<4xf32>
+                    %2 = stablehlo.negate %arg0 : tensor<4xf32>
+                    %3 = stablehlo.compare EQ, %arg0, %arg1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %4 = stablehlo.compare EQ, %arg0, %2, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %5 = stablehlo.and %3, %4 : tensor<4xi1>
+                    %6 = stablehlo.add %arg0, %arg1 : tensor<4xf32>
+                    %7 = stablehlo.select %5, %6, %1 : tensor<4xi1>, tensor<4xf32>
+                    %8 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %9 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %10 = stablehlo.select %9, %arg1, %7 : tensor<4xi1>, tensor<4xf32>
+                    %11 = stablehlo.select %8, %arg0, %10 : tensor<4xi1>, tensor<4xf32>
+                    return %11 : tensor<4xf32>
+                  }
+                  func.func private @main.cuda(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.maximum %arg0, %arg1 : tensor<4xf32>
+                    %1 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %2 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %3 = stablehlo.select %2, %arg1, %0 : tensor<4xi1>, tensor<4xf32>
+                    %4 = stablehlo.select %1, %arg0, %3 : tensor<4xi1>, tensor<4xf32>
+                    return %4 : tensor<4xf32>
+                  }
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>, %arg2: tensor<i32>) -> tensor<4xf32> {
+                    %0 = "stablehlo.case"(%arg2) ({
+                      %1 = func.call @main.cpu(%arg0, %arg1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+                      stablehlo.return %1 : tensor<4xf32>
+                    }, {
+                      %1 = func.call @main.cuda(%arg0, %arg1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+                      stablehlo.return %1 : tensor<4xf32>
+                    }, {
+                      %1 = func.call @main.cpu(%arg0, %arg1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+                      stablehlo.return %1 : tensor<4xf32>
+                    }) : (tensor<i32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+
+        // Every body computes the same maximum on CPU, whichever platform index the execution passes.
+        let client = cpu_client(1);
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
+            .unwrap();
+        let device = executable.addressable_devices().unwrap().remove(0);
+        for platform_index in 0..3_i32 {
+            let buffer = |bytes: Vec<u8>, r#type: BufferType, dimensions: &[u64]| {
+                let buffer = client.buffer(bytes.as_slice(), r#type, dimensions, None, device.clone(), None).unwrap();
+                ExecutionInput { buffer: Arc::new(buffer), donatable: false }
+            };
+            let inputs = [
+                buffer(values_to_bytes::<f32>(&[1.0, 5.0, -3.0, 0.0]), BufferType::F32, &[4]),
+                buffer(values_to_bytes::<f32>(&[2.0, 4.0, -4.0, 0.5]), BufferType::F32, &[4]),
+                buffer(values_to_bytes::<i32>(&[platform_index]), BufferType::I32, &[]),
+            ];
+            let execution = executable
+                .execute(
+                    vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                    Vec::new(),
+                    0,
+                    None,
+                    Some(file!()),
+                    None,
+                    None,
+                    &[],
+                )
+                .unwrap();
+            let output = execution.block_until_ready().unwrap().remove(0).outputs.remove(0);
+            let output = output.copy_to_host(None).unwrap().r#await().unwrap();
+            assert_eq!(values_from_bytes::<f32>(output.as_slice()), vec![2.0, 5.0, -3.0, 0.5], "{platform_index}");
+        }
+    }
+
+    #[test]
+    fn test_program_to_mlir_lowers_the_private_functions_of_each_platform() {
+        // The repeated callee lowers differently on the two platforms, so each body calls a shared function of its
+        // own platform, and the functions of the two platforms have different symbols.
+        let vector_type = test_vector_type(4);
+        let callee = {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let left = builder.add_input(vector_type.clone().into());
+            let right = builder.add_input(vector_type.clone().into());
+            let output = builder.add_instruction(MaxOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+            Arc::new(builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap())
+        };
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let left = builder.add_input(vector_type.clone().into());
+        let right = builder.add_input(vector_type.into());
+        let first = add_call(&mut builder, &callee, vec![left, right]);
+        let second = add_call(&mut builder, &callee, vec![first, right]);
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![second], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let options = ProgramLoweringOptions::new().with_target_platforms(["cuda", "cpu"]);
+        assert_eq!(
+            program.to_rendered_mlir("main", &options).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func private @callee_0(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.maximum %arg0, %arg1 : tensor<4xf32>
+                    %1 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %2 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %3 = stablehlo.select %2, %arg1, %0 : tensor<4xi1>, tensor<4xf32>
+                    %4 = stablehlo.select %1, %arg0, %3 : tensor<4xi1>, tensor<4xf32>
+                    return %4 : tensor<4xf32>
+                  }
+                  func.func private @main.cuda(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = call @callee_0(%arg0, %arg1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+                    %1 = call @callee_0(%0, %arg1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+                    return %1 : tensor<4xf32>
+                  }
+                  func.func private @callee_0_1(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.compare GT, %arg0, %arg1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %1 = stablehlo.select %0, %arg0, %arg1 : tensor<4xi1>, tensor<4xf32>
+                    %2 = stablehlo.negate %arg0 : tensor<4xf32>
+                    %3 = stablehlo.compare EQ, %arg0, %arg1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %4 = stablehlo.compare EQ, %arg0, %2, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %5 = stablehlo.and %3, %4 : tensor<4xi1>
+                    %6 = stablehlo.add %arg0, %arg1 : tensor<4xf32>
+                    %7 = stablehlo.select %5, %6, %1 : tensor<4xi1>, tensor<4xf32>
+                    %8 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %9 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %10 = stablehlo.select %9, %arg1, %7 : tensor<4xi1>, tensor<4xf32>
+                    %11 = stablehlo.select %8, %arg0, %10 : tensor<4xi1>, tensor<4xf32>
+                    return %11 : tensor<4xf32>
+                  }
+                  func.func private @main.cpu(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = call @callee_0_1(%arg0, %arg1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+                    %1 = call @callee_0_1(%0, %arg1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+                    return %1 : tensor<4xf32>
+                  }
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>, %arg2: tensor<i32>) -> tensor<4xf32> {
+                    %0 = "stablehlo.case"(%arg2) ({
+                      %1 = func.call @main.cuda(%arg0, %arg1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+                      stablehlo.return %1 : tensor<4xf32>
+                    }, {
+                      %1 = func.call @main.cpu(%arg0, %arg1) : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
+                      stablehlo.return %1 : tensor<4xf32>
+                    }) : (tensor<i32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_mlir_gives_the_module_the_inputs_of_every_platform() {
+        // A backend implementation replaces the call on CUDA, so only the body that is lowered for the CPU reads the
+        // session constant. The module receives the constant as a hidden input for both platforms, and the body of the
+        // platform that does not read it ignores it.
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let constant = RetainedArray::new(&f32_scalar(&session, &domain_mesh(client, "x", 1), 2.0));
+        let program = named_square_program_with_session_constant(&constant);
+        let options = ProgramLoweringOptions::new()
+            .without_pruning()
+            .without_boundary_shardings()
+            .with_target_platforms(["cuda", "cpu"]);
+        assert_eq!(
+            program.to_rendered_mlir("main", &options).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func private @main.cuda(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
+                    %0 = stablehlo.multiply %arg1, %arg1 : tensor<f32>
+                    return %0 : tensor<f32>
+                  }
+                  func.func private @main.cpu(%arg0: tensor<f32>, %arg1: tensor<f32>) -> tensor<f32> {
+                    %0 = stablehlo.add %arg1, %arg0 : tensor<f32>
+                    return %0 : tensor<f32>
+                  }
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<f32>, %arg2: tensor<i32>) -> tensor<f32> {
+                    %0 = "stablehlo.case"(%arg2) ({
+                      %1 = func.call @main.cuda(%arg0, %arg1) : (tensor<f32>, tensor<f32>) -> tensor<f32>
+                      stablehlo.return %1 : tensor<f32>
+                    }, {
+                      %1 = func.call @main.cpu(%arg0, %arg1) : (tensor<f32>, tensor<f32>) -> tensor<f32>
+                      stablehlo.return %1 : tensor<f32>
+                    }) : (tensor<i32>) -> tensor<f32>
+                    return %0 : tensor<f32>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
@@ -6173,6 +6867,7 @@ mod tests {
         assert_eq!(options.exact_output_shardings(), None);
         assert!(options.prunes());
         assert_eq!(options.target_platform(), None);
+        assert_eq!(options.target_platforms(), &[] as &[String]);
         assert!(options.supports_shardy());
         assert_eq!(options.reference_bindings(), &[]);
         assert_eq!(options.donated_inputs(), &[] as &[bool]);
@@ -6259,6 +6954,19 @@ mod tests {
     }
 
     #[test]
+    fn test_program_lowering_options_with_target_platforms() {
+        // Repeated platforms are kept once, in the order of their first occurrence, and several platforms are no
+        // single target platform.
+        let options = ProgramLoweringOptions::new().with_target_platforms(["cuda", "cpu", "cuda"]);
+        assert_eq!(options.target_platforms(), ["cuda".to_string(), "cpu".to_string()]);
+        assert_eq!(options.target_platform(), None);
+        let options = options.with_target_platforms(["cpu"]);
+        assert_eq!(options.target_platforms(), ["cpu".to_string()]);
+        assert_eq!(options.target_platform(), Some("cpu"));
+        assert_eq!(options.with_target_platform(None).target_platforms(), &[] as &[String]);
+    }
+
+    #[test]
     fn test_program_lowering_options_with_shardy_support() {
         assert!(!ProgramLoweringOptions::new().with_shardy_support(false).supports_shardy());
     }
@@ -6282,6 +6990,15 @@ mod tests {
         let options =
             ProgramLoweringOptions::new().with_ragged_dot_lowering_strategy(RaggedDotLoweringStrategy::Instruction);
         assert_eq!(options.ragged_dot_lowering_strategy(), RaggedDotLoweringStrategy::Instruction);
+    }
+
+    #[test]
+    fn test_program_lowering_options_with_lowering_rule() {
+        let options = ProgramLoweringOptions::new();
+        assert!(!options.has_lowering_rule("add"));
+        let options = options.with_lowering_rule("add", DefaultLoweringRule);
+        assert!(options.has_lowering_rule("add"));
+        assert!(!options.has_lowering_rule("mul"));
     }
 
     #[test]
@@ -6518,6 +7235,24 @@ mod tests {
     }
 
     #[test]
+    fn test_program_session_constants_union() {
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let [first, second, third] =
+            [1.0, 2.0, 3.0].map(|value| RetainedArray::new(&f32_scalar(&session, &mesh, value)));
+
+        // An array that is a hidden input anywhere is a hidden input, even where another group only passes it on,
+        // and each array is kept once, in the order of its first occurrence.
+        let union = ProgramSessionConstants::union([
+            ProgramSessionConstants { inputs: vec![first.clone()], forwarded: vec![second.clone(), third.clone()] },
+            ProgramSessionConstants { inputs: vec![second.clone(), first.clone()], forwarded: vec![third.clone()] },
+        ]);
+        assert_eq!(union, ProgramSessionConstants { inputs: vec![first, second], forwarded: vec![third] });
+        assert_eq!(ProgramSessionConstants::union([]), ProgramSessionConstants { inputs: vec![], forwarded: vec![] },);
+    }
+
+    #[test]
     fn test_program_session_constants_from_regions_assigns_the_same_inputs_on_every_process() {
         // Two single-device clients stand for two processes. Each independently places its default scalar on global
         // device 0 twice. Only the owner can reuse the original device buffer.
@@ -6641,25 +7376,7 @@ mod tests {
         let client = cpu_client(1);
         let session = Session::builder().client(client).build().unwrap();
         let constant = RetainedArray::new(&f32_scalar(&session, &domain_mesh(client, "x", 1), 2.0));
-        let scalar_type = Type::Array(constant.r#type().into_owned());
-        let body = {
-            let mut builder = ProgramBuilder::<Constant, Operation>::new();
-            let input = builder.add_input(scalar_type.clone());
-            let constant = builder.add_constant(Constant::Session(constant.clone()));
-            let output =
-                builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
-            Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
-        };
-        let key = CompositeKey::new("ryft.tests.xla_named_square".to_string(), 1);
-        let named = NamedComposite::new(key, |types: &[Type]| Ok(types.to_vec()), |inputs| Ok(vec![inputs[0].clone()]));
-        let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("adding").with_named_composite(named));
-        let mut builder = ProgramBuilder::<Constant, Operation>::new();
-        let input = builder.add_input(scalar_type);
-        let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
-        let regions = vec![builder.intern_callee(&body, None).unwrap()];
-        let output = builder.add_instruction(operation, regions, vec![input], None).unwrap()[0];
-        let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder]);
-        let program = program.unwrap();
+        let program = named_square_program_with_session_constant(&constant);
         for (platform, expected) in [("cuda", vec![]), ("cpu", vec![constant])] {
             let regions = program.entry_region_ref().emitted_regions(Some(platform), CallTraversal::Enter);
             assert_eq!(
@@ -6972,7 +7689,8 @@ mod tests {
         let options =
             ProgramLoweringOptions::new().with_reference_bindings(Vec::new(), vec![true, false], vec![false, true]);
         let boundary = |logical_input_shardings: &[Option<Sharding>], output_shardings: &[Option<Sharding>]| {
-            program.entry_boundary(
+            ProgramLoweringAnalysisExtension::entry_boundary(
+                &[(None, &program)],
                 " @main ",
                 no_constants(),
                 &[],
@@ -7008,19 +7726,19 @@ mod tests {
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![], vec![Placeholder]).unwrap();
         let session_constants = ProgramSessionConstants { inputs: vec![constant], forwarded: vec![] };
         assert_eq!(
-            program
-                .entry_boundary(
-                    "main",
-                    session_constants,
-                    &[],
-                    &[],
-                    &[constant_type],
-                    &[],
-                    &[None],
-                    &[],
-                    &ProgramLoweringOptions::new(),
-                )
-                .err(),
+            ProgramLoweringAnalysisExtension::entry_boundary(
+                &[(None, &program)],
+                "main",
+                session_constants,
+                &[],
+                &[],
+                &[constant_type],
+                &[],
+                &[None],
+                &[],
+                &ProgramLoweringOptions::new(),
+            )
+            .err(),
             Some(Error::from(ProgramError::MalformedProgram(
                 "the trailing capture types of the entry function must be the types of its 1 session constant(s)"
                     .to_string(),
@@ -7047,7 +7765,6 @@ mod tests {
                 .lower_inline(
                     &[],
                     &[left, right],
-                    None,
                     &ProgramLoweringContext::new(),
                     &mut EffectTokens::default(),
                     block_ref,
@@ -7091,7 +7808,6 @@ mod tests {
         let result = program.lower_inline(
             &[],
             &[],
-            None,
             &ProgramLoweringContext::new(),
             &mut EffectTokens::default(),
             block.as_ref(),
