@@ -38,8 +38,8 @@ use ryft_core::{
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, SymbolVisibility,
-    Type as MlirType, TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
+    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Type as MlirType,
+    TypeAndAttributes, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
 
 use crate::compilation::domains::{commits_public_outputs, relocated_input_type};
@@ -58,6 +58,8 @@ use crate::{
     Array, Constant, Error, ExecutionError, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError,
     Session, Type, Value,
 };
+
+// TODO(eaplatanios): Review this module.
 
 /// Structural identity of a flat callee program attached behind a `call`, used to deduplicate repeated nested
 /// programs into shared private `func.func`s at lowering time.
@@ -110,6 +112,12 @@ impl<O: CoreOperation<Type = Type>> CallFunction<O> {
     #[inline]
     pub(crate) fn symbol(&self) -> &str {
         &self.symbol
+    }
+
+    /// Returns the representative callee program, which is lowered once as the function body.
+    #[inline]
+    pub(crate) fn program(&self) -> &FlatProgram<EagerContext<Constant, O>> {
+        &self.program
     }
 
     /// Returns the flat input types of the callee, also the emitted function's argument types.
@@ -280,81 +288,6 @@ where
             .push(NamedFunction { input_types, output_types, symbol });
     }
     Ok(map)
-}
-
-/// Emits the shared private `func.func` for one deduplicated callee into `module_block`.
-///
-/// The body is lowered with `nested_functions` in scope so that any repeated `call`s inside this callee also
-/// lower to `func.call`s. Calls between shared functions are resolved by symbol, so emission order does not matter.
-/// Private functions start outside manual regions and use the module's `lowering_context` to share its channel
-/// allocator, mesh, and target platform with the entry function.
-pub(crate) fn emit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    module_block: &mut BlockRef<'b, 'c, 't>,
-    function: &CallFunction<O>,
-    nested_functions: &Rc<CallFunctionMap<O>>,
-    lowering_context: &ProgramLoweringContext,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<(), Error> {
-    let argument_tensor_types = function
-        .input_types
-        .iter()
-        .map(|r#type| r#type.lower(context, location))
-        .collect::<Result<Vec<_>, _>>()?;
-    let result_tensor_types = function
-        .output_types
-        .iter()
-        .map(|r#type| r#type.lower(context, location))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let function_block = context.block(
-        argument_tensor_types
-            .iter()
-            .map(|tensor_type| (*tensor_type, location))
-            .collect::<Vec<_>>()
-            .as_slice(),
-    );
-    {
-        let mut function_block_ref = function_block.as_ref();
-        let input_values = (0..function.input_types.len())
-            .map(|index| function_block.argument(index).expect("shared function block arguments should exist").as_ref())
-            .collect::<Vec<_>>();
-        // Deduplicated callees are pure by construction (`collect_call_functions` skips programs whose lowering
-        // has effects, including synthesized entry guards), so the shared function body never creates an effect token.
-        let mut effect_tokens = EffectTokens::default();
-        let outputs = function.program.lower_inline(
-            input_values.as_slice(),
-            &mut function_block_ref,
-            context,
-            location,
-            &[],
-            &RematerializationOptimizationBarrier::None,
-            Some(nested_functions),
-            lowering_context,
-            &mut effect_tokens,
-        )?;
-        function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
-    }
-    let mut function_region = context.region();
-    function_region.append_block(function_block)?;
-    module_block.append_operation(func::func(
-        function.symbol.as_str(),
-        func::FuncAttributes {
-            arguments: argument_tensor_types
-                .iter()
-                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
-                .collect(),
-            results: result_tensor_types
-                .iter()
-                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
-                .collect(),
-            visibility: SymbolVisibility::Private,
-            ..Default::default()
-        },
-        function_region,
-        location,
-    )?)?;
-    Ok(())
 }
 
 /// Calls the shared private `func.func` named `symbol` with the provided operands, which must match its inputs, and

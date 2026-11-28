@@ -5,6 +5,8 @@ use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef}
 use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
+// TODO(eaplatanios): Review this module.
+
 // [`ErfOperation`] lowers to `chlo.erf`, which the XLA compiler legalizes to a rational polynomial approximation
 // over StableHLO operations during compilation.
 impl LowerableOperation for ErfOperation<ArrayType> {

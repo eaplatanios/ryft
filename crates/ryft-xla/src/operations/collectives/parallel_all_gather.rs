@@ -13,6 +13,8 @@ use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::operations::collectives::refine_collective_result_dimensions;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation, Type};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for ParallelAllGatherOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

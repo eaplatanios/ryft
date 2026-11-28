@@ -8,6 +8,8 @@ use crate::Error;
 use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::ArrayTypeLoweringExtension;
 
+// TODO(eaplatanios): Review this module.
+
 /// StableHLO lowering of `axis_index`.
 pub(crate) mod axis_index;
 /// StableHLO lowering of `parallel_all_gather`.

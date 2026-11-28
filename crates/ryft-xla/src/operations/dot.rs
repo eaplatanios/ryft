@@ -18,6 +18,8 @@ use crate::lowering::types::{
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, RaggedDotLoweringStrategy};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for DotOperation {
     // Lower a dot to one `stablehlo.dot_general` that carries its per-input precisions and its algorithm. An algorithm
     // may compute with other element types than the inputs and the output have, in which case the inputs are converted

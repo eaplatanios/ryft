@@ -34,6 +34,8 @@ use crate::{
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_pjrt::extensions::ffi::FfiStream;
 
+// TODO(eaplatanios): Review this module.
+
 /// Name of the typed XLA FFI custom call that reports failed runtime assertions.
 const ASSERT_CUSTOM_CALL_TARGET: &str = "ryft.assert";
 

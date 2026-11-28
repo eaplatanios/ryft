@@ -19,6 +19,8 @@ use crate::operations::assertions::{
 };
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for SliceOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

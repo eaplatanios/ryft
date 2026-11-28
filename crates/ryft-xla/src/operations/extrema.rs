@@ -9,6 +9,8 @@ use ryft_mlir::{
 use crate::operations::{normalize_binary_elementwise_inputs, normalize_elementwise_input};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for MaxOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

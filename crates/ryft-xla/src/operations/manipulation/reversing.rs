@@ -4,6 +4,8 @@ use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef}
 
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for ReverseOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

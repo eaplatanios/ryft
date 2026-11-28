@@ -11,6 +11,8 @@ use crate::lowering::types::MemoryLoweringExtension;
 use crate::operations::manipulation::conversions::ArrayTypeLayoutConversionLoweringExtension;
 use crate::{Array, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
+// TODO(eaplatanios): Review this module.
+
 impl PlaceDispatch<ArrayType, Array> for ValueDomainDispatch {
     fn place_operation(input: &Array, operation: PlaceOperation) -> Result<Array, ProgramError> {
         Self::place_operations(vec![(input.clone(), operation)]).map(|mut outputs| outputs.remove(0))

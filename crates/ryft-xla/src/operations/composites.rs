@@ -21,6 +21,8 @@ use crate::operations::quantization::{
 };
 use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Session, Type};
 
+// TODO(eaplatanios): Review this module.
+
 /// Backend implementation that replaces the calls of a named composite when the XLA lowering targets a
 /// platform that supports it. Implementations are selected from an explicit table by the name and version of the
 /// definition, together with the boundary of the call and the target platform, before anything is emitted, so that

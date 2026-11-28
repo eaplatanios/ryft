@@ -17,6 +17,8 @@ use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_inputs};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for ExpOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

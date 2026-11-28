@@ -25,6 +25,8 @@ use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::call::CallFunctionMap;
 use crate::{Constant, Error, LowerableOperationFamily, Type};
 
+// TODO(eaplatanios): Review this module.
+
 pub(crate) mod condition;
 pub(crate) mod scan;
 pub(crate) mod select;

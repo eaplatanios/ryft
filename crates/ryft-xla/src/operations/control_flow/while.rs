@@ -36,6 +36,8 @@ use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for WhileOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

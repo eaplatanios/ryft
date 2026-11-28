@@ -12,6 +12,8 @@ use crate::lowering::types::{ArrayTypeLoweringExtension, annotate_output_memory,
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for RngBitGeneratorOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

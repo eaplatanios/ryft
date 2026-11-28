@@ -10,6 +10,8 @@ use crate::lowering::types::{ArrayTypeLoweringExtension, DataTypeLoweringExtensi
 use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_inputs};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for AddOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

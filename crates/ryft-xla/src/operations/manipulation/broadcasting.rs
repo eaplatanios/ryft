@@ -17,6 +17,8 @@ use crate::operations::constants::{
 };
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for BroadcastOperation {
     /// Lowers a [`BroadcastOperation`] and explicitly constrains any placement transition over an explicit mesh axis.
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(

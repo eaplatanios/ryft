@@ -19,6 +19,8 @@ use crate::operations::call::lower_shared_function_call;
 use crate::operations::composites::{NamedCompositionKey, named_composition_input_types};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer, Type};
 
+// TODO(eaplatanios): Review this module.
+
 /// Traces the canonical scaled dot decomposition for one validated operation boundary.
 pub(crate) fn trace_scaled_dot_composition(
     operation: &ScaledDotOperation,

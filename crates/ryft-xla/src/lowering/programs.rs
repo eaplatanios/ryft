@@ -5,16 +5,17 @@ use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, AtomId, BroadcastOperation, CallOperation, DataType, DeviceMesh, Dimension, EffectClass,
-    ExternalReferenceBinding, LogicalMesh, Memory, MeshAxisType, Parameterized, PlaceOperation, PlacementRequest,
-    Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RematerializationOptimizationBarrier,
-    RequestedPlacement, Shape, Sharding, ShardingDimension, StopGradientOperation, TagOperation,
-    TransferToMemoryOperation, Type as CoreType, Typed, TypedProgram, Value,
+    ArrayType, AtomId, BroadcastOperation, CallOperation, DataType, DeviceMesh, Dimension, EagerContext, EffectClass,
+    ExternalReferenceBinding, FlatProgram, LogicalMesh, Memory, MeshAxisType, Parameterized, PlaceOperation,
+    PlacementRequest, Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef,
+    RematerializationOptimizationBarrier, RequestedPlacement, Shape, Sharding, ShardingDimension,
+    StopGradientOperation, TagOperation, TransferToMemoryOperation, Type as CoreType, Typed, TypedProgram, Value,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
-    Attribute, Block, Context as MlirContext, DetachedBlock, Location, LocationRef, Operation as MlirOperation, Region,
-    SymbolVisibility, Type as MlirType, TypeAndAttributes, Value as MlirValue,
+    Attribute, Block, BlockRef, Context as MlirContext, DetachedBlock, Location, LocationRef,
+    Operation as MlirOperation, Region, SymbolVisibility, TensorTypeRef, Type as MlirType, TypeAndAttributes,
+    Value as MlirValue,
 };
 
 use crate::arrays::host::ReductionChange;
@@ -38,7 +39,7 @@ use crate::lowering::types::{
     lower_unplaced_constant_output, validate_boundary_memory,
 };
 use crate::lowering::{EffectTokens, LowerableOperationFamily, LoweringError, RaggedDotLoweringStrategy};
-use crate::operations::call::{CallFunctionMap, collect_call_functions, emit_call_function};
+use crate::operations::call::{CallFunctionMap, collect_call_functions};
 use crate::operations::composites::NamedCompositionFunctionMap;
 use crate::{
     CompilationError, Constant, Error, ExecutionError, RetainedArray, RuntimeRequirement, Type,
@@ -815,66 +816,28 @@ where
         // repeated calls, in which case every `call` inlines exactly as before.
         let nested_functions = Rc::new(collect_call_functions(program, target_platform)?);
 
-        // Each named composition is emitted as a private function that holds its decomposition, which its calls refer
-        // to by symbol.
+        // The private functions of the module are emitted ahead of its entry function. Each named composition has
+        // one that holds its decomposition, which is traced independently of the lowered program and so contains
+        // no shared `call`, and each shared callee has one, whose own repeated `call`s lower to calls of the other
+        // shared functions. Calls refer to these functions by symbol, so the order of emission does not matter.
         let mut module_block = module.body()?;
+        let location_ref = location.as_ref();
         for function in named_compositions.functions() {
-            let program = function.program();
-            let lower_types = |types: &[Type]| {
-                types.iter().map(|r#type| r#type.lower(&context, location)).collect::<Result<Vec<_>, _>>()
-            };
-
-            let input_tensor_types = lower_types(&program.input_types())?;
-            let output_tensor_types = lower_types(&program.output_types())?;
-            let argument_types = input_tensor_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
-            let function_block = context.block(argument_types.as_slice());
-            let input_values = (0..input_tensor_types.len())
-                .map(|index| function_block.argument(index).unwrap().as_ref())
-                .collect::<Vec<_>>();
-            let mut function_block_ref = function_block.as_ref();
-            let outputs = program.lower_inline(
-                input_values.as_slice(),
-                &mut function_block_ref,
-                &context,
-                location.as_ref(),
-                &[],
-                // Decompositions are traced independently of the lowered program and contain no `call` sharing.
-                &RematerializationOptimizationBarrier::None,
-                None,
-                &lowering_context,
-                &mut EffectTokens::default(),
-            )?;
-
-            function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
-            let mut function_region = context.region();
-            function_region.append_block(function_block)?;
-            module_block.append_operation(func::func(
-                function.symbol(),
-                func::FuncAttributes {
-                    arguments: input_tensor_types
-                        .iter()
-                        .map(|r#type| TypeAndAttributes { r#type: r#type.as_ref(), attributes: None })
-                        .collect(),
-                    results: output_tensor_types
-                        .iter()
-                        .map(|r#type| TypeAndAttributes { r#type: r#type.as_ref(), attributes: None })
-                        .collect(),
-                    visibility: SymbolVisibility::Private,
-                    ..Default::default()
-                },
-                function_region,
-                location,
-            )?)?;
+            let (symbol, program) = (function.symbol(), function.program());
+            emit_private_function(symbol, program, None, &lowering_context, &mut module_block, &context, location_ref)?;
         }
 
         for function in nested_functions.functions() {
-            emit_call_function(
-                &mut module_block,
-                function,
-                &nested_functions,
+            let (symbol, program) = (function.symbol(), function.program());
+            let functions = Some(&nested_functions);
+            emit_private_function(
+                symbol,
+                program,
+                functions,
                 &lowering_context,
+                &mut module_block,
                 &context,
-                location.as_ref(),
+                location_ref,
             )?;
         }
 
@@ -2570,6 +2533,76 @@ pub(crate) fn entry_outputs_with_compiler_chosen_placement(
                     .is_some_and(|sharding| sharding.dimensions().contains(&ShardingDimension::Unconstrained))
         })
         .collect()
+}
+
+/// Emits the private `func.func` named `symbol`, whose body is the lowering of `program`, into `module_block`.
+/// The function takes the inputs of `program` and returns its outputs, without attributes. The repeated `call`s of
+/// `program` lower to calls of the shared functions in `nested_functions`, if any, and inline otherwise. The body is
+/// lowered outside any manual region and with the `lowering_context` of the module, so that it shares the channel
+/// allocator, the mesh, and the target platform of the entry function. `program` must have no effects when it is
+/// lowered (e.g., `collect_call_functions` leaves out callees whose lowering has effects, including synthesized
+/// entry guards), because the function threads no effect token. It must also read no session constant, because
+/// only the entry function receives the hidden inputs that carry them.
+fn emit_private_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    symbol: &str,
+    program: &FlatProgram<EagerContext<Constant, O>>,
+    nested_functions: Option<&Rc<CallFunctionMap<O>>>,
+    lowering_context: &ProgramLoweringContext,
+    module_block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), Error> {
+    let input_tensor_types = program
+        .input_types()
+        .iter()
+        .map(|r#type| r#type.lower(context, location))
+        .collect::<Result<Vec<_>, _>>()?;
+    let output_tensor_types = program
+        .output_types()
+        .iter()
+        .map(|r#type| r#type.lower(context, location))
+        .collect::<Result<Vec<_>, _>>()?;
+    let argument_types = input_tensor_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
+    let function_block = context.block(argument_types.as_slice());
+    let input_values = (0..input_tensor_types.len())
+        .map(|index| function_block.argument(index).unwrap().as_ref())
+        .collect::<Vec<_>>();
+
+    let mut function_block_ref = function_block.as_ref();
+    let outputs = program.lower_inline(
+        input_values.as_slice(),
+        &mut function_block_ref,
+        context,
+        location,
+        &[],
+        &RematerializationOptimizationBarrier::None,
+        nested_functions,
+        lowering_context,
+        &mut EffectTokens::default(),
+    )?;
+
+    function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
+    let mut function_region = context.region();
+    function_region.append_block(function_block)?;
+    module_block.append_operation(func::func(
+        symbol,
+        func::FuncAttributes {
+            arguments: input_tensor_types
+                .iter()
+                .map(|r#type| TypeAndAttributes { r#type: r#type.as_ref(), attributes: None })
+                .collect(),
+            results: output_tensor_types
+                .iter()
+                .map(|r#type| TypeAndAttributes { r#type: r#type.as_ref(), attributes: None })
+                .collect(),
+            visibility: SymbolVisibility::Private,
+            ..Default::default()
+        },
+        function_region,
+        location,
+    )?)?;
+
+    Ok(())
 }
 
 #[cfg(test)]

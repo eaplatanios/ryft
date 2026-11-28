@@ -8,6 +8,8 @@ use ryft_mlir::{
 use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_splat};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for SortOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

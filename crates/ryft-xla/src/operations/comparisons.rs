@@ -7,6 +7,8 @@ use crate::lowering::types::lower_signed_one_bit_to_mlir;
 use crate::operations::normalize_binary_elementwise_inputs;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
 
+// TODO(eaplatanios): Review this module.
+
 /// Lowering of a [`ComparisonDirection`] to StableHLO.
 pub trait ComparisonDirectionLoweringExtension {
     /// Lowers this direction to the StableHLO comparison direction with the same meaning.

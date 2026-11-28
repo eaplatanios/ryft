@@ -11,6 +11,8 @@ use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{ArrayTypeLoweringExtension, lower_u64_scalar_constant};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
+// TODO(eaplatanios): Review this module.
+
 /// Lowering of an [`AxisIndexOperation`] outside of a [`Lowerer`].
 pub(super) trait AxisIndexOperationLoweringExtension {
     /// Lowers one [`AxisIndexOperation`] inside a `sdy.manual_computation` region to the executing device's coordinate

@@ -19,6 +19,8 @@ use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
+// TODO(eaplatanios): Review this module.
+
 /// Lowers the scalar product combiner of a `reduce` or `cumulative` body over `element_type`. Complex operands return
 /// the other operand when one of them is exactly the `1 + 0i` identity that seeds every reduction and pads every
 /// window, because multiplying by it is not exact under complex arithmetic. Its zero imaginary component meets the

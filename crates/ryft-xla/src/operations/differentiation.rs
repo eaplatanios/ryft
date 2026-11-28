@@ -7,6 +7,8 @@ use ryft_mlir::ValueRef;
 use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for StopGradientOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

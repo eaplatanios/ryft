@@ -28,6 +28,8 @@ use ryft_pjrt::extensions::ffi::FfiStream;
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use crate::operations::assertions::copy_cuda_bytes;
 
+// TODO(eaplatanios): Review this module.
+
 /// Name of the XLA custom call target that implements the host callback side of `print` lowering.
 ///
 /// A lowered [`PrintOperation`] becomes a `stablehlo.custom_call` with the following calling convention, which the FFI

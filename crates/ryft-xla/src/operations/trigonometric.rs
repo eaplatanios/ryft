@@ -7,6 +7,8 @@ use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_spla
 use crate::operations::{AccuracyLoweringExtension, normalize_binary_elementwise_inputs};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for SinOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

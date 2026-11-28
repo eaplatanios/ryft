@@ -17,6 +17,8 @@ use crate::operations::reductions::{
 };
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for CumulativeOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

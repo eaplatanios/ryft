@@ -4,6 +4,8 @@ use ryft_mlir::ValueRef;
 use crate::lowering::types::MemoryLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for TransferToMemoryOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

@@ -12,6 +12,8 @@ use crate::lowering::types::{ArrayTypeLoweringExtension, lower_f64_constant_spla
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
+// TODO(eaplatanios): Review this module.
+
 /// Lowering of a [`ParallelReduceOperation`] for one value.
 pub(crate) trait ParallelReduceOperationLoweringExtension {
     /// Lowers one [`ParallelReduceOperation`] inside a `sdy.manual_computation` region to a `stablehlo.all_reduce` over

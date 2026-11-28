@@ -28,6 +28,8 @@ use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
 use crate::{Error, LoweringError, Type};
 
+// TODO(eaplatanios): Review this module.
+
 /// Seed of the dropout masks of the fused attention kernels. Calls with dropout but without a dropout state, which
 /// [`AttentionInputs::dropout_state`] holds, have a mask that the implementation defines, and this fixed seed makes the
 /// forward and backward kernels of one boundary apply the same mask.

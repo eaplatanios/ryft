@@ -22,6 +22,8 @@ use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects
 use crate::operations::control_flow::lowered_effect_classes;
 use crate::{Constant, Error, LowerableOperation, LowerableOperationFamily, Lowerer, SHARDY_MESH_SYMBOL_NAME, Type};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for ShardMapOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

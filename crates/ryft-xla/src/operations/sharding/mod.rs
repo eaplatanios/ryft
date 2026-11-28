@@ -1,3 +1,5 @@
+// TODO(eaplatanios): Review this module.
+
 /// Shardy lowering of sharding constraints.
 pub(crate) mod constrain_sharding;
 /// XLA lowering of `place`.

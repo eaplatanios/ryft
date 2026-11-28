@@ -21,6 +21,8 @@ use crate::operations::assertions::{
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Type};
 
+// TODO(eaplatanios): Review this module.
+
 impl LowerableOperation for DimensionSizeOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,

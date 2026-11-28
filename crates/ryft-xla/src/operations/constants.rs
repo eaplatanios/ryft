@@ -21,6 +21,8 @@ use crate::{
     Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation, Type,
 };
 
+// TODO(eaplatanios): Review this module.
+
 /// Lowering of the layout of an [`ArrayType`] to a constraint on a value.
 pub(crate) trait ArrayTypeLayoutConstraintLoweringExtension {
     /// Constrains the layout of a statically shaped physical buffer before attaching its runtime dimensions.
