@@ -33,7 +33,7 @@ use ryft_pjrt::{
 use crate::arrays::metadata::ArrayOutputPlan;
 use crate::compilation::programs::OutputDeviceAssignment;
 use crate::devices::MemoryExtension;
-use crate::lowering::programs::MlirProgramSignature;
+use crate::lowering::programs::MlirProgramBoundaryMapping;
 use crate::sessions::effects::ensure_effect_dispatch_is_allowed;
 use crate::types::DataTypeExtension;
 use crate::{
@@ -195,14 +195,14 @@ impl ExecutionPlan {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
         output_shardings: &[Sharding],
-        signature: &MlirProgramSignature,
+        boundary_mapping: &MlirProgramBoundaryMapping,
         donation_flags: &[bool],
         capture_count: usize,
         mesh: &DeviceMesh,
     ) -> Result<Self, Error> {
         let physical_input_logical_indices =
-            signature.select_input_entries(&(0..input_types.len()).collect::<Vec<_>>())?;
-        let mut physical_input_types = signature.executable_input_types(input_types)?;
+            boundary_mapping.select_input_entries(&(0..input_types.len()).collect::<Vec<_>>())?;
+        let mut physical_input_types = boundary_mapping.executable_input_types(input_types)?;
         let compiled_executable = executable.executable()?;
         // A plugin without the layouts extension (e.g., the MPS plugin) does not report the layouts of its executables.
         // The validation below then rejects an input type that declares a layout, which it cannot confirm, and an
@@ -216,7 +216,7 @@ impl ExecutionPlan {
                 Err(error) => return Err(error.into()),
             }
         };
-        let physical_output_types = signature.executable_output_types(output_types)?;
+        let physical_output_types = boundary_mapping.executable_output_types(output_types)?;
         let output_layouts = if physical_output_types.iter().any(|array_type| array_type.layout().is_some()) {
             compiled_executable.output_layouts()?
         } else {
@@ -315,8 +315,8 @@ impl ExecutionPlan {
         }
         let logical_donation_flags =
             std::iter::repeat_n(false, capture_count).chain(donation_flags.iter().copied()).collect::<Vec<_>>();
-        let mut default_donation_flags = signature.select_input_entries(logical_donation_flags.as_slice())?;
-        default_donation_flags.extend(std::iter::repeat_n(false, signature.input_dimensions().len()));
+        let mut default_donation_flags = boundary_mapping.select_input_entries(logical_donation_flags.as_slice())?;
+        default_donation_flags.extend(std::iter::repeat_n(false, boundary_mapping.input_dimensions().len()));
         for (donation, input_type) in default_donation_flags.iter_mut().zip(physical_input_types.iter()) {
             if input_type.data_type().is_zero() {
                 *donation = false;
@@ -326,8 +326,8 @@ impl ExecutionPlan {
             devices.iter().map(|device| device.id().map_err(Error::from)).collect::<Result<Arc<[_]>, _>>()?;
         let static_inputs = input_types.iter().all(|input_type| input_type.static_shape().is_some());
         let zero_space_inputs = physical_input_types.iter().any(|input_type| input_type.data_type().is_zero());
-        let static_outputs = signature.output_dimensions().is_empty()
-            && output_types.iter().zip(signature.output_mapping()).all(|(output_type, physical_index)| {
+        let static_outputs = boundary_mapping.output_dimensions().is_empty()
+            && output_types.iter().zip(boundary_mapping.output_mapping()).all(|(output_type, physical_index)| {
                 output_type.static_shape().is_some() && (physical_index.is_some() || output_type.data_type().is_zero())
             });
         // Declared shardings only fix output placement when XLA must honor them. Lowering emits no result shardings
@@ -596,7 +596,7 @@ impl Session {
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
         let execution = self.execute_compiled_async(program, inputs)?;
-        if execution.output().is_empty() && !program.signature().has_effects() {
+        if execution.output().is_empty() && !program.boundary_mapping().has_effects() {
             execution.fence().block_until_ready()?;
         }
         let (outputs, fence) = execution.into_parts();
@@ -608,7 +608,7 @@ impl Session {
     /// effects waits here so failures remain observable.
     pub(crate) fn execute_program(&self, program: &CompiledProgram, inputs: Vec<Array>) -> Result<Vec<Array>, Error> {
         let execution = self.execute_compiled_async(program, inputs)?;
-        if execution.output().is_empty() && !program.signature().has_effects() {
+        if execution.output().is_empty() && !program.boundary_mapping().has_effects() {
             // No output array carries the execution fence out of this call, so an asynchronous execution error would
             // otherwise be unobservable. Block here so this synchronous entry point still reports it.
             let (outputs, fence) = execution.into_parts();
@@ -641,11 +641,11 @@ impl Session {
                 actual: inputs.len(),
             }));
         }
-        // An input that the executable never reads has no physical input, and the signature records it as unread
+        // An input that the executable never reads has no physical input, and the boundary mapping records it as unread
         // (refer to `unread_entry_inputs`), so it is neither checked, nor required to hold buffers, nor waited for,
         // whatever its data type. An erased input of the zero data type that the executable reads is not unread, and
         // its producer is still observed below.
-        let is_unread = |index: usize| program.signature().is_unread_input(index);
+        let is_unread = |index: usize| program.boundary_mapping().is_unread_input(index);
         // Check every input, captures included, before anything observes, erases, converts, or donates it. The session
         // owns the program (refer to `Self::validate_program_owner`).
         let checked = inputs.iter().enumerate().map(|(index, input)| (!is_unread(index)).then_some(input));
@@ -722,7 +722,9 @@ impl Session {
         // eager call admits the same input alike (refer to `CallEagerExtension::eager_decision`). The executable
         // receives such an input as its declared type states. A capture that the executable never reads is not
         // admitted.
-        for (index, (input, physical_index)) in inputs.iter().zip(program.signature().input_mapping()).enumerate() {
+        for (index, (input, physical_index)) in
+            inputs.iter().zip(program.boundary_mapping().input_mapping()).enumerate()
+        {
             match physical_index {
                 Some(physical_index) => {
                     let expected = &program.expected_input_shardings()[*physical_index];
@@ -740,7 +742,9 @@ impl Session {
 
         // Erased inputs of the zero data type have no buffers through which PJRT could order consumer work after their
         // producers. Observe completion before dropping those inputs, including before any consumer effects run.
-        for (index, (input, physical_index)) in inputs.iter().zip(program.signature().input_mapping()).enumerate() {
+        for (index, (input, physical_index)) in
+            inputs.iter().zip(program.boundary_mapping().input_mapping()).enumerate()
+        {
             if physical_index.is_none() && !is_unread(index) {
                 input.block_until_ready()?;
             }
@@ -748,7 +752,7 @@ impl Session {
 
         // Without hidden extent scalars, physical inputs are a projection of the logical inputs, which is the identity
         // for most programs. Bounded dynamic inputs are padded to their physical bounds instead.
-        let inputs = if program.signature().input_dimensions().is_empty() {
+        let inputs = if program.boundary_mapping().input_dimensions().is_empty() {
             if plan.physical_input_logical_indices.iter().copied().eq(0..inputs.len()) {
                 inputs
             } else {
@@ -768,7 +772,7 @@ impl Session {
             // not introduce a pending reduction below the bound"). Such an input is rejected here, from global facts
             // alone, so every process rejects it alike, before any input is placed.
             for (logical_input_index, (input, physical_index)) in
-                inputs.iter().zip(program.signature().input_mapping()).enumerate()
+                inputs.iter().zip(program.boundary_mapping().input_mapping()).enumerate()
             {
                 let Some(physical_index) = physical_index else {
                     continue;
@@ -798,7 +802,7 @@ impl Session {
             }
             let inputs = inputs
                 .into_iter()
-                .zip(program.signature().input_mapping())
+                .zip(program.boundary_mapping().input_mapping())
                 .map(|(input, physical_index)| match physical_index {
                     Some(physical_index) if !input.data_type().is_zero() => self.reshard_input_if_needed(
                         program.mesh(),
@@ -810,7 +814,7 @@ impl Session {
                 .collect::<Result<Vec<_>, Error>>()?;
             self.materialize_bounded_dynamic_inputs(
                 program.mesh(),
-                program.signature(),
+                program.boundary_mapping(),
                 program.input_types(),
                 actual_input_types.as_slice(),
                 inputs,
@@ -870,8 +874,9 @@ impl Session {
                 })?;
                 *flag = donation;
             }
-            let mut donation_flags = program.signature().select_input_entries(logical_donation_flags.as_slice())?;
-            donation_flags.extend(std::iter::repeat_n(false, program.signature().input_dimensions().len()));
+            let mut donation_flags =
+                program.boundary_mapping().select_input_entries(logical_donation_flags.as_slice())?;
+            donation_flags.extend(std::iter::repeat_n(false, program.boundary_mapping().input_dimensions().len()));
             for (donation, input_type) in donation_flags.iter_mut().zip(plan.physical_input_types.iter()) {
                 if input_type.data_type().is_zero() {
                     *donation = false;
@@ -884,7 +889,7 @@ impl Session {
             addressable_device_ids: Arc::clone(&plan.addressable_device_ids),
             donation_flags,
             input_refinements,
-            physical_output_count: program.signature().output_array_count(),
+            physical_output_count: program.boundary_mapping().output_array_count(),
             output_assignment: OutputAssignment { committed, locally_assigned },
         })
     }
@@ -982,7 +987,7 @@ impl Session {
                         .into());
                     }
                 };
-                let physical_input_index = program.signature().input_mapping()[logical_input_index].unwrap();
+                let physical_input_index = program.boundary_mapping().input_mapping()[logical_input_index].unwrap();
                 let expected_sharding = &program.expected_input_shardings()[physical_input_index];
                 let declared_type = &program.input_types()[logical_input_index];
                 let effective_type = if declared_type.sharding().is_some() {
@@ -1345,19 +1350,19 @@ impl Session {
     ) -> Result<Execution<Vec<Vec<Buffer<'static>>>>, Error> {
         ensure_effect_dispatch_is_allowed()?;
         let addressable_device_count = arguments.addressable_device_ids().len();
-        let ordered = program.signature().has_ordered_io();
+        let ordered = program.boundary_mapping().has_ordered_io();
         if ordered {
             if !self.target()?.is_fully_addressable_single_process_mesh(program.mesh()) {
                 return Err(ExecutionError::UnsupportedEffectDeviceAssignment.into());
             }
-            if addressable_device_count > 1 && !program.signature().has_device_ordered_io() {
+            if addressable_device_count > 1 && !program.boundary_mapping().has_device_ordered_io() {
                 return Err(ExecutionError::MissingDeviceOrderedEffect.into());
             }
         }
         let devices = ordered.then_some(arguments.addressable_device_ids());
         let mut work = self.reserve_work();
         let mut reservation =
-            if program.signature().has_effects() { Some(self.reserve_effects(devices)?) } else { None };
+            if program.boundary_mapping().has_effects() { Some(self.reserve_effects(devices)?) } else { None };
         if reservation.is_some()
             && !input_fences.is_empty()
             && let Err(error) = ExecutionFence::join(input_fences.iter().cloned()).block_until_ready()
@@ -1406,7 +1411,7 @@ impl Session {
             arguments
                 .inputs_by_device()
                 .iter()
-                .all(|inputs| inputs.len() == program.signature().executable_input_count())
+                .all(|inputs| inputs.len() == program.boundary_mapping().executable_input_count())
         );
         #[cfg(test)]
         if tests::take_stateful_failure_injection(tests::StatefulFailureInjection::BeforeSubmission) {
@@ -1429,8 +1434,8 @@ impl Session {
             .then(|| ExecutionFence::join(std::iter::once(fence.clone()).chain(input_fences)));
         // Reference publication must happen after every successful handoff, including a subsequent marshalling error.
         after_submission(joined_fence.as_ref().unwrap_or(&fence));
-        let output_count = program.signature().executable_output_count();
-        debug_assert_eq!(array_output_count, program.signature().output_array_count());
+        let output_count = program.boundary_mapping().executable_output_count();
+        debug_assert_eq!(array_output_count, program.boundary_mapping().output_array_count());
         let invalid_outputs = device_outputs
             .iter()
             .find(|outputs| outputs.outputs.len() != output_count)
@@ -1448,7 +1453,9 @@ impl Session {
                     device_outputs
                         .iter_mut()
                         .map(|outputs| {
-                            Arc::new(outputs.outputs.remove(program.signature().ordered_io_output_index().unwrap()))
+                            Arc::new(
+                                outputs.outputs.remove(program.boundary_mapping().ordered_io_output_index().unwrap()),
+                            )
                         })
                         .collect(),
                 ))
@@ -1579,24 +1586,24 @@ impl Session {
     fn materialize_bounded_dynamic_inputs(
         &self,
         mesh: &DeviceMesh,
-        signature: &MlirProgramSignature,
+        boundary_mapping: &MlirProgramBoundaryMapping,
         declared_types: &[ArrayType],
         actual_types: &[ArrayType],
         inputs: Vec<Array>,
     ) -> Result<Vec<Array>, Error> {
         assert_eq!(declared_types.len(), inputs.len());
         assert_eq!(actual_types.len(), inputs.len());
-        let physical_types = signature.executable_input_types(declared_types)?;
-        let mut physical_inputs = signature.select_input_entries(inputs.as_slice())?;
+        let physical_types = boundary_mapping.executable_input_types(declared_types)?;
+        let mut physical_inputs = boundary_mapping.select_input_entries(inputs.as_slice())?;
         for logical_input_index in 0..inputs.len() {
-            if !signature
+            if !boundary_mapping
                 .input_dimensions()
                 .iter()
                 .any(|input_dimension| input_dimension.logical_input_index() == logical_input_index)
             {
                 continue;
             }
-            let physical_input_index = signature.input_mapping()[logical_input_index].unwrap();
+            let physical_input_index = boundary_mapping.input_mapping()[logical_input_index].unwrap();
             let physical_type = &physical_types[physical_input_index];
             let physical_shape = physical_type.static_shape().ok_or_else(|| ProgramError::InvalidArgument {
                 message: format!("bounded-dynamic executable input {logical_input_index} has no static upper shape"),
@@ -1686,7 +1693,7 @@ impl Session {
                 input.pad(&zero, vec![0i64; rank].as_slice(), padding.as_slice(), vec![0usize; rank].as_slice())?;
         }
 
-        for input_dimension in signature.input_dimensions() {
+        for input_dimension in boundary_mapping.input_dimensions() {
             let extent = actual_types[input_dimension.logical_input_index()].shape().dimensions()
                 [input_dimension.axis()]
             .value()
@@ -1701,7 +1708,7 @@ impl Session {
             let extent_scalar = Array::from_host_buffer(self, extent_type, mesh.clone(), None, extent.to_ne_bytes())?;
             physical_inputs.push(extent_scalar);
         }
-        assert_eq!(physical_inputs.len(), signature.input_array_count());
+        assert_eq!(physical_inputs.len(), boundary_mapping.input_array_count());
         Ok(physical_inputs)
     }
 
@@ -1762,7 +1769,7 @@ impl Session {
             return logical_indices
                 .into_iter()
                 .map(|logical_index| {
-                    let buffers = match program.signature().output_mapping()[logical_index] {
+                    let buffers = match program.boundary_mapping().output_mapping()[logical_index] {
                         Some(physical_index) => {
                             physical_outputs.get_mut(physical_index).and_then(Option::take).ok_or_else(|| {
                                 ProgramError::MalformedProgram(format!(
@@ -1785,7 +1792,7 @@ impl Session {
         let scalar_type = ArrayType::scalar(DataType::I64).replicated(program.mesh())?;
         let mut output_extents = BTreeMap::new();
         for output_dimension in program
-            .signature()
+            .boundary_mapping()
             .output_dimensions()
             .iter()
             .filter(|dimension| logical_indices.contains(&dimension.logical_output_index()))
@@ -1827,7 +1834,7 @@ impl Session {
             .into_iter()
             .map(|logical_index| {
                 let output_type = &program.all_output_types()[logical_index];
-                match program.signature().output_mapping()[logical_index] {
+                match program.boundary_mapping().output_mapping()[logical_index] {
                     Some(physical_index) => {
                         let dimensions = output_type
                             .shape()
@@ -3689,7 +3696,7 @@ mod tests {
                 )
                 .unwrap();
             let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-            assert_eq!(lowered.signature().input_mapping(), &[None, Some(0)]);
+            assert_eq!(lowered.boundary_mapping().input_mapping(), &[None, Some(0)]);
             let compiled = session.compile_program(&lowered).unwrap();
             let (event, promise) = client.event(()).unwrap();
             promise.set(Some(ryft_pjrt::Error::invalid_argument("erased producer failed"))).unwrap();
@@ -4517,7 +4524,7 @@ mod tests {
         let mesh = domain_mesh(client, "x", 1);
         let session = Session::builder().client(client).build().unwrap();
         let declared_type = bounded_vector_type(Sharding::replicated(mesh.logical_mesh().clone(), 1));
-        let signature = MlirProgramSignature::new(std::slice::from_ref(&declared_type), &[]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(std::slice::from_ref(&declared_type), &[]);
 
         // An input that is already at its bound is passed through with its storage, followed by its extent scalar.
         let exact_type = replicated_vector_type(&mesh, 8);
@@ -4527,7 +4534,7 @@ mod tests {
         let at_bound = session
             .materialize_bounded_dynamic_inputs(
                 &mesh,
-                &signature,
+                &boundary_mapping,
                 std::slice::from_ref(&declared_type),
                 std::slice::from_ref(&exact_type),
                 vec![exact.clone()],
@@ -4547,7 +4554,7 @@ mod tests {
         let padded = session
             .materialize_bounded_dynamic_inputs(
                 &mesh,
-                &signature,
+                &boundary_mapping,
                 std::slice::from_ref(&declared_type),
                 std::slice::from_ref(&smaller_type),
                 vec![smaller.clone()],
@@ -4584,13 +4591,13 @@ mod tests {
         let right =
             Array::from_host_buffer(&session, right_type.clone(), mesh.clone(), None, right_values.as_slice()).unwrap();
         let declared_types = [declared_type.clone(), declared_type];
-        let signature = MlirProgramSignature::new(&declared_types, &[]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(&declared_types, &[]);
 
         // The padded inputs come first, in input order, followed by one extent scalar per bounded dimension.
         let padded = session
             .materialize_bounded_dynamic_inputs(
                 &mesh,
-                &signature,
+                &boundary_mapping,
                 &declared_types,
                 &[left_type, right_type],
                 vec![left, right],
@@ -4633,11 +4640,17 @@ mod tests {
         let source =
             Array::from_host_buffer(&session, actual_type.clone(), mesh.clone(), None, source_values.as_slice())
                 .unwrap();
-        let signature = MlirProgramSignature::new(std::slice::from_ref(&declared_type), &[]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(std::slice::from_ref(&declared_type), &[]);
 
         // The padding runs on the four devices and keeps the result sharded over them.
         let padded = session
-            .materialize_bounded_dynamic_inputs(&mesh, &signature, &[declared_type], &[actual_type], vec![source])
+            .materialize_bounded_dynamic_inputs(
+                &mesh,
+                &boundary_mapping,
+                &[declared_type],
+                &[actual_type],
+                vec![source],
+            )
             .unwrap();
         assert_eq!(
             padded[0].copy_to_host().unwrap().elements::<f32>().unwrap(),
@@ -4666,11 +4679,11 @@ mod tests {
         let values = values_to_bytes::<i32>(&[1, 2, 3, 4]);
         let input =
             Array::from_host_buffer(&session, actual_type.clone(), mesh.clone(), None, values.as_slice()).unwrap();
-        let signature = MlirProgramSignature::new(std::slice::from_ref(&declared_type), &[]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(std::slice::from_ref(&declared_type), &[]);
 
         // The elements stay at the origin and zeros follow them along every axis, with one extent scalar per axis.
         let padded = session
-            .materialize_bounded_dynamic_inputs(&mesh, &signature, &[declared_type], &[actual_type], vec![input])
+            .materialize_bounded_dynamic_inputs(&mesh, &boundary_mapping, &[declared_type], &[actual_type], vec![input])
             .unwrap();
         assert_eq!(padded.len(), 3);
         assert_eq!(padded[0].shape(), StaticShape::new(vec![3, 4]));
@@ -5093,7 +5106,7 @@ mod tests {
                 .unwrap()
         };
         let declared_types = [bounded_type(DataType::Zero, "n"), bounded_type(DataType::F32, "m")];
-        let signature = MlirProgramSignature::new(&declared_types, &[]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(&declared_types, &[]);
         let zero =
             Array::from_host_buffer(&session, ArrayType::new_static(DataType::Zero, [2]), None, None, []).unwrap();
         let value_type = ArrayType::new_static(DataType::F32, [3]).with_sharding(replicated.clone()).unwrap();
@@ -5102,7 +5115,13 @@ mod tests {
         assert_eq!((zero.is_committed(), zero.is_locally_assigned()), (false, true));
         let actual_types = [zero.r#type().into_owned(), value.r#type().into_owned()];
         let inputs = session
-            .materialize_bounded_dynamic_inputs(&mesh, &signature, &declared_types, &actual_types, vec![zero, value])
+            .materialize_bounded_dynamic_inputs(
+                &mesh,
+                &boundary_mapping,
+                &declared_types,
+                &actual_types,
+                vec![zero, value],
+            )
             .unwrap();
         let observe = |scalar: &Array| {
             let values = scalar.copy_to_host().unwrap().elements::<i32>().unwrap();
@@ -5212,7 +5231,7 @@ mod tests {
         )
         .with_sharding(sharding.clone())
         .unwrap();
-        let signature = MlirProgramSignature::new(std::slice::from_ref(&declared_type), &[]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(std::slice::from_ref(&declared_type), &[]);
         let actual_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(2)]))
             .with_sharding(sharding)
             .unwrap();
@@ -5223,7 +5242,7 @@ mod tests {
         let inputs = session
             .materialize_bounded_dynamic_inputs(
                 &mesh,
-                &signature,
+                &boundary_mapping,
                 std::slice::from_ref(&declared_type),
                 std::slice::from_ref(&actual_type),
                 vec![zero.clone()],
@@ -5232,7 +5251,7 @@ mod tests {
         assert_eq!(inputs.len(), 2);
         assert_eq!(inputs[0], zero);
 
-        let physical_types = signature.executable_input_types(std::slice::from_ref(&declared_type)).unwrap();
+        let physical_types = boundary_mapping.executable_input_types(std::slice::from_ref(&declared_type)).unwrap();
         let carriers = session.materialize_zero_space_carriers(&mesh, &physical_types, inputs).unwrap();
         assert_eq!(carriers[0].data_type(), DataType::Boolean);
         assert_eq!(carriers[0].shape().as_slice(), &[3]);

@@ -14,14 +14,14 @@
 //! constrained to that placement. Reference state is discharged before lowering.
 
 use ryft_core::{
-    ArrayType, ComparisonDirection, DataType, EffectClasses, Operation, ProgramError, ReductionKind,
-    RematerializationOptimizationBarrier, TypedProgram, WhileOperation,
+    ArrayType, ComparisonDirection, DataType, EffectClasses, Operation, ProgramError, ReductionKind, TypedProgram,
+    WhileOperation,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{Block, Operation as MlirOperation, Region, Type as MlirType, Value as MlirValue, ValueRef};
 
 use crate::lowering::EffectTokens;
-use crate::lowering::regions::NestedProgramLoweringExtension;
+use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, TypeLoweringExtension, lower_explicit_shape, lower_runtime_dimension_size_i64,
     lower_static_index_constants, physical_bound_type,
@@ -179,15 +179,13 @@ impl LowerableOperation for WhileOperation<Type> {
         state_values.extend_from_slice(input_values);
         if threaded_predicate {
             let initial_predicate = condition.lower_inline(
-                input_values,
-                block,
-                context,
-                location,
                 captured_values,
-                &RematerializationOptimizationBarrier::None,
+                input_values,
                 nested_functions,
                 lowering_context,
                 effect_tokens,
+                *block,
+                location,
             )?;
             state_values.push(initial_predicate[0]);
         }
@@ -235,15 +233,13 @@ impl LowerableOperation for WhileOperation<Type> {
                 });
                 let entry_effect_tokens = condition_effect_tokens;
                 let condition_outputs = condition.lower_inline(
-                    condition_inputs.as_slice(),
-                    &mut condition_block_ref,
-                    context,
-                    location,
                     captured_values,
-                    &RematerializationOptimizationBarrier::None,
+                    condition_inputs.as_slice(),
                     nested_functions,
                     lowering_context,
                     &mut condition_effect_tokens,
+                    condition_block_ref,
+                    location,
                 )?;
                 // The condition region of a `stablehlo.while` returns only the predicate, so it threads no token.
                 validate_unthreaded_effect_tokens(entry_effect_tokens, condition_effect_tokens, EffectClasses::NONE)?;
@@ -286,15 +282,13 @@ impl LowerableOperation for WhileOperation<Type> {
             });
             let entry_effect_tokens = body_effect_tokens;
             let body_outputs = body.lower_inline(
-                body_inputs.as_slice(),
-                &mut body_block_ref,
-                context,
-                location,
                 captured_values,
-                &RematerializationOptimizationBarrier::None,
+                body_inputs.as_slice(),
                 nested_functions,
                 lowering_context,
                 &mut body_effect_tokens,
+                body_block_ref,
+                location,
             )?;
             // For a batched predicate, mask each carry update under the carried predicate of the incoming state, so
             // finished batch items freeze. A scalar loop uses the body outputs directly.
@@ -454,15 +448,13 @@ impl LowerableOperation for WhileOperation<Type> {
                     Some(guarded_condition.result(0).unwrap().as_ref())
                 } else {
                     let next_predicate = condition.lower_inline(
-                        next_state_values.as_slice(),
-                        &mut body_block_ref,
-                        context,
-                        location,
                         captured_values,
-                        &RematerializationOptimizationBarrier::None,
+                        next_state_values.as_slice(),
                         nested_functions,
                         lowering_context,
                         &mut body_effect_tokens,
+                        body_block_ref,
+                        location,
                     )?;
                     Some(next_predicate[0])
                 }

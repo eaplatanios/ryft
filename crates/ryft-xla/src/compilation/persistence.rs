@@ -31,7 +31,7 @@ use crate::compilation::CompilationError;
 use crate::compilation::keys::COMPILER_IDENTITY;
 use crate::compilation::programs::{CompiledProgram, OutputDeviceAssignment};
 use crate::execution::{ExecutionPlan, flatten_device_assignment};
-use crate::lowering::programs::MlirProgramSignature;
+use crate::lowering::programs::MlirProgramBoundaryMapping;
 use crate::{Error, RuntimeRequirement, Session, normalize_runtime_requirements};
 
 // TODO(eaplatanios): Review this module.
@@ -152,9 +152,9 @@ pub(super) struct PersistentBoundaryDimension {
 }
 
 impl PersistentBoundaryDimension {
-    /// Encodes the hidden extent slots of the bounded dynamic inputs of one executable signature.
-    pub(super) fn from_input_dimensions(signature: &MlirProgramSignature) -> Vec<Self> {
-        signature
+    /// Encodes the hidden extent slots of the bounded dynamic inputs in the boundary mapping.
+    pub(super) fn from_input_dimensions(boundary_mapping: &MlirProgramBoundaryMapping) -> Vec<Self> {
+        boundary_mapping
             .input_dimensions()
             .iter()
             .map(|dimension| Self {
@@ -165,9 +165,9 @@ impl PersistentBoundaryDimension {
             .collect()
     }
 
-    /// Encodes the hidden extent slots of the bounded dynamic outputs of one executable signature.
-    pub(super) fn from_output_dimensions(signature: &MlirProgramSignature) -> Vec<Self> {
-        signature
+    /// Encodes the hidden extent slots of the bounded dynamic outputs in the boundary mapping.
+    pub(super) fn from_output_dimensions(boundary_mapping: &MlirProgramBoundaryMapping) -> Vec<Self> {
+        boundary_mapping
             .output_dimensions()
             .iter()
             .map(|dimension| Self {
@@ -465,7 +465,7 @@ impl TryFrom<PersistentDeviceMesh> for DeviceMesh {
     }
 }
 
-/// Converts an in-memory executable signature mapping to its stable persistent representation.
+/// Converts executable slot indices from an in-memory boundary mapping to their stable persistent representation.
 pub(super) fn persistent_mapping(mapping: &[Option<usize>]) -> Result<Vec<Option<u64>>, Error> {
     mapping
         .iter()
@@ -503,18 +503,18 @@ impl CompiledProgram {
             feature_flags: PERSISTENT_EXECUTABLE_FEATURE_FLAGS,
             compilation_options: self.compilation_options().encode_to_vec(),
             signature: PersistentArraySignature::encode(self.input_types(), self.all_output_types()),
-            input_mapping: persistent_mapping(self.signature().input_mapping())?,
-            unread_inputs: self.signature().unread_inputs().to_vec(),
-            output_mapping: persistent_mapping(self.signature().output_mapping())?,
-            input_dimensions: PersistentBoundaryDimension::from_input_dimensions(self.signature()),
-            output_dimensions: PersistentBoundaryDimension::from_output_dimensions(self.signature()),
+            input_mapping: persistent_mapping(self.boundary_mapping().input_mapping())?,
+            unread_inputs: self.boundary_mapping().unread_inputs().to_vec(),
+            output_mapping: persistent_mapping(self.boundary_mapping().output_mapping())?,
+            input_dimensions: PersistentBoundaryDimension::from_input_dimensions(self.boundary_mapping()),
+            output_dimensions: PersistentBoundaryDimension::from_output_dimensions(self.boundary_mapping()),
             output_count: self.output_count() as u64,
             reference_states: PersistentReferenceState::encode(self.reference_states(), self.capture_count())?,
             requires_assertion_handler: self.requires_assertion_handler(),
             runtime_requirements: self.runtime_requirements().to_vec(),
-            ordered_io: self.signature().has_ordered_io(),
-            unordered_io: self.signature().has_unordered_io(),
-            device_ordered_io: self.signature().has_device_ordered_io(),
+            ordered_io: self.boundary_mapping().has_ordered_io(),
+            unordered_io: self.boundary_mapping().has_unordered_io(),
+            device_ordered_io: self.boundary_mapping().has_device_ordered_io(),
             effect_abi_version: 1,
             donation_flags: self.donation_flags().to_vec(),
             capture_count: self.capture_count() as u64,
@@ -557,7 +557,7 @@ impl Session {
     /// Validates and loads a versioned executable envelope for this session. Unsupported schemas, target
     /// configurations, or PJRT loading return `None`. Malformed supported metadata returns an error.
     ///
-    /// The envelope, target, runtime contracts, and signature mapping logical values to executable slots are
+    /// The envelope, target, runtime contracts, and mapping from logical values to executable slots are
     /// validated before loading the native PJRT executable bytes. Persistent cache directories must be trusted sources
     /// of executable code.
     pub(crate) fn deserialize_compiled_program(&self, bytes: &[u8]) -> Result<Option<CompiledProgram>, Error> {
@@ -735,11 +735,11 @@ impl Session {
                 }));
             }
         }
-        // The inputs that the executable never reads are recorded as they were lowered (refer to
-        // `MlirProgramSignature::with_unread_inputs`), never inferred from the mapping, which cannot tell such an input
-        // from a read one without a buffer. An unread input has a static shape and backs no reference state, and the
-        // signature that is rebuilt with them is then compared in full below. A record of no unread input is omitted,
-        // so that the metadata of an executable without one is what it was before unread inputs were recorded.
+        // Lowering records which inputs the executable never reads (refer to
+        // `MlirProgramBoundaryMapping::with_unread_inputs`). An erased slot can also represent a read input without
+        // a buffer. Each unread input must have a static shape and back no reference state. After checking these
+        // conditions, rebuild the boundary mapping and compare its slots with the persisted ones. An executable
+        // without unread inputs retains the metadata format used before unread inputs were recorded.
         let unread_inputs = metadata.unread_inputs;
         if !unread_inputs.is_empty()
             && (unread_inputs.len() != input_types.len()
@@ -751,7 +751,7 @@ impl Session {
                 reason: "unread input metadata does not match the logical inputs".into(),
             }));
         }
-        let signature = MlirProgramSignature::new(input_types.as_slice(), output_types.as_slice())
+        let boundary_mapping = MlirProgramBoundaryMapping::new(input_types.as_slice(), output_types.as_slice())
             .with_unread_inputs(&unread_inputs)
             .with_effects(
                 metadata.ordered_io,
@@ -759,10 +759,10 @@ impl Session {
                 metadata.requires_assertion_handler,
                 metadata.device_ordered_io,
             );
-        if persistent_mapping(signature.input_mapping())? != metadata.input_mapping
-            || persistent_mapping(signature.output_mapping())? != metadata.output_mapping
-            || PersistentBoundaryDimension::from_input_dimensions(&signature) != metadata.input_dimensions
-            || PersistentBoundaryDimension::from_output_dimensions(&signature) != metadata.output_dimensions
+        if persistent_mapping(boundary_mapping.input_mapping())? != metadata.input_mapping
+            || persistent_mapping(boundary_mapping.output_mapping())? != metadata.output_mapping
+            || PersistentBoundaryDimension::from_input_dimensions(&boundary_mapping) != metadata.input_dimensions
+            || PersistentBoundaryDimension::from_output_dimensions(&boundary_mapping) != metadata.output_dimensions
         {
             return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
                 reason: "executable signature does not match logical input and output types".into(),
@@ -810,14 +810,14 @@ impl Session {
                 reason: "output commitment metadata does not match the output count".into(),
             }));
         }
-        let executable_array_input_count = signature.input_array_count();
+        let executable_array_input_count = boundary_mapping.input_array_count();
         if expected_input_shardings.len() != executable_array_input_count {
             return Err(Error::Compilation(CompilationError::InvalidPersistentExecutable {
                 reason: "expected input shardings do not match the executable array input count".into(),
             }));
         }
         for (state, &expected_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
-            let executable_input_index = signature.input_mapping()[expected_input_index].ok_or_else(|| {
+            let executable_input_index = boundary_mapping.input_mapping()[expected_input_index].ok_or_else(|| {
                 Error::Compilation(CompilationError::InvalidPersistentExecutable {
                     reason: "reference-state input is erased from the executable boundary".into(),
                 })
@@ -843,7 +843,7 @@ impl Session {
                 }));
             }
             if let Some(logical_output_index) = state.output_index() {
-                signature.output_mapping()[logical_output_index].ok_or_else(|| {
+                boundary_mapping.output_mapping()[logical_output_index].ok_or_else(|| {
                     Error::Compilation(CompilationError::InvalidPersistentExecutable {
                         reason: "reference-state output is erased from the executable boundary".into(),
                     })
@@ -897,8 +897,8 @@ impl Session {
             &LoadOptions::default(),
         )?;
         let output_element_types = executable.executable()?.output_element_types()?;
-        if output_element_types.len() != signature.executable_output_count()
-            || signature
+        if output_element_types.len() != boundary_mapping.executable_output_count()
+            || boundary_mapping
                 .ordered_io_output_index()
                 .is_some_and(|index| output_element_types[index] != BufferType::Token)
         {
@@ -919,7 +919,7 @@ impl Session {
             &input_types,
             &output_types,
             &output_shardings,
-            &signature,
+            &boundary_mapping,
             &donation_flags,
             capture_count,
             &mesh,
@@ -930,7 +930,7 @@ impl Session {
             output_types.into(),
             output_count,
             reference_states.into(),
-            signature,
+            boundary_mapping,
             runtime_requirements.into(),
             donation_flags.into(),
             capture_count,
@@ -1705,7 +1705,7 @@ mod tests {
         let restored = session.deserialize_program(bytes.as_slice()).unwrap().unwrap();
         assert_eq!(restored.input_types(), compiled.compiled_program().input_types());
         assert_eq!(restored.all_output_types(), compiled.compiled_program().all_output_types());
-        assert_eq!(restored.signature(), compiled.compiled_program().signature());
+        assert_eq!(restored.boundary_mapping(), compiled.compiled_program().boundary_mapping());
         assert_eq!(restored.runtime_requirements(), compiled.compiled_program().runtime_requirements());
         assert_eq!(restored.donation_flags(), compiled.compiled_program().donation_flags());
         assert_eq!(restored.capture_count(), compiled.compiled_program().capture_count());
@@ -1749,7 +1749,7 @@ mod tests {
             &[RuntimeRequirement::builtin("ryft.assert"), RuntimeRequirement::builtin("ryft.ordered-io")],
         );
         assert!(!explicit.requires_assertion_handler());
-        assert!(!explicit.signature().has_ordered_io());
+        assert!(!explicit.boundary_mapping().has_ordered_io());
 
         let mut invalid_signature_metadata = decode_envelope(&bytes).0;
         invalid_signature_metadata.input_mapping[0] = None;
@@ -2423,11 +2423,11 @@ mod tests {
         let program = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         let lowered = session.lower_program(&program, 0, &Options::new(mesh)).unwrap();
         let compiled = session.compile_program(&lowered).unwrap();
-        assert!(compiled.signature().has_ordered_io());
+        assert!(compiled.boundary_mapping().has_ordered_io());
         let bytes = compiled.serialize().unwrap().unwrap();
 
         let restored = session.deserialize_compiled_program(&bytes).unwrap().unwrap();
-        assert_eq!(restored.signature(), compiled.signature());
+        assert_eq!(restored.boundary_mapping(), compiled.boundary_mapping());
         let (outputs, prints) = with_captured_prints(|| {
             let outputs = session.execute_program(&restored, vec![input]).unwrap();
             session.synchronize().unwrap();

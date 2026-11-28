@@ -21,7 +21,7 @@ use crate::compilation::keys::{COMPILER_IDENTITY, canonical_boundary_types};
 use crate::compilation::options::FeedbackDirectedProfile;
 use crate::execution::{ExecutionPlan, validate_input_reduction};
 use crate::lowering::programs::MlirProgram;
-use crate::lowering::programs::MlirProgramSignature;
+use crate::lowering::programs::MlirProgramBoundaryMapping;
 use crate::{Array, Error, RetainedArray, RuntimeRequirement, Session, Target, Type};
 
 // TODO(eaplatanios): Review this module.
@@ -79,11 +79,11 @@ pub(super) struct ProgramLowering {
 }
 
 impl ProgramLowering {
-    /// Combines the lowered module with the logical metadata and executable signature that produced it.
+    /// Combines the lowered module and its boundary mapping with the logical metadata used for execution.
     ///
     /// # Parameters
     ///
-    ///   - `module`: Lowered module, which provides the StableHLO text, the executable signature, the runtime
+    ///   - `module`: Lowered module, which provides the StableHLO text, the boundary mapping, the runtime
     ///     requirements, and whether executions need the runtime assertion handler.
     ///   - `compilation_options`: Exact options that PJRT compiles the module with.
     ///   - `input_types`: Effective flat input types, starting with the lowered captures.
@@ -119,7 +119,7 @@ impl ProgramLowering {
         mesh: DeviceMesh,
         kernel_execution_facts: Option<Vec<u8>>,
     ) -> Self {
-        let (stable_hlo, signature, runtime_requirements) = module.into_parts();
+        let (stable_hlo, boundary_mapping, runtime_requirements) = module.into_parts();
         Self {
             stable_hlo: stable_hlo.into(),
             invocation: InvocationMetadata {
@@ -128,7 +128,7 @@ impl ProgramLowering {
                 output_count,
                 reference_states,
                 input_types,
-                signature,
+                boundary_mapping,
                 runtime_requirements,
                 donation_flags,
                 capture_count,
@@ -169,22 +169,22 @@ impl RemoteEagerProgram {
     /// Builds a description using the same invocation contract that the owner compiles.
     pub(super) fn new(lowering: &ProgramLowering) -> Result<Self, Error> {
         let program = &lowering.invocation;
-        let signature = &program.signature;
+        let boundary_mapping = &program.boundary_mapping;
         let output_types = &program.output_types[..program.output_count];
-        if signature.has_effects() || output_types.iter().any(|r#type| r#type.static_shape().is_none()) {
+        if boundary_mapping.has_effects() || output_types.iter().any(|r#type| r#type.static_shape().is_none()) {
             return Err(ProgramError::UnsupportedOperation {
                 message: "eager operations on a remote singleton require static outputs and no effects".to_string(),
             }
             .into());
         }
         // Erased zero arrays have a sharding and can carry a failed producer. Only unread inputs have no dependency.
-        let input_shardings = signature
+        let input_shardings = boundary_mapping
             .input_mapping()
             .iter()
             .zip(program.input_types.iter())
             .enumerate()
             .map(|(index, (executable_index, input_type))| {
-                if signature.is_unread_input(index) {
+                if boundary_mapping.is_unread_input(index) {
                     return None;
                 }
                 Some(match executable_index {
@@ -396,8 +396,8 @@ impl LoweredProgram {
     }
 
     /// Returns the mapping between the logical boundary of the program and the slots of its executable.
-    pub(crate) fn signature(&self) -> &MlirProgramSignature {
-        &self.lowering.invocation.signature
+    pub(crate) fn boundary_mapping(&self) -> &MlirProgramBoundaryMapping {
+        &self.lowering.invocation.boundary_mapping
     }
 
     /// Returns the number of leading program outputs exposed through the structured public function output.
@@ -422,7 +422,7 @@ impl LoweredProgram {
     /// Returns whether execution requires Ryft's host runtime assertion handler.
     #[inline]
     pub(super) fn requires_assertion_handler(&self) -> bool {
-        self.lowering.invocation.signature.requires_assertion_handler()
+        self.lowering.invocation.boundary_mapping.requires_assertion_handler()
     }
 
     /// Returns the number of leading program inputs supplied by the staged capture table, followed by the hidden
@@ -600,7 +600,7 @@ impl CompiledProgram {
     ///   - `output_types`: Flat output types, including the hidden final reference states.
     ///   - `output_count`: Number of public outputs.
     ///   - `reference_states`: External reference states of the program.
-    ///   - `signature`: Mapping between the logical boundary and the executable's input and output slots.
+    ///   - `boundary_mapping`: Mapping between the logical boundary and the executable's input and output slots.
     ///   - `runtime_requirements`: Runtime contracts that executions of the program need.
     ///   - `donation_flags`: Donation declaration of each public input.
     ///   - `capture_count`: Number of leading inputs that are lowered captures.
@@ -625,7 +625,7 @@ impl CompiledProgram {
         output_types: Arc<[ArrayType]>,
         output_count: usize,
         reference_states: Arc<[ExternalReferenceBinding]>,
-        signature: MlirProgramSignature,
+        boundary_mapping: MlirProgramBoundaryMapping,
         runtime_requirements: Arc<[RuntimeRequirement]>,
         donation_flags: Arc<[bool]>,
         capture_count: usize,
@@ -651,7 +651,7 @@ impl CompiledProgram {
                 output_types,
                 output_count,
                 reference_states,
-                signature,
+                boundary_mapping,
                 runtime_requirements,
                 donation_flags,
                 capture_count,
@@ -690,7 +690,7 @@ impl CompiledProgram {
             compiled.input_types = Arc::clone(&lowered.input_types);
             compiled.output_types = Arc::clone(&lowered.output_types);
             compiled.reference_states = Arc::clone(&lowered.reference_states);
-            compiled.signature = lowered.signature.clone();
+            compiled.boundary_mapping = lowered.boundary_mapping.clone();
             compiled.output_device_assignment = lowered.output_device_assignment;
         }
         program
@@ -757,8 +757,8 @@ impl CompiledProgram {
 
     /// Returns the mapping between the logical boundary of the program and the slots of its executable.
     #[inline]
-    pub(crate) fn signature(&self) -> &MlirProgramSignature {
-        &self.invocation.signature
+    pub(crate) fn boundary_mapping(&self) -> &MlirProgramBoundaryMapping {
+        &self.invocation.boundary_mapping
     }
 
     /// Returns the default donation flag of each public input.
@@ -828,7 +828,7 @@ impl CompiledProgram {
     /// Returns whether the executable requires the host runtime assertion handler.
     #[inline]
     pub fn requires_assertion_handler(&self) -> bool {
-        self.invocation.signature.requires_assertion_handler()
+        self.invocation.boundary_mapping.requires_assertion_handler()
     }
 
     /// Returns the backend's optimized program only when explicitly requested.
@@ -955,7 +955,7 @@ pub(super) struct InvocationMetadata {
     input_types: Arc<[ArrayType]>,
 
     /// Mapping from the logical boundary to the executable boundary shared by StableHLO and PJRT.
-    signature: MlirProgramSignature,
+    boundary_mapping: MlirProgramBoundaryMapping,
 
     /// Canonical runtime contracts resolved against the invoking session.
     runtime_requirements: Arc<[RuntimeRequirement]>,
@@ -1012,7 +1012,7 @@ impl InvocationMetadata {
             Some("output count")
         } else if self.reference_states != other.reference_states {
             Some("reference-state signature")
-        } else if self.signature != other.signature {
+        } else if self.boundary_mapping != other.boundary_mapping {
             Some("executable signature")
         } else if self.runtime_requirements != other.runtime_requirements {
             Some("runtime requirements")
@@ -1078,7 +1078,7 @@ mod tests {
     };
 
     use crate::compilation::functions::stage;
-    use crate::lowering::programs::MlirProgramSignature;
+    use crate::lowering::programs::MlirProgramBoundaryMapping;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{device_mesh_2x2, execution_client};
     use crate::{Error, Options, Session};
@@ -1121,8 +1121,8 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
         let other_mesh = device_mesh_2x2();
-        let signature = MlirProgramSignature::new(&[], &[]);
-        let other_signature = MlirProgramSignature::new(&[ArrayType::scalar(DataType::F32)], &[]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(&[], &[]);
+        let other_boundary_mapping = MlirProgramBoundaryMapping::new(&[ArrayType::scalar(DataType::F32)], &[]);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let current = InvocationMetadata {
             compilation_options: CompilationOptions::default(),
@@ -1130,7 +1130,7 @@ mod tests {
             output_types: [].into(),
             output_count: 0,
             reference_states: [].into(),
-            signature,
+            boundary_mapping,
             runtime_requirements: [].into(),
             donation_flags: [false].into(),
             capture_count: 0,
@@ -1144,7 +1144,10 @@ mod tests {
         };
         assert_eq!(current.incompatible_field(&current), None);
         assert_eq!(
-            current.incompatible_field(&InvocationMetadata { signature: other_signature, ..current.clone() }),
+            current.incompatible_field(&InvocationMetadata {
+                boundary_mapping: other_boundary_mapping,
+                ..current.clone()
+            }),
             Some("executable signature"),
         );
         assert_eq!(
@@ -1191,14 +1194,14 @@ mod tests {
     fn test_invocation_metadata_validate_replacement() {
         let client = execution_client();
         let mesh = domain_mesh(client, "x", 1);
-        let signature = MlirProgramSignature::new(&[], &[]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(&[], &[]);
         let current = InvocationMetadata {
             compilation_options: CompilationOptions::default(),
             input_types: [].into(),
             output_types: [].into(),
             output_count: 0,
             reference_states: [].into(),
-            signature,
+            boundary_mapping,
             runtime_requirements: [].into(),
             donation_flags: [false].into(),
             capture_count: 0,
@@ -1243,9 +1246,9 @@ mod tests {
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))
                 if reason == "replacement executable has incompatible reference-state signature",
         ));
-        // Whether an executable requires the runtime assertion handler is part of its signature.
-        let asserting = current.signature.clone().with_effects(false, false, true, false);
-        let replacement = InvocationMetadata { signature: asserting, ..current.clone() };
+        // Whether an executable requires the runtime assertion handler is part of its boundary mapping.
+        let asserting = current.boundary_mapping.clone().with_effects(false, false, true, false);
+        let replacement = InvocationMetadata { boundary_mapping: asserting, ..current.clone() };
         assert!(matches!(
             current.validate_replacement(&replacement),
             Err(Error::Compilation(CompilationError::IncompatibleExecutable { reason }))

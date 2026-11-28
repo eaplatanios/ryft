@@ -6,14 +6,13 @@ use ryft_core::{
     ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, COMPOSITE_OPERATION_NAME,
     COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation, CompositeTransposeOperation,
     CustomRuleSource, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-    DifferentiableType, FlatProgram, Operation, Parameter, Placeholder, ProgramError,
-    RematerializationOptimizationBarrier, Typed,
+    DifferentiableType, FlatProgram, Operation, Parameter, Placeholder, ProgramError, Typed,
 };
 use ryft_mlir::ValueRef;
 #[cfg(test)]
 use ryft_mlir::{Block as _, Operation as _, Value as _};
 
-use crate::lowering::regions::NestedProgramLoweringExtension;
+use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::operations::attention::{AttentionConfigurationLoweringExtension, select_attention_implementation};
 use crate::operations::call::lower_shared_function_call;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Session, Type};
@@ -249,19 +248,17 @@ where
         // dormant under lowering and retained rules are callbacks rather than regions. Regions traced as nested
         // programs (i.e., those of `while`, `scan`, `condition`, and `linear_call`) share the enclosing capture scope
         // and keep inheriting it.
-        let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+        let (block, location) = (lowerer.block(), lowerer.location());
         let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
             lowerer.split_effect_tokens();
         regions[0].lower_inline(
-            input_values,
-            &mut block,
-            context,
-            location,
             lowering_context.session_values(captured_values),
-            &RematerializationOptimizationBarrier::None,
+            input_values,
             nested_functions,
             lowering_context,
             effect_tokens,
+            block,
+            location,
         )
     }
 }

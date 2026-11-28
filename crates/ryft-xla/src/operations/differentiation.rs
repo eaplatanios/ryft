@@ -1,10 +1,14 @@
-use ryft_core::{
-    ArrayType, LINEAR_CALL_OPERATION_NAME, LinearCallOperation, Operation, ProgramError, REMATERIALIZE_OPERATION_NAME,
-    RematerializationOptimizationBarrier, RematerializeOperation, StopGradientOperation,
-};
-use ryft_mlir::ValueRef;
+use std::borrow::Cow;
 
-use crate::lowering::regions::NestedProgramLoweringExtension;
+use ryft_core::macros::check_count;
+use ryft_core::{
+    ArrayType, EffectClass, LINEAR_CALL_OPERATION_NAME, LinearCallOperation, Operation, ProgramError,
+    REMATERIALIZE_OPERATION_NAME, RematerializeOperation, StopGradientOperation, TypedProgram,
+};
+use ryft_mlir::dialects::stable_hlo;
+use ryft_mlir::{Block, Operation as MlirOperation, Value as MlirValue, ValueRef};
+
+use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError, Type};
 
 // TODO(eaplatanios): Review this module.
@@ -69,36 +73,54 @@ impl LowerableOperation for RematerializeOperation<Type> {
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (input_types, output_types);
-        let [_] = lowerer.regions() else {
+        let mut block = lowerer.block();
+        let location = lowerer.location();
+        let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
+            lowerer.split_effect_tokens();
+        let [body] = regions else {
             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                 operation: self.name().to_string(),
                 reason: format!(
                     "`{REMATERIALIZE_OPERATION_NAME}` expected 1 attached region but got {}",
-                    lowerer.regions().len(),
+                    regions.len(),
                 ),
             }));
         };
-        // Rematerialized bodies are traced through contexts with fresh roots and lower with an empty capture namespace,
-        // for the reasons that the `CompositeOperation` lowering explains. A differentiated call recomputes values that
-        // the original computation also computes, so a barrier on its selected inputs keeps XLA from merging the two
-        // computations or from scheduling the recomputation before those inputs are available.
-        let optimization_barrier = match self.differentiated() {
-            true => self.optimization_barrier(),
-            false => &RematerializationOptimizationBarrier::None,
-        };
-        let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-        let (effect_tokens, regions, captured_values, nested_functions, lowering_context) =
-            lowerer.split_effect_tokens();
-        regions[0].lower_inline(
-            input_values,
-            &mut block,
-            context,
-            location,
+        let mut inputs = Cow::Borrowed(input_values);
+        if self.differentiated() {
+            check_count!("input", input_values, body.input_count(), ProgramError);
+            let selected = (0..input_values.len()).filter(|&index| self.optimization_barrier().selects(index));
+            let mut barrier_inputs = selected.clone().map(|index| input_values[index]).collect::<Vec<_>>();
+            if !barrier_inputs.is_empty() {
+                // A single barrier prevents XLA from merging the recomputation with the primal or scheduling it
+                // before the selected inputs are available. Threading all live tokens through the same barrier also
+                // orders the body's effects after those inputs. The results mirror the inputs in order
+                // (https://openxla.org/stablehlo/spec#optimization_barrier).
+                let first_token = barrier_inputs.len();
+                let live_tokens = [EffectClass::OrderedAssertion, EffectClass::OrderedIo]
+                    .map(|class| effect_tokens.get(class).map(|token| (class, token)))
+                    .into_iter()
+                    .flatten();
+                barrier_inputs.extend(live_tokens.clone().map(|(_, token)| token));
+                let barrier = block.append_operation(stable_hlo::optimization_barrier(&barrier_inputs, location)?)?;
+                for (result, index) in selected.enumerate() {
+                    inputs.to_mut()[index] = barrier.result(result)?.as_ref();
+                }
+                for (result, (class, _)) in (first_token..).zip(live_tokens) {
+                    effect_tokens.set(class, barrier.result(result)?.as_ref());
+                }
+            }
+        }
+        // Like composite bodies, rematerialized bodies have fresh tracing roots. They inherit only the session
+        // constants visible in the enclosing scope.
+        body.lower_inline(
             lowering_context.session_values(captured_values),
-            optimization_barrier,
+            &inputs,
             nested_functions,
             lowering_context,
             effect_tokens,
+            block,
+            location,
         )
     }
 }
@@ -132,10 +154,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayOperation, CaptureReference, Context, CosOperation, DataType, DomainTracingContext,
-        Error as CoreError, EverythingSavable, FlatProgram, Memory, MulOperation, NothingSavable, Placeholder,
-        PrintOperation, ProgramBuilder, ProgramError, ResidualPolicyReference, SaveAndOffloadOnlyTheseNames,
-        SinOperation, StopGradient, TagOperation, TypedProgram, Value, differentiate_at, rematerialize,
+        AddOperation, ArrayOperation, AssertOperation, CaptureReference, Context, CosOperation, DataType,
+        DomainTracingContext, Error as CoreError, EverythingSavable, FlatProgram, Memory, MulOperation, NothingSavable,
+        Placeholder, PrintOperation, ProgramBuilder, ProgramError, RematerializationOptimizationBarrier,
+        ResidualPolicyReference, SaveAndOffloadOnlyTheseNames, SinOperation, StopGradient, TagOperation, TypedProgram,
+        Value, differentiate_at, rematerialize,
     };
 
     use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
@@ -233,7 +256,9 @@ mod tests {
     fn test_rematerialize_operation_lower_rejects_malformed_instructions() {
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
-        let block = context.block_with_no_arguments();
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let tensor_type = scalar_type.lower(&context, location).unwrap();
+        let block = context.block(&[(tensor_type, location)]);
         let operation = RematerializeOperation::<Type>::new(ResidualPolicyReference::new(NothingSavable));
 
         // The plain array family cannot carry the body region.
@@ -256,58 +281,111 @@ mod tests {
             Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
                 if operation == "rematerialize" && reason == "`rematerialize` expected 1 attached region but got 0",
         ));
+
+        // A differentiated call checks its arity before emitting a barrier into the enclosing block.
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(scalar_type.clone().into());
+        let body = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut lowerer = lowerer.with_regions(vec![body]);
+        let input = block.argument(0).unwrap().as_ref();
+        let input_types = [Type::Array(scalar_type.clone()), Type::Array(scalar_type)];
+        assert!(matches!(
+            operation.with_differentiated(true).lower(&mut lowerer, &[input, input], &input_types, &input_types[..1]),
+            Err(Error::Core(core_error)) if matches!(core_error.as_ref(),
+                CoreError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 2 })),
+        ));
+        assert!(block.is_empty());
     }
 
     #[test]
     fn test_rematerialize_operation_lower_inlines_body_effects_on_the_enclosing_token_chain() {
-        // Rematerialization is a transform boundary, not an execution boundary. Lowering inlines its body, so prints
-        // immediately before, inside, and after the call must form one ordered I/O token chain.
+        // The differentiated call selects the printed value. Its barrier must also thread both live token chains,
+        // including the one for assertions on the unselected predicate.
         let scalar_type = ArrayType::scalar(DataType::F64);
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
         let body = {
             let mut builder = ProgramBuilder::<Constant, Operation>::new();
             let input = builder.add_input(scalar_type.clone().into());
+            let predicate = builder.add_input(predicate_type.clone().into());
+            builder
+                .add_instruction(AssertOperation::<Type>::new("body"), Vec::new(), vec![predicate], None)
+                .unwrap();
             let output = builder
                 .add_instruction(PrintOperation::<ArrayType>::new("body"), Vec::new(), vec![input], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         let mut builder = ProgramBuilder::<Constant, Operation>::new();
         let body = builder.import_region(body.entry_region_ref());
-        let input = builder.add_input(scalar_type.clone().into());
+        let input = builder.add_input(scalar_type.into());
+        let predicate = builder.add_input(predicate_type.into());
+        builder
+            .add_instruction(AssertOperation::<Type>::new("before"), Vec::new(), vec![predicate], None)
+            .unwrap();
         let before = builder
             .add_instruction(PrintOperation::<ArrayType>::new("before"), Vec::new(), vec![input], None)
             .unwrap()[0];
         let rematerialized = builder
             .add_instruction(
-                Operation::Rematerialize(RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))),
+                Operation::Rematerialize(
+                    RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable))
+                        .with_differentiated(true)
+                        .with_optimization_barrier(RematerializationOptimizationBarrier::Inputs(vec![true, false])),
+                ),
                 vec![body],
-                vec![before],
+                vec![before, predicate],
                 None,
             )
             .unwrap()[0];
+        builder
+            .add_instruction(AssertOperation::<Type>::new("after"), Vec::new(), vec![predicate], None)
+            .unwrap();
         let output = builder
             .add_instruction(PrintOperation::<ArrayType>::new("after"), Vec::new(), vec![rematerialized], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert_eq!(
             stablehlo,
-            indoc! {r#"
+            indoc! {"
                 module {
-                  func.func @main(%arg0: tensor<f64>) -> tensor<f64> {
+                  func.func @main(%arg0: tensor<f64>, %arg1: tensor<i1>) -> tensor<f64> {
                     %0 = stablehlo.after_all  : !stablehlo.token
-                    %1 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "before"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
-                    %2 = stablehlo.custom_call @ryft.print(%arg0, %1) {api_version = 4 : i32, backend_config = {label = "body"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
-                    %3 = stablehlo.custom_call @ryft.print(%arg0, %2) {api_version = 4 : i32, backend_config = {label = "after"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
-                    return %arg0 : tensor<f64>
+                    %1 = stablehlo.custom_call @ryft.assert(%arg1, %0) {api_version = 4 : i32, backend_config = {actor \
+                        = \"assert\", kind = \"generic\", label_count = \"0\", message = \"before\"}, has_side_effect \
+                        = true} : (tensor<i1>, !stablehlo.token) -> !stablehlo.token
+                    %2 = stablehlo.after_all  : !stablehlo.token
+                    %3 = stablehlo.custom_call @ryft.print(%arg0, %2) {api_version = 4 : i32, backend_config = {label \
+                        = \"before\"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : \
+                        tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, \
+                        !stablehlo.token) -> !stablehlo.token
+                    %4:3 = stablehlo.optimization_barrier %arg0, %1, %3 : tensor<f64>, !stablehlo.token, \
+                        !stablehlo.token
+                    %5 = stablehlo.custom_call @ryft.assert(%arg1, %4#1) {api_version = 4 : i32, backend_config = \
+                        {actor = \"assert\", kind = \"generic\", label_count = \"0\", message = \"body\"}, \
+                        has_side_effect = true} : (tensor<i1>, !stablehlo.token) -> !stablehlo.token
+                    %6 = stablehlo.custom_call @ryft.print(%4#0, %4#2) {api_version = 4 : i32, backend_config = {label \
+                        = \"body\"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : \
+                        tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, \
+                        !stablehlo.token) -> !stablehlo.token
+                    %7 = stablehlo.custom_call @ryft.assert(%arg1, %5) {api_version = 4 : i32, backend_config = {actor \
+                        = \"assert\", kind = \"generic\", label_count = \"0\", message = \"after\"}, has_side_effect = \
+                        true} : (tensor<i1>, !stablehlo.token) -> !stablehlo.token
+                    %8 = stablehlo.custom_call @ryft.print(%4#0, %6) {api_version = 4 : i32, backend_config = {label = \
+                        \"after\"}, has_side_effect = true, operand_layouts = [dense<> : tensor<0xindex>, dense<> : \
+                        tensor<0xindex>], result_layouts = [dense<> : tensor<0xindex>]} : (tensor<f64>, \
+                        !stablehlo.token) -> !stablehlo.token
+                    return %4#0 : tensor<f64>
                   }
                 }
-            "#},
+            "},
         );
     }
 

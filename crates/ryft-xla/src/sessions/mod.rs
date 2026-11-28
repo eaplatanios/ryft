@@ -9696,7 +9696,7 @@ pub(crate) mod tests {
                 .any(|requirement| requirement.identifier() == "ryft.kernel.cuda")
         );
         assert!(lowered.kernel_execution_facts().is_some());
-        assert!(!lowered.signature().has_effects());
+        assert!(!lowered.boundary_mapping().has_effects());
 
         let compiled = session.compile_program(&lowered).unwrap();
         let input = Array::from_host_buffer(&session, scalar, None, None, 42i32.to_ne_bytes()).unwrap();

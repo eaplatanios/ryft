@@ -950,8 +950,8 @@ mod tests {
                     .with_reference_bindings(states.to_vec(), Vec::new(), Vec::new()),
             )
             .unwrap();
-        assert_eq!(lowered.signature().input_mapping(), &[None, Some(0), Some(1)]);
-        assert_eq!(lowered.signature().output_mapping(), &[Some(0)]);
+        assert_eq!(lowered.boundary_mapping().input_mapping(), &[None, Some(0), Some(1)]);
+        assert_eq!(lowered.boundary_mapping().output_mapping(), &[Some(0)]);
         let expected_signature = concat!(
             "  func.func @main(",
             "%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>, ",

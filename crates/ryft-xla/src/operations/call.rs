@@ -33,8 +33,8 @@ use std::sync::Arc;
 use ryft_core::{
     AtomId, AttachedRegions, CALL_OPERATION_NAME, CallOperation, CompositeKey, ConstrainShardingOperation, Device,
     DeviceMesh, EagerContext, FlatProgram, InterpretableOperation, InterpretationDriver, Operation as CoreOperation,
-    Parameterized, Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RegionRole,
-    RematerializationOptimizationBarrier, ShardMapOperation, Sharding, Typed, TypedProgram,
+    Parameterized, Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RegionRole, ShardMapOperation,
+    Sharding, Typed, TypedProgram,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -46,9 +46,8 @@ use crate::compilation::domains::{commits_public_outputs, relocated_input_type};
 use crate::execution::{validate_committed_input_devices, validate_input_clients, validate_input_reduction};
 use crate::lowering::EffectTokens;
 use crate::lowering::emissions::{omits_regions, partition_session_constants, unread_call_captures};
-use crate::lowering::programs::RegionPlacementRequestsExtension;
+use crate::lowering::programs::{ProgramInlineLoweringExtension, RegionPlacementRequestsExtension};
 use crate::lowering::reductions::validate_declared_pending_reduction;
-use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{TypeLoweringExtension, lower_unplaced_constant_output};
 use crate::operations::control_flow::lowered_effect_classes;
@@ -1288,15 +1287,13 @@ impl<O: LowerableOperationFamily> CallProgramLoweringExtension<O> for FlatProgra
         let mut captured_values = input_values[..capture_count].to_vec();
         captured_values.extend_from_slice(lowering_context.session_values(caller_captured_values));
         self.lower_inline(
-            input_values,
-            block,
-            context,
-            location,
             captured_values.as_slice(),
-            &RematerializationOptimizationBarrier::None,
+            input_values,
             nested_functions,
             lowering_context,
             effect_tokens,
+            *block,
+            location,
         )
     }
 }

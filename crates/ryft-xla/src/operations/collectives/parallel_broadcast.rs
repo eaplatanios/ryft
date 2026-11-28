@@ -1,13 +1,13 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, DomainTracingContext, EmptyRegionDriver, InterpretableOperation, NamedAxis, Operation,
-    PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcastOperation, ParallelBroadcastSource, ProgramError,
-    RematerializationOptimizationBarrier, Value, ValueProjection,
+    PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcastOperation, ParallelBroadcastSource, ProgramError, Value,
+    ValueProjection,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::lowering::regions::NestedProgramLoweringExtension;
+use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::states::ProgramLoweringContext;
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Session, Tracer, Type};
@@ -73,17 +73,15 @@ impl LowerableOperation for ParallelBroadcastOperation {
                 input_types.iter().cloned().map(Type::from).collect::<Vec<_>>(),
                 axes,
             )?;
-            let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
-            return program.to_flat_program().lower_inline(
-                input_values,
-                &mut block,
-                context,
-                location,
+            let (block, location) = (lowerer.block(), lowerer.location());
+            return program.lower_inline(
                 &[],
-                &RematerializationOptimizationBarrier::None,
+                input_values,
                 None,
                 &lowering_context,
                 lowerer.effect_tokens_mut(),
+                block,
+                location,
             );
         }
         self.lower_static_to_mlir(&lowering_context, input_values[0], &mut lowerer.block(), lowerer.location())

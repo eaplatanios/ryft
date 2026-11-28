@@ -33,22 +33,21 @@ use std::sync::Arc;
 
 use ryft_core::{
     ArrayType, CALL_OPERATION_NAME, CompositeKey, ConstrainShardingOperation, DataType, Device, DeviceMesh,
-    EagerContext, EffectClass, EffectClasses, FlatProgram, Instruction, LogicalMesh, Memory,
-    Operation as CoreOperation, OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, Program, ProgramError,
-    RegionRef, RematerializationOptimizationBarrier, Sharding, ShardingDimension, Type as CoreType, Typed,
+    EagerContext, EffectClass, EffectClasses, FlatProgram, LogicalMesh, Memory, Operation as CoreOperation,
+    OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized, Program, ProgramError, RegionRef, Sharding,
+    ShardingDimension, Type as CoreType,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
     Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::emissions::lowers_without_regions;
 use crate::lowering::modules::render_devices;
+use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::reductions::{
     constrain_unreduced_intermediates, constrain_unreduced_outputs, validate_declared_pending_reduction,
     validate_pending_reductions_across_regions,
 };
-use crate::lowering::regions::NestedProgramLoweringExtension;
 use crate::lowering::states::ProgramLoweringContext;
 use crate::operations::call::CallFunctionMap;
 use crate::operations::composites::NamedCompositionKey;
@@ -173,8 +172,8 @@ pub(crate) mod modules;
 pub(crate) mod programs;
 /// Lowering and validation of pending reductions.
 pub(crate) mod reductions;
-/// Lowering of nested programs and regions inline into an enclosing block.
-pub(crate) mod regions;
+/// Lowering of instructions while replaying a borrowed program region.
+mod regions;
 /// Lowering of logical meshes, shardings, and sharding constraints to Shardy.
 pub(crate) mod sharding;
 /// Program lowering context for nested regions and their enclosing module.
@@ -186,8 +185,8 @@ pub(crate) mod values;
 
 pub use admission::DataDependentPaddingDiscipline;
 pub use programs::{
-    EntryShardingOverride, MlirProgram, MlirProgramSignature, MlirProgramSignatureInputDimension,
-    MlirProgramSignatureOutputDimension, ProgramLoweringExtension, ProgramLoweringOptions,
+    EntryShardingOverride, MlirProgram, MlirProgramBoundaryMapping, MlirProgramBoundaryMappingInputDimension,
+    MlirProgramBoundaryMappingOutputDimension, ProgramLoweringExtension, ProgramLoweringOptions,
 };
 pub use sharding::{
     LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension, UnreducedKindExtension,
@@ -532,40 +531,39 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
             .into());
         };
         region.lower_inline(
-            input_values,
-            &mut self.block,
-            self.context,
-            self.location,
             self.captured_values.as_slice(),
-            &RematerializationOptimizationBarrier::None,
+            input_values,
             self.nested_functions.as_ref(),
             &self.lowering_context,
             &mut self.effect_tokens,
+            self.block,
+            self.location,
         )
     }
 }
 
 /// Operations that can be lowered to StableHLO for XLA compilation.
 ///
-/// Each operation type implements this trait at the type universe of its [`CoreOperation`](ryft_core::Operation)
-/// contract. Homogeneous array operations implement it at [`ArrayType`], array IR operations at [`Type`], and
-/// first-class dimension operations at [`DimensionType`](ryft_core::DimensionType). Operation families (e.g.,
-/// [`ArrayOperation`](ryft_core::ArrayOperation) and [`Operation`]) implement this trait by dispatching each variant to
-/// its payload through [`lower_operation_variants`](crate::lower_operation_variants), which also handles payloads that
-/// a family stores as projected or mixed members. A family whose type universe is [`Type`] and that implements
-/// [`OperationPayloadProjection`] is a [`LowerableOperationFamily`] whose programs [`ProgramLoweringExtension`] lowers,
-/// so downstream crates extend lowering by implementing this trait for their own operations and families, just like
-/// they extend the transformation traits of `ryft-core`.
+/// In [`Self::lower`], `Self` is the operation being lowered. Its [`CoreOperation`](ryft_core::Operation) contract
+/// determines `Self::Type`, the type of its input and output descriptors. For example, an array operation receives
+/// [`ArrayType`] descriptors, and a first-class dimension operation receives [`DimensionType`](ryft_core::DimensionType)
+/// descriptors. `O` is the enclosing program's operation family, which [`Lowerer`] uses to lower attached regions.
+/// Both kinds of operation can be lowered inside a program whose family uses [`Type`].
 ///
-/// Operations with attached regions lower them through the lowerer (e.g., [`Lowerer::lower_region_inline`]) rather
-/// than through bounds on their own family, so the bounds of a family implementation stay finite.
+/// Families such as [`ArrayOperation`](ryft_core::ArrayOperation) and [`Operation`] implement this trait by dispatching
+/// each variant to its payload through [`lower_operation_variants`](crate::lower_operation_variants), which also handles
+/// projected and mixed members. Downstream families that meet the bounds of [`LowerableOperationFamily`] can lower whole
+/// programs through [`ProgramLoweringExtension`].
+///
+/// Operations lower attached regions through methods such as [`Lowerer::lower_region_inline`]. This keeps the bounds of
+/// a family's lowering implementation from depending recursively on its own lowering rules.
 pub trait LowerableOperation: CoreOperation {
     /// Lowers this operation to one or more StableHLO operations emitted into the block of `lowerer`, returning one
     /// MLIR value per output.
     ///
     /// # Parameters
     ///
-    ///   - `lowerer`: Lowering state of the instruction applying this operation.
+    ///   - `lowerer`: Lowering state of the instruction applying this operation, with access to attached regions of `O`.
     ///   - `input_values`: Lowered MLIR values of the instruction inputs, one per input.
     ///   - `input_types`: Declared types of the instruction inputs, in input order.
     ///   - `output_types`: Declared types of the instruction outputs, in output order.
@@ -657,10 +655,13 @@ pub trait LowerableOperation: CoreOperation {
     }
 }
 
-/// Operation families whose programs the XLA lowering entry points lower. Such a family lowers at [`Type`],
-/// and its payloads can be recognized through [`OperationPayloadProjection`] by the module-level lowering passes
-/// (e.g., the `call` deduplication and the Shardy mesh declaration passes). Every type that satisfies these bounds
-/// is an operation family, so downstream families only need to implement [`LowerableOperation`].
+/// Enclosing operation families for programs lowered by [`ProgramLoweringExtension`].
+///
+/// This is the bound on `O` in [`LowerableOperation::lower`]. The family lowers program instructions at [`Type`]
+/// and exposes its payloads through [`OperationPayloadProjection`] so that lowering passes can recognize operations
+/// inside the family, for example when deduplicating calls or deciding which regions to emit.
+///
+/// The blanket implementation covers every type that meets these bounds, including downstream operation families.
 pub trait LowerableOperationFamily: LowerableOperation<Type = Type> + OperationPayloadProjection {}
 
 impl<O: LowerableOperation<Type = Type> + OperationPayloadProjection> LowerableOperationFamily for O {}
@@ -824,78 +825,10 @@ pub(crate) fn current_or_new_token<'b, 'c: 'b, 't: 'c>(
     Ok(created)
 }
 
-/// Lowers one traced instruction to the corresponding StableHLO operations through its [`LowerableOperation`]
-/// implementation and returns its output values. The ordered effect tokens of the enclosing scope flow through
-/// `effect_tokens`, and an instruction that uses the assertion token marks the module as requiring the runtime
-/// assertion handler.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
-    program: &Program<Constant, O, ProgramInput, ProgramOutput>,
-    instruction: &Instruction<O>,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-    captured_values: &[ValueRef<'b, 'c, 't>],
-    nested_functions: Option<&Rc<CallFunctionMap<O>>>,
-    lowering_context: &ProgramLoweringContext,
-    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
-where
-    ProgramInput: Parameterized<Constant>,
-    ProgramOutput: Parameterized<Constant>,
-{
-    let input_types = instruction
-        .inputs()
-        .iter()
-        .map(|input| program.atoms()[input.index()].r#type().into_owned())
-        .collect::<Vec<_>>();
-    let output_types = instruction
-        .outputs()
-        .iter()
-        .map(|output| program.atoms()[output.index()].r#type().into_owned())
-        .collect::<Vec<_>>();
-    // Every StableHLO operation generated from this one Ryft instruction inherits the instruction's provenance
-    // through the lowerer's shared location, with the ambient location as its base.
-    let location = lowering_context.instruction_location(context, instruction.provenance(), location);
-    let regions = if lowers_without_regions(
-        instruction.operation(),
-        &input_types,
-        &output_types,
-        nested_functions,
-        lowering_context.target_platform(),
-    ) {
-        Vec::new()
-    } else {
-        instruction
-            .regions()
-            .iter()
-            .map(|region| program.region_ref(*region).map(|region| region.to_program()))
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    let mut lowerer = Lowerer::new(*block, context, location, lowering_context.clone())
-        .with_regions(regions)
-        .with_nested_functions(nested_functions.cloned())
-        .with_captured_values(captured_values)
-        .with_effect_tokens(*effect_tokens);
-    let outputs = lower_instruction_operation(
-        instruction.operation(),
-        &mut lowerer,
-        input_values,
-        input_types.as_slice(),
-        output_types.as_slice(),
-    )?;
-    if lowerer.effect_tokens.ordered_assertion.is_some() {
-        lowering_context.record_assertion();
-    }
-    *effect_tokens = lowerer.effect_tokens;
-    Ok(outputs)
-}
-
 /// Lowers `operation`, applied by one instruction to `input_values` of `input_types` with outputs of `output_types`,
 /// with `lowerer`, and constrains every emitted value that carries a pending reduction over a mesh axis that no
-/// enclosing manual region binds. Every path that lowers an instruction (i.e., [`lower_instruction`] and the inline
-/// lowering of nested regions) goes through this function, which owns the following rule.
+/// enclosing manual region binds. [`ProgramInlineLoweringExtension::lower_inline`] applies these constraints to the
+/// instructions of both entry functions and nested regions.
 ///
 /// Shardy rejects an operation whose result drops an unreduced axis of its operands, unless a blessed operation (e.g.,
 /// `sdy.sharding_constraint`) performs that transition, and its propagation does not carry unreduced axes through most
@@ -914,7 +847,7 @@ where
 /// other instruction pays one scan of its input types and of its output types, without allocating or walking the
 /// emitted operations. The constraints are emitted for every target, and lowering removes them, with every other
 /// Shardy operation, for a target without the Shardy dialect (refer to `remove_shardy_operations`).
-pub(crate) fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     operation: &O,
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -1044,8 +977,6 @@ pub(crate) mod tests {
     use crate::lowering::LoweringError;
     use crate::lowering::modules::{normalize_function_name, serialize_lowered_module};
 
-    use crate::lowering::regions::tests::lower_plain_program_outputs;
-
     use crate::lowering::states::ProgramLoweringContext;
     use crate::lowering::types::ArrayTypeLoweringExtension;
     use crate::lowering::values::MlirLowerableValue;
@@ -1063,6 +994,70 @@ pub(crate) mod tests {
     /// test-only plain program lowering or lift into the array IR through [`unproject_plain_program`].
     pub(crate) type PlainProgram =
         Program<ArrayConstant, ArrayOperation<ArrayConstant>, Vec<ArrayConstant>, Vec<ArrayConstant>>;
+
+    /// Lowers one plain traced program to values inside `block`, whose arguments are the program inputs. This test-only
+    /// path supports no attached regions.
+    fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
+        program: &Program<V, O, Input, Output>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+        lowering_context: &ProgramLoweringContext,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
+    where
+        V: MlirLowerableValue,
+        O: LowerableOperation<Type = ArrayType>,
+        Input: Parameterized<V>,
+        Output: Parameterized<V>,
+    {
+        let input_values = (0..program.input_ids().len())
+            .map(|index| block.argument(index).unwrap().as_ref())
+            .collect::<Vec<_>>();
+        // The per-class effect chains of the function body are created lazily and dropped at the end of that body.
+        let mut effect_tokens = EffectTokens::default();
+        let instruction_block = *block;
+        program.interpret_with(
+            input_values,
+            |_, value| value.lower_literal(block, context, location),
+            |instruction, inputs| {
+                let input_types = instruction
+                    .inputs()
+                    .iter()
+                    .map(|input| program.atoms()[input.index()].r#type().into_owned())
+                    .collect::<Vec<_>>();
+                let output_types = instruction
+                    .outputs()
+                    .iter()
+                    .map(|output| program.atoms()[output.index()].r#type().into_owned())
+                    .collect::<Vec<_>>();
+                if !instruction.regions().is_empty() {
+                    return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                        operation: instruction.operation().name().to_string(),
+                        reason: format!(
+                            "plain-program lowering does not support attached regions for `{}`; use the production \
+                             array IR XLA lowerer",
+                            instruction.operation().name(),
+                        ),
+                    }));
+                }
+                let location = lowering_context.instruction_location(context, instruction.provenance(), location);
+                let mut lowerer: Lowerer<'_, '_, '_, Operation> =
+                    Lowerer::new(instruction_block, context, location, lowering_context.clone())
+                        .with_effect_tokens(std::mem::take(&mut effect_tokens));
+                let outputs = instruction.operation().lower(
+                    &mut lowerer,
+                    inputs,
+                    input_types.as_slice(),
+                    output_types.as_slice(),
+                )?;
+                if lowerer.effect_tokens.ordered_assertion.is_some() {
+                    lowering_context.record_assertion();
+                }
+                effect_tokens = lowerer.effect_tokens;
+                Ok(outputs)
+            },
+        )
+    }
 
     /// Lowers a plain traced [`Program`] to a textual StableHLO MLIR module.
     pub(crate) fn to_rendered_mlir_for_plain_program<

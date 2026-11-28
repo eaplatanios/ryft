@@ -14,7 +14,7 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::regions::lower_program_outputs_with_inputs;
+use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::sharding::UnreducedKindExtension;
 use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{ArrayTypeLoweringExtension, annotate_output_memory};
@@ -238,16 +238,14 @@ where
         let body_inputs = (0..local_input_types.len())
             .map(|index| body_block.argument(index).unwrap().as_ref())
             .collect::<Vec<_>>();
-        let mut body_outputs = lower_program_outputs_with_inputs(
-            program,
+        let mut body_outputs = program.lower_inline(
             &[],
             &body_inputs,
-            &mut body_block_ref,
-            context,
-            location,
             None,
             &body_lowering_context,
             &mut body_effect_tokens,
+            body_block_ref,
+            location,
         )?;
         body_outputs.extend(threaded_effects.iter().map(|&effect| body_effect_tokens.get(effect).unwrap()));
         body_block_ref.append_operation(shardy::r#return(body_outputs.as_slice(), location)?)?;

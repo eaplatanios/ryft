@@ -803,8 +803,8 @@ mod tests {
                         .with_reference_bindings(Vec::new(), Vec::new(), Vec::new()),
                 )
                 .unwrap();
-            let (stable_hlo, signature, runtime_requirements) = lowered.into_parts();
-            assert_eq!(signature.has_ordered_io(), ordered);
+            let (stable_hlo, boundary_mapping, runtime_requirements) = lowered.into_parts();
+            assert_eq!(boundary_mapping.has_ordered_io(), ordered);
             let requirements = if ordered {
                 vec![
                     RuntimeRequirement::builtin("ryft.ordered-io"),
@@ -814,13 +814,13 @@ mod tests {
                 vec![RuntimeRequirement::builtin(PRINT_CUSTOM_CALL_TARGET)]
             };
             assert_eq!(runtime_requirements.as_ref(), requirements);
-            assert_eq!(signature.has_device_ordered_io(), effect_class == EffectClass::DeviceOrderedIo);
-            assert_eq!(signature.has_unordered_io(), !ordered);
-            assert!(signature.has_effects());
-            assert!(!signature.requires_assertion_handler());
-            assert_eq!(signature.ordered_io_input_index(), ordered.then_some(1));
-            assert_eq!(signature.ordered_io_output_index(), ordered.then_some(0));
-            assert_eq!(signature.executable_input_count(), 1 + usize::from(ordered));
+            assert_eq!(boundary_mapping.has_device_ordered_io(), effect_class == EffectClass::DeviceOrderedIo);
+            assert_eq!(boundary_mapping.has_unordered_io(), !ordered);
+            assert!(boundary_mapping.has_effects());
+            assert!(!boundary_mapping.requires_assertion_handler());
+            assert_eq!(boundary_mapping.ordered_io_input_index(), ordered.then_some(1));
+            assert_eq!(boundary_mapping.ordered_io_output_index(), ordered.then_some(0));
+            assert_eq!(boundary_mapping.executable_input_count(), 1 + usize::from(ordered));
             let expected = if ordered {
                 indoc! {"
                     module {

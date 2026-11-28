@@ -216,10 +216,9 @@ pub(crate) fn unread_call_captures<O: LowerableOperationFamily>(
 /// `target_platform` (refer to [`emitted_capture_reads`]) and public inputs that
 /// `unread_inputs` flags, which the caller states because it cannot be read from `program` (refer to
 /// `Options::with_unread_inputs`), of a static shape and backing no reference state (i.e., not at one of
-/// `reference_state_inputs`). This is the one liveness decision of an executable boundary: the admission and the
-/// placement of its inputs when a function is compiled, the signature of its executable, which records it (refer to
-/// `MlirProgramSignature::is_unread_input`), and every execution and persisted copy of it read it, and none of them
-/// requires anything of such an input.
+/// `reference_state_inputs`). Input admission and placement use this liveness decision during compilation. The
+/// executable boundary mapping records it for execution and persistence, so an unread input requires no buffer
+/// (refer to [`MlirProgramBoundaryMapping::is_unread_input`](super::MlirProgramBoundaryMapping::is_unread_input)).
 pub(crate) fn unread_entry_inputs<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
     logical_input_types: &[ArrayType],

@@ -68,9 +68,10 @@ pub use kernels::{
     stage_kernel_with_rules, stage_kernel_with_vjp,
 };
 pub use lowering::{
-    DataDependentPaddingDiscipline, EntryShardingOverride, MlirProgramSignatureInputDimension, LogicalMeshExtension, LowerableOperation,
-    LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation, MlirProgram, MlirProgramSignature,
-    OpenDimensions, MlirProgramSignatureOutputDimension, ProgramLoweringExtension, ProgramLoweringOptions, RaggedDotLoweringStrategy,
+    DataDependentPaddingDiscipline, EntryShardingOverride, LogicalMeshExtension, LowerableOperation,
+    LowerableOperationFamily, Lowerer, LoweringError, MemberLowerableOperation, MlirProgram,
+    MlirProgramBoundaryMapping, MlirProgramBoundaryMappingInputDimension, MlirProgramBoundaryMappingOutputDimension,
+    OpenDimensions, ProgramLoweringExtension, ProgramLoweringOptions, RaggedDotLoweringStrategy,
     SHARDY_MESH_SYMBOL_NAME, ShardingExtension, UnreducedKindExtension, lower_projected_operation,
 };
 pub use operations::{

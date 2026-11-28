@@ -224,7 +224,7 @@ impl Session {
         Ok(lowered_program)
     }
 
-    /// Lowers a staged program to StableHLO and derives its complete logical metadata and executable signature for this
+    /// Lowers a staged program to StableHLO and derives its logical metadata and executable boundary mapping for this
     /// session. A mesh that assigns a device to another process than the one that owns it, or that assigns to this
     /// process a device that it cannot address, is rejected first, as a direct placement and a placement of a capture
     /// reject it (refer to `validate_mesh_devices`), before anything is lowered, compiled, or looked up in a
@@ -849,15 +849,16 @@ impl Session {
             }
             .into());
         }
-        let signature = lowered_module.signature();
+        let boundary_mapping = lowered_module.boundary_mapping();
         for (mapping, donation) in
-            signature.input_mapping()[lowered_capture_count..].iter().zip(donation_flags.iter_mut())
+            boundary_mapping.input_mapping()[lowered_capture_count..].iter().zip(donation_flags.iter_mut())
         {
             if mapping.is_none() {
                 *donation = false;
             }
         }
-        let expected_input_shardings = signature.executable_input_shardings(logical_input_shardings.as_slice())?;
+        let expected_input_shardings =
+            boundary_mapping.executable_input_shardings(logical_input_shardings.as_slice())?;
         let embeds_kernels = emitted_regions(program.entry_region_ref(), target_platform).any(|region| {
             region.instructions().iter().any(|instruction| match instruction.operation() {
                 Operation::CustomCall(operation) | Operation::Array(ArrayOperation::CustomCall(operation)) => {
@@ -905,7 +906,7 @@ impl Session {
             program.input_types(),
             program.all_output_types(),
             &output_shardings,
-            program.signature(),
+            program.boundary_mapping(),
             program.donation_flags(),
             program.capture_count(),
             program.mesh(),
@@ -1816,7 +1817,7 @@ fn resolve_output_shardings(
         .zip(program.open_outputs().iter())
         .enumerate()
         .map(|(index, (declared, &open))| {
-            let Some(executable_index) = program.signature().output_mapping()[index].filter(|_| open) else {
+            let Some(executable_index) = program.boundary_mapping().output_mapping()[index].filter(|_| open) else {
                 return Ok(declared.clone());
             };
             let op_sharding = op_shardings.get(executable_index).ok_or_else(|| {
@@ -5928,9 +5929,9 @@ mod tests {
         assert_eq!([executed(&reversed, 1), called(&reversed, 1)], [read.clone(), read.clone()]);
         // A capture of another client of the zero data type and a capture of this client that is split unevenly are
         // rejected like the captures above when the function reads them, and require nothing when it does not. The
-        // signature records which captures are unread rather than leaving execution to infer it from a missing buffer,
-        // which a capture of the zero data type never has (refer to `MlirProgramSignature::is_unread_input`), and a
-        // capture is placed only once it is known to be read.
+        // boundary mapping records unread captures explicitly, because a capture of the zero data type also has no
+        // buffer (refer to `MlirProgramBoundaryMapping::is_unread_input`). A capture is placed only once it is known
+        // to be read.
         let zero_message = format!(
             "session constant `{}` retains an array of a different PJRT client than the client of this session",
             RetainedArray::new(&zero),

@@ -509,8 +509,8 @@ mod tests {
         let source = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         let lowered = session.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
         let program = session.compile_program(&lowered).unwrap();
-        assert!(program.signature().has_unordered_io());
-        assert!(!program.signature().has_ordered_io());
+        assert!(program.boundary_mapping().has_unordered_io());
+        assert!(!program.boundary_mapping().has_ordered_io());
 
         // Leave a completed entry at the ordered tail so any unordered reservation that joins the chain is visible.
         let ordered = session.reserve_effects(Some(&[mesh.devices()[0].id()])).unwrap();
@@ -786,7 +786,7 @@ mod tests {
         let source = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         let lowered = session.lower_program(&source, 0, &Options::new(mesh)).unwrap();
         let program = session.compile_program(&lowered).unwrap();
-        assert!(program.signature().has_device_ordered_io());
+        assert!(program.boundary_mapping().has_device_ordered_io());
         let devices = program.executable().addressable_devices().unwrap();
         let managers = devices
             .iter()

@@ -23,7 +23,7 @@ use std::rc::Rc;
 
 use ryft_core::{
     ArrayType, ComparisonDirection, DataType, Dimension, EagerContext, EffectClasses, FlatProgram, Operation,
-    ProgramError, RematerializationOptimizationBarrier, SCAN_OPERATION_NAME, ScanOperation, Shape, TypedProgram,
+    ProgramError, SCAN_OPERATION_NAME, ScanOperation, Shape, TypedProgram,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -32,7 +32,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::EffectTokens;
-use crate::lowering::regions::NestedProgramLoweringExtension;
+use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, TypeLoweringExtension, lower_constant_output, lower_static_index_constants,
@@ -610,15 +610,13 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
         }
 
         let mut body_outputs = self.body.lower_inline(
-            iteration_inputs.as_slice(),
-            block,
-            self.context,
-            location,
             self.captured_values,
-            &RematerializationOptimizationBarrier::None,
+            iteration_inputs.as_slice(),
             self.nested_functions,
             self.lowering_context,
             effect_tokens,
+            *block,
+            location,
         )?;
         let stacked_outputs = body_outputs.split_off(self.carry_count);
         let mut new_accumulators = Vec::with_capacity(self.stacked_output_slice_types.len());

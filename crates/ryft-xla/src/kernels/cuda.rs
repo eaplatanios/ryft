@@ -1050,7 +1050,7 @@ mod tests {
             .unwrap();
         let lowered =
             program.to_mlir("main", &ProgramLoweringOptions::new().with_target_platform(Some("cuda"))).unwrap();
-        let (module, signature, requirements) = lowered.into_parts();
+        let (module, boundary_mapping, requirements) = lowered.into_parts();
         assert_eq!(
             module,
             formatdoc! {r#"
@@ -1063,8 +1063,8 @@ mod tests {
         "#},
         );
         assert_eq!(requirements.as_ref(), &[RuntimeRequirement::builtin(CUDA_KERNEL_CUSTOM_CALL_TARGET)]);
-        assert!(!signature.has_effects());
-        assert!(!signature.requires_assertion_handler());
+        assert!(!boundary_mapping.has_effects());
+        assert!(!boundary_mapping.requires_assertion_handler());
     }
 
     #[test]

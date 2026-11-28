@@ -4,8 +4,8 @@ use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, CONDITION_OPERATION_NAME, ConditionOperation, CustomCallOperation, DataType, Dimension, EagerContext,
     EffectClass, EffectClasses, FlatProgram, GuardOperation, IotaOperation, MeshAxisType, OneOperation, Parameterized,
-    Program, ProgramError, RematerializationOptimizationBarrier, RngBitGeneratorOperation, SCAN_OPERATION_NAME,
-    ScanOperation, Shape, Typed, TypedProgram, WHILE_OPERATION_NAME, WhileOperation, ZeroOperation,
+    Program, ProgramError, RngBitGeneratorOperation, SCAN_OPERATION_NAME, ScanOperation, Shape, Typed, TypedProgram,
+    WHILE_OPERATION_NAME, WhileOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -14,7 +14,7 @@ use ryft_mlir::{
 };
 
 use crate::lowering::emissions::emitted_regions;
-use crate::lowering::regions::NestedProgramLoweringExtension;
+use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{
@@ -387,15 +387,13 @@ impl<O: LowerableOperationFamily> ControlFlowRegionLoweringExtension<O> for Flat
             let mut block_ref = block.as_ref();
             let mut region_effect_tokens = entry_effect_tokens;
             let mut outputs = self.lower_inline(
-                input_values,
-                &mut block_ref,
-                context,
-                location,
                 captured_values,
-                &RematerializationOptimizationBarrier::None,
+                input_values,
                 nested_functions,
                 lowering_context,
                 &mut region_effect_tokens,
+                block_ref,
+                location,
             )?;
             validate_unthreaded_effect_tokens(entry_effect_tokens, region_effect_tokens, threaded_effects)?;
             // Normalize ordinary outputs before appending tokens so both conditional branches return the instruction's
@@ -698,8 +696,8 @@ mod tests {
             .unwrap();
         assert_eq!(lowered_effect_classes(&jvp).unwrap(), EffectClasses::single(EffectClass::OrderedAssertion));
         let active = jvp.to_mlir("main", &ProgramLoweringOptions::new()).unwrap();
-        let (_, signature, runtime_requirements) = active.into_parts();
-        assert!(signature.requires_assertion_handler());
+        let (_, boundary_mapping, runtime_requirements) = active.into_parts();
+        assert!(boundary_mapping.requires_assertion_handler());
         assert_eq!(runtime_requirements.as_ref(), &[RuntimeRequirement::builtin("ryft.assert")],);
 
         let mut builder = ProgramBuilder::<Constant, Operation>::new();
@@ -720,8 +718,8 @@ mod tests {
         let dormant = program.to_mlir("main", &ProgramLoweringOptions::new()).unwrap();
 
         assert!(lowered_effect_classes(&program).unwrap().is_empty());
-        let (stable_hlo, signature, runtime_requirements) = dormant.into_parts();
-        assert!(!signature.requires_assertion_handler());
+        let (stable_hlo, boundary_mapping, runtime_requirements) = dormant.into_parts();
+        assert!(!boundary_mapping.requires_assertion_handler());
         assert!(runtime_requirements.is_empty());
         assert_eq!(
             stable_hlo,

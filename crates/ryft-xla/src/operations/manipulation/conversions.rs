@@ -3571,8 +3571,8 @@ mod tests {
                     )
                     .unwrap();
                 let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-                assert_eq!(lowered.signature().input_mapping(), &[Some(0), None]);
-                assert_eq!(lowered.signature().output_mapping(), &[None, Some(0), Some(1)]);
+                assert_eq!(lowered.boundary_mapping().input_mapping(), &[Some(0), None]);
+                assert_eq!(lowered.boundary_mapping().output_mapping(), &[None, Some(0), Some(1)]);
                 let compiled = session.compile_program(&lowered).unwrap();
                 let outputs = session.execute_program(&compiled, vec![input.clone(), zero.clone()]).unwrap();
                 assert_eq!(outputs[1].shape().as_slice(), &[2, 3]);
@@ -3619,7 +3619,7 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let lowered = session.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        assert_eq!(lowered.signature().ordered_io_output_index(), Some(2));
+        assert_eq!(lowered.boundary_mapping().ordered_io_output_index(), Some(2));
         let compiled = session.compile_program(&lowered).unwrap();
         for rows in [2, 0] {
             let values = (1..=rows * 3).map(|value| value as f64).collect::<Vec<_>>();

@@ -7,14 +7,15 @@ use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayType, AtomId, BroadcastOperation, CallOperation, DataType, DeviceMesh, Dimension, EagerContext, EffectClass,
     ExternalReferenceBinding, FlatProgram, LogicalMesh, Memory, MeshAxisType, Parameterized, PlaceOperation,
-    PlacementRequest, Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef,
-    RematerializationOptimizationBarrier, RequestedPlacement, Shape, Sharding, ShardingDimension,
-    StopGradientOperation, TagOperation, TransferToMemoryOperation, Type as CoreType, Typed, TypedProgram, Value,
+    PlacementRequest, Program, ProgramError, RegionId, RegionPlacementRequests, RegionRef, RequestedPlacement, Shape,
+    Sharding, ShardingDimension, StopGradientOperation, TagOperation, TransferToMemoryOperation, Type as CoreType,
+    Typed, TypedProgram, Value,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
-    Attribute, Block, Context as MlirContext, DetachedBlock, Location, LocationRef, Operation as MlirOperation, Region,
-    SymbolVisibility, Type as MlirType, TypeAndAttributes, Value as MlirValue,
+    Attribute, Block, BlockRef, Context as MlirContext, DetachedBlock, Location, LocationRef,
+    Operation as MlirOperation, Region, SymbolVisibility, Type as MlirType, TypeAndAttributes, Value as MlirValue,
+    ValueRef,
 };
 
 use crate::arrays::host::ReductionChange;
@@ -30,7 +31,7 @@ use crate::lowering::reductions::{
     ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
     validate_pending_reduction_change,
 };
-use crate::lowering::regions::{NestedProgramLoweringExtension, lower_program_outputs_with_inputs};
+use crate::lowering::regions::lower_instruction;
 use crate::lowering::sharding::{LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension};
 use crate::lowering::states::ProgramLoweringContext;
 use crate::lowering::types::{
@@ -49,8 +50,8 @@ pub struct MlirProgram {
     /// Textual StableHLO/Shardy module of this [`MlirProgram`].
     stable_hlo: String,
 
-    /// Entry function signature, which maps logical inputs and outputs to executable slots.
-    signature: MlirProgramSignature,
+    /// Mapping from the logical inputs and outputs of the entry function to executable slots.
+    boundary_mapping: MlirProgramBoundaryMapping,
 
     /// Canonical runtime contracts required by emitted calls and synthesized checks.
     runtime_requirements: Arc<[RuntimeRequirement]>,
@@ -61,16 +62,16 @@ pub struct MlirProgram {
 }
 
 impl MlirProgram {
-    /// Pairs the rendered `stable_hlo` module with the `signature` of its entry function, its canonical
+    /// Pairs the rendered `stable_hlo` module with the entry function's `boundary_mapping`, its canonical
     /// `runtime_requirements`, and its module `mesh`.
     #[inline]
     fn new(
         stable_hlo: String,
-        signature: MlirProgramSignature,
+        boundary_mapping: MlirProgramBoundaryMapping,
         runtime_requirements: Arc<[RuntimeRequirement]>,
         mesh: Option<LogicalMesh>,
     ) -> Self {
-        Self { stable_hlo, signature, runtime_requirements, mesh }
+        Self { stable_hlo, boundary_mapping, runtime_requirements, mesh }
     }
 
     /// Returns the rendered StableHLO module of this [`MlirProgram`].
@@ -79,10 +80,10 @@ impl MlirProgram {
         &self.stable_hlo
     }
 
-    /// Returns the entry function signature, which maps logical inputs and outputs to executable slots.
+    /// Returns the mapping from the logical inputs and outputs of the entry function to executable slots.
     #[inline]
-    pub fn signature(&self) -> &MlirProgramSignature {
-        &self.signature
+    pub fn boundary_mapping(&self) -> &MlirProgramBoundaryMapping {
+        &self.boundary_mapping
     }
 
     /// Returns the module mesh that every sharding and `shard_map` boundary of the module refers to, or `None` when the
@@ -98,12 +99,11 @@ impl MlirProgram {
         self.stable_hlo
     }
 
-    /// Consumes this [`MlirProgram`] and returns its textual module, the signature of its entry function, and its
-    /// runtime requirements. Whether executing it requires the host runtime assertion handler is part of the
-    /// signature.
+    /// Consumes this [`MlirProgram`] and returns its textual module, its entry boundary mapping, and its runtime
+    /// requirements. The mapping records whether execution requires the host runtime assertion handler.
     #[inline]
-    pub fn into_parts(self) -> (String, MlirProgramSignature, Arc<[RuntimeRequirement]>) {
-        (self.stable_hlo, self.signature, self.runtime_requirements)
+    pub fn into_parts(self) -> (String, MlirProgramBoundaryMapping, Arc<[RuntimeRequirement]>) {
+        (self.stable_hlo, self.boundary_mapping, self.runtime_requirements)
     }
 }
 
@@ -117,7 +117,7 @@ impl MlirProgram {
 /// The constructor uses the logical types to compute slot indices and hidden extents. Callers supply the types and
 /// sharding annotations separately when projecting them into executable order.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MlirProgramSignature {
+pub struct MlirProgramBoundaryMapping {
     /// Executable slot index for each flattened logical input, or `None` for an erased input.
     input_mapping: Arc<[Option<usize>]>,
 
@@ -129,10 +129,10 @@ pub struct MlirProgramSignature {
     unread_inputs: Arc<[bool]>,
 
     /// Hidden scalar inputs that carry the runtime extents of tensors padded to their bounds.
-    input_dimensions: Arc<[MlirProgramSignatureInputDimension]>,
+    input_dimensions: Arc<[MlirProgramBoundaryMappingInputDimension]>,
 
     /// Hidden scalar outputs that report bounded dynamic logical output extents.
-    output_dimensions: Arc<[MlirProgramSignatureOutputDimension]>,
+    output_dimensions: Arc<[MlirProgramBoundaryMappingOutputDimension]>,
 
     /// Whether the executable carries the ordered I/O boundary token (i.e., whether the program contains
     /// [`OrderedIo`](EffectClass::OrderedIo) or [`DeviceOrderedIo`](EffectClass::DeviceOrderedIo) effects).
@@ -149,7 +149,7 @@ pub struct MlirProgramSignature {
     requires_assertion_handler: bool,
 }
 
-impl MlirProgramSignature {
+impl MlirProgramBoundaryMapping {
     /// Derives the executable boundary mapping for the provided logical input and output types.
     pub(crate) fn new(input_types: &[ArrayType], output_types: &[ArrayType]) -> Self {
         /// Maps each flattened logical type to its executable array slot. Statically shaped [`DataType::Zero`]
@@ -177,7 +177,7 @@ impl MlirProgramSignature {
         for (logical_input_index, input_type) in input_types.iter().enumerate() {
             for (axis, dimension) in input_type.shape().dimensions().iter().enumerate() {
                 if dimension.value().is_none() && dimension.upper_bound().is_some() {
-                    input_dimensions.push(MlirProgramSignatureInputDimension {
+                    input_dimensions.push(MlirProgramBoundaryMappingInputDimension {
                         axis,
                         logical_input_index,
                         executable_input_index,
@@ -193,7 +193,7 @@ impl MlirProgramSignature {
         for (logical_output_index, output_type) in output_types.iter().enumerate() {
             for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
                 if dimension.value().is_none() && dimension.upper_bound().is_some() {
-                    output_dimensions.push(MlirProgramSignatureOutputDimension {
+                    output_dimensions.push(MlirProgramBoundaryMappingOutputDimension {
                         axis,
                         logical_output_index,
                         executable_output_index,
@@ -220,7 +220,7 @@ impl MlirProgramSignature {
     /// never reads, and records them, so that executions and persisted copies of the executable read which inputs are
     /// unread rather than infer it from the mapping, which cannot tell an unread input from a read one that has no
     /// buffer (e.g., of the zero data type). Every flagged input must have a static shape. Flags that state no unread
-    /// input leave the signature unchanged.
+    /// input leave the mapping unchanged.
     pub(crate) fn with_unread_inputs(mut self, unread_inputs: &[bool]) -> Self {
         if !unread_inputs.contains(&true) {
             return self;
@@ -242,14 +242,9 @@ impl MlirProgramSignature {
             })
             .collect();
 
-        let input_dimensions =
-            self.input_dimensions
-                .iter()
-                .enumerate()
-                .map(|(offset, dimension)| MlirProgramSignatureInputDimension {
-                    executable_input_index: executable_index + offset,
-                    ..*dimension
-                });
+        let input_dimensions = self.input_dimensions.iter().enumerate().map(|(offset, dimension)| {
+            MlirProgramBoundaryMappingInputDimension { executable_input_index: executable_index + offset, ..*dimension }
+        });
 
         self.input_dimensions = input_dimensions.collect();
         self.unread_inputs = unread_inputs.into();
@@ -306,13 +301,13 @@ impl MlirProgramSignature {
 
     /// Returns the hidden scalar inputs carrying bounded dynamic input extents, in executable order.
     #[inline]
-    pub fn input_dimensions(&self) -> &[MlirProgramSignatureInputDimension] {
+    pub fn input_dimensions(&self) -> &[MlirProgramBoundaryMappingInputDimension] {
         &self.input_dimensions
     }
 
     /// Returns the hidden scalar outputs carrying bounded dynamic output extents, in executable order.
     #[inline]
-    pub fn output_dimensions(&self) -> &[MlirProgramSignatureOutputDimension] {
+    pub fn output_dimensions(&self) -> &[MlirProgramBoundaryMappingOutputDimension] {
         &self.output_dimensions
     }
 
@@ -522,9 +517,9 @@ impl MlirProgramSignature {
         Ok(Self::select_mapped_entries(&self.output_mapping, outputs))
     }
 
-    /// Clones entries from `values` whose corresponding entries in `mapping` are `Some(_)`. The signature assigns
-    /// executable indices consecutively in logical order, so keeping these entries in sequence gives executable order.
-    /// `mapping` and `values` must have the same length, which every caller validates before it selects.
+    /// Clones entries from `values` whose corresponding entries in `mapping` are `Some(_)`. Executable indices are
+    /// consecutive in logical order, so keeping these entries in sequence gives executable order. `mapping` and
+    /// `values` must have the same length, which every caller validates before it selects.
     fn select_mapped_entries<T: Clone>(mapping: &[Option<usize>], values: &[T]) -> Vec<T> {
         debug_assert_eq!(mapping.len(), values.len());
         mapping
@@ -537,7 +532,7 @@ impl MlirProgramSignature {
 
 /// A bounded dynamic input axis whose extent is carried by a hidden scalar executable input.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct MlirProgramSignatureInputDimension {
+pub struct MlirProgramBoundaryMappingInputDimension {
     /// Axis within the logical input.
     axis: usize,
 
@@ -548,7 +543,7 @@ pub struct MlirProgramSignatureInputDimension {
     executable_input_index: usize,
 }
 
-impl MlirProgramSignatureInputDimension {
+impl MlirProgramBoundaryMappingInputDimension {
     /// Returns the dynamic axis within the logical input.
     #[inline]
     pub fn axis(&self) -> usize {
@@ -570,7 +565,7 @@ impl MlirProgramSignatureInputDimension {
 
 /// A bounded dynamic output axis whose extent is carried by a hidden scalar executable output.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct MlirProgramSignatureOutputDimension {
+pub struct MlirProgramBoundaryMappingOutputDimension {
     /// Axis within the logical output.
     axis: usize,
 
@@ -581,7 +576,7 @@ pub struct MlirProgramSignatureOutputDimension {
     executable_output_index: usize,
 }
 
-impl MlirProgramSignatureOutputDimension {
+impl MlirProgramBoundaryMappingOutputDimension {
     /// Returns the dynamic axis within the logical output.
     #[inline]
     pub fn axis(&self) -> usize {
@@ -873,7 +868,7 @@ where
             index += 1;
         }
 
-        let mut signature = boundary.signature;
+        let mut boundary_mapping = boundary.boundary_mapping;
 
         // Everything that lowering emitted over a mesh refers to the recorded one, which is declared ahead of the
         // functions that refer to it.
@@ -893,15 +888,15 @@ where
         }
 
         if lowering_context.has_assertions() {
-            signature.require_assertion_handler();
+            boundary_mapping.require_assertion_handler();
         }
 
         let mut runtime_requirements = lowering_context.runtime_requirements();
-        if signature.requires_assertion_handler() {
+        if boundary_mapping.requires_assertion_handler() {
             runtime_requirements.push(RuntimeRequirement::builtin("ryft.assert"));
         }
 
-        if signature.has_ordered_io() {
+        if boundary_mapping.has_ordered_io() {
             runtime_requirements.push(RuntimeRequirement::builtin("ryft.ordered-io"));
         }
 
@@ -909,7 +904,7 @@ where
 
         Ok(MlirProgram::new(
             serialize_lowered_module(&module, &lowering_context)?,
-            signature,
+            boundary_mapping,
             runtime_requirements,
             mesh,
         ))
@@ -1284,8 +1279,8 @@ pub(crate) struct ProgramBoundary {
     /// Name of the entry function.
     function_name: String,
 
-    /// Signature that maps the program's logical inputs and outputs to executable slots.
-    signature: MlirProgramSignature,
+    /// Mapping from the program's logical inputs and outputs to executable slots.
+    boundary_mapping: MlirProgramBoundaryMapping,
 
     /// Session constants of the program, which the entry function receives as its trailing captures.
     session_constants: Vec<RetainedArray>,
@@ -1325,7 +1320,7 @@ impl ProgramBoundary {
         donated_inputs: &[bool],
         open_outputs: &[bool],
         capture_count: usize,
-        signature: &MlirProgramSignature,
+        boundary_mapping: &MlirProgramBoundaryMapping,
         input_types: &[ArrayType],
         output_types: &[ArrayType],
         input_shardings: &[Option<Sharding>],
@@ -1346,7 +1341,7 @@ impl ProgramBoundary {
                     message: format!("logical input index {logical_input_index} is out of range"),
                 })
             })?;
-            let executable_input_index = signature.input_mapping()[logical_input_index].ok_or_else(|| {
+            let executable_input_index = boundary_mapping.input_mapping()[logical_input_index].ok_or_else(|| {
                 Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                     message: format!(
                         "logical state input {logical_input_index} is erased from the executable boundary"
@@ -1359,13 +1354,14 @@ impl ProgramBoundary {
                         message: format!("logical output index {logical_output_index} is out of range"),
                     })
                 })?;
-                let executable_output_index = signature.output_mapping()[logical_output_index].ok_or_else(|| {
-                    Error::Lowering(LoweringError::InvalidReferenceStateAbi {
-                        message: format!(
-                            "logical state output {logical_output_index} is erased from the executable boundary",
-                        ),
-                    })
-                })?;
+                let executable_output_index =
+                    boundary_mapping.output_mapping()[logical_output_index].ok_or_else(|| {
+                        Error::Lowering(LoweringError::InvalidReferenceStateAbi {
+                            message: format!(
+                                "logical state output {logical_output_index} is erased from the executable boundary",
+                            ),
+                        })
+                    })?;
                 if input_type.static_shape().is_none() || output_type.static_shape().is_none() {
                     return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                         message: format!(
@@ -1434,7 +1430,9 @@ impl ProgramBoundary {
             for (input_index, _) in donated_inputs.iter().enumerate().filter(|(_, donated)| **donated) {
                 let logical_input_index = capture_count + input_index;
                 let input_type = &input_types[logical_input_index];
-                let Some(executable_input_index) = signature.input_mapping()[logical_input_index] else { continue };
+                let Some(executable_input_index) = boundary_mapping.input_mapping()[logical_input_index] else {
+                    continue;
+                };
                 if state_inputs.contains(&logical_input_index)
                     || aliases.contains_key(&executable_input_index)
                     || input_type.static_shape().is_none()
@@ -1450,7 +1448,7 @@ impl ProgramBoundary {
                 });
                 let executable_output_index =
                     output_types.iter().enumerate().find_map(|(logical_output_index, output_type)| {
-                        let executable_output_index = signature.output_mapping()[logical_output_index]?;
+                        let executable_output_index = boundary_mapping.output_mapping()[logical_output_index]?;
                         let is_open = open_outputs.get(logical_output_index).copied().unwrap_or(false);
                         let output_sharding = &output_shardings[logical_output_index];
                         let shares_buffers = match same_sharding {
@@ -1531,22 +1529,22 @@ impl ProgramBoundary {
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<(Vec<TypeAndAttributes<'c, 't, 'static>>, Vec<TypeAndAttributes<'c, 't, 'static>>), Error> {
-        let Self { signature, executable_input_types, executable_output_types, aliases, .. } = self;
+        let Self { boundary_mapping, executable_input_types, executable_output_types, aliases, .. } = self;
         let mut argument_types = executable_input_types
             .iter()
             .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
-        if signature.has_ordered_io() {
+        if boundary_mapping.has_ordered_io() {
             argument_types.push(context.stable_hlo_token_type()?.as_ref());
         }
         let mut result_types = executable_output_types
             .iter()
             .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
-        if signature.has_ordered_io() {
+        if boundary_mapping.has_ordered_io() {
             result_types.push(context.stable_hlo_token_type()?.as_ref());
         }
-        let mut argument_sharding_attributes = signature
+        let mut argument_sharding_attributes = boundary_mapping
             .executable_optional_input_shardings(input_shardings)?
             .iter()
             .map(|sharding| {
@@ -1556,8 +1554,8 @@ impl ProgramBoundary {
         // Results whose placement over auto mesh axes the compiler chooses are open over those axes, like JAX lowers
         // the shardings of output types without `out_shardings` (refer to `ShardingExtension::lower`).
         let executable_open_outputs =
-            if open_outputs.is_empty() { Vec::new() } else { signature.select_output_entries(open_outputs)? };
-        let mut result_sharding_attributes = signature
+            if open_outputs.is_empty() { Vec::new() } else { boundary_mapping.select_output_entries(open_outputs)? };
+        let mut result_sharding_attributes = boundary_mapping
             .executable_optional_output_shardings(output_shardings)?
             .iter()
             .enumerate()
@@ -1569,7 +1567,7 @@ impl ProgramBoundary {
             .collect::<Result<Vec<_>, _>>()?;
         // The effect token of a signature side is annotated when any value of that side is, as each device threads its
         // own token.
-        if signature.has_ordered_io() {
+        if boundary_mapping.has_ordered_io() {
             let token_sharding = context.shardy_tensor_sharding(
                 context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME),
                 &[],
@@ -1675,17 +1673,22 @@ impl ProgramBoundary {
         ProgramOutput: Parameterized<Constant>,
     {
         let Self {
-            signature, session_constants, passed_on_constants, logical_input_types, executable_input_types, ..
+            boundary_mapping,
+            session_constants,
+            passed_on_constants,
+            logical_input_types,
+            executable_input_types,
+            ..
         } = self;
         let session_count = session_constants.len();
         let mut function_block_ref = function_block.as_ref();
         let mut logical_input_values = Vec::with_capacity(logical_input_types.len());
         for (logical_index, array_type) in logical_input_types.iter().enumerate() {
-            let value = match signature.input_mapping()[logical_index] {
+            let value = match boundary_mapping.input_mapping()[logical_index] {
                 Some(executable_index) => {
                     let mut value = function_block.argument(executable_index).unwrap().as_ref();
                     let mut refined_type = executable_input_types[executable_index].clone();
-                    for input_dimension in signature
+                    for input_dimension in boundary_mapping
                         .input_dimensions()
                         .iter()
                         .filter(|dimension| dimension.logical_input_index() == logical_index)
@@ -1719,7 +1722,7 @@ impl ProgramBoundary {
                     .unwrap();
                     // An unread input (refer to `unread_logical_inputs` above) is a placeholder that no emitted region
                     // reads and that XLA removes, so its sharding is not applied either.
-                    if signature.is_unread_input(logical_index) {
+                    if boundary_mapping.is_unread_input(logical_index) {
                         logical_input_values.push(value);
                         continue;
                     }
@@ -1811,21 +1814,19 @@ impl ProgramBoundary {
             captured_values.to_mut().extend(values);
         }
         let mut effect_tokens = EffectTokens::default();
-        if let Some(index) = signature.ordered_io_input_index() {
+        if let Some(index) = boundary_mapping.ordered_io_input_index() {
             effect_tokens.set(EffectClass::OrderedIo, function_block.argument(index).unwrap().as_ref());
         }
-        let logical_outputs = lower_program_outputs_with_inputs(
-            program,
+        let logical_outputs = program.lower_inline(
             &captured_values,
             input_values,
-            &mut function_block_ref,
-            context,
-            location.as_ref(),
             Some(nested_functions),
             lowering_context,
             &mut effect_tokens,
+            function_block_ref,
+            location.as_ref(),
         )?;
-        let mut executable_outputs = signature.select_output_entries(logical_outputs.as_slice())?;
+        let mut executable_outputs = boundary_mapping.select_output_entries(logical_outputs.as_slice())?;
         // XLA writes the runtime-size trailer of a bounded dynamic result only in the `SliceToDynamic` that
         // `DynamicPadder` inserts before each output leaf. When several such leaves carry values that XLA proves
         // equal (e.g., the same SSA value or equal computations merged by CSE), one `SliceToDynamic` survives and
@@ -1834,10 +1835,10 @@ impl ProgramBoundary {
         // optimization barrier makes every leaf a distinct barrier result. XLA expands barriers only after copy
         // insertion, so each leaf keeps its own `SliceToDynamic`. A single dynamic result cannot alias a static
         // one, so the barrier is only needed with two or more of them.
-        let mut dynamic_output_slots = signature
+        let mut dynamic_output_slots = boundary_mapping
             .output_dimensions()
             .iter()
-            .map(|output_dimension| signature.output_mapping()[output_dimension.logical_output_index()].unwrap())
+            .map(|output_dimension| boundary_mapping.output_mapping()[output_dimension.logical_output_index()].unwrap())
             .collect::<Vec<_>>();
         dynamic_output_slots.dedup();
         if dynamic_output_slots.len() > 1 {
@@ -1849,7 +1850,7 @@ impl ProgramBoundary {
                 executable_outputs[executable_index] = barrier.result(result_index).unwrap().as_ref();
             }
         }
-        for output_dimension in signature.output_dimensions() {
+        for output_dimension in boundary_mapping.output_dimensions() {
             executable_outputs.push(lower_runtime_dimension_size_i64(
                 logical_outputs[output_dimension.logical_output_index()],
                 output_dimension.axis(),
@@ -1858,7 +1859,7 @@ impl ProgramBoundary {
                 location.as_ref(),
             )?);
         }
-        if signature.has_ordered_io() {
+        if boundary_mapping.has_ordered_io() {
             executable_outputs.push(effect_tokens.get(EffectClass::OrderedIo).unwrap());
         }
         function_block_ref.append_operation(func::r#return(executable_outputs.as_slice(), location)?)?;
@@ -2209,14 +2210,14 @@ where
             .into());
         }
 
-        // The logical inputs are the captures followed by the public inputs. The signature maps the logical inputs
-        // and outputs to executable slots.
+        // The logical inputs are the captures followed by the public inputs. The boundary mapping assigns them and the
+        // logical outputs to executable slots.
         let logical_input_types = capture_types.iter().cloned().chain(input_types.iter().cloned()).collect::<Vec<_>>();
         let effects = self.effects().classes();
         let ordered_io = effects.contains(EffectClass::OrderedIo) || effects.contains(EffectClass::DeviceOrderedIo);
 
         // An input that the executable never reads has no executable slot, so that executions neither admit, require,
-        // nor wait for its buffers, and the signature records it as unread.
+        // nor wait for its buffers, and the boundary mapping records it as unread.
         let reference_state_inputs = reference_states
             .iter()
             .filter_map(|state| state.source().flat_input_index(capture_types.len()).ok())
@@ -2233,7 +2234,7 @@ where
 
         // The ordered I/O token chain crosses the boundary only when the options export it. Its ordering is per device
         // unless some effect of the program is ordered across all devices.
-        let signature = MlirProgramSignature::new(logical_input_types.as_slice(), output_types)
+        let boundary_mapping = MlirProgramBoundaryMapping::new(logical_input_types.as_slice(), output_types)
             .with_unread_inputs(&unread_logical_inputs)
             .with_effects(
                 export_effects && ordered_io,
@@ -2290,19 +2291,19 @@ where
             donated_inputs,
             open_outputs,
             capture_types.len(),
-            &signature,
+            &boundary_mapping,
             &logical_input_types,
             output_types,
             logical_input_shardings,
             output_shardings,
         )?;
 
-        let executable_input_types = signature.executable_input_types(logical_input_types.as_slice())?;
-        let executable_output_types = signature.executable_output_types(output_types)?;
+        let executable_input_types = boundary_mapping.executable_input_types(logical_input_types.as_slice())?;
+        let executable_output_types = boundary_mapping.executable_output_types(output_types)?;
 
         Ok(ProgramBoundary {
             function_name,
-            signature,
+            boundary_mapping,
             session_constants,
             passed_on_constants,
             logical_input_types,
@@ -2310,6 +2311,77 @@ where
             executable_output_types,
             aliases,
         })
+    }
+}
+
+/// Lowering of a program body into an existing MLIR block.
+pub(crate) trait ProgramInlineLoweringExtension {
+    /// Operation family of the program.
+    type Operation: LowerableOperationFamily;
+
+    /// Appends the program body to `block` and returns its flat outputs. Captured constants resolve against
+    /// `captured_values` and the program's input atoms bind to `input_values`. Each instruction inherits its
+    /// location from `location` and its provenance. Calls may use private functions registered in `nested_functions`.
+    ///
+    /// Ordered effects consume and update the caller's `effect_tokens` in program order. The caller continues from
+    /// the final token of each chain after the body returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidInputCount`] before emitting any operations when the input count differs from
+    /// the program's input count. Propagates errors from lowering constants and instructions.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_inline<'b, 'c: 'b, 't: 'c>(
+        &self,
+        captured_values: &[ValueRef<'b, 'c, 't>],
+        input_values: &[ValueRef<'b, 'c, 't>],
+        nested_functions: Option<&Rc<CallFunctionMap<Self::Operation>>>,
+        lowering_context: &ProgramLoweringContext,
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+        block: BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+}
+
+impl<O, Input, Output> ProgramInlineLoweringExtension for Program<Constant, O, Input, Output>
+where
+    O: LowerableOperationFamily,
+    Input: Parameterized<Constant>,
+    Output: Parameterized<Constant>,
+{
+    type Operation = O;
+
+    #[inline]
+    fn lower_inline<'b, 'c: 'b, 't: 'c>(
+        &self,
+        captured_values: &[ValueRef<'b, 'c, 't>],
+        input_values: &[ValueRef<'b, 'c, 't>],
+        nested_functions: Option<&Rc<CallFunctionMap<O>>>,
+        lowering_context: &ProgramLoweringContext,
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+        block: BlockRef<'b, 'c, 't>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let region = self.entry_region_ref();
+        let context = block.context();
+        let mut constant_block = block;
+        region.interpret_with(
+            input_values.to_vec(),
+            |_, value| value.lower(captured_values, lowering_context, &mut constant_block, context, location),
+            |instruction, inputs| {
+                lower_instruction(
+                    region,
+                    instruction,
+                    captured_values,
+                    inputs,
+                    nested_functions,
+                    lowering_context,
+                    effect_tokens,
+                    block,
+                    location,
+                )
+            },
+        )
     }
 }
 
@@ -2568,15 +2640,13 @@ fn lower_private_function<'c, 't: 'c, O: LowerableOperationFamily>(
 
     let mut function_block_ref = function_block.as_ref();
     let outputs = program.lower_inline(
-        input_values.as_slice(),
-        &mut function_block_ref,
-        context,
-        location,
         &[],
-        &RematerializationOptimizationBarrier::None,
+        input_values.as_slice(),
         nested_functions,
         lowering_context,
         &mut EffectTokens::default(),
+        function_block_ref,
+        location,
     )?;
 
     function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
@@ -2611,7 +2681,7 @@ mod tests {
         ArrayOperation, ArrayType, CALL_OPERATION_NAME, CastOperation, CompositeKey, CompositeOperation,
         ConstrainSharding, CustomRuleDefinition, CustomRuleRegistration, DataType, Device, DeviceMesh, Dimension,
         DimensionBounds, DimensionValue, DimensionVariable, DomainTracingContext, DotDimensionNumbers, EffectClass,
-        FlatProgram, ImportingContext, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite,
+        Error as CoreError, FlatProgram, ImportingContext, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite,
         PLACE_OPERATION_NAME, Place, PlaceOperation, Placeholder, Placement, PlacementRequest, Print, ProgramBuilder,
         ReshapeOperation, Reshard, ScaledDotOperation, ScanOperation, Shape, ShardMapOptions, Sharding,
         ShardingDimension, Sin, StopGradient, Tag, TransferToMemory, TypeError, Typed, ValueProjection, shard_map,
@@ -2658,67 +2728,67 @@ mod tests {
     }
 
     #[test]
-    fn test_mlir_program_signature_new() {
+    fn test_mlir_program_boundary_mapping_new() {
         let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let dynamic_zero = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("dynamic_zero", Some(3))]));
         let boolean = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3)]));
-        let signature = MlirProgramSignature::new(
+        let boundary_mapping = MlirProgramBoundaryMapping::new(
             &[static_zero.clone(), boolean.clone(), dynamic_zero.clone()],
             &[dynamic_zero, static_zero],
         );
 
-        assert_eq!(signature.input_mapping(), &[None, Some(0), Some(1)]);
-        assert_eq!(signature.output_mapping(), &[Some(0), None]);
-        assert_eq!(signature.executable_input_count(), 3);
-        assert_eq!(signature.input_dimensions().len(), 1);
-        assert_eq!(signature.input_dimensions()[0].logical_input_index(), 2);
-        assert_eq!(signature.input_dimensions()[0].axis(), 0);
-        assert_eq!(signature.input_dimensions()[0].executable_input_index(), 2);
-        assert_eq!(signature.output_dimensions().len(), 1);
-        assert_eq!(signature.output_dimensions()[0].logical_output_index(), 0);
-        assert_eq!(signature.output_dimensions()[0].axis(), 0);
-        assert_eq!(signature.output_dimensions()[0].executable_output_index(), 1);
+        assert_eq!(boundary_mapping.input_mapping(), &[None, Some(0), Some(1)]);
+        assert_eq!(boundary_mapping.output_mapping(), &[Some(0), None]);
+        assert_eq!(boundary_mapping.executable_input_count(), 3);
+        assert_eq!(boundary_mapping.input_dimensions().len(), 1);
+        assert_eq!(boundary_mapping.input_dimensions()[0].logical_input_index(), 2);
+        assert_eq!(boundary_mapping.input_dimensions()[0].axis(), 0);
+        assert_eq!(boundary_mapping.input_dimensions()[0].executable_input_index(), 2);
+        assert_eq!(boundary_mapping.output_dimensions().len(), 1);
+        assert_eq!(boundary_mapping.output_dimensions()[0].logical_output_index(), 0);
+        assert_eq!(boundary_mapping.output_dimensions()[0].axis(), 0);
+        assert_eq!(boundary_mapping.output_dimensions()[0].executable_output_index(), 1);
     }
 
     #[test]
-    fn test_mlir_program_signature_with_unread_inputs() {
+    fn test_mlir_program_boundary_mapping_with_unread_inputs() {
         // An unread input is erased whatever its data type and recorded as unread, while an input of the zero data type
         // that is read is erased without being recorded, and the hidden extent inputs follow the remaining arrays.
         let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let vector = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
         let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
         let input_types = [vector.clone(), static_zero.clone(), static_zero, vector, dynamic];
-        let signature = MlirProgramSignature::new(&input_types, &[]);
-        assert_eq!(signature.clone().with_unread_inputs(&[false; 5]), signature);
-        let signature = signature.with_unread_inputs(&[true, true, false, false, false]);
-        assert_eq!(signature.input_mapping(), &[None, None, None, Some(0), Some(1)]);
-        assert_eq!(signature.unread_inputs(), &[true, true, false, false, false]);
-        assert_eq!([0, 1, 2].map(|index| signature.is_unread_input(index)), [true, true, false]);
-        assert_eq!(signature.input_dimensions()[0].executable_input_index(), 2);
-        assert_eq!(signature.executable_input_count(), 3);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(&input_types, &[]);
+        assert_eq!(boundary_mapping.clone().with_unread_inputs(&[false; 5]), boundary_mapping);
+        let boundary_mapping = boundary_mapping.with_unread_inputs(&[true, true, false, false, false]);
+        assert_eq!(boundary_mapping.input_mapping(), &[None, None, None, Some(0), Some(1)]);
+        assert_eq!(boundary_mapping.unread_inputs(), &[true, true, false, false, false]);
+        assert_eq!([0, 1, 2].map(|index| boundary_mapping.is_unread_input(index)), [true, true, false]);
+        assert_eq!(boundary_mapping.input_dimensions()[0].executable_input_index(), 2);
+        assert_eq!(boundary_mapping.executable_input_count(), 3);
     }
 
     #[test]
-    fn test_mlir_program_signature_with_effects() {
+    fn test_mlir_program_boundary_mapping_with_effects() {
         let scalar = ArrayType::scalar(DataType::F32);
         let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("count", Some(3))]));
-        let signature = MlirProgramSignature::new(&[scalar.clone(), dynamic.clone()], &[dynamic, scalar]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(&[scalar.clone(), dynamic.clone()], &[dynamic, scalar]);
 
         // Without effects, the boundary has no token and does not participate in the effect barrier.
-        assert!(!signature.has_ordered_io());
-        assert!(!signature.has_device_ordered_io());
-        assert!(!signature.has_unordered_io());
-        assert!(!signature.requires_assertion_handler());
-        assert!(!signature.has_effects());
-        assert_eq!(signature.ordered_io_input_index(), None);
-        assert_eq!(signature.ordered_io_output_index(), None);
-        assert_eq!(signature.input_array_count(), 3);
-        assert_eq!(signature.output_array_count(), 3);
-        assert_eq!(signature.executable_input_count(), 3);
-        assert_eq!(signature.executable_output_count(), 3);
+        assert!(!boundary_mapping.has_ordered_io());
+        assert!(!boundary_mapping.has_device_ordered_io());
+        assert!(!boundary_mapping.has_unordered_io());
+        assert!(!boundary_mapping.requires_assertion_handler());
+        assert!(!boundary_mapping.has_effects());
+        assert_eq!(boundary_mapping.ordered_io_input_index(), None);
+        assert_eq!(boundary_mapping.ordered_io_output_index(), None);
+        assert_eq!(boundary_mapping.input_array_count(), 3);
+        assert_eq!(boundary_mapping.output_array_count(), 3);
+        assert_eq!(boundary_mapping.executable_input_count(), 3);
+        assert_eq!(boundary_mapping.executable_output_count(), 3);
 
         // Ordered I/O appends one token after every array and hidden extent input and output.
-        let ordered = signature.clone().with_effects(true, false, false, true);
+        let ordered = boundary_mapping.clone().with_effects(true, false, false, true);
         assert!(ordered.has_ordered_io());
         assert!(ordered.has_device_ordered_io());
         assert!(!ordered.has_unordered_io());
@@ -2732,18 +2802,18 @@ mod tests {
 
         // Device ordering only applies together with ordered I/O, while unordered I/O and runtime assertions still
         // participate in the effect barrier.
-        let unordered = signature.clone().with_effects(false, true, false, true);
+        let unordered = boundary_mapping.clone().with_effects(false, true, false, true);
         assert!(!unordered.has_device_ordered_io());
         assert!(unordered.has_unordered_io());
         assert!(unordered.has_effects());
         assert_eq!(unordered.executable_input_count(), 3);
-        let asserting = signature.with_effects(false, false, true, false);
+        let asserting = boundary_mapping.with_effects(false, false, true, false);
         assert!(asserting.requires_assertion_handler());
         assert!(asserting.has_effects());
     }
 
     #[test]
-    fn test_mlir_program_signature_executable_input_types() {
+    fn test_mlir_program_boundary_mapping_executable_input_types() {
         // Every bounded dynamic axis of a materialized input uses its maximum extent and adds a hidden `i32`
         // extent input, while statically shaped structural zeros are erased.
         let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
@@ -2751,9 +2821,9 @@ mod tests {
             DataType::F32,
             Shape::new(vec![dynamic_dimension("rows", Some(3)), dynamic_dimension("columns", Some(5))]),
         );
-        let signature = MlirProgramSignature::new(&[static_zero.clone(), dynamic.clone()], &[]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(&[static_zero.clone(), dynamic.clone()], &[]);
         assert_eq!(
-            signature.executable_input_types(&[static_zero.clone(), dynamic]).unwrap(),
+            boundary_mapping.executable_input_types(&[static_zero.clone(), dynamic]).unwrap(),
             vec![
                 ArrayType::new_static(DataType::F32, [2, 4]),
                 ArrayType::scalar(DataType::I32),
@@ -2761,39 +2831,39 @@ mod tests {
             ],
         );
         assert_eq!(
-            signature.executable_input_types(&[static_zero]),
+            boundary_mapping.executable_input_types(&[static_zero]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }.into()),
         );
     }
 
     #[test]
-    fn test_mlir_program_signature_executable_output_types() {
+    fn test_mlir_program_boundary_mapping_executable_output_types() {
         // Dynamic outputs keep their logical types and each bounded dynamic axis appends a hidden `i64` extent output.
         let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
-        let signature = MlirProgramSignature::new(&[], &[dynamic.clone(), static_zero.clone()]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(&[], &[dynamic.clone(), static_zero.clone()]);
         assert_eq!(
-            signature.executable_output_types(&[dynamic.clone(), static_zero]).unwrap(),
+            boundary_mapping.executable_output_types(&[dynamic.clone(), static_zero]).unwrap(),
             vec![dynamic.clone(), ArrayType::scalar(DataType::I64)],
         );
         assert_eq!(
-            signature.executable_output_types(&[dynamic]),
+            boundary_mapping.executable_output_types(&[dynamic]),
             Err(ProgramError::InvalidOutputCount { expected: 2, actual: 1 }.into()),
         );
     }
 
     #[test]
-    fn test_mlir_program_signature_executable_input_shardings() {
+    fn test_mlir_program_boundary_mapping_executable_input_shardings() {
         // Each hidden extent input is a replicated scalar on the mesh of the input that owns the extent, and it
         // stays unannotated when that input is unannotated.
         let mesh = test_manual_mesh("x", 2);
         let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
-        let signature = MlirProgramSignature::new(&[static_zero, dynamic.clone(), dynamic], &[]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(&[static_zero, dynamic.clone(), dynamic], &[]);
         let vector_sharding = Sharding::replicated(mesh.clone(), 1);
         let scalar_sharding = Sharding::replicated(mesh, 0);
         assert_eq!(
-            signature
+            boundary_mapping
                 .executable_input_shardings(&[
                     vector_sharding.clone(),
                     vector_sharding.clone(),
@@ -2803,69 +2873,73 @@ mod tests {
             vec![vector_sharding.clone(), vector_sharding.clone(), scalar_sharding.clone(), scalar_sharding.clone()],
         );
         assert_eq!(
-            signature.executable_input_shardings(std::slice::from_ref(&vector_sharding)),
+            boundary_mapping.executable_input_shardings(std::slice::from_ref(&vector_sharding)),
             Err(ProgramError::InvalidInputCount { expected: 3, actual: 1 }.into()),
         );
         assert_eq!(
-            signature.executable_optional_input_shardings(&[None, Some(vector_sharding.clone()), None]).unwrap(),
+            boundary_mapping
+                .executable_optional_input_shardings(&[None, Some(vector_sharding.clone()), None])
+                .unwrap(),
             vec![Some(vector_sharding), None, Some(scalar_sharding), None],
         );
         assert_eq!(
-            signature.executable_optional_input_shardings(&[None]),
+            boundary_mapping.executable_optional_input_shardings(&[None]),
             Err(ProgramError::InvalidInputCount { expected: 3, actual: 1 }.into()),
         );
     }
 
     #[test]
-    fn test_mlir_program_signature_executable_optional_output_shardings() {
+    fn test_mlir_program_boundary_mapping_executable_optional_output_shardings() {
         let mesh = test_manual_mesh("x", 2);
         let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
-        let signature = MlirProgramSignature::new(&[], &[dynamic.clone(), dynamic]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(&[], &[dynamic.clone(), dynamic]);
         let vector_sharding = Sharding::replicated(mesh.clone(), 1);
         assert_eq!(
-            signature.executable_optional_output_shardings(&[Some(vector_sharding.clone()), None]).unwrap(),
+            boundary_mapping
+                .executable_optional_output_shardings(&[Some(vector_sharding.clone()), None])
+                .unwrap(),
             vec![Some(vector_sharding), None, Some(Sharding::replicated(mesh, 0)), None],
         );
         assert_eq!(
-            signature.executable_optional_output_shardings(&[None]),
+            boundary_mapping.executable_optional_output_shardings(&[None]),
             Err(ProgramError::InvalidOutputCount { expected: 2, actual: 1 }.into()),
         );
     }
 
     #[test]
-    fn test_mlir_program_signature_select_input_entries() {
+    fn test_mlir_program_boundary_mapping_select_input_entries() {
         // The erased static zero has no executable slot, and the hidden extent input of the dynamic zero is not an
         // entry of the selection.
         let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let dynamic_zero = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
         let boolean = ArrayType::new_static(DataType::Boolean, [3]);
-        let signature = MlirProgramSignature::new(&[static_zero, boolean, dynamic_zero], &[]);
-        assert_eq!(signature.select_input_entries(&[0, 1, 2]).unwrap(), vec![1, 2]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(&[static_zero, boolean, dynamic_zero], &[]);
+        assert_eq!(boundary_mapping.select_input_entries(&[0, 1, 2]).unwrap(), vec![1, 2]);
         assert_eq!(
-            signature.select_input_entries(&[0, 1]),
+            boundary_mapping.select_input_entries(&[0, 1]),
             Err(ProgramError::InvalidInputCount { expected: 3, actual: 2 }.into()),
         );
     }
 
     #[test]
-    fn test_mlir_program_signature_select_output_entries() {
+    fn test_mlir_program_boundary_mapping_select_output_entries() {
         let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let dynamic_zero = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
-        let signature = MlirProgramSignature::new(&[], &[dynamic_zero, static_zero]);
-        assert_eq!(signature.select_output_entries(&[0, 1]).unwrap(), vec![0]);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(&[], &[dynamic_zero, static_zero]);
+        assert_eq!(boundary_mapping.select_output_entries(&[0, 1]).unwrap(), vec![0]);
         assert_eq!(
-            signature.select_output_entries(&[0, 1, 2]),
+            boundary_mapping.select_output_entries(&[0, 1, 2]),
             Err(ProgramError::InvalidOutputCount { expected: 2, actual: 3 }.into()),
         );
     }
 
     #[test]
-    fn test_mlir_program_signature_require_assertion_handler() {
-        let mut signature = MlirProgramSignature::new(&[], &[]);
-        assert!(!signature.requires_assertion_handler());
-        signature.require_assertion_handler();
-        assert!(signature.requires_assertion_handler());
-        assert!(signature.has_effects());
+    fn test_mlir_program_boundary_mapping_require_assertion_handler() {
+        let mut boundary_mapping = MlirProgramBoundaryMapping::new(&[], &[]);
+        assert!(!boundary_mapping.requires_assertion_handler());
+        boundary_mapping.require_assertion_handler();
+        assert!(boundary_mapping.requires_assertion_handler());
+        assert!(boundary_mapping.has_effects());
     }
 
     #[test]
@@ -3741,7 +3815,7 @@ mod tests {
         let other_type = ArrayType::new_static(DataType::F32, [2]);
         let input_types = vec![r#type.clone(); 3];
         let output_types = [other_type, r#type.clone(), r#type];
-        let signature = MlirProgramSignature::new(&input_types, &output_types);
+        let boundary_mapping = MlirProgramBoundaryMapping::new(&input_types, &output_types);
         let shardings = [None, None, None];
         let aliases = |donated_inputs: &[bool]| {
             ProgramBoundary::aliases(
@@ -3749,7 +3823,7 @@ mod tests {
                 donated_inputs,
                 &[],
                 1,
-                &signature,
+                &boundary_mapping,
                 &input_types,
                 &output_types,
                 &shardings,
@@ -3979,6 +4053,62 @@ mod tests {
             sharding.dimensions_with_unconstrained_replicated().to_vec(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated(), ShardingDimension::replicated()],
         );
+    }
+
+    #[test]
+    fn test_program_lower_inline() {
+        let array_type = test_vector_type(2);
+        let program =
+            trace(|(left, right): (ArrayTracer, ArrayTracer)| left * right, (array_type.clone(), array_type.clone()))
+                .unwrap();
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = array_type.lower(&context, location).unwrap();
+        let block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+        let left = block.argument(0).unwrap().as_ref();
+        let right = block.argument(1).unwrap().as_ref();
+        let outputs = program
+            .lower_inline(
+                &[],
+                &[left, right],
+                None,
+                &ProgramLoweringContext::new(),
+                &mut EffectTokens::default(),
+                block.as_ref(),
+                location.as_ref(),
+            )
+            .unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(operations.len(), 1);
+        let multiply = operations[0];
+        assert_eq!(multiply.name().as_str(), Ok("stablehlo.multiply"));
+        assert_eq!(multiply.operand(0).unwrap().value().unwrap(), left);
+        assert_eq!(multiply.operand(1).unwrap().value().unwrap(), right);
+        assert_eq!(outputs, vec![multiply.result(0).unwrap().as_ref()]);
+    }
+
+    #[test]
+    fn test_program_lower_inline_rejects_input_count_mismatch() {
+        let program = trace(|x: ArrayTracer| x.sin().unwrap(), test_vector_type(2)).unwrap();
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let block = context.block_with_no_arguments();
+        assert!(matches!(
+            program.lower_inline(
+                &[],
+                &[],
+                None,
+                &ProgramLoweringContext::new(),
+                &mut EffectTokens::default(),
+                block.as_ref(),
+                location.as_ref(),
+            ),
+            Err(Error::Core(error)) if matches!(
+                error.as_ref(),
+                CoreError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+            ),
+        ));
+        assert!(block.is_empty());
     }
 
     #[test]
