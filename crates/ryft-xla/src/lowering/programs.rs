@@ -1302,7 +1302,6 @@ pub(crate) struct ProgramBoundary {
     aliases: HashMap<usize, usize>,
 }
 
-// TODO(eaplatanios): Review this.
 impl ProgramBoundary {
     /// Returns a map from executable input indices to the output indices with which they may share buffers. The aliases
     /// of `reference_states` are validated and paired first. Each donated input then gets an output that no earlier
@@ -1336,11 +1335,13 @@ impl ProgramBoundary {
                     message: format!("logical state input {logical_input_index} appears more than once"),
                 }));
             }
+
             let input_type = input_types.get(logical_input_index).ok_or_else(|| {
                 Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                     message: format!("logical input index {logical_input_index} is out of range"),
                 })
             })?;
+
             let executable_input_index = boundary_mapping.input_mapping()[logical_input_index].ok_or_else(|| {
                 Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                     message: format!(
@@ -1348,12 +1349,14 @@ impl ProgramBoundary {
                     ),
                 })
             })?;
+
             if let Some(logical_output_index) = state.output_index() {
                 let output_type = output_types.get(logical_output_index).ok_or_else(|| {
                     Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                         message: format!("logical output index {logical_output_index} is out of range"),
                     })
                 })?;
+
                 let executable_output_index =
                     boundary_mapping.output_mapping()[logical_output_index].ok_or_else(|| {
                         Error::Lowering(LoweringError::InvalidReferenceStateAbi {
@@ -1362,14 +1365,16 @@ impl ProgramBoundary {
                             ),
                         })
                     })?;
+
                 if input_type.static_shape().is_none() || output_type.static_shape().is_none() {
                     return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                         message: format!(
-                            "state input {logical_input_index} and output {logical_output_index} must be static because \
-                             bounded-dynamic mutation alias compatibility is unsupported",
+                            "state input {logical_input_index} and output {logical_output_index} must be static \
+                             because bounded-dynamic mutation alias compatibility is unsupported",
                         ),
                     }));
                 }
+
                 if input_type.memory() != Memory::Device || output_type.memory() != Memory::Device {
                     return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                         message: format!(
@@ -1378,6 +1383,7 @@ impl ProgramBoundary {
                         ),
                     }));
                 }
+
                 if input_type != output_type {
                     return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                         message: format!(
@@ -1386,12 +1392,13 @@ impl ProgramBoundary {
                         ),
                     }));
                 }
+
                 match (&input_shardings[logical_input_index], &output_shardings[logical_output_index]) {
                     (Some(input_sharding), Some(output_sharding)) if input_sharding != output_sharding => {
                         return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                             message: format!(
-                                "state input {logical_input_index} and output {logical_output_index} must use the same \
-                                 sharding",
+                                "state input {logical_input_index} and output {logical_output_index} \
+                                 must use the same sharding",
                             ),
                         }));
                     }
@@ -1404,28 +1411,31 @@ impl ProgramBoundary {
                     }
                     _ => {}
                 }
+
                 if !aliased_outputs.insert(executable_output_index) {
                     return Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi {
                         message: "reference-state aliases must be injective".to_string(),
                     }));
                 }
-                // Distinct logical inputs, which `state_inputs` enforces above, map to distinct executable slots, so
-                // this insertion can never displace an earlier alias.
+
+                // Distinct logical inputs, which `state_inputs` enforces above, map to distinct executable slots,
+                // so this insertion can never displace an earlier alias.
                 aliases.insert(executable_input_index, executable_output_index);
             }
         }
+
         if !donated_inputs.is_empty() && donated_inputs.len() != input_types.len() - capture_count {
             return Err(Error::Execution(ExecutionError::DonationFlagCountMismatch {
                 expected_count: input_types.len() - capture_count,
                 actual_count: donated_inputs.len(),
             }));
         }
+
         // Each donated input is paired with the first output that can share its buffers and that no earlier input was
-        // paired with, as JAX pairs the donated arguments of a `jit` function with its results. The pairs are the same
-        // hints as the reference state aliases above, so an input that finds no output simply stays unpaired. Every
-        // donated input is first paired with an output of its own type and sharding, and only an input that finds none
-        // is then paired with an output whose shards have the types of its shards, so that the second pass only adds
-        // pairs to inputs that the first one leaves unpaired.
+        // paired with. The pairs are the same hints as the reference state aliases above, so an input that finds no
+        // output simply stays unpaired. Every donated input is first paired with an output of its own type and
+        // sharding, and only an input that finds none is then paired with an output whose shards have the types
+        // of its shards, so that the second pass only adds pairs to inputs that the first one leaves unpaired.
         for same_sharding in [true, false] {
             for (input_index, _) in donated_inputs.iter().enumerate().filter(|(_, donated)| **donated) {
                 let logical_input_index = capture_count + input_index;
@@ -1433,6 +1443,7 @@ impl ProgramBoundary {
                 let Some(executable_input_index) = boundary_mapping.input_mapping()[logical_input_index] else {
                     continue;
                 };
+
                 if state_inputs.contains(&logical_input_index)
                     || aliases.contains_key(&executable_input_index)
                     || input_type.static_shape().is_none()
@@ -1440,12 +1451,15 @@ impl ProgramBoundary {
                 {
                     continue;
                 }
+
                 let input_sharding = &input_shardings[logical_input_index];
+
                 // The compiler places an open output itself, and only on a single device is that placement certain to
                 // be the placement of the input.
                 let has_single_device = input_sharding.as_ref().is_none_or(|sharding| {
                     sharding.mesh().axes().iter().map(|axis| axis.size()).product::<usize>() == 1
                 });
+
                 let executable_output_index =
                     output_types.iter().enumerate().find_map(|(logical_output_index, output_type)| {
                         let executable_output_index = boundary_mapping.output_mapping()[logical_output_index]?;
@@ -1453,26 +1467,28 @@ impl ProgramBoundary {
                         let output_sharding = &output_shardings[logical_output_index];
                         let shares_buffers = match same_sharding {
                             true => output_type == input_type && output_sharding == input_sharding,
-                            // Every device must hold shards of the same type of the input and of the output, although
-                            // the two shardings may differ (e.g., when the output completes a pending sum of the input
-                            // along a mesh axis, or splits a dimension along another axis of the same size). The output
-                            // can then take the buffers of the donated input on every device, as JAX pairs a donated
-                            // argument of a `jit` function with a result of the same shard shape. That is the case when
-                            // both shardings are on the same mesh, the types are identical apart from their shardings
-                            // (i.e., in data type, shape, layout, and memory), and both shardings split each dimension
-                            // into shards of the same static extent.
+                            // TODO(eaplatanios): Can we avoid the use of a label here? I don't like this kind of control flow.
                             false => 'shards: {
+                                // Every device must hold shards of the same type of the input and of the output,
+                                // although the two shardings may differ (e.g., when the output completes a pending sum
+                                // of the input along a mesh axis, or splits a dimension along another axis of the same
+                                // size). The output can then take the buffers of the donated input on every device.
+                                // That is the case when both shardings are on the same mesh, the types are identical
+                                // apart from their shardings (i.e., in data type, shape, layout, and memory), and both
+                                // shardings split each dimension into shards of the same static extent.
                                 let (Some(input_sharding), Some(output_sharding), Some(shape)) =
                                     (input_sharding.as_ref(), output_sharding.as_ref(), input_type.static_shape())
                                 else {
                                     break 'shards false;
                                 };
+
                                 // The extent of the shards of each dimension, or `None` when a dimension is
                                 // unconstrained, names an axis that the mesh does not have, or is not split evenly.
                                 let shard_extents = |sharding: &Sharding| {
                                     if sharding.rank() != shape.rank() {
                                         return None;
                                     }
+
                                     shape
                                         .dimensions()
                                         .iter()
@@ -1490,6 +1506,7 @@ impl ProgramBoundary {
                                         })
                                         .collect::<Option<Vec<_>>>()
                                 };
+
                                 let without_sharding = |r#type: &ArrayType| r#type.clone().with_sharding(None).ok();
                                 input_sharding.mesh() == output_sharding.mesh()
                                     && without_sharding(input_type) == without_sharding(output_type)
@@ -1497,20 +1514,24 @@ impl ProgramBoundary {
                                         .is_some_and(|extents| Some(extents) == shard_extents(output_sharding))
                             }
                         };
+
                         (shares_buffers
                             && (has_single_device || !is_open)
                             && !aliased_outputs.contains(&executable_output_index))
                         .then_some(executable_output_index)
                     });
+
                 if let Some(executable_output_index) = executable_output_index {
                     aliased_outputs.insert(executable_output_index);
                     aliases.insert(executable_input_index, executable_output_index);
                 }
             }
         }
+
         Ok(aliases)
     }
 
+    // TODO(eaplatanios): Review this.
     /// Returns the MLIR types and attributes of the entry function arguments and results in executable order.
     /// `input_shardings` and `output_shardings` follow logical boundary order, with captures first on the input side.
     /// The attributes declare the sharding, memory kind, layout, and aliased output of each value.
@@ -1652,6 +1673,7 @@ impl ProgramBoundary {
         Ok((function_arguments, function_results))
     }
 
+    // TODO(eaplatanios): Review this.
     /// Lowers the entry function body into `function_block`. It reconstructs the logical inputs from the executable
     /// arguments, completes pending input reductions, lowers `program`, and emits `func.return` with the executable
     /// results. `input_shardings` follows logical input order, with the `capture_count` captures first.
