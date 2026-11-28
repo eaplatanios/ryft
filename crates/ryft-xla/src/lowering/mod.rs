@@ -47,6 +47,28 @@ use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::operations::call::CallFunctionMap;
 use crate::{Constant, Error, Operation, RuntimeRequirement, Session, Type};
 
+pub mod contexts;
+pub mod programs;
+pub mod sharding;
+pub mod types;
+pub mod values;
+
+pub use contexts::NamedCompositionKey;
+pub use programs::{
+    EntryShardingOverride, MlirProgram, MlirProgramBoundaryMapping, MlirProgramBoundaryMappingInputDimension,
+    MlirProgramBoundaryMappingOutputDimension, ProgramLoweringExtension, ProgramLoweringOptions,
+};
+pub use sharding::{
+    LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension, UnreducedKindExtension,
+};
+pub use types::{
+    ArrayTypeLoweringExtension, DataTypeLoweringExtension, MemoryLoweringExtension, PhysicalStoragePadding,
+    TypeLoweringExtension, dimension_extent_i32, dimension_extent_i64, lower_constant_output, lower_explicit_shape,
+    lower_f64_constant_splat, lower_runtime_dimension_size_i64, lower_signed_one_bit_to_mlir,
+    lower_static_index_constants, lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type,
+    stable_hlo_dynamic_dimension_bound, static_dimensions,
+};
+
 /// Represents errors produced while validating a program for XLA lowering, constructing its StableHLO
 /// representation, or verifying the result.
 ///
@@ -85,11 +107,9 @@ pub enum LoweringError {
     ModuleVerificationFailed { diagnostic: String },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// XLA representation used when lowering ragged dots. Set it for a compilation with
-/// [`Options::with_ragged_dot_lowering_strategy`](crate::Options::with_ragged_dot_lowering_strategy) or for a direct
-/// lowering with [`ProgramLoweringOptions::with_ragged_dot_lowering_strategy`].
+/// [`Options::with_ragged_dot_lowering_strategy`](crate::Options::with_ragged_dot_lowering_strategy)
+/// or for a direct lowering with [`ProgramLoweringOptions::with_ragged_dot_lowering_strategy`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum RaggedDotLoweringStrategy {
     /// Expand ragged dots into masking plus ordinary dense generalized dots. This is the default used by
@@ -101,100 +121,183 @@ pub enum RaggedDotLoweringStrategy {
     Instruction,
 }
 
-/// Program lowering context for nested regions and their enclosing module.
-pub(crate) mod contexts;
-/// Options, entry points, and analysis for lowering programs and their regions.
-pub(crate) mod programs;
-/// Lowering of logical meshes and sharding constraints to Shardy, including propagation of pending reductions.
-pub(crate) mod sharding;
-/// Shared StableHLO type, constant, and dynamic-dimension lowering helpers.
-pub(crate) mod types;
-/// Lowering of the values of programs (i.e., their constants) to StableHLO values.
-pub(crate) mod values;
+// TODO(eaplatanios): Review from here onwards.
 
-pub use contexts::NamedCompositionKey;
-pub use programs::{
-    EntryShardingOverride, MlirProgram, MlirProgramBoundaryMapping, MlirProgramBoundaryMappingInputDimension,
-    MlirProgramBoundaryMappingOutputDimension, ProgramLoweringExtension, ProgramLoweringOptions,
-};
-pub use sharding::{
-    LogicalMeshExtension, OpenDimensions, SHARDY_MESH_SYMBOL_NAME, ShardingExtension, UnreducedKindExtension,
-};
-pub use types::{
-    ArrayTypeLoweringExtension, DataTypeLoweringExtension, MemoryLoweringExtension, PhysicalStoragePadding,
-    TypeLoweringExtension, dimension_extent_i32, dimension_extent_i64, lower_constant_output, lower_explicit_shape,
-    lower_f64_constant_splat, lower_runtime_dimension_size_i64, lower_signed_one_bit_to_mlir,
-    lower_static_index_constants, lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type,
-    stable_hlo_dynamic_dimension_bound, static_dimensions,
-};
-
-/// Per-class StableHLO tokens owned by one lowering scope.
+/// Operations that can be lowered to StableHLO for XLA compilation.
 ///
-/// Ordered assertions and ordered I/O intentionally use independent chains. This preserves program order within
-/// each observable class without introducing an ordering relationship between unrelated classes. Unordered I/O has
-/// no token slot. Region input guards are the exception, because input validation must precede every operation in the
-/// invoked region, so their lowering joins the assertion chain into the ordered I/O chain (refer to
-/// [`lower_guard`](crate::operations::assertions::lower_guard)).
-#[derive(Copy, Clone, Default)]
-pub(crate) struct EffectTokens<'b, 'c: 'b, 't: 'c> {
-    /// Current ordered assertion token, created lazily by the first runtime assertion in this scope.
-    ordered_assertion: Option<ValueRef<'b, 'c, 't>>,
+/// In [`Self::lower`], `Self` is the operation being lowered. Its [`CoreOperation`](ryft_core::Operation) contract
+/// determines `Self::Type`, the type of its input and output descriptors. For example, an array operation receives
+/// [`ArrayType`] descriptors, and a first-class dimension operation receives [`DimensionType`](ryft_core::DimensionType)
+/// descriptors. `O` is the enclosing program's operation family, which [`Lowerer`] uses to lower attached regions.
+/// Both kinds of operation can be lowered inside a program whose family uses [`Type`].
+///
+/// Families such as [`ArrayOperation`](ryft_core::ArrayOperation) and [`Operation`] implement this trait by dispatching
+/// each variant to its payload through [`lower_operation_variants`](crate::lower_operation_variants), which also handles
+/// projected and mixed members. Downstream families that meet the bounds of [`ProgramLoweringOperation`] can lower whole
+/// programs through [`ProgramLoweringExtension`].
+///
+/// Operations lower attached regions through methods such as [`Lowerer::lower_region_inline`]. This keeps the bounds of
+/// a family's lowering implementation from depending recursively on its own lowering rules.
+pub trait LowerableOperation: CoreOperation {
+    /// Lowers this operation to one or more StableHLO operations emitted into the block of `lowerer`, returning one
+    /// MLIR value per output.
+    ///
+    /// # Parameters
+    ///
+    ///   - `lowerer`: Lowering state of the instruction applying this operation, with access to attached regions of `O`.
+    ///   - `input_values`: Lowered MLIR values of the instruction inputs, one per input.
+    ///   - `input_types`: Declared types of the instruction inputs, in input order.
+    ///   - `output_types`: Declared types of the instruction outputs, in output order.
+    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[Self::Type],
+        output_types: &[Self::Type],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 
-    /// Current ordered I/O token, created lazily by the first ordered I/O operation in this scope.
-    ordered_io: Option<ValueRef<'b, 'c, 't>>,
-}
-
-impl<'b, 'c: 'b, 't: 'c> EffectTokens<'b, 'c, 't> {
-    /// Returns the current token for `effect_class`. Both ordered I/O classes share the ordered I/O slot, because they
-    /// form one ordering domain on any given device and differ only in whether that order also spans devices.
-    pub(crate) fn get(&self, effect_class: EffectClass) -> Option<ValueRef<'b, 'c, 't>> {
-        match effect_class {
-            EffectClass::OrderedState => unreachable!("ordered state effects must be discharged before XLA lowering"),
-            EffectClass::OrderedAssertion => self.ordered_assertion,
-            EffectClass::OrderedIo | EffectClass::DeviceOrderedIo => self.ordered_io,
-            EffectClass::UnorderedIo => None,
-        }
-    }
-
-    /// Returns the current ordered assertion token, created lazily by the first runtime assertion in this scope.
+    /// Returns the semantic identity of this operation if it is a call of a named composite (refer to
+    /// [`NamedComposite`](ryft_core::NamedComposite)), and [`None`] otherwise. Module-level lowering passes use it to
+    /// emit one shared function per specialization of a named composite body and to skip the bodies that a backend
+    /// implementation replaces. Families forward it to the variants that can hold such calls, and the calls of a family
+    /// that does not are lowered without sharing their bodies.
     #[inline]
-    pub(crate) fn ordered_assertion(&self) -> Option<ValueRef<'b, 'c, 't>> {
-        self.ordered_assertion
+    fn composite_key(&self) -> Option<&CompositeKey> {
+        None
     }
 
-    /// Replaces the current token for one ordered effect class.
-    pub(crate) fn set(&mut self, effect_class: EffectClass, token: ValueRef<'b, 'c, 't>) {
-        match effect_class {
-            EffectClass::OrderedState => unreachable!("ordered state effects must be discharged before XLA lowering"),
-            EffectClass::OrderedAssertion => self.ordered_assertion = Some(token),
-            EffectClass::OrderedIo | EffectClass::DeviceOrderedIo => self.ordered_io = Some(token),
-            EffectClass::UnorderedIo => panic!("unordered effects do not have token slots"),
-        }
+    /// Returns `true` if a backend implementation replaces the calls of the named composite `key` of this family at
+    /// the boundary with the provided types when they are lowered for `target_platform`. The lowering of such a call
+    /// emits none of its regions, so the module-level lowering passes skip them. It returns `false` unless a family
+    /// overrides it, in which case the body of every named composite call is lowered.
+    #[inline]
+    fn has_composite_implementation(
+        key: &CompositeKey,
+        input_types: &[Type],
+        output_types: &[Type],
+        target_platform: Option<&str>,
+    ) -> bool {
+        let _ = (key, input_types, output_types, target_platform);
+        false
+    }
+
+    /// Validates that this operation can consume a dimension that is derived from runtime data (i.e., one that
+    /// `dimension_from_scalar` produces, or that dimension arithmetic derives from such a dimension). A value with
+    /// such a dimension is bounded dynamic, so an operation can consume it only if its lowering keeps the physical
+    /// padding of that value unobservable. Compilation admits a program that derives dimensions from data only if
+    /// every operation that consumes one passes this validation. Families answer for each of their variants, and
+    /// [`Operation`] does so with exhaustive matches, so that adding an operation to it does not compile until it
+    /// is stated whether that operation passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::UnsupportedOperation`], which names this operation and the reason, when this
+    /// operation cannot consume such a dimension. It returns that error unless a family overrides this function, so
+    /// that an operation whose padding behavior nobody has stated is rejected and never assumed to be safe.
+    #[inline]
+    fn validate_data_derived_dimensions(&self) -> Result<(), Error> {
+        Err(unsupported_data_derived_dimensions(
+            self.name(),
+            "its operation family does not state how it keeps the padding of data-derived dimensions unobservable",
+        ))
+    }
+
+    /// Returns `program`, a pruned program of this family, without the mesh that each of its `call`s records for the
+    /// devices that its callee names when that callee names none anymore once it is lowered for `target_platform`
+    /// (e.g., because pruning dropped the only request that named them). Lowering prepares every program that it
+    /// prunes with this function. It returns `program` as it is unless a family overrides it, in which case such a
+    /// call keeps its mesh.
+    #[inline]
+    fn without_stale_call_meshes<Input, Output>(
+        program: Program<Constant, Self, Input, Output>,
+        target_platform: Option<&str>,
+    ) -> Result<Program<Constant, Self, Input, Output>, ProgramError>
+    where
+        Self: CoreOperation<Type = Type> + Sized,
+        Input: Parameterized<Constant>,
+        Output: Parameterized<Constant>,
+    {
+        let _ = target_platform;
+        Ok(program)
+    }
+
+    /// Returns, for each input of `callee`, the callee of a `call` of this family whose first `capture_count`
+    /// inputs are its lifted captures, whether it is a capture that the callee never reads when it is lowered for
+    /// `target_platform`, or [`None`] when every input counts as read. The lowering of the call passes a value that
+    /// requires no buffer in place of such a capture, and the function that makes the call reads the input only
+    /// where the callee reads it. Only a family knows the regions of its callees, so this function is asked of the
+    /// family. It returns [`None`] unless a family overrides it, and [`Operation`] answers from the regions that its
+    /// lowering emits.
+    #[inline]
+    fn unread_captures(
+        callee: RegionRef<'_, Constant, Self>,
+        capture_count: usize,
+        target_platform: Option<&str>,
+    ) -> Option<Arc<[bool]>>
+    where
+        Self: CoreOperation<Type = Type>,
+    {
+        let _ = (callee, capture_count, target_platform);
+        None
     }
 }
 
-/// Returns the effect classes that have StableHLO token slots, in canonical token and result order.
+/// Operations whose own type universe is a member universe of an enclosing operation family that lowers them at the
+/// family's parent universe `T` (e.g., [`ZeroOperation<ArrayType>`](ryft_core::ZeroOperation) stored in an
+/// [`Type`] family receives first-class dimension inputs that size its dynamic output axes).
 ///
-/// Token slots are an XLA/StableHLO representation decision, so the classification lives here rather than on the core
-/// [`EffectClass`] type. The classification tests for each ordered class explicitly with [`EffectClasses::contains`],
-/// so a newly added [`EffectClass`] gets no token slot here until it is listed. Only [`EffectTokens::get`] and
-/// [`EffectTokens::set`] match exhaustively and force an explicit decision for a new class.
-/// [`EffectClass::OrderedState`] has no slot, because ordinary XLA lowering rejects unresolved state at its module
-/// entry boundaries, and no defensive path may accidentally turn state into an ordinary token-threaded effect.
-pub(crate) fn token_threaded_effects(effects: EffectClasses) -> impl Iterator<Item = EffectClass> {
-    // Each yielded class names one token slot of `EffectTokens`. Both ordered I/O classes share the ordered I/O slot,
-    // so a program mixing them still threads exactly one I/O token, keyed by `OrderedIo`. A scope that threads the
-    // assertion token also threads the I/O slot, because an entry guard inside it joins its assertion token into the
-    // I/O chain (refer to `lower_guard`), and that dependency must reach the I/O that follows the scope.
-    let ordered_io = effects.contains(EffectClass::OrderedIo)
-        || effects.contains(EffectClass::DeviceOrderedIo)
-        || effects.contains(EffectClass::OrderedAssertion);
-    effects
-        .contains(EffectClass::OrderedAssertion)
-        .then_some(EffectClass::OrderedAssertion)
-        .into_iter()
-        .chain(ordered_io.then_some(EffectClass::OrderedIo))
+/// This is the lowering counterpart of [`MemberOperation`](ryft_core::MemberOperation), and families dispatch their
+/// mixed member variants to it through [`lower_operation_variants`](crate::lower_operation_variants).
+pub trait MemberLowerableOperation<T: CoreType>: CoreOperation {
+    /// Lowers this operation, applied by an instruction of the parent universe `T`, to one or more StableHLO
+    /// operations emitted into the block of `lowerer`, returning one MLIR value per output.
+    ///
+    /// # Parameters
+    ///
+    ///   - `lowerer`: Lowering state of the instruction applying this operation.
+    ///   - `input_values`: Lowered MLIR values of the instruction inputs, one per input.
+    ///   - `input_types`: Declared parent-universe types of the instruction inputs, in input order.
+    ///   - `output_types`: Declared parent-universe types of the instruction outputs, in output order.
+    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[T],
+        output_types: &[T],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
+
+/// Enclosing operation families for programs lowered by [`ProgramLoweringExtension`].
+///
+/// This is the bound on `O` in [`LowerableOperation::lower`]. The family lowers program instructions at [`Type`]
+/// and exposes its payloads through [`OperationPayloadProjection`] so that lowering passes can recognize operations
+/// inside the family, for example when deduplicating calls or deciding which regions to emit.
+///
+/// The blanket implementation covers every type that meets these bounds, including downstream operation families.
+pub trait ProgramLoweringOperation: LowerableOperation<Type = Type> + OperationPayloadProjection {
+    /// Returns whether lowering skips the bodies of this operation's attached regions on `target_platform`.
+    /// A scan with zero iterations omits its body on every platform, though lowering still reads the body interface
+    /// to type the results. A named composite omits its body when this family supplies a
+    /// [backend implementation](LowerableOperation::has_composite_implementation) for its key and boundary types.
+    /// Only that lookup evaluates `boundary_types`, which returns the input types followed by the output types.
+    /// Staged lowering and eager dispatch use this decision to skip captures and placements in omitted regions.
+    fn omits_regions(
+        &self,
+        target_platform: Option<&str>,
+        boundary_types: impl FnOnce() -> (Vec<Type>, Vec<Type>),
+    ) -> bool {
+        if self.projected_payload::<ScanOperation<Type>>().is_some_and(ScanOperation::has_zero_iterations) {
+            return true;
+        }
+        let Some(key) = self.composite_key() else {
+            return false;
+        };
+        let (input_types, output_types) = boundary_types();
+        Self::has_composite_implementation(key, &input_types, &output_types, target_platform)
+    }
+}
+
+impl<O: LowerableOperation<Type = Type> + OperationPayloadProjection> ProgramLoweringOperation for O {}
 
 /// Per-instruction StableHLO lowering state passed to [`LowerableOperation::lower`] while lowering a program of the
 /// operation family `O`.
@@ -471,180 +574,72 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     }
 }
 
-/// Operations that can be lowered to StableHLO for XLA compilation.
+/// Per-class StableHLO tokens owned by one lowering scope.
 ///
-/// In [`Self::lower`], `Self` is the operation being lowered. Its [`CoreOperation`](ryft_core::Operation) contract
-/// determines `Self::Type`, the type of its input and output descriptors. For example, an array operation receives
-/// [`ArrayType`] descriptors, and a first-class dimension operation receives [`DimensionType`](ryft_core::DimensionType)
-/// descriptors. `O` is the enclosing program's operation family, which [`Lowerer`] uses to lower attached regions.
-/// Both kinds of operation can be lowered inside a program whose family uses [`Type`].
-///
-/// Families such as [`ArrayOperation`](ryft_core::ArrayOperation) and [`Operation`] implement this trait by dispatching
-/// each variant to its payload through [`lower_operation_variants`](crate::lower_operation_variants), which also handles
-/// projected and mixed members. Downstream families that meet the bounds of [`ProgramLoweringOperation`] can lower whole
-/// programs through [`ProgramLoweringExtension`].
-///
-/// Operations lower attached regions through methods such as [`Lowerer::lower_region_inline`]. This keeps the bounds of
-/// a family's lowering implementation from depending recursively on its own lowering rules.
-pub trait LowerableOperation: CoreOperation {
-    /// Lowers this operation to one or more StableHLO operations emitted into the block of `lowerer`, returning one
-    /// MLIR value per output.
-    ///
-    /// # Parameters
-    ///
-    ///   - `lowerer`: Lowering state of the instruction applying this operation, with access to attached regions of `O`.
-    ///   - `input_values`: Lowered MLIR values of the instruction inputs, one per input.
-    ///   - `input_types`: Declared types of the instruction inputs, in input order.
-    ///   - `output_types`: Declared types of the instruction outputs, in output order.
-    fn lower<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[Self::Type],
-        output_types: &[Self::Type],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+/// Ordered assertions and ordered I/O intentionally use independent chains. This preserves program order within
+/// each observable class without introducing an ordering relationship between unrelated classes. Unordered I/O has
+/// no token slot. Region input guards are the exception, because input validation must precede every operation in the
+/// invoked region, so their lowering joins the assertion chain into the ordered I/O chain (refer to
+/// [`lower_guard`](crate::operations::assertions::lower_guard)).
+#[derive(Copy, Clone, Default)]
+pub(crate) struct EffectTokens<'b, 'c: 'b, 't: 'c> {
+    /// Current ordered assertion token, created lazily by the first runtime assertion in this scope.
+    ordered_assertion: Option<ValueRef<'b, 'c, 't>>,
 
-    /// Returns the semantic identity of this operation if it is a call of a named composite (refer to
-    /// [`NamedComposite`](ryft_core::NamedComposite)), and [`None`] otherwise. Module-level lowering passes use it to
-    /// emit one shared function per specialization of a named composite body and to skip the bodies that a backend
-    /// implementation replaces. Families forward it to the variants that can hold such calls, and the calls of a family
-    /// that does not are lowered without sharing their bodies.
-    #[inline]
-    fn composite_key(&self) -> Option<&CompositeKey> {
-        None
-    }
-
-    /// Returns `true` if a backend implementation replaces the calls of the named composite `key` of this family at
-    /// the boundary with the provided types when they are lowered for `target_platform`. The lowering of such a call
-    /// emits none of its regions, so the module-level lowering passes skip them. It returns `false` unless a family
-    /// overrides it, in which case the body of every named composite call is lowered.
-    #[inline]
-    fn has_composite_implementation(
-        key: &CompositeKey,
-        input_types: &[Type],
-        output_types: &[Type],
-        target_platform: Option<&str>,
-    ) -> bool {
-        let _ = (key, input_types, output_types, target_platform);
-        false
-    }
-
-    /// Validates that this operation can consume a dimension that is derived from runtime data (i.e., one that
-    /// `dimension_from_scalar` produces, or that dimension arithmetic derives from such a dimension). A value with
-    /// such a dimension is bounded dynamic, so an operation can consume it only if its lowering keeps the physical
-    /// padding of that value unobservable. Compilation admits a program that derives dimensions from data only if
-    /// every operation that consumes one passes this validation. Families answer for each of their variants, and
-    /// [`Operation`] does so with exhaustive matches, so that adding an operation to it does not compile until it
-    /// is stated whether that operation passes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::UnsupportedOperation`], which names this operation and the reason, when this
-    /// operation cannot consume such a dimension. It returns that error unless a family overrides this function, so
-    /// that an operation whose padding behavior nobody has stated is rejected and never assumed to be safe.
-    #[inline]
-    fn validate_data_derived_dimensions(&self) -> Result<(), Error> {
-        Err(unsupported_data_derived_dimensions(
-            self.name(),
-            "its operation family does not state how it keeps the padding of data-derived dimensions unobservable",
-        ))
-    }
-
-    /// Returns `program`, a pruned program of this family, without the mesh that each of its `call`s records for the
-    /// devices that its callee names when that callee names none anymore once it is lowered for `target_platform`
-    /// (e.g., because pruning dropped the only request that named them). Lowering prepares every program that it
-    /// prunes with this function. It returns `program` as it is unless a family overrides it, in which case such a
-    /// call keeps its mesh.
-    #[inline]
-    fn without_stale_call_meshes<Input, Output>(
-        program: Program<Constant, Self, Input, Output>,
-        target_platform: Option<&str>,
-    ) -> Result<Program<Constant, Self, Input, Output>, ProgramError>
-    where
-        Self: CoreOperation<Type = Type> + Sized,
-        Input: Parameterized<Constant>,
-        Output: Parameterized<Constant>,
-    {
-        let _ = target_platform;
-        Ok(program)
-    }
-
-    /// Returns, for each input of `callee`, the callee of a `call` of this family whose first `capture_count`
-    /// inputs are its lifted captures, whether it is a capture that the callee never reads when it is lowered for
-    /// `target_platform`, or [`None`] when every input counts as read. The lowering of the call passes a value that
-    /// requires no buffer in place of such a capture, and the function that makes the call reads the input only
-    /// where the callee reads it. Only a family knows the regions of its callees, so this function is asked of the
-    /// family. It returns [`None`] unless a family overrides it, and [`Operation`] answers from the regions that its
-    /// lowering emits.
-    #[inline]
-    fn unread_captures(
-        callee: RegionRef<'_, Constant, Self>,
-        capture_count: usize,
-        target_platform: Option<&str>,
-    ) -> Option<Arc<[bool]>>
-    where
-        Self: CoreOperation<Type = Type>,
-    {
-        let _ = (callee, capture_count, target_platform);
-        None
-    }
+    /// Current ordered I/O token, created lazily by the first ordered I/O operation in this scope.
+    ordered_io: Option<ValueRef<'b, 'c, 't>>,
 }
 
-/// Enclosing operation families for programs lowered by [`ProgramLoweringExtension`].
-///
-/// This is the bound on `O` in [`LowerableOperation::lower`]. The family lowers program instructions at [`Type`]
-/// and exposes its payloads through [`OperationPayloadProjection`] so that lowering passes can recognize operations
-/// inside the family, for example when deduplicating calls or deciding which regions to emit.
-///
-/// The blanket implementation covers every type that meets these bounds, including downstream operation families.
-pub trait ProgramLoweringOperation: LowerableOperation<Type = Type> + OperationPayloadProjection {
-    /// Returns whether lowering skips the bodies of this operation's attached regions on `target_platform`.
-    /// A scan with zero iterations omits its body on every platform, though lowering still reads the body interface
-    /// to type the results. A named composite omits its body when this family supplies a
-    /// [backend implementation](LowerableOperation::has_composite_implementation) for its key and boundary types.
-    /// Only that lookup evaluates `boundary_types`, which returns the input types followed by the output types.
-    /// Staged lowering and eager dispatch use this decision to skip captures and placements in omitted regions.
-    fn omits_regions(
-        &self,
-        target_platform: Option<&str>,
-        boundary_types: impl FnOnce() -> (Vec<Type>, Vec<Type>),
-    ) -> bool {
-        if self.projected_payload::<ScanOperation<Type>>().is_some_and(ScanOperation::has_zero_iterations) {
-            return true;
+impl<'b, 'c: 'b, 't: 'c> EffectTokens<'b, 'c, 't> {
+    /// Returns the current token for `effect_class`. Both ordered I/O classes share the ordered I/O slot, because they
+    /// form one ordering domain on any given device and differ only in whether that order also spans devices.
+    pub(crate) fn get(&self, effect_class: EffectClass) -> Option<ValueRef<'b, 'c, 't>> {
+        match effect_class {
+            EffectClass::OrderedState => unreachable!("ordered state effects must be discharged before XLA lowering"),
+            EffectClass::OrderedAssertion => self.ordered_assertion,
+            EffectClass::OrderedIo | EffectClass::DeviceOrderedIo => self.ordered_io,
+            EffectClass::UnorderedIo => None,
         }
-        let Some(key) = self.composite_key() else {
-            return false;
-        };
-        let (input_types, output_types) = boundary_types();
-        Self::has_composite_implementation(key, &input_types, &output_types, target_platform)
+    }
+
+    /// Returns the current ordered assertion token, created lazily by the first runtime assertion in this scope.
+    #[inline]
+    pub(crate) fn ordered_assertion(&self) -> Option<ValueRef<'b, 'c, 't>> {
+        self.ordered_assertion
+    }
+
+    /// Replaces the current token for one ordered effect class.
+    pub(crate) fn set(&mut self, effect_class: EffectClass, token: ValueRef<'b, 'c, 't>) {
+        match effect_class {
+            EffectClass::OrderedState => unreachable!("ordered state effects must be discharged before XLA lowering"),
+            EffectClass::OrderedAssertion => self.ordered_assertion = Some(token),
+            EffectClass::OrderedIo | EffectClass::DeviceOrderedIo => self.ordered_io = Some(token),
+            EffectClass::UnorderedIo => panic!("unordered effects do not have token slots"),
+        }
     }
 }
 
-impl<O: LowerableOperation<Type = Type> + OperationPayloadProjection> ProgramLoweringOperation for O {}
-
-/// Operations whose own type universe is a member universe of an enclosing operation family that lowers them at the
-/// family's parent universe `T` (e.g., [`ZeroOperation<ArrayType>`](ryft_core::ZeroOperation) stored in an
-/// [`Type`] family receives first-class dimension inputs that size its dynamic output axes).
+/// Returns the effect classes that have StableHLO token slots, in canonical token and result order.
 ///
-/// This is the lowering counterpart of [`MemberOperation`](ryft_core::MemberOperation), and families dispatch their
-/// mixed member variants to it through [`lower_operation_variants`](crate::lower_operation_variants).
-pub trait MemberLowerableOperation<T: CoreType>: CoreOperation {
-    /// Lowers this operation, applied by an instruction of the parent universe `T`, to one or more StableHLO
-    /// operations emitted into the block of `lowerer`, returning one MLIR value per output.
-    ///
-    /// # Parameters
-    ///
-    ///   - `lowerer`: Lowering state of the instruction applying this operation.
-    ///   - `input_values`: Lowered MLIR values of the instruction inputs, one per input.
-    ///   - `input_types`: Declared parent-universe types of the instruction inputs, in input order.
-    ///   - `output_types`: Declared parent-universe types of the instruction outputs, in output order.
-    fn lower_in_parent<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[T],
-        output_types: &[T],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
+/// Token slots are an XLA/StableHLO representation decision, so the classification lives here rather than on the core
+/// [`EffectClass`] type. The classification tests for each ordered class explicitly with [`EffectClasses::contains`],
+/// so a newly added [`EffectClass`] gets no token slot here until it is listed. Only [`EffectTokens::get`] and
+/// [`EffectTokens::set`] match exhaustively and force an explicit decision for a new class.
+/// [`EffectClass::OrderedState`] has no slot, because ordinary XLA lowering rejects unresolved state at its module
+/// entry boundaries, and no defensive path may accidentally turn state into an ordinary token-threaded effect.
+pub(crate) fn token_threaded_effects(effects: EffectClasses) -> impl Iterator<Item = EffectClass> {
+    // Each yielded class names one token slot of `EffectTokens`. Both ordered I/O classes share the ordered I/O slot,
+    // so a program mixing them still threads exactly one I/O token, keyed by `OrderedIo`. A scope that threads the
+    // assertion token also threads the I/O slot, because an entry guard inside it joins its assertion token into the
+    // I/O chain (refer to `lower_guard`), and that dependency must reach the I/O that follows the scope.
+    let ordered_io = effects.contains(EffectClass::OrderedIo)
+        || effects.contains(EffectClass::DeviceOrderedIo)
+        || effects.contains(EffectClass::OrderedAssertion);
+    effects
+        .contains(EffectClass::OrderedAssertion)
+        .then_some(EffectClass::OrderedAssertion)
+        .into_iter()
+        .chain(ordered_io.then_some(EffectClass::OrderedIo))
 }
 
 /// Lowers a payload that a family stores as a projected member of universe `U` by projecting the instruction's

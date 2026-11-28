@@ -68,11 +68,15 @@ pub use kernels::{
     stage_kernel_with_rules, stage_kernel_with_vjp,
 };
 pub use lowering::{
-    EntryShardingOverride, LogicalMeshExtension, LowerableOperation, Lowerer, LoweringError, MemberLowerableOperation,
-    MlirProgram, MlirProgramBoundaryMapping, MlirProgramBoundaryMappingInputDimension,
-    MlirProgramBoundaryMappingOutputDimension, OpenDimensions, ProgramLoweringExtension, ProgramLoweringOperation,
+    ArrayTypeLoweringExtension, DataTypeLoweringExtension, EntryShardingOverride, LogicalMeshExtension,
+    LowerableOperation, Lowerer, LoweringError, MemberLowerableOperation, MemoryLoweringExtension, MlirProgram,
+    MlirProgramBoundaryMapping, MlirProgramBoundaryMappingInputDimension, MlirProgramBoundaryMappingOutputDimension,
+    NamedCompositionKey, OpenDimensions, PhysicalStoragePadding, ProgramLoweringExtension, ProgramLoweringOperation,
     ProgramLoweringOptions, RaggedDotLoweringStrategy, SHARDY_MESH_SYMBOL_NAME, ShardingExtension,
-    UnreducedKindExtension, lower_projected_operation,
+    TypeLoweringExtension, UnreducedKindExtension, dimension_extent_i32, dimension_extent_i64, lower_constant_output,
+    lower_explicit_shape, lower_f64_constant_splat, lower_projected_operation, lower_runtime_dimension_size_i64,
+    lower_signed_one_bit_to_mlir, lower_static_index_constants, lower_u64_scalar_constant,
+    lower_unplaced_constant_output, physical_bound_type, stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 pub use operations::{
     Operation, PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE, ensure_print_handler_registered, with_captured_prints,

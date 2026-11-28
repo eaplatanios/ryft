@@ -1074,7 +1074,7 @@ mod tests {
                 None,
             ),
             Err(Error::Lowering(LoweringError::ModuleVerificationFailed { diagnostic }))
-                if diagnostic == "PLACEHOLDER",
+                if { eprintln!("DIAG[{diagnostic}]"); false },
         ));
     }
 
