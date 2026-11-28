@@ -6,16 +6,17 @@
 //! compiles that module through the PJRT client of the session and derives the reusable execution plan.
 //! [`with_input_shardings`] applies input sharding overrides to input types before staging.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 use ryft_core::{
     ArrayOperation, ArrayType, CALL_OPERATION_NAME, CallOperation, CapturePlacement, CompilationCacheDomain,
-    CompilationDomain, Device, DeviceMesh, Dimension, DispatchInputs, ExternalReferenceBinding, FlatProgram,
-    LogicalMesh, Memory, Operation as CoreOperation, OperationPayloadProjection, PLACE_OPERATION_NAME, Parameterized,
-    PlaceOperation, PlacementRequest, ProgramError, ReferenceDischargeResult, RegionRole, SHARD_MAP_OPERATION_NAME,
-    Sharding, ShardingDimension, ShardingError, StagedProgram, Type as CoreType, TypeError, Typed, TypedProgram,
+    CompilationDomain, Device, DeviceMesh, Dimension, DimensionFromScalarOperation, DispatchInputs,
+    ExternalReferenceBinding, FlatProgram, LogicalMesh, Memory, Operation as CoreOperation, OperationPayloadProjection,
+    PLACE_OPERATION_NAME, Parameterized, PlaceOperation, PlacementRequest, ProgramError, ReferenceDischargeResult,
+    RegionRole, SHARD_MAP_OPERATION_NAME, Sharding, ShardingDimension, ShardingError, StagedProgram, Type as CoreType,
+    TypeError, Typed, TypedProgram,
 };
 use ryft_pjrt::protos::{
     CompilationOptions, ComputationDeviceAssignment, DeviceAssignment, ExecutableCompilationOptions, OpShardingType,
@@ -31,7 +32,6 @@ use crate::compilation::programs::{
     SessionConstantBinding,
 };
 use crate::execution::{ExecutionPlan, validate_capture_reduction};
-use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::emissions::{
     collect_session_constants, emitted_capture_reads, emitted_regions, omits_regions, unread_entry_inputs,
 };
@@ -40,8 +40,8 @@ use crate::lowering::programs::{
     entry_output_shardings, entry_outputs_with_compiler_chosen_placement,
 };
 use crate::{
-    Array, Constant, Error, ExecutionError, LoweringError, OpShardingExtension, Operation, RetainedArray, Session,
-    Type, Value,
+    Array, Constant, DataDependentPaddingDiscipline, Error, ExecutionError, LowerableOperation, LoweringError,
+    OpShardingExtension, Operation, RetainedArray, Session, Type, Value,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -405,7 +405,86 @@ impl Session {
         // query fails the lowering.
         let target = self.target()?;
         let target_platform = Some(target.platform_name());
-        validate_data_dependent_compilation(program, target_platform)?;
+
+        // Data-derived dimensions need finite bounds. Search only the regions emitted for this target, so
+        // dormant rules, zero-iteration scans, and composite bodies replaced on this platform can be skipped.
+        let mut data_derived_dimensions = HashSet::new();
+        for region in emitted_regions(program.entry_region_ref(), target_platform) {
+            for instruction in region.instructions() {
+                if let Some(operation) = instruction.operation().projected_payload::<DimensionFromScalarOperation>() {
+                    // A static output defines no identity and is checked against its extent.
+                    let Some(variable) = operation.output_type().variable() else {
+                        continue;
+                    };
+                    if variable.bounds().upper().is_none() {
+                        return Err(ProgramError::InvalidArgument {
+                            message: format!(
+                                "data-derived dimension `{variable}` with bounds {} needs a finite upper bound for XLA \
+                                 compilation",
+                                variable.bounds(),
+                            ),
+                        }
+                        .into());
+                    }
+                    data_derived_dimensions.insert(variable.clone());
+                }
+            }
+        }
+        if !data_derived_dimensions.is_empty() {
+            // Dimension arithmetic produces fresh identities. Track them until no new data-derived dimension is
+            // found, then check that each consumer keeps bounded dynamic padding unobservable.
+            loop {
+                let count = data_derived_dimensions.len();
+                for region in emitted_regions(program.entry_region_ref(), None) {
+                    for instruction in region.instructions() {
+                        if !instruction.inputs().iter().any(|input| {
+                            region.atoms()[input.index()]
+                                .r#type()
+                                .identities()
+                                .any(|(_, identity)| data_derived_dimensions.contains(identity))
+                        }) {
+                            continue;
+                        }
+                        for output in instruction.outputs() {
+                            // A static output defines no identity, like the static output of `dimension_from_scalar` above.
+                            if let Type::Dimension(r#type) = region.atoms()[output.index()].r#type().as_ref()
+                                && let Some(variable) = r#type.variable()
+                            {
+                                data_derived_dimensions.insert(variable.clone());
+                            }
+                        }
+                    }
+                }
+                if data_derived_dimensions.len() == count {
+                    break;
+                }
+            }
+
+            for region in emitted_regions(program.entry_region_ref(), None) {
+                for instruction in region.instructions() {
+                    let consumes_data_derived_extent =
+                        instruction.inputs().iter().chain(instruction.outputs()).any(|atom| {
+                            region.atoms()[atom.index()]
+                                .r#type()
+                                .identities()
+                                .any(|(_, identity)| data_derived_dimensions.contains(identity))
+                        });
+                    if consumes_data_derived_extent
+                        && let DataDependentPaddingDiscipline::Unsupported { reason } =
+                            instruction.operation().data_dependent_padding_discipline()
+                    {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: format!(
+                                "operation `{}` cannot consume data-derived dimensions during XLA lowering because \
+                                     {reason}",
+                                instruction.operation().name(),
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+        }
         if output_count > program.output_count() {
             return Err(ProgramError::MalformedProgram(format!(
                 "output count {output_count} exceeds the complete discharged output count {}",
@@ -1885,18 +1964,20 @@ mod tests {
         ArraySliceAxis, ArrayType, AttachedRegions, CallOperation, CaptureReference, CompilationArtifactExchange,
         CompilationArtifactExchangeError, CompilationArtifactExchangePolicy, CompilationCache, CompilationCacheDomain,
         CompilationTracer, CompiledFunction, CompositeKey, CompositeOperation, ConditionOperation, ConstantOperation,
-        Context, CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomRuleDefinition,
-        CustomRuleRegistration, DataType, Device, DeviceMesh, Differentiate, Dimension, DimensionAddOperation,
-        DimensionBounds, DimensionFromScalarOperation, DimensionOperation, DimensionSizeOperation, DimensionType,
-        DimensionValue, DimensionVariable, DynamicBroadcastOperation, DynamicReshapeOperation,
-        EagerInterpretationDriver, Error as CoreError, Exp, ImportingContext, InterpretableOperation, Layout,
-        LinearCallOperation, LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation, NamedComposite, NegOperation,
-        OneOperation, Operation as CoreOperation, Place, Placeholder, Placement, ProgramBuilder, ProgramError,
-        Provenance, ProvenanceScope, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        Context, CotangentDestinationKind, CumulativeKind, CumulativeOperation, CustomCallOperation,
+        CustomRuleDefinition, CustomRuleRegistration, DataType, Device, DeviceMesh, Differentiate, Dimension,
+        DimensionAddOperation, DimensionBounds, DimensionFromScalarOperation, DimensionOperation,
+        DimensionSizeOperation, DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable,
+        DynamicBroadcastOperation, DynamicReshapeOperation, EagerInterpretationDriver, Error as CoreError, Exp,
+        ImportingContext, InterpretableOperation, IotaOperation, Layout, LinearCallOperation, LogicalMesh, Memory,
+        MeshAxis, MeshAxisType, MulOperation, NamedComposite, NegOperation, OneOperation, Operation as CoreOperation,
+        Place, Placeholder, Placement, PrintOperation, ProgramBuilder, ProgramError, Provenance, ProvenanceScope,
+        RandomAlgorithm, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
         ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation,
-        Reshard, ScanOperation, ScanOptions, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension,
-        Sin, SliceOperation, StagedFunction, StridedLayout, ThroughCapture, ValueProjection, WhileOperation,
+        Reshard, RngBitGeneratorOperation, ScanOperation, ScanOptions, ScatterDimensionNumbers, ScatterOperation,
+        ScatterReductionKind, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin,
+        SliceOperation, StagedFunction, StridedLayout, ThroughCapture, ValueProjection, WhileOperation,
         differentiate_at, scan,
     };
     use ryft_pjrt::protos::Precision;
@@ -2816,6 +2897,392 @@ mod tests {
             assert!(!capture.is_locally_assigned());
             assert!(Arc::ptr_eq(capture.shards()[0].buffer().unwrap(), array.shards()[0].buffer().unwrap()));
         }
+    }
+
+    #[test]
+    fn test_session_lower_program_data_dependent_admission() {
+        let client = execution_client();
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap().with_device_mesh(mesh.clone());
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let size = builder.add_input(size_type.clone().into());
+        let extent = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            session.lower_program(&program, 0, &Options::new(mesh.clone())),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::InvalidArgument { message })
+                    if *message == "data-derived dimension `unbounded` with bounds [0, ∞) needs a finite upper bound \
+                        for XLA compilation",
+            ),
+        ));
+
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let size = builder.add_input(size_type.clone().into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let input = builder
+            .add_instruction(IotaOperation::new(dynamic_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                CustomCallOperation::new("ryft.test.opaque_dynamic", vec![dynamic_type]),
+                Vec::new(),
+                vec![input, dimension],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            session.lower_program(&program, 0, &Options::new(mesh.clone())),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == "operation `custom_call` cannot consume data-derived dimensions during XLA lowering \
+                        because custom-call physical-padding semantics are opaque",
+            ),
+        ));
+
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let size = builder.add_input(size_type.clone().into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let input = builder
+            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Mean), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            session.lower_program(&program, 0, &Options::new(mesh.clone())),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == "operation `reduce` cannot consume data-derived dimensions during XLA lowering \
+                        because mean over a dynamically sized reduction axis is not supported by the XLA lowering",
+            ),
+        ));
+
+        // `print` renders whatever the physical buffer holds, so the padded suffix of a bounded-dynamic input would
+        // become observable.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let size = builder.add_input(size_type.clone().into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let input = builder
+            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            session.lower_program(&program, 0, &Options::new(mesh.clone())),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
+                    if *message
+                        == "operation `print` cannot consume data-derived \
+                        dimensions during XLA lowering because \
+                        print exposes the physical representation of its input",
+            ),
+        ));
+
+        // Bit generation over a bounded-dynamic output would advance the functional generator state by the physical
+        // upper-bound element count rather than the logical one.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let size = builder.add_input(size_type.clone().into());
+        let state = builder.add_input(RandomAlgorithm::ThreeFry.state_type().into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                RngBitGeneratorOperation::<Type>::new(RandomAlgorithm::ThreeFry, bits_type),
+                Vec::new(),
+                vec![state, dimension],
+                None,
+            )
+            .unwrap()[1];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            session.lower_program(&program, 0, &Options::new(mesh.clone())),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == "operation `rng_bit_generator` cannot consume data-derived dimensions during XLA \
+                        lowering because random generation advances state according to physical rather than logical \
+                        element count",
+            ),
+        ));
+
+        // Every scatter combiner is unverified against physical padding, so a data-derived operand extent is rejected
+        // per kind rather than per operation name.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let updates_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let size = builder.add_input(size_type.into());
+        let indices = builder.add_input(indices_type.into());
+        let updates = builder.add_input(updates_type.into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let operand = builder
+            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ScatterOperation::new(
+                    ScatterDimensionNumbers::new(Vec::new(), vec![0], vec![0]),
+                    ScatterReductionKind::Add,
+                ),
+                Vec::new(),
+                vec![operand, indices, updates],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            session.lower_program(&program, 0, &Options::new(mesh)),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::UnsupportedOperation { message })
+                    if *message
+                        == "operation `scatter` cannot consume data-derived \
+                        dimensions during XLA lowering because \
+                        add-scatter padding semantics have not been verified for data-derived dimensions",
+            ),
+        ));
+    }
+
+    #[test]
+    fn test_session_lower_program_data_dependent_admission_accepts_static_dimension_outputs() {
+        // The sum of a data-derived dimension with itself has singleton bounds here, so its type is static and
+        // defines no identity to track.
+        let client = execution_client();
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap();
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(4, Some(5)).unwrap());
+        let dimension_type = DimensionType::from(extent.clone());
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let size = builder.add_input(replicated_scalar_type(&mesh, DataType::I64).into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let sum = builder
+            .add_instruction(
+                DimensionAddOperation::new(&dimension_type, &dimension_type).unwrap(),
+                Vec::new(),
+                vec![dimension, dimension],
+                None,
+            )
+            .unwrap()[0];
+        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![sum], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.regions()[0].atoms()[sum.index()].r#type().as_ref(),
+            &Type::Dimension(DimensionType::from(Dimension::Static(8))),
+        );
+        session.lower_program(&program, 0, &Options::new(mesh)).unwrap();
+    }
+
+    #[test]
+    fn test_session_lower_program_data_dependent_admission_ignores_dormant_regions() {
+        let client = cpu_client(2);
+        let mesh = domain_mesh(client, "x", 2);
+        let session = Session::builder().client(client).build().unwrap();
+        let options = Options::new(mesh.clone());
+        let vector_type = replicated_vector_type(&mesh, 2);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(4)).unwrap());
+
+        // Returns a region that multiplies its residual and linear inputs, which also takes the mean of a bounded
+        // dynamic broadcast of the sum of its linear input when `dynamic` is set. That mean consumes a data-derived
+        // dimension, which admission rejects in a region that lowering emits.
+        let build_region = |dynamic: bool| {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let residual = builder.add_input(vector_type.clone().into());
+            let linear = builder.add_input(vector_type.clone().into());
+            let output =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, linear], None).unwrap()[0];
+            if dynamic {
+                let size = CoreArray::from_elements(replicated_scalar_type(&mesh, DataType::I64), &[2i64]).unwrap();
+                let size =
+                    builder.add_instruction(ConstantOperation::new(size), Vec::new(), Vec::new(), None).unwrap()[0];
+                let dimension = builder
+                    .add_instruction(
+                        DimensionFromScalarOperation::new(extent.clone().into()),
+                        Vec::new(),
+                        vec![size],
+                        None,
+                    )
+                    .unwrap()[0];
+                let sum = builder
+                    .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![linear], None)
+                    .unwrap()[0];
+                let broadcast = builder
+                    .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![sum, dimension], None)
+                    .unwrap()[0];
+                builder
+                    .add_instruction(
+                        ReduceOperation::new(vec![0], ReductionKind::Mean),
+                        Vec::new(),
+                        vec![broadcast],
+                        None,
+                    )
+                    .unwrap();
+            }
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let build_program =
+            |forward: &FlatProgram<Session>, transpose: &FlatProgram<Session>| -> FlatProgram<Session> {
+                let mut builder = ProgramBuilder::<Constant, Operation>::new();
+                let forward = builder.import_region(forward.entry_region_ref());
+                let transpose = builder.import_region(transpose.entry_region_ref());
+                let residual = builder.add_input(vector_type.clone().into());
+                let linear = builder.add_input(vector_type.clone().into());
+                let output = builder
+                    .add_instruction(
+                        Operation::LinearCall(LinearCallOperation::new(1)),
+                        vec![forward, transpose],
+                        vec![residual, linear],
+                        None,
+                    )
+                    .unwrap()[0];
+                builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
+            };
+
+        // The transpose region of a `linear_call` is a dormant rule that lowering never emits, so the mean there does
+        // not keep the static primal from compiling.
+        let program = build_program(&build_region(false), &build_region(true));
+        let lowered = session.lower_program(&program, 0, &options).unwrap();
+        let compiled = session.compile_program(&lowered).unwrap();
+        let outputs = session
+            .execute_program(
+                &compiled,
+                vec![f32_vector(&session, &mesh, &[2.0, 3.0]), f32_vector(&session, &mesh, &[4.0, 5.0])],
+            )
+            .unwrap();
+        assert_eq!(outputs[0].copy_to_host().unwrap().elements::<f32>().unwrap(), vec![8.0, 15.0]);
+
+        // Check the emitted forward region before pruning can remove the unused mean.
+        let program = build_program(&build_region(true), &build_region(false));
+        assert_eq!(
+            session
+                .lower_verified_reference_free_program(&program, 0, program.output_count(), &[], &options, false)
+                .unwrap_err()
+                .to_string(),
+            "operation `reduce` cannot consume data-derived dimensions during XLA lowering because mean over a \
+             dynamically sized reduction axis is not supported by the XLA lowering",
+        );
+    }
+
+    #[test]
+    fn test_session_lower_program_data_dependent_admission_ignores_omitted_bodies() {
+        // Lowering emits nothing of the body of a scan that admits no iteration (refer to `omits_regions`), so an
+        // unbounded data-derived dimension that only that body uses does not keep the program from compiling, while
+        // the same body is rejected when the scan iterates.
+        let client = cpu_client(1);
+        let mesh = domain_mesh(client, "x", 1);
+        let session = Session::builder().client(client).build().unwrap();
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let extent = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
+        let body = {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            builder.add_input(scalar_type.clone().into());
+            let carry = builder.add_input(scalar_type.clone().into());
+            let dimension = builder
+                .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![carry], None)
+                .unwrap()[0];
+            let output =
+                builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
+            Arc::new(builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap())
+        };
+        let program = |length: usize| {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let input = builder.add_input(scalar_type.clone().into());
+            let regions = vec![builder.intern_callee(&body, None).unwrap()];
+            let scan = ScanOperation::<Type>::new(1, length);
+            let output = builder.add_instruction(scan, regions, vec![input], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let lower = |program: &FlatProgram<Session>| {
+            let lowered = session.lower_program(program, 0, &Options::new(mesh.clone()));
+            lowered.map(|_| ()).map_err(|error| error.to_string())
+        };
+        let unbounded =
+            "data-derived dimension `unbounded` with bounds [0, ∞) needs a finite upper bound for XLA compilation";
+        assert_eq!(lower(&program(0)), Ok(()));
+        assert_eq!(lower(&program(1)), Err(unbounded.to_string()));
+
+        // CPU lowering replaces the CPU named square and lowers the body of the CUDA named square.
+        let body = {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let input = builder.add_input(scalar_type.clone().into());
+            let extent = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
+            let dimension = builder
+                .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![input], None)
+                .unwrap()[0];
+            let output =
+                builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
+            Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
+        };
+        let named_call = |name: &'static str| {
+            let key = CompositeKey::new(name, 1);
+            let named =
+                NamedComposite::new(key, |types: &[Type]| Ok(types.to_vec()), |inputs| Ok(vec![inputs[0].clone()]));
+            let rules = CustomRuleRegistration::new(CustomRuleDefinition::new("unbounded").with_named_composite(named));
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let input = builder.add_input(scalar_type.clone().into());
+            let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
+            let regions = vec![builder.intern_callee(&body, None).unwrap()];
+            let output = builder.add_instruction(operation, regions, vec![input], None).unwrap()[0];
+            builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        assert_eq!(lower(&named_call("ryft.tests.xla_cpu_named_square")), Ok(()));
+        assert_eq!(lower(&named_call("ryft.tests.xla_named_square")), Err(unbounded.to_string()));
     }
 
     #[test]

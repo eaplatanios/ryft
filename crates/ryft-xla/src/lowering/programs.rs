@@ -4092,10 +4092,10 @@ mod tests {
                 module {
                   func.func @main(%arg0: tensor<f64>, %arg1: tensor<f64>, %arg2: tensor<f64>, %arg3: tensor<f64>) -> (tensor<f64>, tensor<f64>) {
                     %0 = stablehlo.multiply %arg3, %arg0 : tensor<f64>
-                    %1 = stablehlo.multiply %arg2, %arg0 : tensor<f64>
-                    %2 = stablehlo.multiply %arg1, %arg0 : tensor<f64>
-                    %3 = stablehlo.add %0, %2 : tensor<f64>
-                    return %3, %1 : tensor<f64>, tensor<f64>
+                    %1 = stablehlo.multiply %arg1, %arg0 : tensor<f64>
+                    %2 = stablehlo.add %0, %1 : tensor<f64>
+                    %3 = stablehlo.multiply %arg2, %arg0 : tensor<f64>
+                    return %2, %3 : tensor<f64>, tensor<f64>
                   }
                 }
             "#},

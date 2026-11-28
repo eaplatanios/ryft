@@ -922,10 +922,8 @@ mod tests {
         // through the canonical zero path to a scalar constant broadcast to the array shape. The reverse path
         // stages the pullback over the primal operation family taking `[output_cotangents ++ residuals]`. This slice
         // pullback captures no residuals, so the pullback consumes only the single output cotangent.
-        let render_pullback = |primal: FlatProgram<Session>| {
-            primal
-                .linearize()
-                .unwrap()
+        let render_pullback = |linearization: Linearization<Constant, Operation>| {
+            linearization
                 .pullback()
                 .unwrap()
                 .into_program()
@@ -937,7 +935,7 @@ mod tests {
             ArrayType::new_static(DataType::F64, [4]),
         )
         .unwrap();
-        let stablehlo = render_pullback(primal.into_flat_program());
+        let stablehlo = render_pullback(primal.into_flat_program().linearize().unwrap());
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -960,7 +958,7 @@ mod tests {
             ArrayType::new_static(DataType::F64, [6]),
         )
         .unwrap();
-        let stablehlo = render_pullback(primal.into_flat_program());
+        let stablehlo = render_pullback(primal.into_flat_program().linearize().unwrap());
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -982,7 +980,7 @@ mod tests {
             (ArrayType::new_static(DataType::F64, [3]), ArrayType::scalar(DataType::F64)),
         )
         .unwrap();
-        let stablehlo = render_pullback(primal.into_flat_program());
+        let stablehlo = render_pullback(primal.into_flat_program().linearize().unwrap());
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -1007,29 +1005,33 @@ mod tests {
         );
 
         // The dynamic slice pullback scatters the cotangent at the index saved by the forward pass.
+        let index_literal = ConstantOperation::new(CoreArray::scalar(1i32).unwrap());
         let primal = crate::trace_with_context(
             |context, x: ArrayTracer| {
-                let start =
-                    context.bind(ConstantOperation::new(CoreArray::scalar(1i32).unwrap()), Vec::new(), &[])?.remove(0);
+                let start = context.bind(index_literal.clone(), Vec::new(), &[])?.remove(0);
                 x.dynamic_slice(&[ValueProjection::<ArrayType>::into_projected(start)?], &[2])
             },
             ArrayType::new_static(DataType::F64, [4]),
         )
         .unwrap();
-        let stablehlo = render_pullback(primal.into_flat_program());
+        let linearization = primal.into_flat_program().linearize().unwrap();
+        let forward = linearization.primal();
+        let start = &forward.instructions()[0];
+        assert_eq!(start.operation(), &Operation::from(index_literal));
+        assert_eq!(&forward.output_ids()[1..], start.outputs());
+        let stablehlo = render_pullback(linearization);
         assert_eq!(
             stablehlo,
             indoc! {r#"
                 module {
-                  func.func @main(%arg0: tensor<2xf64>) -> tensor<4xf64> {
-                    %c = stablehlo.constant dense<1> : tensor<i32>
+                  func.func @main(%arg0: tensor<2xf64>, %arg1: tensor<i32>) -> tensor<4xf64> {
                     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
                     %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<4xf64>
-                    %c_0 = stablehlo.constant dense<0> : tensor<i32>
-                    %c_1 = stablehlo.constant dense<4> : tensor<i32>
-                    %1 = stablehlo.compare LT, %c, %c_0, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
-                    %2 = stablehlo.add %c, %c_1 : tensor<i32>
-                    %3 = stablehlo.select %1, %2, %c : tensor<i1>, tensor<i32>
+                    %c = stablehlo.constant dense<0> : tensor<i32>
+                    %c_0 = stablehlo.constant dense<4> : tensor<i32>
+                    %1 = stablehlo.compare LT, %arg1, %c, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                    %2 = stablehlo.add %arg1, %c_0 : tensor<i32>
+                    %3 = stablehlo.select %1, %2, %arg1 : tensor<i1>, tensor<i32>
                     %4 = stablehlo.dynamic_update_slice %0, %arg0, %3 : (tensor<4xf64>, tensor<2xf64>, tensor<i32>) -> tensor<4xf64>
                     return %4 : tensor<4xf64>
                   }

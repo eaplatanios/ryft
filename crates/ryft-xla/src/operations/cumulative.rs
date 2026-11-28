@@ -1040,8 +1040,10 @@ mod tests {
                     .unwrap(),
                     indoc! {"
                         module {
-                          func.func @main(%arg0: tensor<3xi1>) -> tensor<3xi1> {
-                            return %arg0 : tensor<3xi1>
+                          func.func @main() {
+                            %c = stablehlo.constant dense<false> : tensor<i1>
+                            %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i1>) -> tensor<3xi1>
+                            return
                           }
                         }
                     "}

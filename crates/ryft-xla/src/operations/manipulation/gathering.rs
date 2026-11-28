@@ -328,8 +328,7 @@ mod tests {
             "#},
         );
 
-        // A dynamic query batch axis remains the same array identity through gather, so it is not reconstructed from
-        // a shape operand or lowered through `stablehlo.dynamic_gather`.
+        // Gather preserves the query batch extent reconstructed from the hidden boundary input.
         let query = DimensionVariable::new("query", DimensionBounds::new(1, Some(5)).unwrap());
         let indices_type =
             ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(query), Dimension::Static(1)]));
@@ -355,10 +354,13 @@ mod tests {
             stablehlo,
             indoc! {r#"
                 module {
-                  func.func @main(%arg0: tensor<3x2xf32>, %arg1: tensor<?x1xi32, #stablehlo.bounds<4, ?>>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>> {
-                    %0 = stablehlo.convert %arg1 : (tensor<?x1xi32, #stablehlo.bounds<4, ?>>) -> tensor<?x1xi64, #stablehlo.bounds<4, ?>>
-                    %1 = "stablehlo.gather"(%arg0, %0) <{dimension_numbers = #stablehlo.gather<offset_dims = [1], collapsed_slice_dims = [0], start_index_map = [0], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 1, 2>}> : (tensor<3x2xf32>, tensor<?x1xi64, #stablehlo.bounds<4, ?>>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>>
-                    return %1 : tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                  func.func @main(%arg0: tensor<3x2xf32>, %arg1: tensor<4x1xi32>, %arg2: tensor<i32>) -> (tensor<?x2xf32, #stablehlo.bounds<4, ?>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg1, %arg2, dim = 0 : (tensor<4x1xi32>, tensor<i32>) -> tensor<?x1xi32, #stablehlo.bounds<4, ?>>
+                    %1 = stablehlo.convert %0 : (tensor<?x1xi32, #stablehlo.bounds<4, ?>>) -> tensor<?x1xi64, #stablehlo.bounds<4, ?>>
+                    %2 = "stablehlo.gather"(%arg0, %1) <{dimension_numbers = #stablehlo.gather<offset_dims = [1], collapsed_slice_dims = [0], start_index_map = [0], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 1, 2>}> : (tensor<3x2xf32>, tensor<?x1xi64, #stablehlo.bounds<4, ?>>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                    %3 = stablehlo.get_dimension_size %2, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %4 = stablehlo.convert %3 : (tensor<i32>) -> tensor<i64>
+                    return %2, %4 : tensor<?x2xf32, #stablehlo.bounds<4, ?>>, tensor<i64>
                   }
                 }
             "#},

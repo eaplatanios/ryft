@@ -1890,7 +1890,8 @@ mod tests {
                 CastOperation::checked as fn(ArrayType, Vec<ArrayType>) -> Result<CastOperation<ArrayType>, TypeError>,
                 indoc! {"
                     module {
-                      func.func @main(%arg0: tensor<i1>, %arg1: tensor<2x3xf32>) -> tensor<2x3xf32> {
+                      func.func @main(%arg0: tensor<i1>, %arg1: tensor<2x3xf32>) -> \
+                          (tensor<2x3xf32> {mhlo.layout_mode = \"{0,1}\"}) {
                         %0 = stablehlo.after_all  : !stablehlo.token
                         %1 = stablehlo.custom_call @ryft.assert(%arg0, %0) {api_version = 4 : i32, \
                             backend_config = {actor = \"assert\", kind = \"generic\", label_count = \"0\", \
@@ -1909,7 +1910,8 @@ mod tests {
                 CastOperation::unchecked,
                 indoc! {"
                     module {
-                      func.func @main(%arg0: tensor<i1>, %arg1: tensor<2x3xf32>) -> tensor<2x3xf32> {
+                      func.func @main(%arg0: tensor<i1>, %arg1: tensor<2x3xf32>) -> \
+                          (tensor<2x3xf32> {mhlo.layout_mode = \"{0,1}\"}) {
                         %0 = stablehlo.after_all  : !stablehlo.token
                         %1 = stablehlo.custom_call @ryft.assert(%arg0, %0) {api_version = 4 : i32, \
                             backend_config = {actor = \"assert\", kind = \"generic\", label_count = \"0\", \
@@ -2552,7 +2554,7 @@ mod tests {
                     %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
                     %c = stablehlo.constant dense<3> : tensor<i64>
                     %3 = stablehlo.compare EQ, %c, %2, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
-                    %4 = stablehlo.after_all : !stablehlo.token
+                    %4 = stablehlo.after_all  : !stablehlo.token
                     %5 = stablehlo.custom_call @ryft.assert(%3, %2, %c, %4) {api_version = 4 : i32, backend_config = \
                         {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \"actual\", \
                         label_count = \"2\", message = \"input dimension `a` must have one extent in `cast`\"}, \
@@ -2617,7 +2619,7 @@ mod tests {
                     %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
                     %c = stablehlo.constant dense<3> : tensor<i64>
                     %4 = stablehlo.compare EQ, %3, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
-                    %5 = stablehlo.after_all : !stablehlo.token
+                    %5 = stablehlo.after_all  : !stablehlo.token
                     %6 = stablehlo.custom_call @ryft.assert(%4, %c, %3, %5) {api_version = 4 : i32, backend_config = \
                         {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \"actual\", \
                         label_count = \"2\", message = \"input dimension `b` must have the declared extent in \
@@ -2670,7 +2672,7 @@ mod tests {
                         tensor<i32>
                     %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
                     %6 = stablehlo.compare EQ, %5, %3, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
-                    %7 = stablehlo.after_all : !stablehlo.token
+                    %7 = stablehlo.after_all  : !stablehlo.token
                     %8 = stablehlo.custom_call @ryft.assert(%6, %3, %5, %7) {api_version = 4 : i32, backend_config = \
                         {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \"actual\", \
                         label_count = \"2\", message = \"input dimension `a` must have one extent in `cast`\"}, \
@@ -2727,33 +2729,45 @@ mod tests {
             module,
             indoc! {"
                 module {
-                  func.func @main(%arg0: tensor<?x?xf32, #stablehlo.bounds<4, 4>>, %arg1: \
-                      tensor<?x?xf32, #stablehlo.bounds<4, 4>>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>> {
-                    %0 = stablehlo.get_dimension_size %arg0, dim = 1 : (tensor<?x?xf32, #stablehlo.bounds<4, 4>>) -> \
+                  func.func @main(%arg0: tensor<4x4xf32>, %arg1: tensor<4x4xf32>, %arg2: tensor<i32>, %arg3: \
+                      tensor<i32>, %arg4: tensor<i32>, %arg5: tensor<i32>) -> (tensor<?x2xf32, #stablehlo.bounds<4, \
+                      ?>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : (tensor<4x4xf32>, tensor<i32>) -> \
+                        tensor<?x4xf32, #stablehlo.bounds<4, ?>>
+                    %1 = stablehlo.set_dimension_size %0, %arg3, dim = 1 : (tensor<?x4xf32, #stablehlo.bounds<4, ?>>, \
+                        tensor<i32>) -> tensor<?x?xf32, #stablehlo.bounds<4, 4>>
+                    %2 = stablehlo.set_dimension_size %arg1, %arg4, dim = 0 : (tensor<4x4xf32>, tensor<i32>) -> \
+                        tensor<?x4xf32, #stablehlo.bounds<4, ?>>
+                    %3 = stablehlo.set_dimension_size %2, %arg5, dim = 1 : (tensor<?x4xf32, #stablehlo.bounds<4, ?>>, \
+                        tensor<i32>) -> tensor<?x?xf32, #stablehlo.bounds<4, 4>>
+                    %4 = stablehlo.get_dimension_size %1, dim = 1 : (tensor<?x?xf32, #stablehlo.bounds<4, 4>>) -> \
                         tensor<i32>
-                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
                     %c = stablehlo.constant dense<2> : tensor<i64>
-                    %2 = stablehlo.compare EQ, %1, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
-                    %3 = stablehlo.after_all  : !stablehlo.token
-                    %4 = stablehlo.custom_call @ryft.assert(%2, %c, %1, %3) {api_version = 4 : i32, backend_config = \
+                    %6 = stablehlo.compare EQ, %5, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %7 = stablehlo.after_all  : !stablehlo.token
+                    %8 = stablehlo.custom_call @ryft.assert(%6, %c, %5, %7) {api_version = 4 : i32, backend_config = \
                         {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \"actual\", \
                         label_count = \"2\", message = \"input dimension `b` must have the declared extent in \
                         `cast`\"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) \
                         -> !stablehlo.token
-                    %5:3 = stablehlo.optimization_barrier %arg0, %arg1, %4 : tensor<?x?xf32, #stablehlo.bounds<4, 4>>, \
+                    %9:3 = stablehlo.optimization_barrier %1, %3, %8 : tensor<?x?xf32, #stablehlo.bounds<4, 4>>, \
                         tensor<?x?xf32, #stablehlo.bounds<4, 4>>, !stablehlo.token
-                    %6 = stablehlo.get_dimension_size %5#0, dim = 0 : (tensor<?x?xf32, #stablehlo.bounds<4, 4>>) -> \
+                    %10 = stablehlo.get_dimension_size %9#0, dim = 0 : (tensor<?x?xf32, #stablehlo.bounds<4, 4>>) -> \
                         tensor<i32>
                     %c_0 = stablehlo.constant dense<4> : tensor<i32>
-                    %7 = stablehlo.set_dimension_size %5#0, %c_0, dim = 0 : (tensor<?x?xf32, #stablehlo.bounds<4, 4>>, \
+                    %11 = stablehlo.set_dimension_size %9#0, %c_0, dim = 0 : (tensor<?x?xf32, #stablehlo.bounds<4, 4>>, \
                         tensor<i32>) -> tensor<4x?xf32, #stablehlo.bounds<?, 4>>
                     %c_1 = stablehlo.constant dense<4> : tensor<i32>
-                    %8 = stablehlo.set_dimension_size %7, %c_1, dim = 1 : (tensor<4x?xf32, #stablehlo.bounds<?, 4>>, \
+                    %12 = stablehlo.set_dimension_size %11, %c_1, dim = 1 : (tensor<4x?xf32, #stablehlo.bounds<?, 4>>, \
                         tensor<i32>) -> tensor<4x4xf32>
-                    %9 = stablehlo.slice %8 [0:4, 0:2] : (tensor<4x4xf32>) -> tensor<4x2xf32>
-                    %10 = stablehlo.set_dimension_size %9, %6, dim = 0 : (tensor<4x2xf32>, tensor<i32>) -> \
+                    %13 = stablehlo.slice %12 [0:4, 0:2] : (tensor<4x4xf32>) -> tensor<4x2xf32>
+                    %14 = stablehlo.set_dimension_size %13, %10, dim = 0 : (tensor<4x2xf32>, tensor<i32>) -> \
                         tensor<?x2xf32, #stablehlo.bounds<4, ?>>
-                    return %10 : tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                    %15 = stablehlo.get_dimension_size %14, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> \
+                        tensor<i32>
+                    %16 = stablehlo.convert %15 : (tensor<i32>) -> tensor<i64>
+                    return %14, %16 : tensor<?x2xf32, #stablehlo.bounds<4, ?>>, tensor<i64>
                   }
                 }
             "},
@@ -2791,28 +2805,32 @@ mod tests {
             module,
             indoc! {"
                 module {
-                  func.func @main(%arg0: tensor<?x?xf64, #stablehlo.bounds<4, 4>>) -> tensor<2x2xf64> {
-                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>) -> \
+                  func.func @main(%arg0: tensor<4x4xf64>, %arg1: tensor<i32>, %arg2: tensor<i32>) -> tensor<2x2xf64> {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4x4xf64>, tensor<i32>) -> \
+                        tensor<?x4xf64, #stablehlo.bounds<4, ?>>
+                    %1 = stablehlo.set_dimension_size %0, %arg2, dim = 1 : (tensor<?x4xf64, #stablehlo.bounds<4, ?>>, \
+                        tensor<i32>) -> tensor<?x?xf64, #stablehlo.bounds<4, 4>>
+                    %2 = stablehlo.get_dimension_size %1, dim = 0 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>) -> \
                         tensor<i32>
-                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
+                    %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
                     %c = stablehlo.constant dense<2> : tensor<i64>
-                    %2 = stablehlo.compare EQ, %1, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
-                    %3 = stablehlo.after_all  : !stablehlo.token
-                    %4 = stablehlo.custom_call @ryft.assert(%2, %c, %1, %3) {api_version = 4 : i32, backend_config = \
+                    %4 = stablehlo.compare EQ, %3, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %5 = stablehlo.after_all  : !stablehlo.token
+                    %6 = stablehlo.custom_call @ryft.assert(%4, %c, %3, %5) {api_version = 4 : i32, backend_config = \
                         {actor = \"cast\", kind = \"generic\", label_0 = \"expected\", label_1 = \"actual\", \
                         label_count = \"2\", message = \"input dimension `n` must have the declared extent in \
                         `cast`\"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) \
                         -> !stablehlo.token
-                    %5:2 = stablehlo.optimization_barrier %arg0, %4 : tensor<?x?xf64, #stablehlo.bounds<4, 4>>, \
+                    %7:2 = stablehlo.optimization_barrier %1, %6 : tensor<?x?xf64, #stablehlo.bounds<4, 4>>, \
                         !stablehlo.token
                     %c_0 = stablehlo.constant dense<4> : tensor<i32>
-                    %6 = stablehlo.set_dimension_size %5#0, %c_0, dim = 0 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>, \
+                    %8 = stablehlo.set_dimension_size %7#0, %c_0, dim = 0 : (tensor<?x?xf64, #stablehlo.bounds<4, 4>>, \
                         tensor<i32>) -> tensor<4x?xf64, #stablehlo.bounds<?, 4>>
                     %c_1 = stablehlo.constant dense<4> : tensor<i32>
-                    %7 = stablehlo.set_dimension_size %6, %c_1, dim = 1 : (tensor<4x?xf64, #stablehlo.bounds<?, 4>>, \
+                    %9 = stablehlo.set_dimension_size %8, %c_1, dim = 1 : (tensor<4x?xf64, #stablehlo.bounds<?, 4>>, \
                         tensor<i32>) -> tensor<4x4xf64>
-                    %8 = stablehlo.slice %7 [0:2, 0:2] : (tensor<4x4xf64>) -> tensor<2x2xf64>
-                    return %8 : tensor<2x2xf64>
+                    %10 = stablehlo.slice %9 [0:2, 0:2] : (tensor<4x4xf64>) -> tensor<2x2xf64>
+                    return %10 : tensor<2x2xf64>
                   }
                 }
             "},

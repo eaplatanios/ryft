@@ -745,8 +745,10 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let program = unproject_plain_program(program);
+            let options =
+                ProgramLoweringOptions::new().without_pruning().with_output_types(&output_type.with_layout(None));
             assert!(matches!(
-                program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning().with_output_types(&output_type.with_layout(None))),
+                program.to_rendered_mlir("main", &options),
                 Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                     if reason == format!("{kind} output layout `{layout}`"),
             ));
@@ -768,8 +770,9 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let program = unproject_plain_program(program);
+        let options = ProgramLoweringOptions::new().without_pruning().with_output_types(&output_type.with_layout(None));
         assert!(matches!(
-            program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning().with_output_types(&output_type.with_layout(None))),
+            program.to_rendered_mlir("main", &options),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "dynamic broadcast with explicit output layout needs finite allocation bounds",
         ));
@@ -1340,23 +1343,30 @@ mod tests {
             module,
             indoc! {r#"
                 module {
-                  func.func @main(%arg0: tensor<3xf32>, %arg1: tensor<?x1xf32, #stablehlo.bounds<4, ?>>, %arg2: tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> (tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<?x3xf32, #stablehlo.bounds<4, ?>>) {
-                    %0 = stablehlo.broadcast_in_dim %arg0, dims = [1] : (tensor<3xf32>) -> tensor<4x3xf32>
-                    %1 = stablehlo.get_dimension_size %arg2, dim = 0 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
-                    %2 = stablehlo.set_dimension_size %0, %1, dim = 0 : (tensor<4x3xf32>, tensor<i32>) -> tensor<?x3xf32, #stablehlo.bounds<4, ?>>
-                    %3 = stablehlo.get_dimension_size %arg1, dim = 0 : (tensor<?x1xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                  func.func @main(%arg0: tensor<3xf32>, %arg1: tensor<4x1xf32>, %arg2: tensor<4x3xf32>, %arg3: tensor<i32>, %arg4: tensor<i32>) -> (tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<i64>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg1, %arg3, dim = 0 : (tensor<4x1xf32>, tensor<i32>) -> tensor<?x1xf32, #stablehlo.bounds<4, ?>>
+                    %1 = stablehlo.set_dimension_size %arg2, %arg4, dim = 0 : (tensor<4x3xf32>, tensor<i32>) -> tensor<?x3xf32, #stablehlo.bounds<4, ?>>
+                    %2 = stablehlo.broadcast_in_dim %arg0, dims = [1] : (tensor<3xf32>) -> tensor<4x3xf32>
+                    %3 = stablehlo.get_dimension_size %1, dim = 0 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %4 = stablehlo.set_dimension_size %2, %3, dim = 0 : (tensor<4x3xf32>, tensor<i32>) -> tensor<?x3xf32, #stablehlo.bounds<4, ?>>
+                    %5 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?x1xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
                     %c = stablehlo.constant dense<4> : tensor<i32>
-                    %4 = stablehlo.set_dimension_size %arg1, %c, dim = 0 : (tensor<?x1xf32, #stablehlo.bounds<4, ?>>, tensor<i32>) -> tensor<4x1xf32>
-                    %5 = stablehlo.iota dim = 0 : tensor<4x1xi32>
-                    %6 = stablehlo.broadcast_in_dim %3, dims = [] : (tensor<i32>) -> tensor<4x1xi32>
-                    %7 = stablehlo.compare LT, %5, %6, SIGNED : (tensor<4x1xi32>, tensor<4x1xi32>) -> tensor<4x1xi1>
+                    %6 = stablehlo.set_dimension_size %0, %c, dim = 0 : (tensor<?x1xf32, #stablehlo.bounds<4, ?>>, tensor<i32>) -> tensor<4x1xf32>
+                    %7 = stablehlo.iota dim = 0 : tensor<4x1xi32>
+                    %8 = stablehlo.broadcast_in_dim %5, dims = [] : (tensor<i32>) -> tensor<4x1xi32>
+                    %9 = stablehlo.compare LT, %7, %8, SIGNED : (tensor<4x1xi32>, tensor<4x1xi32>) -> tensor<4x1xi1>
                     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %8 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4x1xf32>
-                    %9 = stablehlo.select %7, %4, %8 : tensor<4x1xi1>, tensor<4x1xf32>
-                    %10 = stablehlo.broadcast_in_dim %9, dims = [0, 1] : (tensor<4x1xf32>) -> tensor<4x3xf32>
-                    %11 = stablehlo.get_dimension_size %arg2, dim = 0 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
-                    %12 = stablehlo.set_dimension_size %10, %11, dim = 0 : (tensor<4x3xf32>, tensor<i32>) -> tensor<?x3xf32, #stablehlo.bounds<4, ?>>
-                    return %2, %12 : tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<?x3xf32, #stablehlo.bounds<4, ?>>
+                    %10 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4x1xf32>
+                    %11 = stablehlo.select %9, %6, %10 : tensor<4x1xi1>, tensor<4x1xf32>
+                    %12 = stablehlo.broadcast_in_dim %11, dims = [0, 1] : (tensor<4x1xf32>) -> tensor<4x3xf32>
+                    %13 = stablehlo.get_dimension_size %1, dim = 0 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %14 = stablehlo.set_dimension_size %12, %13, dim = 0 : (tensor<4x3xf32>, tensor<i32>) -> tensor<?x3xf32, #stablehlo.bounds<4, ?>>
+                    %15:2 = stablehlo.optimization_barrier %4, %14 : tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<?x3xf32, #stablehlo.bounds<4, ?>>
+                    %16 = stablehlo.get_dimension_size %4, dim = 0 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %17 = stablehlo.convert %16 : (tensor<i32>) -> tensor<i64>
+                    %18 = stablehlo.get_dimension_size %14, dim = 0 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %19 = stablehlo.convert %18 : (tensor<i32>) -> tensor<i64>
+                    return %15#0, %15#1, %17, %19 : tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<i64>, tensor<i64>
                   }
                 }
             "#},
