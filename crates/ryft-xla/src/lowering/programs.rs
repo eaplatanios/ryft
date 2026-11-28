@@ -887,7 +887,9 @@ where
     }
 }
 
-// TODO(eaplatanios): Inline this function.
+// TODO(eaplatanios): Is the way in which we're handling multi-platform support with a platform index input argument
+//  the same as the way in which JAX handles multi-platform support?
+
 /// Lowers the module of a program whose entry function has the provided `boundary`, for the provided `variants` of
 /// the program, each of which is the program as it is lowered for one target platform (i.e., pruned for it) together
 /// with that platform. The shardings and open output flags follow logical boundary order, with the `capture_count`
@@ -916,9 +918,9 @@ where
     Input: Parameterized<Constant>,
     Output: Parameterized<Constant>,
 {
-    /// Lowers the body of `variant` into `body_block`, whose arguments are the executable inputs of `boundary`, and
-    /// inserts the private functions that the variant plans and requests into `module_block`, at
-    /// `private_function_count`, which counts the private functions that the module holds.
+    /// Lowers the body of `variant` into `body_block`, whose arguments are the executable inputs of `boundary`,
+    /// and inserts the private functions that the variant plans and requests into `module_block`,
+    /// at `private_function_count`, which counts the private functions that the module holds.
     /// `registered_function_count` counts the functions of the registry of `module_context` that the module holds,
     /// which are fewer when the module also holds the bodies of other variants as private functions.
     ///
@@ -966,11 +968,13 @@ where
                 }
             }
         };
+
         while let Some(function) = lowering_context.function(*registered_function_count) {
             module_block.insert_operation(lower_function(function)?, *private_function_count)?;
             *private_function_count += 1;
             *registered_function_count += 1;
         }
+
         boundary.lower_body(
             program,
             capture_count,
@@ -982,13 +986,14 @@ where
             location,
         )?;
 
-        // The functions that lowering the body requested (e.g., the decompositions of the named compositions that it
-        // emitted) are recorded as it requests them.
+        // The functions that lowering the body requested (e.g., the decompositions of the named compositions
+        // that it emitted) are recorded as it requests them.
         while let Some(function) = lowering_context.function(*registered_function_count) {
             module_block.insert_operation(lower_function(function)?, *private_function_count)?;
             *private_function_count += 1;
             *registered_function_count += 1;
         }
+
         Ok(())
     }
 
@@ -1132,6 +1137,7 @@ where
             .collect::<Vec<ValueRef<'_, '_, '_>>>();
         function_block_ref.append_operation(func::r#return(results.as_slice(), location)?)?;
     }
+
     module_block.append_operation({
         let mut function_region = context.region();
         function_region.append_block(function_block)?;
@@ -1184,6 +1190,7 @@ where
             true
         }
     });
+
     let verified = module.verify();
     context.detach_diagnostics_handler(handler);
     if !verified? {
