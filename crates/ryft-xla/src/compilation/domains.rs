@@ -3636,8 +3636,8 @@ mod tests {
         };
         let uneven = |kind: &str| {
             format!(
-                "the sharding of {kind} 0 splits dimension 0 of extent 5 into 2 shards, but XLA requires the number of \
-                 shards to divide the extent",
+                "the sharding of {kind} 0 splits dimension 0 of extent 5 into 2 shards, but the boundary of an \
+                 executable requires shards of equal extent, while XLA pads the last shards of an uneven split",
             )
         };
 
@@ -3820,8 +3820,11 @@ mod tests {
         assert_eq!(validate(Some("cuda")), Ok(()));
         assert_eq!(
             validate(Some("cpu")),
-            Err(Error::Compilation(CompilationError::PlacementDeviceMismatch { device: elsewhere, mesh: mesh.clone() })
-                .to_string()),
+            Err(Error::Compilation(CompilationError::PlacementDeviceMismatch {
+                device: elsewhere,
+                mesh: mesh.clone()
+            })
+            .to_string()),
         );
         assert_eq!(validate(None), validate(Some("cpu")));
     }
@@ -3955,9 +3958,11 @@ mod tests {
         let validate = |length, target_platform| {
             validate_placements(&program(length), &mesh, true, target_platform).map_err(|error| error.to_string())
         };
-        let rejected =
-            Err(Error::Compilation(CompilationError::PlacementDeviceMismatch { device: elsewhere, mesh: mesh.clone() })
-                .to_string());
+        let rejected = Err(Error::Compilation(CompilationError::PlacementDeviceMismatch {
+            device: elsewhere,
+            mesh: mesh.clone(),
+        })
+        .to_string());
         assert_eq!(validate(0, Some("cpu")), Ok(()));
         assert_eq!(validate(0, None), Ok(()));
         assert_eq!(validate(1, Some("cpu")), rejected);
@@ -6426,8 +6431,9 @@ mod tests {
             "session constant `{}` retains an array of a different PJRT client than the client of this session",
             RetainedArray::new(&zero),
         );
-        let uneven_message = "the sharding of capture 0 splits dimension 0 of extent 3 into 2 shards, but XLA requires \
-                              the number of shards to divide the extent";
+        let uneven_message = "the sharding of capture 0 splits dimension 0 of extent 3 into 2 shards, but the boundary \
+                              of an executable requires shards of equal extent, while XLA pads the last shards of an \
+                              uneven split";
         for (capture, message) in [(&zero, zero_message), (&uneven, uneven_message.to_string())] {
             assert_eq!([executed(capture, 1), called(capture, 1)], [Err(message.clone()), Err(message)]);
         }

@@ -899,7 +899,7 @@ mod tests {
         assert!(matches!(
             physical_bound_type(&unbounded),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
-                if operation == "physical_bound_type"
+                if operation == "physical bound"
                     && reason == "dynamic dimension `rows` needs a finite positive physical bound",
         ));
     }

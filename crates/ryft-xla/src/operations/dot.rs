@@ -1074,7 +1074,8 @@ mod tests {
                 None,
             ),
             Err(Error::Lowering(LoweringError::ModuleVerificationFailed { diagnostic }))
-                if { eprintln!("DIAG[{diagnostic}]"); false },
+                if diagnostic == "dot algorithm not known to be supported on any hardware: {lhs:'f16', rhs:'bf16', \
+                    accum:'f32', lhs_components:2, rhs_components:3, primitive_ops:1, imprecise:0}",
         ));
     }
 

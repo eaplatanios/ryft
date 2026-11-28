@@ -2453,7 +2453,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_elementwise_operand() {
+    fn test_normalize_elementwise_input() {
         let mut builder = PlainProgramBuilder::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
         let left = builder
@@ -2528,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_elementwise_operand_zero_sized_operands() {
+    fn test_normalize_elementwise_input_zero_sized_inputs() {
         let mut builder = PlainProgramBuilder::new();
         let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
         let empty = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)])));
@@ -2559,7 +2559,7 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_elementwise_operand_rejects_incompatible_operands() {
+    fn test_normalize_elementwise_input_rejects_incompatible_inputs() {
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
         let token_type = context.stable_hlo_token_type().unwrap();
@@ -2574,13 +2574,13 @@ mod tests {
         assert!(matches!(
             normalize_elementwise_input(token, &vector_type, &mut block.as_ref(), &context, location),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
-                if operation == "normalize_elementwise_input"
+                if operation == "elementwise input"
                     && reason == "elementwise operand has non-tensor MLIR type `!stablehlo.token`",
         ));
         assert!(matches!(
             normalize_elementwise_input(matrix, &vector_type, &mut block.as_ref(), &context, location),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
-                if operation == "normalize_elementwise_input"
+                if operation == "elementwise input"
                     && reason == "cannot broadcast rank-2 elementwise operand to rank-1 output",
         ));
     }
