@@ -154,7 +154,7 @@ impl LowerableOperation for PrintOperation<ArrayType> {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("input type", input_types, 1, TypeError);
         lowerer.require_runtime(RuntimeRequirement::builtin(PRINT_CUSTOM_CALL_TARGET))?;
-        let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+        let (mut block, context, location) = (lowerer.block(), lowerer.mlir_context(), lowerer.location());
         lower_print_to_custom_call(
             self.label(),
             self.effect_class().is_ordered(),
@@ -254,24 +254,26 @@ fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
     value_type: &ArrayType,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
     // Unordered calls retain the registered handler ABI, using a fresh local token with no boundary dependency.
     let mut local_tokens = EffectTokens::default();
     let effect_tokens = if ordered { effect_tokens } else { &mut local_tokens };
     let input_token = current_or_new_token(EffectClass::OrderedIo, effect_tokens, block, location)?;
-    let token_type = context.stable_hlo_token_type()?;
-    let mut attributes =
-        vec![context.named_attribute(context.identifier(PRINT_LABEL_ATTRIBUTE), context.string_attribute(label))];
+    let token_type = mlir_context.stable_hlo_token_type()?;
+    let mut attributes = vec![
+        mlir_context
+            .named_attribute(mlir_context.identifier(PRINT_LABEL_ATTRIBUTE), mlir_context.string_attribute(label)),
+    ];
     let data_type = value_type.data_type();
     if matches!(data_type, DataType::Zero | DataType::F4E2M1FN | DataType::F6E2M3FN | DataType::F6E3M2FN) {
-        attributes.push(context.named_attribute(
-            context.identifier(PRINT_LOGICAL_TYPE_ATTRIBUTE),
-            context.string_attribute(data_type.to_string().as_str()),
+        attributes.push(mlir_context.named_attribute(
+            mlir_context.identifier(PRINT_LOGICAL_TYPE_ATTRIBUTE),
+            mlir_context.string_attribute(data_type.to_string().as_str()),
         ));
     }
-    let backend_config = context.dictionary_attribute(&attributes);
+    let backend_config = mlir_context.dictionary_attribute(&attributes);
     let value = if data_type == DataType::I1 {
         value.widen_i1_to_i8(block, location)?
     } else {
@@ -283,7 +285,7 @@ fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
             _ => None,
         };
         if let Some(carrier) = carrier {
-            let carrier_type = value_type.clone().with_data_type(carrier).lower(context, location)?;
+            let carrier_type = value_type.clone().with_data_type(carrier).lower(mlir_context, location)?;
             block
                 .append_operation(stable_hlo::convert(value, carrier_type, location)?)?
                 .result(0)

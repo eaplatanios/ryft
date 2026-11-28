@@ -138,11 +138,11 @@ pub(crate) fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
     output_type: &ArrayType,
     mut refined_type: ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     result = refined_type.lower_layout_constraint(result, block, location)?;
-    let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
+    let i32_scalar_type = mlir_context.tensor_type(mlir_context.signless_integer_type(32), &[], None, location)?;
     // The dimension inputs are compact (i.e., one per dynamic axis, in axis order), so advance the input iterator only
     // when a dynamic axis is encountered rather than indexing by the physical axis number.
     let mut inputs = input_values.iter();
@@ -156,7 +156,7 @@ pub(crate) fn refine_dynamic_constructor_result<'b, 'c: 'b, 't: 'c>(
         let mut dimensions = refined_type.shape().dimensions().to_vec();
         dimensions[axis] = dimension;
         refined_type = refined_type.with_shape(Shape::new(dimensions));
-        let refined_tensor_type = refined_type.lower(context, location)?;
+        let refined_tensor_type = refined_type.lower(mlir_context, location)?;
         let operation = block.append_operation(stable_hlo::set_dimension_size(
             result,
             extent,
@@ -189,7 +189,9 @@ impl LowerableOperation for IotaOperation<ArrayType> {
         let result = result.result(0).unwrap().as_ref();
         let result = match output_types[0].memory() {
             Memory::Device => result,
-            memory => memory.lower_transfer(&[result], &mut lowerer.block(), lowerer.context(), lowerer.location())?[0],
+            memory => {
+                memory.lower_transfer(&[result], &mut lowerer.block(), lowerer.mlir_context(), lowerer.location())?[0]
+            }
         };
         lower_constructor_sharding_constraint(
             vec![result],
@@ -213,7 +215,7 @@ impl LowerableOperation for ConstantOperation<Array> {
         check_count!("input", input_values, 0, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let constant_value =
-            self.value().lower_constant(&mut lowerer.block(), lowerer.context(), lowerer.location())?;
+            self.value().lower_constant(&mut lowerer.block(), lowerer.mlir_context(), lowerer.location())?;
         Ok(vec![constant_value])
     }
 }
@@ -233,7 +235,7 @@ impl LowerableOperation for FillLikeOperation<ArrayType> {
         // statically shaped physical allocation, like the static `fill`.
         let physical_type = output_types[0].physical_bound_type()?;
         let physical_tensor_type = lowerer.lower_tensor_type(&physical_type)?;
-        let value = self.value().lower_constant(&mut lowerer.block(), lowerer.context(), lowerer.location())?;
+        let value = self.value().lower_constant(&mut lowerer.block(), lowerer.mlir_context(), lowerer.location())?;
         let result = lowerer.block().append_operation(stable_hlo::broadcast(
             value,
             physical_tensor_type,
@@ -247,7 +249,7 @@ impl LowerableOperation for FillLikeOperation<ArrayType> {
             &output_types[0],
             lowerer.lowering_context(),
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )
     }
@@ -280,7 +282,7 @@ impl LowerableOperation for IotaLikeOperation<ArrayType> {
             &output_types[0],
             lowerer.lowering_context(),
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )
     }
@@ -351,7 +353,7 @@ impl LowerableOperation for ZeroLikeOperation<ArrayType> {
             0,
             lowerer.lowering_context(),
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )
     }
@@ -372,7 +374,7 @@ impl LowerableOperation for OneLikeOperation<ArrayType> {
             1,
             lowerer.lowering_context(),
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )
     }
@@ -386,7 +388,7 @@ impl MemberLowerableOperation<Type> for ZeroOperation<ArrayType> {
         input_types: &[Type],
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let input_values =
             dynamic_constructor_inputs(self.name(), self.r#type(), input_values, input_types, output_types, lowerer)?;
@@ -414,7 +416,7 @@ impl MemberLowerableOperation<Type> for OneOperation<ArrayType> {
         input_types: &[Type],
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let input_values =
             dynamic_constructor_inputs(self.name(), self.r#type(), input_values, input_types, output_types, lowerer)?;
@@ -442,7 +444,7 @@ impl MemberLowerableOperation<Type> for IotaOperation<ArrayType> {
         input_types: &[Type],
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let input_values =
             dynamic_constructor_inputs(self.name(), self.r#type(), input_values, input_types, output_types, lowerer)?;
@@ -482,7 +484,7 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
     integer_value: i64,
     lowering_context: &ProgramLoweringContext,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     if input_values.len() != 1 {
@@ -524,7 +526,7 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
             &dimensions,
             &[output_type.clone().into()],
             block,
-            context,
+            mlir_context,
             location,
         )?
     };
@@ -547,17 +549,17 @@ fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
     output_type: &ArrayType,
     lowering_context: &ProgramLoweringContext,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let physical_type = output_type.physical_bound_type()?;
     let result = match physical_type.memory() {
         Memory::Device => result,
-        memory => memory.lower_transfer(&[result], block, context, location)?[0],
+        memory => memory.lower_transfer(&[result], block, mlir_context, location)?[0],
     };
     let result = physical_type.lower_layout_constraint(result, block, location)?;
     let sources = (0..output_type.rank()).map(|axis| (exemplar, axis)).collect::<Vec<_>>();
-    let result = output_type.restore_dynamic_dimensions(result, &sources, block, context, location)?;
+    let result = output_type.restore_dynamic_dimensions(result, &sources, block, mlir_context, location)?;
     let result = match output_type.sharding() {
         Some(sharding) => {
             lowering_context.lower_sharding_constraint(sharding, result, OpenDimensions::All, block, location)?
@@ -618,7 +620,7 @@ fn dynamic_constructor_inputs<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         ))
         .into());
     }
-    let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+    let (mut block, context, location) = (lowerer.block(), lowerer.mlir_context(), lowerer.location());
     lower_output_extent_validation(
         name,
         std::slice::from_ref(declared_type),
@@ -651,12 +653,12 @@ fn lower_dynamic_constructor<'b, 'c: 'b, 't: 'c>(
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[Type],
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     let (output_type, physical_type) = dynamic_constructor_types(name, input_values.len(), output_types)?;
     let result = physical_type.lower_i64_splat_in_declared_memory(integer_value, block, location)?;
-    refine_dynamic_constructor_result(result, input_values, &output_type, physical_type, block, context, location)
+    refine_dynamic_constructor_result(result, input_values, &output_type, physical_type, block, mlir_context, location)
 }
 
 #[cfg(test)]

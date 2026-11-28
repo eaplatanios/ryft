@@ -92,7 +92,7 @@ impl LowerableOperation for ScanOperation<Type> {
         // error, reported as the operation's own region contract and input count would report it.
         lowerer.validate_pending_reductions_across_regions(self.name(), input_types, output_types)?;
         self.validate_region_count(lowerer.regions().len())?;
-        let (context, location) = (lowerer.context(), lowerer.location());
+        let (context, location) = (lowerer.mlir_context(), lowerer.location());
         let block = &mut lowerer.block();
         let (effect_tokens, regions, captured_values, lowering_context) = lowerer.split_effect_tokens();
         let body = &regions[0];
@@ -181,7 +181,7 @@ impl LowerableOperation for ScanOperation<Type> {
             },
             reverse: self.reverse(),
             threaded_effects: lowered_effect_classes(body)?,
-            context,
+            mlir_context: context,
             location,
             captured_values,
             lowering_context,
@@ -327,7 +327,7 @@ struct ScanLoopInputs<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> {
     threaded_effects: EffectClasses,
 
     /// MLIR context that owns the emitted operations.
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
 
     /// Location of the emitted operations.
     location: LocationRef<'c, 't>,
@@ -346,7 +346,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> ScanLoopInputs<'o, 'b,
     /// length and, for a dynamic length, given the runtime length as the runtime extent of its leading axis with
     /// `stablehlo.set_dimension_size`.
     fn lower_accumulators(&self, block: &mut BlockRef<'b, 'c, 't>) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let (context, location) = (self.context, self.location);
+        let (context, location) = (self.mlir_context, self.location);
         let mut accumulators = Vec::with_capacity(self.stacked_output_types.len());
         for stack_type in &self.stacked_output_types {
             let mut physical_dimensions = stack_type.shape().dimensions().to_vec();
@@ -428,7 +428,7 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> ScanLoopInputs<'o, 'b,
         block: &mut BlockRef<'b, 'c, 't>,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let (context, location) = (self.context, self.location);
+        let (context, location) = (self.mlir_context, self.location);
         let state_count = self.state_types.len();
         let mut state_types = self
             .state_types
@@ -1035,7 +1035,7 @@ mod tests {
                 length: ScanLoopLength::Static(3),
                 reverse: false,
                 threaded_effects,
-                context: &context,
+                mlir_context: &context,
                 location,
                 captured_values: &[],
                 lowering_context: &lowering_context,

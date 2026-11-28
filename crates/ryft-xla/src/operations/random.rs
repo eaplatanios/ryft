@@ -29,7 +29,7 @@ impl LowerableOperation for RngBitGeneratorOperation<ArrayType> {
             self.output_type(),
             input_values,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )
     }
@@ -43,7 +43,7 @@ impl LowerableOperation for RngBitGeneratorOperation<Type> {
         input_types: &[Type],
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
         // Type inference refines the declared dynamic output axes whose extents are exact (e.g., those of eager
@@ -116,7 +116,7 @@ impl LowerableOperation for DropoutOperation {
                 reason: format!("`{DROPOUT_OPERATION_NAME}` with dynamic input extents"),
             }));
         }
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
         let (algorithm, state) = match input_values.get(1) {
@@ -180,7 +180,7 @@ trait RandomAlgorithmLoweringExtension {
         bits_type: &ArrayType,
         input_values: &[ValueRef<'b, 'c, 't>],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 
@@ -195,7 +195,7 @@ trait RandomAlgorithmLoweringExtension {
         bits_type: &ArrayType,
         input_values: &[ValueRef<'b, 'c, 't>],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -206,13 +206,14 @@ impl RandomAlgorithmLoweringExtension for RandomAlgorithm {
         bits_type: &ArrayType,
         input_values: &[ValueRef<'b, 'c, 't>],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let mut generated = self.lower_unplaced_bit_generator(bits_type, input_values, block, context, location)?;
+        let mut generated =
+            self.lower_unplaced_bit_generator(bits_type, input_values, block, mlir_context, location)?;
         let memory = bits_type.memory();
         if memory != Memory::Device {
-            generated[1] = memory.lower_transfer(&[generated[1]], block, context, location)?[0];
+            generated[1] = memory.lower_transfer(&[generated[1]], block, mlir_context, location)?[0];
         }
         Ok(generated)
     }
@@ -222,7 +223,7 @@ impl RandomAlgorithmLoweringExtension for RandomAlgorithm {
         bits_type: &ArrayType,
         input_values: &[ValueRef<'b, 'c, 't>],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
@@ -230,7 +231,7 @@ impl RandomAlgorithmLoweringExtension for RandomAlgorithm {
             RandomAlgorithm::ThreeFry => stable_hlo::RngAlgorithm::ThreeFry,
             RandomAlgorithm::Philox => stable_hlo::RngAlgorithm::Philox,
         };
-        let output_type = bits_type.lower(context, location)?;
+        let output_type = bits_type.lower(mlir_context, location)?;
         let generated = block.append_operation(stable_hlo::rng_bit_generator(
             input_values[0],
             algorithm,

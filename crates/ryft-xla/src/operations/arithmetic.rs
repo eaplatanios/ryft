@@ -76,18 +76,19 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
         let width = data_type.bit_width();
         let minimum = i64::MIN >> (64 - width);
         let maximum = i64::MAX >> (64 - width);
-        let scalar_type = ArrayType::scalar(carrier_data_type).lower(lowerer.context(), lowerer.location())?;
+        let scalar_type = ArrayType::scalar(carrier_data_type).lower(lowerer.mlir_context(), lowerer.location())?;
         let constants = [minimum, maximum, 0]
             .into_iter()
             .map(|value| {
-                let elements = carrier_data_type.lower_i64_splat_attribute(scalar_type, value, lowerer.context())?;
+                let elements =
+                    carrier_data_type.lower_i64_splat_attribute(scalar_type, value, lowerer.mlir_context())?;
                 let constant = lowerer.block().append_operation(stable_hlo::constant(elements, lowerer.location())?)?;
                 // Broadcasting against a normalized input retains its runtime extents for bounded dynamic arrays.
                 Ok(normalize_binary_elementwise_inputs(
                     &[constant.result(0).unwrap().as_ref(), left],
                     std::slice::from_ref(&carrier_type),
                     &mut lowerer.block(),
-                    lowerer.context(),
+                    lowerer.mlir_context(),
                     lowerer.location(),
                 )?[0])
             })
@@ -218,7 +219,7 @@ impl LowerableOperation for PowOperation<ArrayType> {
             input_values,
             output_types,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let result = lowerer.block().append_operation(stable_hlo::power(left, right, lowerer.location())?)?;
@@ -295,7 +296,7 @@ fn normalize_arithmetic_inputs<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         &inputs,
         &[output_type],
         &mut lowerer.block(),
-        lowerer.context(),
+        lowerer.mlir_context(),
         lowerer.location(),
     )
 }
@@ -312,21 +313,21 @@ fn lower_arithmetic_output<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     // A direct conversion from an integer to a predicate tests nonzero, which would incorrectly turn an even sum into
     // one.
     let tensor_type = output.r#type()?.cast::<TensorTypeRef>().unwrap();
-    let scalar_type = lowerer.context().tensor_type(tensor_type.element_type()?, &[], None, lowerer.location())?;
+    let scalar_type = lowerer.mlir_context().tensor_type(tensor_type.element_type()?, &[], None, lowerer.location())?;
     let data_type = if output_type.data_type() == DataType::I1 { DataType::I8 } else { DataType::U8 };
-    let one = data_type.lower_i64_splat_attribute(scalar_type, 1, lowerer.context())?;
+    let one = data_type.lower_i64_splat_attribute(scalar_type, 1, lowerer.mlir_context())?;
     let one = lowerer.block().append_operation(stable_hlo::constant(one, lowerer.location())?)?;
     let one = normalize_binary_elementwise_inputs(
         &[one.result(0).unwrap().as_ref(), output],
         &[output_type.clone().with_data_type(data_type)],
         &mut lowerer.block(),
-        lowerer.context(),
+        lowerer.mlir_context(),
         lowerer.location(),
     )?[0];
     let masked = lowerer.block().append_operation(stable_hlo::and(output, one, lowerer.location())?)?;
     let narrowed = lowerer.block().append_operation(stable_hlo::convert(
         masked.result(0).unwrap().as_ref(),
-        output_type.lower(lowerer.context(), lowerer.location())?,
+        output_type.lower(lowerer.mlir_context(), lowerer.location())?,
         lowerer.location(),
     )?)?;
     Ok(narrowed.result(0).unwrap().as_ref())

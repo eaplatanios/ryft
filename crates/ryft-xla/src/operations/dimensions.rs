@@ -60,7 +60,7 @@ impl LowerableOperation for DimensionFromScalarOperation {
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (input_types, output_types);
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
         let effect_tokens = lowerer.effect_tokens_mut();
@@ -276,7 +276,7 @@ trait DimensionOperationLoweringExtension {
         right: ValueRef<'b, 'c, 't>,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<(), Error>;
 }
@@ -288,7 +288,7 @@ impl DimensionOperationLoweringExtension for DimensionOperation<DimensionValue> 
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
         let effect_tokens = lowerer.effect_tokens_mut();
@@ -375,7 +375,7 @@ impl DimensionOperationLoweringExtension for DimensionOperation<DimensionValue> 
         right: ValueRef<'b, 'c, 't>,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<(), Error> {
         let kind = match self {
@@ -390,19 +390,31 @@ impl DimensionOperationLoweringExtension for DimensionOperation<DimensionValue> 
         let predicate = lower_deliberately_false_assertion_predicate(left, block, location)?;
         let left_name = left_type.dimension().to_string();
         let right_name = right_type.dimension().to_string();
-        let backend_config = context.dictionary_attribute(&[
-            context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute(self.name())),
-            context.named_attribute(context.identifier(ASSERT_KIND_ATTRIBUTE), context.string_attribute(kind)),
-            context.named_attribute(
-                context.identifier(ASSERT_LEFT_ATTRIBUTE),
-                context.string_attribute(left_name.as_str()),
+        let backend_config = mlir_context.dictionary_attribute(&[
+            mlir_context.named_attribute(
+                mlir_context.identifier(ASSERT_ACTOR_ATTRIBUTE),
+                mlir_context.string_attribute(self.name()),
             ),
-            context.named_attribute(
-                context.identifier(ASSERT_RIGHT_ATTRIBUTE),
-                context.string_attribute(right_name.as_str()),
+            mlir_context
+                .named_attribute(mlir_context.identifier(ASSERT_KIND_ATTRIBUTE), mlir_context.string_attribute(kind)),
+            mlir_context.named_attribute(
+                mlir_context.identifier(ASSERT_LEFT_ATTRIBUTE),
+                mlir_context.string_attribute(left_name.as_str()),
+            ),
+            mlir_context.named_attribute(
+                mlir_context.identifier(ASSERT_RIGHT_ATTRIBUTE),
+                mlir_context.string_attribute(right_name.as_str()),
             ),
         ]);
-        lower_assertion_custom_call(predicate, &[left, right], backend_config, effect_tokens, block, context, location)
+        lower_assertion_custom_call(
+            predicate,
+            &[left, right],
+            backend_config,
+            effect_tokens,
+            block,
+            mlir_context,
+            location,
+        )
     }
 }
 

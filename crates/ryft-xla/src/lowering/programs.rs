@@ -1639,6 +1639,19 @@ impl Default for ProgramLoweringOptions {
     }
 }
 
+impl<O: ProgramLoweringOperation> PrivateFunctionProgram for Program<Constant, O, Vec<Constant>, Vec<Constant>> {
+    #[inline]
+    fn lower_private_function<'c, 't: 'c>(
+        &self,
+        symbol: &str,
+        lowering_context: &ProgramLoweringContext,
+        mlir_context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<func::DetachedFuncOperation<'c, 't>, Error> {
+        lower_private_function(symbol, self, 0, lowering_context, mlir_context, location)
+    }
+}
+
 /// Exact entry boundary sharding overrides reported by [`ProgramLoweringOptions`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EntryShardingOverride {
@@ -4046,20 +4059,6 @@ impl PendingReduction {
             None => declare(Sharding::replicated(mesh.clone(), rank))
                 .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() }.into()),
         }
-    }
-}
-
-// TODO(eaplatanios): Move this higher up maybe?
-impl<O: ProgramLoweringOperation> PrivateFunctionProgram for Program<Constant, O, Vec<Constant>, Vec<Constant>> {
-    #[inline]
-    fn lower_private_function<'c, 't: 'c>(
-        &self,
-        symbol: &str,
-        lowering_context: &ProgramLoweringContext,
-        mlir_context: &'c MlirContext<'t>,
-        location: LocationRef<'c, 't>,
-    ) -> Result<func::DetachedFuncOperation<'c, 't>, Error> {
-        lower_private_function(symbol, self, 0, lowering_context, mlir_context, location)
     }
 }
 

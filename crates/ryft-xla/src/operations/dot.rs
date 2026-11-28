@@ -84,7 +84,7 @@ impl LowerableOperation for DotOperation {
         }
 
         let dimension_numbers = self.dimensions();
-        let dimensions = lowerer.context().stable_hlo_dot_dimensions(
+        let dimensions = lowerer.mlir_context().stable_hlo_dot_dimensions(
             dimension_numbers.lhs_batching_dimensions(),
             dimension_numbers.rhs_batching_dimensions(),
             dimension_numbers.lhs_contracting_dimensions(),
@@ -96,7 +96,7 @@ impl LowerableOperation for DotOperation {
             DotInputPrecision::Highest => Precision::Highest,
         };
         let (left_precision, right_precision) = precision.input_precisions();
-        let algorithm = precision.lower(left_type, right_type, lowerer.context())?;
+        let algorithm = precision.lower(left_type, right_type, lowerer.mlir_context())?;
         let result_tensor_type = lowerer.lower_tensor_type(&output_type.clone().with_data_type(result_type))?;
         let result = lowerer.block().append_operation(stable_hlo::dot_general(
             inputs[0],
@@ -138,7 +138,7 @@ impl LowerableOperation for RaggedDotOperation {
             // backend layout workaround. Ryft emits the canonical CHLO contract and leaves target specific layout
             // selection to legalization.
             let dot = dimensions.dot_dimensions();
-            let attribute = lowerer.context().chlo_ragged_dot_dimensions(
+            let attribute = lowerer.mlir_context().chlo_ragged_dot_dimensions(
                 dot.lhs_batching_dimensions(),
                 dot.rhs_batching_dimensions(),
                 dot.lhs_contracting_dimensions(),
@@ -152,7 +152,7 @@ impl LowerableOperation for RaggedDotOperation {
                 input_values[2],
                 attribute,
                 Some((chlo::Precision::Default, chlo::Precision::Default)),
-                output_types[0].lower(lowerer.context(), lowerer.location())?,
+                output_types[0].lower(lowerer.mlir_context(), lowerer.location())?,
                 lowerer.location(),
             )?)?;
             return Ok(vec![result.result(0).unwrap().as_ref()]);
@@ -169,7 +169,7 @@ impl LowerableOperation for RaggedDotOperation {
                 dimensions.dot_dimensions(),
                 &output_types[0],
                 &mut lowerer.block(),
-                lowerer.context(),
+                lowerer.mlir_context(),
                 lowerer.location(),
             )?]);
         }
@@ -181,7 +181,7 @@ impl LowerableOperation for RaggedDotOperation {
             group_sizes_type,
             physical_ragged_extent,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let left = lower_ragged_dot_expansion(
@@ -193,7 +193,7 @@ impl LowerableOperation for RaggedDotOperation {
             left_ragged_axis,
             left_prefix.as_slice(),
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let shift = |axes: &[usize]| axes.iter().map(|axis| axis + 1).collect::<Vec<_>>();
@@ -230,7 +230,7 @@ impl LowerableOperation for RaggedDotOperation {
                     right_ragged_axis,
                     right_prefix.as_slice(),
                     &mut lowerer.block(),
-                    lowerer.context(),
+                    lowerer.mlir_context(),
                     lowerer.location(),
                 )?;
                 let mut left_batching = vec![0];
@@ -248,7 +248,7 @@ impl LowerableOperation for RaggedDotOperation {
                     ),
                     &output_types[0],
                     &mut lowerer.block(),
-                    lowerer.context(),
+                    lowerer.mlir_context(),
                     lowerer.location(),
                 )?]);
             }
@@ -260,7 +260,7 @@ impl LowerableOperation for RaggedDotOperation {
             &dense_dimensions,
             &output_types[0],
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?])
     }
@@ -275,7 +275,7 @@ trait DotPrecisionLoweringExtension {
         self,
         left_type: DataType,
         right_type: DataType,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
     ) -> Result<Option<DotAlgorithmAttributeRef<'c, 't>>, Error>;
 }
 
@@ -284,10 +284,10 @@ impl DotPrecisionLoweringExtension for DotPrecision {
         self,
         left_type: DataType,
         right_type: DataType,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
     ) -> Result<Option<DotAlgorithmAttributeRef<'c, 't>>, Error> {
         let float_type = |data_type: DataType| {
-            data_type.lower(context)?.cast::<FloatTypeRef>().ok_or_else(|| {
+            data_type.lower(mlir_context)?.cast::<FloatTypeRef>().ok_or_else(|| {
                 Error::Lowering(LoweringError::UnsupportedOperation {
                     operation: DOT_OPERATION_NAME.to_string(),
                     reason: format!("the algorithm type `{data_type}` is not a floating-point type"),
@@ -295,7 +295,7 @@ impl DotPrecisionLoweringExtension for DotPrecision {
             })
         };
         let float8_type = |data_type: DataType| {
-            data_type.lower(context)?.cast::<Float8TypeRef>().ok_or_else(|| {
+            data_type.lower(mlir_context)?.cast::<Float8TypeRef>().ok_or_else(|| {
                 Error::Lowering(LoweringError::UnsupportedOperation {
                     operation: DOT_OPERATION_NAME.to_string(),
                     reason: format!("the algorithm input type `{data_type}` is not an 8-bit floating-point type"),
@@ -305,7 +305,7 @@ impl DotPrecisionLoweringExtension for DotPrecision {
         let preset = match self {
             DotPrecision::Inputs { .. } => return Ok(None),
             DotPrecision::Algorithm(algorithm) => {
-                return Ok(Some(context.stable_hlo_dot_algorithm(
+                return Ok(Some(mlir_context.stable_hlo_dot_algorithm(
                     float_type(algorithm.lhs_precision_type())?,
                     float_type(algorithm.rhs_precision_type())?,
                     float_type(algorithm.accumulation_type())?,
@@ -356,7 +356,7 @@ impl DotPrecisionLoweringExtension for DotPrecision {
             DotAlgorithmPreset::F32_F32_F32 => stable_hlo::DotAlgorithmPreset::F32_F32_F32,
             DotAlgorithmPreset::F64_F64_F64 => stable_hlo::DotAlgorithmPreset::F64_F64_F64,
         };
-        Ok(context.stable_hlo_dot_algorithm_from_preset(preset)?)
+        Ok(mlir_context.stable_hlo_dot_algorithm_from_preset(preset)?)
     }
 }
 
@@ -368,7 +368,7 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
     group_sizes_type: &ArrayType,
     physical_ragged_extent: usize,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(ValueRef<'b, 'c, 't>, ValueRef<'b, 'c, 't>), Error> {
     let group_axis = group_sizes_type.rank() - 1;
@@ -390,7 +390,7 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
         group_sizes
     };
     let wide_group_sizes_type = group_sizes_type.clone().with_data_type(DataType::U64);
-    let wide_group_sizes_tensor_type = wide_group_sizes_type.lower(context, location)?;
+    let wide_group_sizes_tensor_type = wide_group_sizes_type.lower(mlir_context, location)?;
     let wide_group_sizes = if group_sizes_type.data_type() == DataType::U64 {
         group_sizes
     } else {
@@ -402,7 +402,7 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
         wide_group_sizes,
         PhysicalStoragePadding::Constant(0.0),
         block,
-        context,
+        mlir_context,
         location,
     )?;
     let physical_ragged_extent = u64::try_from(physical_ragged_extent).unwrap();
@@ -416,9 +416,9 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
     // physical extent and the saturating reducer remains associative.
     let capped_group_sizes = block.append_operation(stable_hlo::clamp(zero, wide_group_sizes, extent, location)?)?;
     let capped_group_sizes = capped_group_sizes.result(0).unwrap().as_ref();
-    let scalar_tensor_type = ArrayType::scalar(DataType::U64).lower(context, location)?;
-    let reducer_block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
-    let mut reducer_region = context.region();
+    let scalar_tensor_type = ArrayType::scalar(DataType::U64).lower(mlir_context, location)?;
+    let reducer_block = mlir_context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
+    let mut reducer_region = mlir_context.region();
     let mut reducer_block = reducer_region.append_block(reducer_block)?;
     let left = reducer_block.argument(0)?.as_ref();
     let right = reducer_block.argument(1)?.as_ref();
@@ -479,7 +479,7 @@ fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
     ragged_axis: usize,
     prefix_axes: &[usize],
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let group_axis = group_sizes_type.rank() - 1;
@@ -498,7 +498,7 @@ fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
     intermediate_dimensions.push(group_count.clone());
     intermediate_dimensions.extend(remaining_axes.iter().map(|axis| input_type.dimension(*axis)));
     let intermediate_type = input_type.clone().with_shape(Shape::new(intermediate_dimensions));
-    let intermediate_tensor_type = intermediate_type.lower(context, location)?;
+    let intermediate_tensor_type = intermediate_type.lower(mlir_context, location)?;
     let input_broadcast_dimensions =
         (0..prefix_axes.len()).chain((prefix_axes.len() + 1)..intermediate_type.rank()).collect::<Vec<_>>();
     let input = block.append_operation(stable_hlo::broadcast(
@@ -513,7 +513,7 @@ fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
         if group_sizes_type.rank() == 1 { vec![prefix_axes.len()] } else { (0..=prefix_axes.len()).collect() };
     let metadata_type = intermediate_type.clone().with_data_type(DataType::U64);
     let physical_metadata_type = metadata_type.physical_bound_type()?;
-    let physical_metadata_tensor_type = physical_metadata_type.lower(context, location)?;
+    let physical_metadata_tensor_type = physical_metadata_type.lower(mlir_context, location)?;
     let dimension_sources = (0..metadata_type.rank()).map(|axis| (input, axis)).collect::<Vec<_>>();
     let group_starts = block.append_operation(stable_hlo::broadcast(
         group_starts,
@@ -542,7 +542,7 @@ fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
         mask,
         dimension_sources.as_slice(),
         block,
-        context,
+        mlir_context,
         location,
     )?;
     let zero = if intermediate_type.static_shape().is_some() {
@@ -582,10 +582,10 @@ fn lower_dense_ragged_dot<'b, 'c: 'b, 't: 'c>(
     dimensions: &DotDimensionNumbers,
     output_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let dimensions = context.stable_hlo_dot_dimensions(
+    let dimensions = mlir_context.stable_hlo_dot_dimensions(
         dimensions.lhs_batching_dimensions(),
         dimensions.rhs_batching_dimensions(),
         dimensions.lhs_contracting_dimensions(),
@@ -597,7 +597,7 @@ fn lower_dense_ragged_dot<'b, 'c: 'b, 't: 'c>(
         dimensions,
         Some((Precision::Default, Precision::Default)),
         None,
-        output_type.lower(context, location)?,
+        output_type.lower(mlir_context, location)?,
         location,
     )?)?;
     Ok(dot.result(0).unwrap().as_ref())

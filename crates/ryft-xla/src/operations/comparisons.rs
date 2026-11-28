@@ -78,7 +78,7 @@ impl LowerableOperation for CompareOperation<ArrayType> {
             &inputs,
             &[operand_type],
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let value = self.direction().lower_comparison(left, right, &mut lowerer.block(), lowerer.location())?;

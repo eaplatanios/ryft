@@ -113,7 +113,7 @@ impl LowerableOperation for PlaceOperation {
             value = output_type.memory().lower_transfer(
                 &[value],
                 &mut lowerer.block(),
-                lowerer.context(),
+                lowerer.mlir_context(),
                 lowerer.location(),
             )?[0];
         }

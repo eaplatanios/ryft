@@ -37,7 +37,7 @@ impl LowerableOperation for SelectOperation<ArrayType> {
             input_types,
             output_types,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let result =
@@ -56,7 +56,7 @@ fn normalize_select_inputs<'b, 'c: 'b, 't: 'c, B, L>(
     input_types: &[ArrayType],
     output_types: &[ArrayType],
     block: &mut B,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: L,
 ) -> Result<[ValueRef<'b, 'c, 't>; 3], Error>
 where
@@ -67,7 +67,7 @@ where
     check_count!("input", input_types, 3, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
     let output_type = &output_types[0];
-    let output_tensor_type = output_type.lower(context, location)?;
+    let output_tensor_type = output_type.lower(mlir_context, location)?;
     let multiple_dynamic_axes = output_type
         .shape()
         .dimensions()
@@ -113,12 +113,12 @@ where
             // Native broadcast supports at most one bounded dynamic result axis. Convert at the input shape,
             // expose its physical capacity, broadcast that capacity, then restore the composed logical extents.
             let converted_type = input_types[index].clone().with_data_type(target_type.data_type());
-            let converted = normalize_elementwise_input(inputs[index], &converted_type, block, context, location)?;
+            let converted = normalize_elementwise_input(inputs[index], &converted_type, block, mlir_context, location)?;
             let physical_input = converted_type.lower_padded_physical_storage(
                 converted,
                 PhysicalStoragePadding::Constant(0.0),
                 &mut block.as_ref(),
-                context,
+                mlir_context,
                 location.as_ref(),
             )?;
             let physical_type = target_type.physical_bound_type()?;
@@ -135,7 +135,7 @@ where
             let output_axes = (first_axis..target_type.rank()).collect::<Vec<_>>();
             let broadcast = block.append_operation(stable_hlo::broadcast(
                 physical_input,
-                physical_type.lower(context, location)?,
+                physical_type.lower(mlir_context, location)?,
                 &output_axes,
                 location,
             )?)?;
@@ -148,11 +148,11 @@ where
                 result,
                 &sources,
                 &mut block.as_ref(),
-                context,
+                mlir_context,
                 location.as_ref(),
             )?;
         } else {
-            inputs[index] = normalize_elementwise_input(inputs[index], &target_type, block, context, location)?;
+            inputs[index] = normalize_elementwise_input(inputs[index], &target_type, block, mlir_context, location)?;
         }
     }
     Ok(inputs)

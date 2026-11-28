@@ -154,7 +154,7 @@ pub(crate) trait AttentionConfigurationLoweringExtension {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 
@@ -173,7 +173,7 @@ pub(crate) trait AttentionConfigurationLoweringExtension {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -188,7 +188,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let input_count = input_structure.parameter_count();
@@ -227,7 +227,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                         *value,
                         PhysicalStoragePadding::Constant(0.0),
                         block,
-                        context,
+                        mlir_context,
                         location,
                     )
                 })
@@ -247,7 +247,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 input_types,
                 &score_type,
                 block,
-                context,
+                mlir_context,
                 location,
             )?;
             let sequence_lengths = if uses_sequence_lengths {
@@ -259,7 +259,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                         &batch,
                         physical_batch,
                         block,
-                        context,
+                        mlir_context,
                         location,
                     )?,
                 };
@@ -271,7 +271,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                         &batch,
                         physical_batch,
                         block,
-                        context,
+                        mlir_context,
                         location,
                     )?,
                 };
@@ -306,21 +306,21 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
             }
             let attended_type =
                 attention_array_type(data_type, &[physical_batch, heads, physical_query_sequence, head_dimension]);
-            let mut custom_call_output_types = vec![attended_type.lower(context, location)?];
+            let mut custom_call_output_types = vec![attended_type.lower(mlir_context, location)?];
             let mut result_layouts = vec![vec![3, 1, 2, 0]];
             if return_residual {
                 let residual_type =
                     attention_array_type(DataType::F32, &[physical_batch, heads, physical_query_sequence]);
-                custom_call_output_types.push(residual_type.lower(context, location)?);
+                custom_call_output_types.push(residual_type.lower(mlir_context, location)?);
                 result_layouts.push(vec![2, 1, 0]);
             }
-            custom_call_output_types.push(attention_array_type(DataType::U8, &[0]).lower(context, location)?);
+            custom_call_output_types.push(attention_array_type(DataType::U8, &[0]).lower(mlir_context, location)?);
             result_layouts.push(vec![0]);
             let custom_call = block.append_operation(stable_hlo::custom_call(
                 operands.as_slice(),
                 fused_attention_target_name(bias.is_some(), self.dropout().is_some(), false).as_str(),
                 false,
-                Some(context.string_attribute(backend_config.as_str()).as_ref()),
+                Some(mlir_context.string_attribute(backend_config.as_str()).as_ref()),
                 CustomCallApiVersion::StatusReturning,
                 &[],
                 Some(CustomCallMemoryLayouts { operands: operand_layouts, results: result_layouts }),
@@ -345,7 +345,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 result,
                 output_sources.as_slice(),
                 block,
-                context,
+                mlir_context,
                 location,
             )?;
             let mut results = vec![result];
@@ -370,7 +370,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                     residual,
                     residual_sources.as_slice(),
                     block,
-                    context,
+                    mlir_context,
                     location,
                 )?);
             }
@@ -386,7 +386,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let input_count = input_structure.parameter_count() + 3;
@@ -437,7 +437,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                         *value,
                         PhysicalStoragePadding::Constant(0.0),
                         block,
-                        context,
+                        mlir_context,
                         location,
                     )
                 })
@@ -455,7 +455,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 input_types,
                 &score_type,
                 block,
-                context,
+                mlir_context,
                 location,
             )?;
             let sequence_lengths = if uses_sequence_lengths {
@@ -467,7 +467,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                         &batch,
                         physical_batch,
                         block,
-                        context,
+                        mlir_context,
                         location,
                     )?,
                 };
@@ -479,7 +479,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                         &batch,
                         physical_batch,
                         block,
-                        context,
+                        mlir_context,
                         location,
                     )?,
                 };
@@ -534,22 +534,22 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 &[physical_batch, key_value_heads, physical_key_value_sequence, head_dimension],
             );
             let mut custom_call_output_types = vec![
-                query_gradient_type.lower(context, location)?,
-                key_value_gradient_type.lower(context, location)?,
-                key_value_gradient_type.lower(context, location)?,
+                query_gradient_type.lower(mlir_context, location)?,
+                key_value_gradient_type.lower(mlir_context, location)?,
+                key_value_gradient_type.lower(mlir_context, location)?,
             ];
             let mut result_layouts = vec![vec![3, 1, 2, 0], vec![3, 1, 2, 0], vec![3, 1, 2, 0]];
             if bias.is_some() {
-                custom_call_output_types.push(score_type.lower(context, location)?);
+                custom_call_output_types.push(score_type.lower(mlir_context, location)?);
                 result_layouts.push(vec![3, 2, 1, 0]);
             }
-            custom_call_output_types.push(attention_array_type(DataType::U8, &[0]).lower(context, location)?);
+            custom_call_output_types.push(attention_array_type(DataType::U8, &[0]).lower(mlir_context, location)?);
             result_layouts.push(vec![0]);
             let custom_call = block.append_operation(stable_hlo::custom_call(
                 operands.as_slice(),
                 fused_attention_target_name(bias.is_some(), self.dropout().is_some(), true).as_str(),
                 false,
-                Some(context.string_attribute(backend_config.as_str()).as_ref()),
+                Some(mlir_context.string_attribute(backend_config.as_str()).as_ref()),
                 CustomCallApiVersion::StatusReturning,
                 &[],
                 Some(CustomCallMemoryLayouts { operands: operand_layouts, results: result_layouts }),
@@ -580,7 +580,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                     transposed,
                     sources.as_slice(),
                     block,
-                    context,
+                    mlir_context,
                     location,
                 )?);
             }
@@ -611,7 +611,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                         &reduced_type,
                         FloatExtremumForm::TotalOrder,
                         block,
-                        context,
+                        mlir_context,
                         location,
                     )?;
                 }
@@ -629,7 +629,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 if bias_type.data_type() != data_type {
                     let converted = block.append_operation(stable_hlo::convert(
                         bias_cotangent,
-                        physical_bias_type.lower(context, location)?,
+                        physical_bias_type.lower(mlir_context, location)?,
                         location,
                     )?)?;
                     bias_cotangent = converted.result(0).unwrap().as_ref();
@@ -639,7 +639,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                     bias_cotangent,
                     sources.as_slice(),
                     block,
-                    context,
+                    mlir_context,
                     location,
                 )?);
             }
@@ -863,7 +863,7 @@ fn broadcast_fused_attention_score_operand<'b, 'c: 'b, 't: 'c>(
     r#type: &ArrayType,
     score_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let mut dimensions = vec![1; 4 - r#type.rank()];
@@ -876,7 +876,7 @@ fn broadcast_fused_attention_score_operand<'b, 'c: 'b, 't: 'c>(
     };
     let broadcast = block.append_operation(stable_hlo::broadcast(
         value,
-        score_type.lower(context, location)?,
+        score_type.lower(mlir_context, location)?,
         &[0, 1, 2, 3],
         location,
     )?)?;
@@ -892,7 +892,7 @@ fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
     input_types: &[ArrayType],
     score_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Option<ValueRef<'b, 'c, 't>>, Error> {
     let bias = inputs
@@ -905,7 +905,7 @@ fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
                 &input_types[index].physical_bound_type()?,
                 &score_type.clone().with_data_type(input_types[index].data_type()),
                 block,
-                context,
+                mlir_context,
                 location,
             )?;
             let bias_data_type = input_types[index].data_type();
@@ -919,7 +919,8 @@ fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
             // infinite biases and NaNs convert as they are. The saturation runs in the data type of an `f64` bias
             // and in `f32` for every other bias data type.
             let working_data_type = if bias_data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
-            let working_tensor_type = score_type.clone().with_data_type(working_data_type).lower(context, location)?;
+            let working_tensor_type =
+                score_type.clone().with_data_type(working_data_type).lower(mlir_context, location)?;
             let bias = if bias_data_type == working_data_type {
                 bias
             } else {
@@ -936,8 +937,11 @@ fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
             let finite = finite.result(0).unwrap().as_ref();
             let bias = block.append_operation(stable_hlo::select(finite, saturated, bias, location)?)?;
             let bias = bias.result(0).unwrap().as_ref();
-            let converted =
-                block.append_operation(stable_hlo::convert(bias, score_type.lower(context, location)?, location)?)?;
+            let converted = block.append_operation(stable_hlo::convert(
+                bias,
+                score_type.lower(mlir_context, location)?,
+                location,
+            )?)?;
             Ok::<_, Error>(converted.result(0).unwrap().as_ref())
         })
         .transpose()?;
@@ -949,7 +953,7 @@ fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
                 &input_types[index].physical_bound_type()?,
                 &score_type.clone().with_data_type(DataType::Boolean),
                 block,
-                context,
+                mlir_context,
                 location,
             )?;
             let zero = score_type.lower_f64_splat(0.0, block, location)?;
@@ -981,14 +985,18 @@ fn synthesize_fused_attention_sequence_lengths<'b, 'c: 'b, 't: 'c>(
     batch: &Dimension,
     physical_batch: usize,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let size = block.append_operation(stable_hlo::get_dimension_size(source, source_axis, location)?)?;
     let size = size.result(0).unwrap().as_ref();
     let physical_type = attention_array_type(DataType::I32, &[physical_batch]);
-    let lengths =
-        block.append_operation(stable_hlo::broadcast(size, physical_type.lower(context, location)?, &[], location)?)?;
+    let lengths = block.append_operation(stable_hlo::broadcast(
+        size,
+        physical_type.lower(mlir_context, location)?,
+        &[],
+        location,
+    )?)?;
     let mut lengths = lengths.result(0).unwrap().as_ref();
     if matches!(batch, Dimension::Dynamic(_)) {
         let batch_size = block.append_operation(stable_hlo::get_dimension_size(source, 0, location)?)?;
@@ -997,7 +1005,7 @@ fn synthesize_fused_attention_sequence_lengths<'b, 'c: 'b, 't: 'c>(
         let dynamic = block.append_operation(stable_hlo::set_dimension_size(
             lengths,
             batch_size,
-            logical_type.lower(context, location)?,
+            logical_type.lower(mlir_context, location)?,
             0,
             location,
         )?)?;
@@ -1006,7 +1014,7 @@ fn synthesize_fused_attention_sequence_lengths<'b, 'c: 'b, 't: 'c>(
             lengths,
             PhysicalStoragePadding::Constant(0.0),
             block,
-            context,
+            mlir_context,
             location,
         )?;
     }

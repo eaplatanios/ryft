@@ -93,7 +93,7 @@ impl LowerableOperation for Atan2Operation<ArrayType> {
             input_values,
             output_types,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let result = lowerer.block().append_operation(stable_hlo::atan2(left, right, lowerer.location())?)?;

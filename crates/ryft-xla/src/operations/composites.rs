@@ -131,7 +131,7 @@ impl NamedCompositeImplementation {
                 array_types(input_types)?.as_slice(),
                 array_types(output_types)?.as_slice(),
                 &mut lowerer.block(),
-                lowerer.context(),
+                lowerer.mlir_context(),
                 lowerer.location(),
             ),
             Self::AttentionBackward { configuration, input_structure } => (*configuration).lower_fused_backward(
@@ -140,7 +140,7 @@ impl NamedCompositeImplementation {
                 array_types(input_types)?.as_slice(),
                 array_types(output_types)?.as_slice(),
                 &mut lowerer.block(),
-                lowerer.context(),
+                lowerer.mlir_context(),
                 lowerer.location(),
             ),
             Self::FusedAttentionUnavailable { name, reason } => {
@@ -188,7 +188,7 @@ where
             }
             // Calls whose key and boundary are shared by calls with another body have no function under that key and
             // boundary, so they find their shared function by their own body instead, as `NamedFunctionKey` explains.
-            let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+            let (mut block, context, location) = (lowerer.block(), lowerer.mlir_context(), lowerer.location());
             let named_key = NamedFunctionKey::new(key.clone(), input_types.clone(), output_types.clone());
             if let Some(function) = lowerer.lowering_context().shared_function(&named_key) {
                 let symbol = function.symbol();

@@ -46,7 +46,7 @@ impl LowerableOperation for ParallelAllToAllOperation {
             &input_types[0],
             &output_types[0],
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )
     }
@@ -60,7 +60,7 @@ impl MemberLowerableOperation<Type> for ParallelAllToAllOperation {
         input_types: &[Type],
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let lowering_context = lowerer.lowering_context();
         let block = &mut lowerer.block();
@@ -107,7 +107,7 @@ trait ParallelAllToAllOperationLoweringExtension {
         input_array_type: &ArrayType,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -120,7 +120,7 @@ impl ParallelAllToAllOperationLoweringExtension for ParallelAllToAllOperation {
         input_array_type: &ArrayType,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let (replica_groups, axis_size) =
@@ -142,7 +142,7 @@ impl ParallelAllToAllOperationLoweringExtension for ParallelAllToAllOperation {
                 let expanded_type = input_array_type
                     .with_inserted_dimension(concatenation_axis, Dimension::Static(1))
                     .map_err(ProgramError::from)?;
-                let expanded_type = expanded_type.lower(context, location)?;
+                let expanded_type = expanded_type.lower(mlir_context, location)?;
                 let broadcast_dimensions =
                     (0..input_array_type.rank() + 1).filter(|&axis| axis != concatenation_axis).collect::<Vec<_>>();
                 let expanded = block.append_operation(stable_hlo::broadcast(
@@ -169,7 +169,7 @@ impl ParallelAllToAllOperationLoweringExtension for ParallelAllToAllOperation {
         if self.options().mode() == CollectiveMode::Tiled || split_axis == concatenation_axis {
             return Ok(vec![result]);
         }
-        Ok(vec![collapse_singleton_axis(result, output_array_type, block, context, location)?])
+        Ok(vec![collapse_singleton_axis(result, output_array_type, block, mlir_context, location)?])
     }
 }
 

@@ -45,7 +45,7 @@ impl LowerableOperation for ParallelAllGatherOperation {
             input_values[0],
             &output_types[0],
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )
     }
@@ -59,7 +59,7 @@ impl MemberLowerableOperation<Type> for ParallelAllGatherOperation {
         input_types: &[Type],
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let lowering_context = lowerer.lowering_context();
         let block = &mut lowerer.block();
@@ -99,7 +99,7 @@ trait ParallelAllGatherOperationLoweringExtension {
         input_value: ValueRef<'b, 'c, 't>,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -111,15 +111,15 @@ impl ParallelAllGatherOperationLoweringExtension for ParallelAllGatherOperation 
         input_value: ValueRef<'b, 'c, 't>,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let (replica_groups, _) =
             lowering_context.replica_groups(self.axes(), self.axis_size(), self.options().axis_index_groups())?;
         let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
         let input_value =
-            insert_untiled_all_gather_axis(self, input_value, output_array_type, block, context, location)?;
-        let output_type = output_array_type.lower(context, location)?;
+            insert_untiled_all_gather_axis(self, input_value, output_array_type, block, mlir_context, location)?;
+        let output_type = output_array_type.lower(mlir_context, location)?;
         let result = block.append_operation(stable_hlo::all_gather(
             &[input_value],
             self.concatenation_axis(),
@@ -141,7 +141,7 @@ fn insert_untiled_all_gather_axis<'b, 'c: 'b, 't: 'c>(
     input_value: ValueRef<'b, 'c, 't>,
     output_array_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if operation.options().mode() == CollectiveMode::Tiled {
@@ -149,7 +149,7 @@ fn insert_untiled_all_gather_axis<'b, 'c: 'b, 't: 'c>(
     }
     let mut dimensions = output_array_type.shape().dimensions().to_vec();
     dimensions[operation.concatenation_axis()] = Dimension::Static(1);
-    let input_type = (output_array_type.clone().with_shape(Shape::new(dimensions))).lower(context, location)?;
+    let input_type = (output_array_type.clone().with_shape(Shape::new(dimensions))).lower(mlir_context, location)?;
     let broadcast_dimensions = (0..output_array_type.rank())
         .filter(|&axis| axis != operation.concatenation_axis())
         .collect::<Vec<_>>();

@@ -33,7 +33,7 @@ impl LowerableOperation for CustomCallOperation {
         for requirement in self.runtime_requirements()? {
             lowerer.require_runtime(requirement)?;
         }
-        let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+        let (mut block, context, location) = (lowerer.block(), lowerer.mlir_context(), lowerer.location());
         let results = self.lower_to_mlir(
             input_values,
             input_types,
@@ -58,7 +58,7 @@ impl MemberLowerableOperation<Type> for CustomCallOperation {
         for requirement in self.runtime_requirements()? {
             lowerer.require_runtime(requirement)?;
         }
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
         let effect_tokens = lowerer.effect_tokens_mut();
@@ -239,7 +239,7 @@ fn lower_custom_call_output_memories<'b, 'c: 'b, 't: 'c>(
     results: Vec<ValueRef<'b, 'c, 't>>,
     output_types: &[ArrayType],
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     results
@@ -247,7 +247,7 @@ fn lower_custom_call_output_memories<'b, 'c: 'b, 't: 'c>(
         .zip(output_types)
         .map(|(result, output_type)| match output_type.memory() {
             Memory::Device => Ok(result),
-            memory => Ok(memory.lower_transfer(&[result], block, context, location)?[0]),
+            memory => Ok(memory.lower_transfer(&[result], block, mlir_context, location)?[0]),
         })
         .collect()
 }
@@ -273,7 +273,7 @@ trait CustomCallOperationLoweringExtension {
         output_types: &[ArrayType],
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -286,7 +286,7 @@ impl CustomCallOperationLoweringExtension for CustomCallOperation {
         output_types: &[ArrayType],
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let token_class = custom_call_token_class(self)?;
@@ -304,10 +304,10 @@ impl CustomCallOperationLoweringExtension for CustomCallOperation {
         let input_types = input_types.as_slice();
         let attributes = lower_custom_call_attributes(
             self.attributes().iter().filter(|(name, _)| name != RUNTIME_REQUIREMENTS_ATTRIBUTE),
-            context,
+            mlir_context,
             location,
         )?;
-        let backend_config = context.dictionary_attribute(&attributes);
+        let backend_config = mlir_context.dictionary_attribute(&attributes);
         let memory_layouts = Some(lower_custom_call_memory_layouts(input_types, output_types, has_token)?);
         #[cfg(feature = "mosaic-gpu")]
         let memory_layouts = if self.target_name() == ryft_xla_sys::mlir::dialects::mosaic::gpu::MOSAIC_GPU_FFI_TARGET {
@@ -340,10 +340,10 @@ impl CustomCallOperationLoweringExtension for CustomCallOperation {
         }
         let mut lowered_output_types = output_types
             .iter()
-            .map(|output_type| output_type.lower(context, location).map(|r#type| r#type.as_ref()))
+            .map(|output_type| output_type.lower(mlir_context, location).map(|r#type| r#type.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         if has_token {
-            lowered_output_types.push(context.stable_hlo_token_type()?.as_ref());
+            lowered_output_types.push(mlir_context.stable_hlo_token_type()?.as_ref());
         }
         let output_operand_aliases = self
             .input_output_aliases()
@@ -351,7 +351,7 @@ impl CustomCallOperationLoweringExtension for CustomCallOperation {
             .map(|alias| {
                 let output_tuple_indices =
                     if lowered_output_types.len() == 1 { Vec::new() } else { vec![alias.output_index()] };
-                context.stable_hlo_output_operand_alias(output_tuple_indices.as_slice(), alias.input_index(), &[])
+                mlir_context.stable_hlo_output_operand_alias(output_tuple_indices.as_slice(), alias.input_index(), &[])
             })
             .collect::<Result<Vec<_>, _>>()?;
         let lowered = block.append_operation(stable_hlo::custom_call(
@@ -484,14 +484,14 @@ impl ArrayTypeCustomCallLoweringExtension for ArrayType {
 /// [`CustomCallAttributeLoweringExtension::lower`] for the encoding of each attribute kind.
 fn lower_custom_call_attributes<'o, 'c, 't: 'c>(
     attributes: impl IntoIterator<Item = &'o (String, CustomCallAttribute)>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<NamedAttributeRef<'c, 't>>, Error> {
     attributes
         .into_iter()
         .map(|(name, value)| {
-            let value = value.lower(context, location)?;
-            Ok(context.named_attribute(context.identifier(name.as_str()), value))
+            let value = value.lower(mlir_context, location)?;
+            Ok(mlir_context.named_attribute(mlir_context.identifier(name.as_str()), value))
         })
         .collect()
 }
@@ -508,7 +508,7 @@ trait CustomCallAttributeLoweringExtension {
     /// attribute holding the exact bytes, and dictionaries recurse.
     fn lower<'c, 't: 'c>(
         &self,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<AttributeRef<'c, 't>, Error>;
 }
@@ -516,68 +516,77 @@ trait CustomCallAttributeLoweringExtension {
 impl CustomCallAttributeLoweringExtension for CustomCallAttribute {
     fn lower<'c, 't: 'c>(
         &self,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<AttributeRef<'c, 't>, Error> {
         let unsigned_tensor_type = |bit_width: usize, length: usize| {
-            context.tensor_type(context.unsigned_integer_type(bit_width), &[MlirSize::Static(length)], None, location)
+            mlir_context.tensor_type(
+                mlir_context.unsigned_integer_type(bit_width),
+                &[MlirSize::Static(length)],
+                None,
+                location,
+            )
         };
         Ok(match self {
-            CustomCallAttribute::String(string) => context.string_attribute(string.as_str()).as_ref(),
-            CustomCallAttribute::Bytes(bytes) => context.string_attribute(StringRef::from(bytes.as_slice())).as_ref(),
-            CustomCallAttribute::Boolean(boolean) => context.boolean_attribute(*boolean).as_ref(),
+            CustomCallAttribute::String(string) => mlir_context.string_attribute(string.as_str()).as_ref(),
+            CustomCallAttribute::Bytes(bytes) => {
+                mlir_context.string_attribute(StringRef::from(bytes.as_slice())).as_ref()
+            }
+            CustomCallAttribute::Boolean(boolean) => mlir_context.boolean_attribute(*boolean).as_ref(),
             CustomCallAttribute::I8(integer) => {
-                context.integer_attribute(context.signless_integer_type(8), i64::from(*integer)).as_ref()
+                mlir_context.integer_attribute(mlir_context.signless_integer_type(8), i64::from(*integer)).as_ref()
             }
             CustomCallAttribute::I16(integer) => {
-                context.integer_attribute(context.signless_integer_type(16), i64::from(*integer)).as_ref()
+                mlir_context.integer_attribute(mlir_context.signless_integer_type(16), i64::from(*integer)).as_ref()
             }
             CustomCallAttribute::I32(integer) => {
-                context.integer_attribute(context.signless_integer_type(32), i64::from(*integer)).as_ref()
+                mlir_context.integer_attribute(mlir_context.signless_integer_type(32), i64::from(*integer)).as_ref()
             }
             CustomCallAttribute::I64(integer) => {
-                context.integer_attribute(context.signless_integer_type(64), *integer).as_ref()
+                mlir_context.integer_attribute(mlir_context.signless_integer_type(64), *integer).as_ref()
             }
             CustomCallAttribute::U8(integer) => {
-                context.integer_attribute(context.unsigned_integer_type(8), i64::from(*integer)).as_ref()
+                mlir_context.integer_attribute(mlir_context.unsigned_integer_type(8), i64::from(*integer)).as_ref()
             }
             CustomCallAttribute::U16(integer) => {
-                context.integer_attribute(context.unsigned_integer_type(16), i64::from(*integer)).as_ref()
+                mlir_context.integer_attribute(mlir_context.unsigned_integer_type(16), i64::from(*integer)).as_ref()
             }
             CustomCallAttribute::U32(integer) => {
-                context.integer_attribute(context.unsigned_integer_type(32), i64::from(*integer)).as_ref()
+                mlir_context.integer_attribute(mlir_context.unsigned_integer_type(32), i64::from(*integer)).as_ref()
             }
             // MLIR stores integer attributes as 64-bit words and the unsigned type reinterprets their bits.
-            CustomCallAttribute::U64(integer) => {
-                context.integer_attribute(context.unsigned_integer_type(64), integer.cast_signed()).as_ref()
-            }
+            CustomCallAttribute::U64(integer) => mlir_context
+                .integer_attribute(mlir_context.unsigned_integer_type(64), integer.cast_signed())
+                .as_ref(),
             CustomCallAttribute::F32(float) => {
-                context.float_attribute(context.float32_type(), f64::from(*float)).as_ref()
+                mlir_context.float_attribute(mlir_context.float32_type(), f64::from(*float)).as_ref()
             }
-            CustomCallAttribute::F64(float) => context.float_attribute(context.float64_type(), *float).as_ref(),
+            CustomCallAttribute::F64(float) => {
+                mlir_context.float_attribute(mlir_context.float64_type(), *float).as_ref()
+            }
             CustomCallAttribute::Array(array) => match array {
-                CustomCallArrayAttribute::I8(values) => context.dense_i8_array_attribute(values)?.as_ref(),
-                CustomCallArrayAttribute::I16(values) => context.dense_i16_array_attribute(values)?.as_ref(),
-                CustomCallArrayAttribute::I32(values) => context.dense_i32_array_attribute(values)?.as_ref(),
-                CustomCallArrayAttribute::I64(values) => context.dense_i64_array_attribute(values)?.as_ref(),
+                CustomCallArrayAttribute::I8(values) => mlir_context.dense_i8_array_attribute(values)?.as_ref(),
+                CustomCallArrayAttribute::I16(values) => mlir_context.dense_i16_array_attribute(values)?.as_ref(),
+                CustomCallArrayAttribute::I32(values) => mlir_context.dense_i32_array_attribute(values)?.as_ref(),
+                CustomCallArrayAttribute::I64(values) => mlir_context.dense_i64_array_attribute(values)?.as_ref(),
                 CustomCallArrayAttribute::U8(values) => {
-                    context.dense_u8_elements_attribute(unsigned_tensor_type(8, values.len())?, values)?.as_ref()
+                    mlir_context.dense_u8_elements_attribute(unsigned_tensor_type(8, values.len())?, values)?.as_ref()
                 }
                 CustomCallArrayAttribute::U16(values) => {
-                    context.dense_u16_elements_attribute(unsigned_tensor_type(16, values.len())?, values)?.as_ref()
+                    mlir_context.dense_u16_elements_attribute(unsigned_tensor_type(16, values.len())?, values)?.as_ref()
                 }
                 CustomCallArrayAttribute::U32(values) => {
-                    context.dense_u32_elements_attribute(unsigned_tensor_type(32, values.len())?, values)?.as_ref()
+                    mlir_context.dense_u32_elements_attribute(unsigned_tensor_type(32, values.len())?, values)?.as_ref()
                 }
                 CustomCallArrayAttribute::U64(values) => {
-                    context.dense_u64_elements_attribute(unsigned_tensor_type(64, values.len())?, values)?.as_ref()
+                    mlir_context.dense_u64_elements_attribute(unsigned_tensor_type(64, values.len())?, values)?.as_ref()
                 }
-                CustomCallArrayAttribute::F32(values) => context.dense_f32_array_attribute(values)?.as_ref(),
-                CustomCallArrayAttribute::F64(values) => context.dense_f64_array_attribute(values)?.as_ref(),
+                CustomCallArrayAttribute::F32(values) => mlir_context.dense_f32_array_attribute(values)?.as_ref(),
+                CustomCallArrayAttribute::F64(values) => mlir_context.dense_f64_array_attribute(values)?.as_ref(),
             },
-            CustomCallAttribute::Dictionary(attributes) => {
-                context.dictionary_attribute(&lower_custom_call_attributes(attributes, context, location)?).as_ref()
-            }
+            CustomCallAttribute::Dictionary(attributes) => mlir_context
+                .dictionary_attribute(&lower_custom_call_attributes(attributes, mlir_context, location)?)
+                .as_ref(),
         })
     }
 }

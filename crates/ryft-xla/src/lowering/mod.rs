@@ -253,7 +253,7 @@ pub struct Lowerer<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type> = Operation
     block: BlockRef<'b, 'c, 't>,
 
     /// MLIR context owning the block and created operations.
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
 
     /// Shared MLIR location used for emitted operations.
     location: LocationRef<'c, 't>,
@@ -275,13 +275,13 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     /// Creates a lowerer that emits operations into `block` in the given program lowering context.
     pub(crate) fn new(
         block: BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
         lowering_context: ProgramLoweringContext,
     ) -> Self {
         Self {
             block,
-            context,
+            mlir_context,
             location,
             regions: Vec::new(),
             captured_values: Vec::new(),
@@ -349,8 +349,8 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     }
 
     /// Returns the MLIR context that owns the block of this lowerer and the operations emitted into it.
-    pub fn context(&self) -> &'c MlirContext<'t> {
-        self.context
+    pub fn mlir_context(&self) -> &'c MlirContext<'t> {
+        self.mlir_context
     }
 
     /// Returns the location of the emitted operations, which carries the provenance of the instruction being lowered.
@@ -425,7 +425,7 @@ impl<'b, 'c: 'b, 't: 'c, O: CoreOperation<Type = Type>> Lowerer<'b, 'c, 't, O> {
     /// Returns [`LoweringError::UnsupportedDataType`] when an element type has no StableHLO tensor representation,
     /// and propagates native construction failures through [`Error::Mlir`].
     pub fn lower_tensor_type(&self, array_type: &ArrayType) -> Result<ryft_mlir::TensorTypeRef<'c, 't>, Error> {
-        array_type.lower(self.context, self.location)
+        array_type.lower(self.mlir_context, self.location)
     }
 
     /// Returns the current token of the `effect_class` chain of the enclosing lowering scope, creating that chain with
@@ -516,7 +516,7 @@ pub trait InstructionLowerer<'b, 'c: 'b, 't: 'c> {
     fn block(&self) -> BlockRef<'b, 'c, 't>;
 
     /// Returns the MLIR context that owns the block and the operations emitted into it.
-    fn context(&self) -> &'c MlirContext<'t>;
+    fn mlir_context(&self) -> &'c MlirContext<'t>;
 
     /// Returns the location of the emitted operations, which carries the provenance of the instruction.
     fn location(&self) -> LocationRef<'c, 't>;
@@ -651,8 +651,8 @@ impl<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation> InstructionLowerer<'b, 'c,
     }
 
     #[inline]
-    fn context(&self) -> &'c MlirContext<'t> {
-        self.lowerer.context()
+    fn mlir_context(&self) -> &'c MlirContext<'t> {
+        self.lowerer.mlir_context()
     }
 
     #[inline]

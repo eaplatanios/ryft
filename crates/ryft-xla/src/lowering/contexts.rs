@@ -379,22 +379,22 @@ impl ProgramLoweringContext {
     /// being replaced.
     pub(super) fn lower_provenance<'c, 't: 'c>(
         &self,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         provenance: &Provenance,
         base: LocationRef<'c, 't>,
     ) -> LocationRef<'c, 't> {
         /// Recursively lowers `provenance` above `base` without touching the module-wide flag.
         fn lower<'c, 't: 'c>(
-            context: &'c MlirContext<'t>,
+            mlir_context: &'c MlirContext<'t>,
             provenance: &Provenance,
             base: LocationRef<'c, 't>,
         ) -> LocationRef<'c, 't> {
             if let Some((scope, origin)) = provenance.as_scope() {
-                let child = lower(context, origin, base);
-                context.named_location(scope.name(), Some(child)).as_ref()
+                let child = lower(mlir_context, origin, base);
+                mlir_context.named_location(scope.name(), Some(child)).as_ref()
             } else if let Some(origins) = provenance.as_fused() {
-                let locations = origins.iter().map(|origin| lower(context, origin, base)).collect::<Vec<_>>();
-                context.fused_location::<_, AttributeRef>(locations.as_slice(), None).as_ref()
+                let locations = origins.iter().map(|origin| lower(mlir_context, origin, base)).collect::<Vec<_>>();
+                mlir_context.fused_location::<_, AttributeRef>(locations.as_slice(), None).as_ref()
             } else {
                 base
             }
@@ -406,7 +406,7 @@ impl ProgramLoweringContext {
 
         self.state.module.has_provenance.set(true);
 
-        lower(context, provenance, base)
+        lower(mlir_context, provenance, base)
     }
 }
 
@@ -590,7 +590,7 @@ pub(crate) trait PrivateFunctionProgram {
         &self,
         symbol: &str,
         lowering_context: &ProgramLoweringContext,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<func::DetachedFuncOperation<'c, 't>, Error>;
 }

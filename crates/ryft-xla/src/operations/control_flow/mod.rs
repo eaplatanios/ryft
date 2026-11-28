@@ -95,7 +95,7 @@ pub(crate) fn lower_region_guard<'b, 'c: 'b, 't: 'c>(
     values: &[ValueRef<'b, 'c, 't>],
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
     let Some((guard, members)) =
@@ -112,7 +112,7 @@ pub(crate) fn lower_region_guard<'b, 'c: 'b, 't: 'c>(
         &member_types,
         effect_tokens,
         block,
-        context,
+        mlir_context,
         location,
     )
 }
@@ -221,7 +221,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     input_type: &Type,
     region_input_type: &Type,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let (Type::Array(input_type), Type::Array(declared_type)) = (input_type, region_input_type) else {
@@ -257,7 +257,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
         });
     }
 
-    let physical_value = input_type.lower_physical_storage(value, block, context, location)?;
+    let physical_value = input_type.lower_physical_storage(value, block, mlir_context, location)?;
     let physical_input_type = input_type.physical_bound_type()?;
     let physical_type = declared_type.physical_bound_type()?;
     let rank = declared_type.rank();
@@ -290,7 +290,7 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
         let refined = block.append_operation(stable_hlo::set_dimension_size(
             value,
             size,
-            refined_type.lower(context, location)?,
+            refined_type.lower(mlir_context, location)?,
             axis,
             location,
         )?)?;
@@ -311,7 +311,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
     region_output_types: &[Type],
     output_types: &[Type],
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("output", values, region_output_types.len(), ProgramError);
@@ -340,7 +340,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
             });
         }
 
-        let physical_value = declared_type.lower_physical_storage(value, block, context, location)?;
+        let physical_value = declared_type.lower_physical_storage(value, block, mlir_context, location)?;
         let physical_type = declared_type.physical_bound_type()?;
         let limits = physical_type
             .shape()
@@ -366,7 +366,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
             let refined = block.append_operation(stable_hlo::set_dimension_size(
                 value,
                 size,
-                refined_type.lower(context, location)?,
+                refined_type.lower(mlir_context, location)?,
                 axis,
                 location,
             )?)?;
@@ -394,7 +394,7 @@ pub(crate) trait ControlFlowRegionLoweringExtension<O: ProgramLoweringOperation>
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[Type],
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
         captured_values: &[ValueRef<'b, 'c, 't>],
         lowering_context: &ProgramLoweringContext,
@@ -409,15 +409,15 @@ impl<O: ProgramLoweringOperation> ControlFlowRegionLoweringExtension<O> for Flat
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[Type],
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
         captured_values: &[ValueRef<'b, 'c, 't>],
         lowering_context: &ProgramLoweringContext,
         entry_effect_tokens: EffectTokens<'b, 'c, 't>,
         threaded_effects: EffectClasses,
     ) -> Result<DetachedRegion<'c, 't>, Error> {
-        let mut region = context.region();
-        let block = context.block_with_no_arguments();
+        let mut region = mlir_context.region();
+        let block = mlir_context.block_with_no_arguments();
         {
             let mut block_ref = block.as_ref();
             let mut region_effect_tokens = entry_effect_tokens;
@@ -437,7 +437,7 @@ impl<O: ProgramLoweringOperation> ControlFlowRegionLoweringExtension<O> for Flat
                 &self.output_types(),
                 output_types,
                 &mut block_ref,
-                context,
+                mlir_context,
                 location,
             )?;
             outputs.extend(threaded_effect_token_values(region_effect_tokens, threaded_effects));
@@ -487,12 +487,12 @@ pub(crate) fn append_loop_effect_tokens<'b, 'c: 'b, 't: 'c>(
     state_values: &mut Vec<ValueRef<'b, 'c, 't>>,
     state_types: &mut Vec<TypeRef<'c, 't>>,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
     for effect in token_threaded_effects(threaded_effects) {
         state_values.push(current_or_new_token(effect, effect_tokens, block, location)?);
-        state_types.push(context.stable_hlo_token_type()?.as_ref());
+        state_types.push(mlir_context.stable_hlo_token_type()?.as_ref());
     }
     Ok(())
 }

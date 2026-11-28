@@ -95,15 +95,15 @@ pub(crate) trait ArrayLiteralLoweringExtension: 'static + Value<Type = ArrayType
     /// Builds a [`DenseElementsAttributeRef`] that contains this value.
     fn lower_attribute<'c, 't>(
         &self,
-        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        context: &'c MlirContext<'t>,
+        tensor_type: TensorTypeRef<'c, 't>,
+        mlir_context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, Error>;
 
     /// Lowers this concrete value to a StableHLO constant operation and applies its declared memory placement.
     fn lower_constant<'b, 'c: 'b, 't: 'c, B, L>(
         &self,
         block: &mut B,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: L,
     ) -> Result<ValueRef<'b, 'c, 't>, Error>
     where
@@ -111,13 +111,13 @@ pub(crate) trait ArrayLiteralLoweringExtension: 'static + Value<Type = ArrayType
         L: Copy + Location<'c, 't>,
     {
         let value_type = self.r#type();
-        let tensor_type = value_type.lower(context, location)?;
-        let elements = self.lower_attribute(tensor_type, context)?;
+        let tensor_type = value_type.lower(mlir_context, location)?;
+        let elements = self.lower_attribute(tensor_type, mlir_context)?;
         let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
         let constant = constant.result(0)?.as_ref();
         match value_type.memory() {
             Memory::Device => Ok(constant),
-            memory => Ok(memory.lower_transfer(&[constant], block, context, location)?[0]),
+            memory => Ok(memory.lower_transfer(&[constant], block, mlir_context, location)?[0]),
         }
     }
 }
@@ -125,13 +125,13 @@ pub(crate) trait ArrayLiteralLoweringExtension: 'static + Value<Type = ArrayType
 impl ArrayLiteralLoweringExtension for Array {
     fn lower_attribute<'c, 't>(
         &self,
-        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        context: &'c MlirContext<'t>,
+        tensor_type: TensorTypeRef<'c, 't>,
+        mlir_context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
         // This host literal lowering is used by `ConstantOperation` and by MLIR snapshot tooling.
         let data_type = self.r#type().data_type();
         if data_type == DataType::Zero {
-            return data_type.lower_f64_splat_attribute(tensor_type, 0.0, context);
+            return data_type.lower_f64_splat_attribute(tensor_type, 0.0, mlir_context);
         }
 
         if data_type == DataType::Token {
@@ -169,7 +169,7 @@ impl ArrayLiteralLoweringExtension for Array {
         // MLIR's typed constructors own the required packing for one-bit values. Ryft deliberately keeps these values
         // byte-padded in host arrays, so decode only their low bit at this representation boundary.
         if matches!(data_type, DataType::Boolean | DataType::I1 | DataType::U1) {
-            return Ok(context
+            return Ok(mlir_context
                 .dense_bool_elements_attribute(
                     tensor_type,
                     bytes.iter().map(|value| value & 1 != 0).collect::<Vec<_>>().as_slice(),
@@ -178,7 +178,9 @@ impl ArrayLiteralLoweringExtension for Array {
                 .unwrap());
         }
 
-        context.dense_elements_attribute_from_raw_buffer(tensor_type, bytes.as_ref()).map_err(Error::from)
+        mlir_context
+            .dense_elements_attribute_from_raw_buffer(tensor_type, bytes.as_ref())
+            .map_err(Error::from)
     }
 }
 
@@ -186,8 +188,8 @@ impl ArrayLiteralLoweringExtension for ArrayConstant {
     #[inline]
     fn lower_attribute<'c, 't>(
         &self,
-        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        context: &'c MlirContext<'t>,
+        tensor_type: TensorTypeRef<'c, 't>,
+        mlir_context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
         match self {
             Self::Captured(value) => Err(ProgramError::Concretization {
@@ -201,7 +203,7 @@ impl ArrayLiteralLoweringExtension for ArrayConstant {
                 message: format!("session constant `{value}` cannot be materialized as a literal"),
             }
             .into()),
-            Self::Boolean(value) => Array::scalar(*value)?.lower_attribute(tensor_type, context),
+            Self::Boolean(value) => Array::scalar(*value)?.lower_attribute(tensor_type, mlir_context),
         }
     }
 }
@@ -276,7 +278,7 @@ impl Constant {
         captured_values: &[ValueRef<'b, 'c, 't>],
         lowering_context: &ProgramLoweringContext,
         block: &mut B,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: L,
     ) -> Result<ValueRef<'b, 'c, 't>, Error>
     where
@@ -287,7 +289,7 @@ impl Constant {
             Constant::Captured(value) => value.lower(captured_values),
             Constant::Session(value) => lowering_context.lower_session_constant(value, captured_values),
             Constant::Dimension(value) => value.lower(block, location),
-            Constant::Boolean(value) => ArrayConstant::Boolean(*value).lower_constant(block, context, location),
+            Constant::Boolean(value) => ArrayConstant::Boolean(*value).lower_constant(block, mlir_context, location),
         }
     }
 }

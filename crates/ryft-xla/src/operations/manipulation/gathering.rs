@@ -30,7 +30,7 @@ impl LowerableOperation for GatherOperation {
             input_types,
             output_types,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         if self.output_sharding().is_none() {
@@ -59,7 +59,7 @@ trait GatherOperationLoweringExtension {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -71,7 +71,7 @@ impl GatherOperationLoweringExtension for GatherOperation {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 2, ProgramError);
@@ -82,7 +82,11 @@ impl GatherOperationLoweringExtension for GatherOperation {
         let index_data_type = if input_types[1].data_type().is_unsigned() { DataType::U64 } else { DataType::I64 };
         let indices_type = input_types[1].clone().with_data_type(index_data_type);
         let mut indices = block
-            .append_operation(stable_hlo::convert(input_values[1], indices_type.lower(context, location)?, location)?)?
+            .append_operation(stable_hlo::convert(
+                input_values[1],
+                indices_type.lower(mlir_context, location)?,
+                location,
+            )?)?
             .result(0)
             .unwrap()
             .as_ref();
@@ -93,7 +97,7 @@ impl GatherOperationLoweringExtension for GatherOperation {
         let (input_batching, indices_batching): (Vec<_>, Vec<_>) =
             dimensions.batching_dimensions().iter().copied().unzip();
         let index_vector_dimension = input_types[1].rank() - 1;
-        let attribute = context.stable_hlo_gather_dimensions(
+        let attribute = mlir_context.stable_hlo_gather_dimensions(
             dimensions.offset_dimensions(),
             dimensions.collapsed_slice_dimensions(),
             &input_batching,
@@ -140,7 +144,7 @@ impl GatherOperationLoweringExtension for GatherOperation {
             indices,
             PhysicalStoragePadding::Constant(0.0),
             block,
-            context,
+            mlir_context,
             location,
         )?;
 
@@ -164,7 +168,7 @@ impl GatherOperationLoweringExtension for GatherOperation {
         let upper_bounds = block
             .append_operation(stable_hlo::convert(
                 upper_bounds,
-                upper_bounds_type.lower(context, location)?,
+                upper_bounds_type.lower(mlir_context, location)?,
                 location,
             )?)?
             .result(0)
@@ -173,7 +177,7 @@ impl GatherOperationLoweringExtension for GatherOperation {
         let upper_bounds = block
             .append_operation(stable_hlo::broadcast(
                 upper_bounds,
-                comparison_type.lower(context, location)?,
+                comparison_type.lower(mlir_context, location)?,
                 &[index_vector_dimension],
                 location,
             )?)?
@@ -208,11 +212,17 @@ impl GatherOperationLoweringExtension for GatherOperation {
                 clipped,
                 PhysicalStoragePadding::Constant(0.0),
                 block,
-                context,
+                mlir_context,
                 location,
             )?;
             let sources = (0..output_types[0].rank()).map(|axis| (result, axis)).collect::<Vec<_>>();
-            return Ok(vec![output_types[0].restore_dynamic_dimensions(clipped, &sources, block, context, location)?]);
+            return Ok(vec![output_types[0].restore_dynamic_dimensions(
+                clipped,
+                &sources,
+                block,
+                mlir_context,
+                location,
+            )?]);
         }
         let upper_mask =
             ComparisonDirection::LessThanOrEqual.lower_comparison(indices, upper_bounds, block, location)?;
@@ -227,7 +237,7 @@ impl GatherOperationLoweringExtension for GatherOperation {
             ReductionKind::All,
             DataType::Boolean,
             FloatExtremumForm::TotalOrder,
-            context,
+            mlir_context,
             location,
         )?;
         let mask = block
@@ -240,22 +250,27 @@ impl GatherOperationLoweringExtension for GatherOperation {
             .collect::<Vec<_>>();
         let mask_type = physical_output_type.clone().with_data_type(DataType::Boolean);
         let mask = block
-            .append_operation(stable_hlo::broadcast(mask, mask_type.lower(context, location)?, &batch_axes, location)?)?
+            .append_operation(stable_hlo::broadcast(
+                mask,
+                mask_type.lower(mlir_context, location)?,
+                &batch_axes,
+                location,
+            )?)?
             .result(0)
             .unwrap()
             .as_ref();
 
         let fill = self.options().resolved_fill_value(output_types[0].data_type())?;
-        let scalar_type = (ArrayType::scalar(output_types[0].data_type())).lower(context, location)?;
+        let scalar_type = (ArrayType::scalar(output_types[0].data_type())).lower(mlir_context, location)?;
         let fill = block
-            .append_operation(stable_hlo::constant(fill.lower_attribute(scalar_type, context)?, location)?)?
+            .append_operation(stable_hlo::constant(fill.lower_attribute(scalar_type, mlir_context)?, location)?)?
             .result(0)
             .unwrap()
             .as_ref();
         let fill = block
             .append_operation(stable_hlo::broadcast(
                 fill,
-                physical_output_type.lower(context, location)?,
+                physical_output_type.lower(mlir_context, location)?,
                 &[],
                 location,
             )?)?
@@ -266,7 +281,7 @@ impl GatherOperationLoweringExtension for GatherOperation {
             result,
             PhysicalStoragePadding::Constant(0.0),
             block,
-            context,
+            mlir_context,
             location,
         )?;
         let filled = block
@@ -275,7 +290,7 @@ impl GatherOperationLoweringExtension for GatherOperation {
             .unwrap()
             .as_ref();
         let sources = (0..output_types[0].rank()).map(|axis| (result, axis)).collect::<Vec<_>>();
-        Ok(vec![output_types[0].restore_dynamic_dimensions(filled, &sources, block, context, location)?])
+        Ok(vec![output_types[0].restore_dynamic_dimensions(filled, &sources, block, mlir_context, location)?])
     }
 }
 

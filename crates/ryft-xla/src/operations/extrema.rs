@@ -24,7 +24,7 @@ impl LowerableOperation for MaxOperation<ArrayType> {
             input_values,
             output_types,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         // Floating-point values take the form of the target, because the native operation does not propagate NaNs
@@ -56,7 +56,7 @@ impl LowerableOperation for MinOperation<ArrayType> {
             input_values,
             output_types,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         // Floating-point values take the form of the target, because the native operation does not propagate NaNs
@@ -91,7 +91,7 @@ impl LowerableOperation for ClampOperation<ArrayType> {
             input_values[1],
             output_type,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let data_type = output_type.data_type();
@@ -106,7 +106,7 @@ impl LowerableOperation for ClampOperation<ArrayType> {
                     bound,
                     output_type,
                     &mut lowerer.block(),
-                    lowerer.context(),
+                    lowerer.mlir_context(),
                     lowerer.location(),
                 )
             });
@@ -136,7 +136,7 @@ impl LowerableOperation for ClampOperation<ArrayType> {
                 *bound,
                 &bound_type,
                 &mut lowerer.block(),
-                lowerer.context(),
+                lowerer.mlir_context(),
                 lowerer.location(),
             )?;
         }

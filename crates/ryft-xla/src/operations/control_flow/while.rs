@@ -84,7 +84,7 @@ impl LowerableOperation for WhileOperation<Type> {
         // report it.
         lowerer.validate_pending_reductions_across_regions(self.name(), input_types, output_types)?;
         self.validate_region_count(lowerer.regions().len())?;
-        let (context, location) = (lowerer.context(), lowerer.location());
+        let (context, location) = (lowerer.mlir_context(), lowerer.location());
         let block = &mut lowerer.block();
         let (effect_tokens, regions, captured_values, lowering_context) = lowerer.split_effect_tokens();
         let (condition, body) = (&regions[0], &regions[1]);

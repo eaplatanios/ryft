@@ -34,7 +34,7 @@ impl LowerableOperation for ScatterOperation {
             output_types,
             lowerer.lowering_context().target_platform(),
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         if self.output_sharding().is_none() {
@@ -64,7 +64,7 @@ trait ScatterOperationLoweringExtension {
         output_types: &[ArrayType],
         target_platform: Option<&str>,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -77,7 +77,7 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
         output_types: &[ArrayType],
         target_platform: Option<&str>,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 3, ProgramError);
@@ -106,7 +106,11 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
         let index_data_type = if input_types[1].data_type().is_unsigned() { DataType::U64 } else { DataType::I64 };
         let indices_type = input_types[1].clone().with_data_type(index_data_type);
         let mut indices = block
-            .append_operation(stable_hlo::convert(input_values[1], indices_type.lower(context, location)?, location)?)?
+            .append_operation(stable_hlo::convert(
+                input_values[1],
+                indices_type.lower(mlir_context, location)?,
+                location,
+            )?)?
             .result(0)
             .unwrap()
             .as_ref();
@@ -153,7 +157,11 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
             let bound_type = ArrayType::new_static(index_data_type, [upper_bounds.len()]);
             let upper_bounds = lower_i64_vector(&upper_bounds, block, location)?;
             let upper_bounds = block
-                .append_operation(stable_hlo::convert(upper_bounds, bound_type.lower(context, location)?, location)?)?
+                .append_operation(stable_hlo::convert(
+                    upper_bounds,
+                    bound_type.lower(mlir_context, location)?,
+                    location,
+                )?)?
                 .result(0)
                 .unwrap()
                 .as_ref();
@@ -163,11 +171,11 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
                 shape_source,
                 &[index_vector_dimension],
                 block,
-                context,
+                mlir_context,
                 location,
             )?;
             let zero = ArrayType::scalar(index_data_type).lower_i64_splat(0, block, location)?;
-            let zero = lower_index_broadcast(zero, &indices_type, shape_source, &[], block, context, location)?;
+            let zero = lower_index_broadcast(zero, &indices_type, shape_source, &[], block, mlir_context, location)?;
             if self.mode() == ScatterMode::Clip {
                 indices =
                     block.append_operation(stable_hlo::maximum(indices, zero, location)?)?.result(0).unwrap().as_ref();
@@ -187,7 +195,7 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
                     ReductionKind::All,
                     DataType::Boolean,
                     FloatExtremumForm::TotalOrder,
-                    context,
+                    mlir_context,
                     location,
                 )?;
                 let mask = block
@@ -207,12 +215,16 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
                     shape_source,
                     &(0..index_vector_dimension).collect::<Vec<_>>(),
                     block,
-                    context,
+                    mlir_context,
                     location,
                 )?;
                 let sentinels = lower_i64_vector(&sentinels, block, location)?;
                 let sentinels = block
-                    .append_operation(stable_hlo::convert(sentinels, bound_type.lower(context, location)?, location)?)?
+                    .append_operation(stable_hlo::convert(
+                        sentinels,
+                        bound_type.lower(mlir_context, location)?,
+                        location,
+                    )?)?
                     .result(0)
                     .unwrap()
                     .as_ref();
@@ -222,7 +234,7 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
                     shape_source,
                     &[index_vector_dimension],
                     block,
-                    context,
+                    mlir_context,
                     location,
                 )?;
                 indices = block
@@ -232,7 +244,7 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
                     .as_ref();
             }
         }
-        let attribute = context.stable_hlo_scatter_dimensions(
+        let attribute = mlir_context.stable_hlo_scatter_dimensions(
             dimensions.update_window_dimensions(),
             dimensions.inserted_window_dimensions(),
             dimensions.input_batching_dimensions(),
@@ -259,7 +271,7 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
                     block.append_operation(stable_hlo::real(input_values[2], location)?)?.result(0).unwrap().as_ref()
                 };
                 let combiner =
-                    build_scatter_combiner_region(ScatterReductionKind::Add, DataType::F64, context, location)?;
+                    build_scatter_combiner_region(ScatterReductionKind::Add, DataType::F64, mlir_context, location)?;
                 components.push(
                     block
                         .append_operation(stable_hlo::scatter(
@@ -285,7 +297,7 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
                     .as_ref(),
             ]);
         }
-        let combiner = build_scatter_combiner_region(self.kind(), output_types[0].data_type(), context, location)?;
+        let combiner = build_scatter_combiner_region(self.kind(), output_types[0].data_type(), mlir_context, location)?;
         // Clipping can merge formerly unique indices and change their lexicographic order, and masked sentinels
         // likewise introduce duplicates. Do not propagate either promise through that normalization.
         let result = block.append_operation(stable_hlo::scatter(
@@ -310,12 +322,12 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
 fn build_scatter_combiner_region<'c, 't>(
     kind: ScatterReductionKind,
     element_type: DataType,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ryft_mlir::DetachedRegion<'c, 't>, Error> {
-    let scalar_tensor_type = ArrayType::scalar(element_type).lower(context, location)?;
-    let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
-    let mut region = context.region();
+    let scalar_tensor_type = ArrayType::scalar(element_type).lower(mlir_context, location)?;
+    let block = mlir_context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
+    let mut region = mlir_context.region();
     let mut block_ref = region.append_block(block)?;
     let left = block_ref.argument(0)?.as_ref();
     let right = block_ref.argument(1)?.as_ref();
@@ -374,7 +386,7 @@ fn lower_index_broadcast<'b, 'c: 'b, 't: 'c>(
     shape_source: Option<ValueRef<'b, 'c, 't>>,
     axes: &[usize],
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if let Some(exemplar) = shape_source {
@@ -386,20 +398,30 @@ fn lower_index_broadcast<'b, 'c: 'b, 't: 'c>(
             value,
             PhysicalStoragePadding::Constant(0.0),
             block,
-            context,
+            mlir_context,
             location,
         )?;
         let physical_type = output_type.physical_bound_type()?;
         let result = block
-            .append_operation(stable_hlo::broadcast(value, physical_type.lower(context, location)?, axes, location)?)?
+            .append_operation(stable_hlo::broadcast(
+                value,
+                physical_type.lower(mlir_context, location)?,
+                axes,
+                location,
+            )?)?
             .result(0)
             .unwrap()
             .as_ref();
         let sources = (0..output_type.rank()).map(|axis| (exemplar, axis)).collect::<Vec<_>>();
-        output_type.restore_dynamic_dimensions(result, &sources, block, context, location)
+        output_type.restore_dynamic_dimensions(result, &sources, block, mlir_context, location)
     } else {
         Ok(block
-            .append_operation(stable_hlo::broadcast(value, output_type.lower(context, location)?, axes, location)?)?
+            .append_operation(stable_hlo::broadcast(
+                value,
+                output_type.lower(mlir_context, location)?,
+                axes,
+                location,
+            )?)?
             .result(0)
             .unwrap()
             .as_ref())

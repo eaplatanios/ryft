@@ -34,7 +34,7 @@ pub(super) trait AxisIndexOperationLoweringExtension {
         &self,
         lowering_context: &ProgramLoweringContext,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error>;
 }
@@ -44,7 +44,7 @@ impl AxisIndexOperationLoweringExtension for AxisIndexOperation {
         &self,
         lowering_context: &ProgramLoweringContext,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         let axis_name = self.axis_name();
@@ -79,7 +79,7 @@ impl AxisIndexOperationLoweringExtension for AxisIndexOperation {
         let axis_sizes: Vec<usize> = mesh.axes().iter().map(|axis| axis.size()).collect();
         let stride: usize = axis_sizes[axis_index + 1..].iter().product();
 
-        let scalar_u64_type = ArrayType::scalar(DataType::U64).lower(context, location)?;
+        let scalar_u64_type = ArrayType::scalar(DataType::U64).lower(mlir_context, location)?;
         let partition_id = block.append_operation(stable_hlo::partition_id(location)?)?;
         let partition_id = partition_id.result(0).unwrap().as_ref();
         let partition_id = block.append_operation(stable_hlo::convert(partition_id, scalar_u64_type, location)?)?;
@@ -128,8 +128,12 @@ impl LowerableOperation for AxisIndexOperation {
                 .into());
             }
         }
-        let result =
-            self.lower_to_coordinate(&lowering_context, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+        let result = self.lower_to_coordinate(
+            &lowering_context,
+            &mut lowerer.block(),
+            lowerer.mlir_context(),
+            lowerer.location(),
+        )?;
         Ok(vec![result])
     }
 }

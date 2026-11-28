@@ -36,7 +36,7 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
         let input_type = &input_types[0];
         let mut input_data_type = input_type.data_type();
         let output_data_type = output_types[0].data_type();
-        let output_type = output_types[0].lower(lowerer.context(), lowerer.location())?;
+        let output_type = output_types[0].lower(lowerer.mlir_context(), lowerer.location())?;
         let mut input = input_values[0];
         if self.bitcast() {
             return Ok(vec![lower_bitcast_to_mlir(
@@ -44,7 +44,7 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
                 input_type,
                 &output_types[0],
                 &mut lowerer.block(),
-                lowerer.context(),
+                lowerer.mlir_context(),
                 lowerer.location(),
             )?]);
         }
@@ -102,7 +102,7 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
                 DataType::U8
             };
             let carrier_type = ArrayType::new(carrier_data_type, input_type.shape().clone());
-            let carrier_tensor_type = carrier_type.lower(lowerer.context(), lowerer.location())?;
+            let carrier_tensor_type = carrier_type.lower(lowerer.mlir_context(), lowerer.location())?;
             let converted = lowerer.block().append_operation(stable_hlo::convert(
                 input,
                 carrier_tensor_type,
@@ -150,7 +150,7 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
                 input,
                 &input_type.clone().with_data_type(input_data_type),
                 &mut lowerer.block(),
-                lowerer.context(),
+                lowerer.mlir_context(),
                 lowerer.location(),
             )?;
         }
@@ -158,7 +158,7 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
             // These formats have no NaN or infinity encodings. Normalize exceptional values and clamp finite
             // overflow before native conversion, whose handling otherwise differs across CPU and GPU backends.
             let float_type = input_type.clone().with_data_type(DataType::F32);
-            let float_tensor_type = float_type.lower(lowerer.context(), lowerer.location())?;
+            let float_tensor_type = float_type.lower(lowerer.mlir_context(), lowerer.location())?;
             let converted =
                 lowerer
                     .block()
@@ -255,7 +255,7 @@ pub(crate) trait TypeCastLoweringExtension {
         value: ValueRef<'b, 'c, 't>,
         output_type: &Type,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error>;
 }
@@ -266,7 +266,7 @@ impl TypeCastLoweringExtension for Type {
         value: ValueRef<'b, 'c, 't>,
         output_type: &Type,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         // Converting any axis materializes the static physical buffer of the whole value, which needs a finite physical
@@ -329,11 +329,11 @@ impl TypeCastLoweringExtension for Type {
             std::slice::from_ref(self),
             std::slice::from_ref(&intermediate_type),
             block,
-            context,
+            mlir_context,
             location,
         )?
         .remove(0);
-        lower_refined_region_input(value, &intermediate_type, output_type, block, context, location)
+        lower_refined_region_input(value, &intermediate_type, output_type, block, mlir_context, location)
     }
 }
 
@@ -358,10 +358,16 @@ impl ArrayTypeLayoutConversionLoweringExtension for ArrayType {
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         let physical_type = self.physical_bound_type()?;
         let physical =
-            self.lower_physical_storage(value, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+            self.lower_physical_storage(value, &mut lowerer.block(), lowerer.mlir_context(), lowerer.location())?;
         let result = physical_type.lower_layout_constraint(physical, &mut lowerer.block(), lowerer.location())?;
         let sources = (0..self.rank()).map(|axis| (value, axis)).collect::<Vec<_>>();
-        self.restore_dynamic_dimensions(result, &sources, &mut lowerer.block(), lowerer.context(), lowerer.location())
+        self.restore_dynamic_dimensions(
+            result,
+            &sources,
+            &mut lowerer.block(),
+            lowerer.mlir_context(),
+            lowerer.location(),
+        )
     }
 }
 
@@ -442,7 +448,7 @@ impl<T: CastType + Into<Type>> CastOperationLoweringExtension<T> for CastOperati
             .chain(input_types.iter().cloned())
             .map(Into::into)
             .collect::<Vec<_>>();
-        let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+        let (mut block, context, location) = (lowerer.block(), lowerer.mlir_context(), lowerer.location());
         lower_type_relationship_checks(
             CAST_OPERATION_NAME,
             &format!("in `{CAST_OPERATION_NAME}`"),
@@ -465,8 +471,13 @@ fn lower_cast<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     output_type: &Type,
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let value =
-        input_type.lower_cast_shape(value, output_type, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+    let value = input_type.lower_cast_shape(
+        value,
+        output_type,
+        &mut lowerer.block(),
+        lowerer.mlir_context(),
+        lowerer.location(),
+    )?;
     let (Type::Array(input_type), Type::Array(output_type)) = (input_type, output_type) else {
         return Ok(value);
     };
@@ -517,10 +528,10 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
     input: ValueRef<'b, 'c, 't>,
     input_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let float_type = input_type.clone().with_data_type(DataType::F32).lower(context, location)?;
+    let float_type = input_type.clone().with_data_type(DataType::F32).lower(mlir_context, location)?;
     let float = block.append_operation(stable_hlo::convert(input, float_type, location)?)?;
     let float = float.result(0).unwrap().as_ref();
     // The intermediate rounding is observable here. Prevent excess precision optimizations from cancelling
@@ -528,7 +539,7 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
     let float = block.append_operation(stable_hlo::optimization_barrier(&[float], location)?)?;
     let float = float.result(0).unwrap().as_ref();
     let recovered =
-        block.append_operation(stable_hlo::convert(float, input_type.lower(context, location)?, location)?)?;
+        block.append_operation(stable_hlo::convert(float, input_type.lower(mlir_context, location)?, location)?)?;
     let recovered = recovered.result(0).unwrap().as_ref();
     let comparison_type = if input_type.data_type().is_floating_point() {
         stable_hlo::ComparisonType::Float
@@ -578,8 +589,11 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
         increased = direction.result(0).unwrap().as_ref();
     }
     let bits_type = input_type.clone().with_data_type(DataType::U32);
-    let bits =
-        block.append_operation(stable_hlo::bitcast_convert(float, bits_type.lower(context, location)?, location)?)?;
+    let bits = block.append_operation(stable_hlo::bitcast_convert(
+        float,
+        bits_type.lower(mlir_context, location)?,
+        location,
+    )?)?;
     let bits = bits.result(0).unwrap().as_ref();
     let one = bits_type.lower_i64_splat(1, block, location)?;
     let previous = block.append_operation(stable_hlo::subtract(bits, one, location)?)?;
@@ -594,7 +608,7 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
         // encodings directly from f64 bits instead. Shift the exact significand to f32 subnormal precision and
         // jam every discarded nonzero bit into its low bit, without any floating-point arithmetic.
         let wide_type = input_type.clone().with_data_type(DataType::U64);
-        let wide_tensor_type = wide_type.lower(context, location)?;
+        let wide_tensor_type = wide_type.lower(mlir_context, location)?;
         let source_bits = block.append_operation(stable_hlo::bitcast_convert(input, wide_tensor_type, location)?)?;
         let source_bits = source_bits.result(0).unwrap().as_ref();
         let magnitude_mask = wide_type.lower_i64_splat(i64::MAX, block, location)?;
@@ -659,7 +673,7 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
         let subnormal = subnormal.result(0).unwrap().as_ref();
         let subnormal = block.append_operation(stable_hlo::convert(
             subnormal,
-            input_type.clone().with_data_type(DataType::U32).lower(context, location)?,
+            input_type.clone().with_data_type(DataType::U32).lower(mlir_context, location)?,
             location,
         )?)?;
         let subnormal = subnormal.result(0).unwrap().as_ref();
@@ -689,7 +703,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     input_type: &ArrayType,
     output_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let input_one_bit = matches!(input_type.data_type(), DataType::I1 | DataType::U1);
@@ -702,7 +716,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     if input_type.rank() == output_type.rank() {
         let result = block.append_operation(stable_hlo::bitcast_convert(
             input,
-            output_type.lower(context, location)?,
+            output_type.lower(mlir_context, location)?,
             location,
         )?)?;
         return Ok(result.result(0).unwrap().as_ref());
@@ -724,18 +738,18 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         input,
         PhysicalStoragePadding::Constant(padding),
         block,
-        context,
+        mlir_context,
         location,
     )?;
     let physical_output_type = output_type.physical_bound_type()?;
-    let output_tensor_type = physical_output_type.lower(context, location)?;
+    let output_tensor_type = physical_output_type.lower(mlir_context, location)?;
     let result = if matches!(input_type.data_type(), DataType::F6E2M3FN | DataType::F6E3M2FN) {
         // XLA stores FP6 in a byte and native rank-changing bitcasts expose eight bits. Recover the six logical
         // encoding bits explicitly before splitting them into one- or two-bit groups.
-        let bits = lower_fp6_to_bits(physical_input, &physical_input_type, block, context, location)?;
+        let bits = lower_fp6_to_bits(physical_input, &physical_input_type, block, mlir_context, location)?;
         let group_width = if output_one_bit { 1 } else { 2 };
         let expanded_type = physical_output_type.clone().with_data_type(DataType::U8);
-        let expanded_tensor_type = expanded_type.lower(context, location)?;
+        let expanded_tensor_type = expanded_type.lower(mlir_context, location)?;
         let expanded = block.append_operation(stable_hlo::broadcast(
             bits,
             expanded_tensor_type,
@@ -763,7 +777,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     } else if matches!(output_type.data_type(), DataType::F6E2M3FN | DataType::F6E3M2FN) {
         let group_width = if input_one_bit { 1 } else { 2 };
         let groups_type = physical_input_type.clone().with_data_type(DataType::U8);
-        let groups_tensor_type = groups_type.lower(context, location)?;
+        let groups_tensor_type = groups_type.lower(mlir_context, location)?;
         let groups = block.append_operation(stable_hlo::convert(physical_input, groups_tensor_type, location)?)?;
         let mask = groups_type.lower_i64_splat((1 << group_width) - 1, block, location)?;
         let groups = block.append_operation(stable_hlo::and(groups.result(0).unwrap().as_ref(), mask, location)?)?;
@@ -782,10 +796,10 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             &physical_output_type.clone().with_data_type(DataType::U8),
             FloatExtremumForm::TotalOrder,
             block,
-            context,
+            mlir_context,
             location,
         )?;
-        lower_bits_to_fp6(bits, &physical_output_type, block, context, location)?
+        lower_bits_to_fp6(bits, &physical_output_type, block, mlir_context, location)?
     } else if output_one_bit {
         // Split into two-bit groups first, because every supported numeric encoding wider than one bit has an even
         // width, including six-bit floats. Expanding each group to two predicates avoids treating each predicate as
@@ -799,19 +813,19 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             ArrayType::new(DataType::U2, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
         let groups = block.append_operation(stable_hlo::bitcast_convert(
             physical_input,
-            groups_type.lower(context, location)?,
+            groups_type.lower(mlir_context, location)?,
             location,
         )?)?;
         let groups = block.append_operation(stable_hlo::convert(
             groups.result(0).unwrap().as_ref(),
-            groups_type.clone().with_data_type(DataType::U8).lower(context, location)?,
+            groups_type.clone().with_data_type(DataType::U8).lower(mlir_context, location)?,
             location,
         )?)?;
         let group_rank = shape.len();
         shape.push(2);
         let expanded_type =
             ArrayType::new(DataType::U8, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
-        let expanded_tensor_type = expanded_type.lower(context, location)?;
+        let expanded_tensor_type = expanded_type.lower(mlir_context, location)?;
         let expanded = block.append_operation(stable_hlo::broadcast(
             groups.result(0).unwrap().as_ref(),
             expanded_tensor_type,
@@ -828,7 +842,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         let bits = block.append_operation(stable_hlo::and(shifted.result(0).unwrap().as_ref(), one, location)?)?;
         let bits = block.append_operation(stable_hlo::convert(
             bits.result(0).unwrap().as_ref(),
-            expanded_type.with_data_type(DataType::Boolean).lower(context, location)?,
+            expanded_type.with_data_type(DataType::Boolean).lower(mlir_context, location)?,
             location,
         )?)?;
         let result = block.append_operation(stable_hlo::reshape(
@@ -848,7 +862,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         let reshaped = block.append_operation(stable_hlo::reshape(physical_input, &shape, location)?)?;
         let expanded_type =
             ArrayType::new(DataType::U8, Shape::new(shape.iter().copied().map(Dimension::Static).collect()));
-        let expanded_tensor_type = expanded_type.lower(context, location)?;
+        let expanded_tensor_type = expanded_type.lower(mlir_context, location)?;
         let expanded = block.append_operation(stable_hlo::convert(
             reshaped.result(0).unwrap().as_ref(),
             expanded_tensor_type,
@@ -869,12 +883,12 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             &groups_type,
             FloatExtremumForm::TotalOrder,
             block,
-            context,
+            mlir_context,
             location,
         )?;
         let groups = block.append_operation(stable_hlo::convert(
             groups,
-            groups_type.with_data_type(DataType::U2).lower(context, location)?,
+            groups_type.with_data_type(DataType::U2).lower(mlir_context, location)?,
             location,
         )?)?;
         let result = block.append_operation(stable_hlo::bitcast_convert(
@@ -889,7 +903,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         result.result(0).unwrap().as_ref()
     };
     let sources = (0..output_type.rank()).map(|axis| (input, axis)).collect::<Vec<_>>();
-    output_type.restore_dynamic_dimensions(result, &sources, block, context, location)
+    output_type.restore_dynamic_dimensions(result, &sources, block, mlir_context, location)
 }
 
 /// Extracts a finite FP6 encoding through its exact `f32` representation, preserving the sign of zero.
@@ -897,14 +911,14 @@ fn lower_fp6_to_bits<'b, 'c: 'b, 't: 'c>(
     input: ValueRef<'b, 'c, 't>,
     r#type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let (mantissa_bits, bias) = if r#type.data_type() == DataType::F6E2M3FN { (3, 1) } else { (2, 3) };
     let integer_type = r#type.clone().with_data_type(DataType::U32);
-    let integer_tensor_type = integer_type.lower(context, location)?;
+    let integer_tensor_type = integer_type.lower(mlir_context, location)?;
     let float_type = r#type.clone().with_data_type(DataType::F32);
-    let float_tensor_type = float_type.lower(context, location)?;
+    let float_tensor_type = float_type.lower(mlir_context, location)?;
     // The native dependency patches the finite-only FP6 NaN predicate, making this exact widening conversion valid.
     let float = block.append_operation(stable_hlo::convert(input, float_tensor_type, location)?)?;
     let float = float.result(0).unwrap().as_ref();
@@ -958,7 +972,7 @@ fn lower_fp6_to_bits<'b, 'c: 'b, 't: 'c>(
     let encoding = encoding.result(0).unwrap().as_ref();
     let result = block.append_operation(stable_hlo::convert(
         encoding,
-        r#type.clone().with_data_type(DataType::U8).lower(context, location)?,
+        r#type.clone().with_data_type(DataType::U8).lower(mlir_context, location)?,
         location,
     )?)?;
     let result = result.result(0).unwrap().as_ref();
@@ -970,14 +984,14 @@ fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
     input: ValueRef<'b, 'c, 't>,
     r#type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let (mantissa_bits, bias) = if r#type.data_type() == DataType::F6E2M3FN { (3, 1) } else { (2, 3) };
     let integer_type = r#type.clone().with_data_type(DataType::U32);
-    let integer_tensor_type = integer_type.lower(context, location)?;
+    let integer_tensor_type = integer_type.lower(mlir_context, location)?;
     let float_type = r#type.clone().with_data_type(DataType::F32);
-    let float_tensor_type = float_type.lower(context, location)?;
+    let float_tensor_type = float_type.lower(mlir_context, location)?;
     let bits = block.append_operation(stable_hlo::convert(input, integer_tensor_type, location)?)?;
     let bits = bits.result(0).unwrap().as_ref();
     let sign_mask = integer_type.lower_i64_splat(32, block, location)?;
@@ -1028,7 +1042,8 @@ fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
     let encoding = encoding.result(0).unwrap().as_ref();
     let float = block.append_operation(stable_hlo::bitcast_convert(encoding, float_tensor_type, location)?)?;
     let float = float.result(0).unwrap().as_ref();
-    let result = block.append_operation(stable_hlo::convert(float, r#type.lower(context, location)?, location)?)?;
+    let result =
+        block.append_operation(stable_hlo::convert(float, r#type.lower(mlir_context, location)?, location)?)?;
     let result = result.result(0).unwrap().as_ref();
     Ok(result)
 }

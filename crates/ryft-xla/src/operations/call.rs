@@ -195,7 +195,7 @@ pub(crate) fn lower_shared_call<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>
     input_values: &[ValueRef<'b, 'c, 't>],
     caller_captured_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     lowering_context: &ProgramLoweringContext,
 ) -> Result<Option<Vec<ValueRef<'b, 'c, 't>>>, Error> {
@@ -216,7 +216,7 @@ pub(crate) fn lower_shared_call<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>
         arguments.push(lowering_context.lower_session_constant(constant, caller_captured_values)?);
     }
     let output_types = callee.output_types();
-    lower_shared_function_call(function.symbol(), &output_types, &arguments, block, context, location).map(Some)
+    lower_shared_function_call(function.symbol(), &output_types, &arguments, block, mlir_context, location).map(Some)
 }
 
 /// Calls the shared private `func.func` named `symbol` with the provided operands, which must match its inputs, and
@@ -226,11 +226,13 @@ pub(crate) fn lower_shared_function_call<'b, 'c: 'b, 't: 'c>(
     output_types: &[Type],
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let result_tensor_types =
-        output_types.iter().map(|r#type| r#type.lower(context, location)).collect::<Result<Vec<_>, _>>()?;
+    let result_tensor_types = output_types
+        .iter()
+        .map(|r#type| r#type.lower(mlir_context, location))
+        .collect::<Result<Vec<_>, _>>()?;
     let operation = block.append_operation(func::call(
         symbol,
         func::CallProperties {
@@ -791,7 +793,7 @@ impl LowerableOperation for CallOperation<Type> {
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let output_values = {
-            let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+            let (mut block, context, location) = (lowerer.block(), lowerer.mlir_context(), lowerer.location());
             let (effect_tokens, regions, captured_values, lowering_context) = lowerer.split_effect_tokens();
             let [callee] = regions else { unreachable!("validated call region count") };
 
@@ -1207,7 +1209,7 @@ trait CallProgramLoweringExtension<O: ProgramLoweringOperation> {
         input_values: &[ValueRef<'b, 'c, 't>],
         caller_captured_values: &[ValueRef<'b, 'c, 't>],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
         lowering_context: &ProgramLoweringContext,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
@@ -1222,7 +1224,7 @@ impl<O: ProgramLoweringOperation> CallProgramLoweringExtension<O> for FlatProgra
         input_values: &[ValueRef<'b, 'c, 't>],
         caller_captured_values: &[ValueRef<'b, 'c, 't>],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
         lowering_context: &ProgramLoweringContext,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
@@ -1236,7 +1238,7 @@ impl<O: ProgramLoweringOperation> CallProgramLoweringExtension<O> for FlatProgra
             input_values,
             caller_captured_values,
             block,
-            context,
+            mlir_context,
             location,
             lowering_context,
         )? {

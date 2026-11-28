@@ -53,7 +53,7 @@ pub(crate) trait ParallelReduceOperationLoweringExtension {
         input_value: ValueRef<'b, 'c, 't>,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error>;
 }
@@ -65,7 +65,7 @@ impl ParallelReduceOperationLoweringExtension for ParallelReduceOperation {
         input_value: ValueRef<'b, 'c, 't>,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         if let Some(mesh) = self.mesh()
@@ -119,10 +119,10 @@ impl ParallelReduceOperationLoweringExtension for ParallelReduceOperation {
             .into());
         }
 
-        let scalar_tensor_type = (ArrayType::scalar(output_array_type.data_type())).lower(context, location)?;
-        let mut computation = context.region();
+        let scalar_tensor_type = (ArrayType::scalar(output_array_type.data_type())).lower(mlir_context, location)?;
+        let mut computation = mlir_context.region();
         let mut combiner_block = computation
-            .append_block(context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]))?;
+            .append_block(mlir_context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]))?;
         let left = combiner_block.argument(0)?.as_ref();
         let right = combiner_block.argument(1)?.as_ref();
         let combined = match self.kind() {
@@ -236,7 +236,7 @@ impl LowerableOperation for ParallelReduceOperation {
             input_values[0],
             &output_types[0],
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         Ok(vec![result])

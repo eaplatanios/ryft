@@ -38,7 +38,7 @@ impl LowerableOperation for ReshapeOperation {
             output_types,
             lowerer.lowering_context(),
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )
     }
@@ -52,7 +52,7 @@ impl LowerableOperation for DynamicReshapeOperation {
         input_types: &[Type],
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
         let (effect_tokens, _, _, lowering_context) = lowerer.split_effect_tokens();
@@ -176,7 +176,7 @@ trait ReshapeOperationLoweringExtension {
         output_types: &[ArrayType],
         lowering_context: &ProgramLoweringContext,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -190,7 +190,7 @@ impl ReshapeOperationLoweringExtension for ReshapeOperation {
         output_types: &[ArrayType],
         lowering_context: &ProgramLoweringContext,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
@@ -246,7 +246,7 @@ impl ReshapeOperationLoweringExtension for ReshapeOperation {
                 let reshape =
                     block.append_operation(stable_hlo::dynamic_reshape(input, shape, &output_bounds, location)?)?;
                 let result = reshape.result(0).unwrap().as_ref();
-                let expected_type = output_types[0].lower(context, location)?;
+                let expected_type = output_types[0].lower(mlir_context, location)?;
                 if result.r#type()? == expected_type.as_ref() {
                     result
                 } else {
@@ -293,7 +293,7 @@ fn lower_reshape_element_count_assertion<'b, 'c: 'b, 't: 'c>(
     output_extents: &[ValueRef<'b, 'c, 't>],
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
     let observed = input_extents.iter().chain(output_extents).copied().collect::<Vec<_>>();
@@ -303,16 +303,27 @@ fn lower_reshape_element_count_assertion<'b, 'c: 'b, 't: 'c>(
     };
     let predicate = lower_deliberately_false_assertion_predicate(seed, block, location)?;
     let input_rank = input_extents.len().to_string();
-    let backend_configuration = context.dictionary_attribute(&[
-        context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute("reshape")),
-        context
-            .named_attribute(context.identifier(ASSERT_KIND_ATTRIBUTE), context.string_attribute(ASSERT_RESHAPE_KIND)),
-        context.named_attribute(
-            context.identifier(ASSERT_DETAIL_ATTRIBUTE),
-            context.string_attribute(input_rank.as_str()),
+    let backend_configuration = mlir_context.dictionary_attribute(&[
+        mlir_context
+            .named_attribute(mlir_context.identifier(ASSERT_ACTOR_ATTRIBUTE), mlir_context.string_attribute("reshape")),
+        mlir_context.named_attribute(
+            mlir_context.identifier(ASSERT_KIND_ATTRIBUTE),
+            mlir_context.string_attribute(ASSERT_RESHAPE_KIND),
+        ),
+        mlir_context.named_attribute(
+            mlir_context.identifier(ASSERT_DETAIL_ATTRIBUTE),
+            mlir_context.string_attribute(input_rank.as_str()),
         ),
     ]);
-    lower_assertion_custom_call(predicate, &observed, backend_configuration, effect_tokens, block, context, location)
+    lower_assertion_custom_call(
+        predicate,
+        &observed,
+        backend_configuration,
+        effect_tokens,
+        block,
+        mlir_context,
+        location,
+    )
 }
 
 #[cfg(test)]

@@ -32,14 +32,16 @@ impl LowerableOperation for ErfOperation<ArrayType> {
         // its result back to F8E8M0FNU. Selecting the integer encodings keeps the correction independent of f32
         // subnormal handling.
         let byte_type =
-            output_type.clone().with_data_type(DataType::U8).lower(lowerer.context(), lowerer.location())?;
+            output_type.clone().with_data_type(DataType::U8).lower(lowerer.mlir_context(), lowerer.location())?;
         let input_bits =
             lowerer
                 .block()
                 .append_operation(stable_hlo::bitcast_convert(input, byte_type, lowerer.location())?)?;
         let input_bits = input_bits.result(0).unwrap().as_ref();
-        let predicate_type =
-            output_type.clone().with_data_type(DataType::Boolean).lower(lowerer.context(), lowerer.location())?;
+        let predicate_type = output_type
+            .clone()
+            .with_data_type(DataType::Boolean)
+            .lower(lowerer.mlir_context(), lowerer.location())?;
         let is_nonzero_encoding =
             lowerer
                 .block()
@@ -56,7 +58,7 @@ impl LowerableOperation for ErfOperation<ArrayType> {
         )?)?;
         let result = lowerer.block().append_operation(stable_hlo::bitcast_convert(
             selected_bits.result(0).unwrap().as_ref(),
-            output_type.lower(lowerer.context(), lowerer.location())?,
+            output_type.lower(lowerer.mlir_context(), lowerer.location())?,
             lowerer.location(),
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])

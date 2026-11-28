@@ -49,7 +49,7 @@ impl LowerableOperation for ParallelSumScatterOperation {
             input_values[0],
             &output_types[0],
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )
     }
@@ -63,7 +63,7 @@ impl MemberLowerableOperation<Type> for ParallelSumScatterOperation {
         input_types: &[Type],
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let lowering_context = lowerer.lowering_context();
         let block = &mut lowerer.block();
@@ -107,7 +107,7 @@ trait ParallelSumScatterOperationLoweringExtension {
         input_value: ValueRef<'b, 'c, 't>,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -119,7 +119,7 @@ impl ParallelSumScatterOperationLoweringExtension for ParallelSumScatterOperatio
         input_value: ValueRef<'b, 'c, 't>,
         output_array_type: &ArrayType,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let data_type = output_array_type.data_type();
@@ -140,7 +140,7 @@ impl ParallelSumScatterOperationLoweringExtension for ParallelSumScatterOperatio
             ReductionKind::Sum,
             output_array_type.data_type(),
             FloatExtremumForm::TotalOrder,
-            context,
+            mlir_context,
             location,
         )?;
         let native_output_type = match self.options().mode() {
@@ -149,7 +149,7 @@ impl ParallelSumScatterOperationLoweringExtension for ParallelSumScatterOperatio
                 .with_inserted_dimension(self.scatter_axis(), Dimension::Static(1))
                 .map_err(ProgramError::from)?,
         };
-        let output_type = native_output_type.lower(context, location)?;
+        let output_type = native_output_type.lower(mlir_context, location)?;
         let result = block.append_operation(stable_hlo::reduce_scatter(
             input_value,
             self.scatter_axis(),
@@ -165,7 +165,7 @@ impl ParallelSumScatterOperationLoweringExtension for ParallelSumScatterOperatio
         if self.options().mode() == CollectiveMode::Tiled {
             return Ok(vec![result]);
         }
-        Ok(vec![collapse_singleton_axis(result, output_array_type, block, context, location)?])
+        Ok(vec![collapse_singleton_axis(result, output_array_type, block, mlir_context, location)?])
     }
 }
 

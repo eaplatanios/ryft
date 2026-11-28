@@ -66,7 +66,7 @@ impl LowerableOperation for ConditionOperation<Type> {
         // internal error, reported as the operation's own region contract and input count would report it.
         lowerer.validate_pending_reductions_across_regions(self.name(), input_types, output_types)?;
         self.validate_region_count(lowerer.regions().len())?;
-        let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+        let (mut block, context, location) = (lowerer.block(), lowerer.mlir_context(), lowerer.location());
         let (effect_tokens, regions, captured_values, lowering_context) = lowerer.split_effect_tokens();
         let (true_branch, false_branch) = (&regions[0], &regions[1]);
         let branch_input_types = true_branch.input_types();

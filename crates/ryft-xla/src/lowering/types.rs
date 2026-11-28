@@ -35,7 +35,7 @@ pub trait MemoryLoweringExtension {
         self,
         input_values: &[ValueRef<'b, 'c, 't>],
         block: &mut B,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: L,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -45,11 +45,11 @@ impl MemoryLoweringExtension for Memory {
         self,
         input_values: &[ValueRef<'b, 'c, 't>],
         block: &mut B,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: L,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 1, ProgramError);
-        let empty_backend_configuration = context.string_attribute("");
+        let empty_backend_configuration = mlir_context.string_attribute("");
         let mut operation = stable_hlo::custom_call(
             input_values,
             "annotate_device_placement",
@@ -65,9 +65,9 @@ impl MemoryLoweringExtension for Memory {
         )?;
         operation.set_discardable_attribute(
             "mhlo.frontend_attributes",
-            context.dictionary_attribute(&[context.named_attribute(
-                context.identifier("_xla_buffer_placement"),
-                context.string_attribute(self.placement_kind()),
+            mlir_context.dictionary_attribute(&[mlir_context.named_attribute(
+                mlir_context.identifier("_xla_buffer_placement"),
+                mlir_context.string_attribute(self.placement_kind()),
             )]),
         );
         let operation = block.append_operation(operation)?;
@@ -78,7 +78,7 @@ impl MemoryLoweringExtension for Memory {
 /// Provides lowering support of [`DataType`]s, and of values of that type, to StableHLO.
 pub trait DataTypeLoweringExtension {
     /// Lowers one [`DataType`] to the corresponding MLIR element type.
-    fn lower<'c, 't>(self, context: &'c MlirContext<'t>) -> Result<TypeRef<'c, 't>, Error>;
+    fn lower<'c, 't>(self, mlir_context: &'c MlirContext<'t>) -> Result<TypeRef<'c, 't>, Error>;
 
     /// Builds a dense elements attribute of `tensor_type` by splatting the `f64` input `value` in this data type.
     /// Boolean splats hold `value != 0.0`, integer splats truncate the fractional part, and floating-point splats
@@ -89,7 +89,7 @@ pub trait DataTypeLoweringExtension {
         self,
         tensor_type: TensorTypeRef<'c, 't>,
         value: f64,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, Error>;
 
     /// Builds a dense elements attribute of `tensor_type` by splatting the `i64` input `value` in this data type.
@@ -100,12 +100,12 @@ pub trait DataTypeLoweringExtension {
         self,
         tensor_type: TensorTypeRef<'c, 't>,
         value: i64,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, Error>;
 }
 
 impl DataTypeLoweringExtension for DataType {
-    fn lower<'c, 't>(self, context: &'c MlirContext<'t>) -> Result<TypeRef<'c, 't>, Error> {
+    fn lower<'c, 't>(self, mlir_context: &'c MlirContext<'t>) -> Result<TypeRef<'c, 't>, Error> {
         Ok(match self {
             DataType::Token => {
                 return Err(Error::Lowering(LoweringError::UnsupportedDataType {
@@ -117,45 +117,45 @@ impl DataTypeLoweringExtension for DataType {
                 // StableHLO has no element type that carries zero information. Use an `i1` tensor as an unobservable
                 // physical carrier while retaining the logical `DataType::Zero` in the lowered and compiled metadata
                 // of Ryft.
-                context.signless_integer_type(1).as_ref()
+                mlir_context.signless_integer_type(1).as_ref()
             }
-            DataType::Boolean => context.signless_integer_type(1).as_ref(),
-            DataType::I1 => context.signless_integer_type(1).as_ref(),
-            DataType::I2 => context.signless_integer_type(2).as_ref(),
-            DataType::I4 => context.signless_integer_type(4).as_ref(),
-            DataType::I8 => context.signless_integer_type(8).as_ref(),
-            DataType::I16 => context.signless_integer_type(16).as_ref(),
-            DataType::I32 => context.signless_integer_type(32).as_ref(),
-            DataType::I64 => context.signless_integer_type(64).as_ref(),
+            DataType::Boolean => mlir_context.signless_integer_type(1).as_ref(),
+            DataType::I1 => mlir_context.signless_integer_type(1).as_ref(),
+            DataType::I2 => mlir_context.signless_integer_type(2).as_ref(),
+            DataType::I4 => mlir_context.signless_integer_type(4).as_ref(),
+            DataType::I8 => mlir_context.signless_integer_type(8).as_ref(),
+            DataType::I16 => mlir_context.signless_integer_type(16).as_ref(),
+            DataType::I32 => mlir_context.signless_integer_type(32).as_ref(),
+            DataType::I64 => mlir_context.signless_integer_type(64).as_ref(),
             DataType::U1 => {
                 // StableHLO admits signless `i1` as its Boolean and one-bit carrier but rejects `ui1`. The unsigned
                 // semantics of `U1` remain selected by Ryft operation metadata (e.g., comparison direction), while its
                 // sole bit is unchanged.
-                context.signless_integer_type(1).as_ref()
+                mlir_context.signless_integer_type(1).as_ref()
             }
-            DataType::U2 => context.unsigned_integer_type(2).as_ref(),
-            DataType::U4 => context.unsigned_integer_type(4).as_ref(),
-            DataType::U8 => context.unsigned_integer_type(8).as_ref(),
-            DataType::U16 => context.unsigned_integer_type(16).as_ref(),
-            DataType::U32 => context.unsigned_integer_type(32).as_ref(),
-            DataType::U64 => context.unsigned_integer_type(64).as_ref(),
-            DataType::BF16 => context.bfloat16_type().as_ref(),
-            DataType::F16 => context.float16_type().as_ref(),
-            DataType::F32 => context.float32_type().as_ref(),
-            DataType::F64 => context.float64_type().as_ref(),
-            DataType::F4E2M1FN => context.float4e2m1fn_type().as_ref(),
-            DataType::F6E2M3FN => context.float6e2m3fn_type().as_ref(),
-            DataType::F6E3M2FN => context.float6e3m2fn_type().as_ref(),
-            DataType::F8E3M4 => context.float8e3m4_type().as_ref(),
-            DataType::F8E4M3 => context.float8e4m3_type().as_ref(),
-            DataType::F8E4M3FN => context.float8e4m3fn_type().as_ref(),
-            DataType::F8E4M3FNUZ => context.float8e4m3fnuz_type().as_ref(),
-            DataType::F8E4M3B11FNUZ => context.float8e4m3b11fnuz_type().as_ref(),
-            DataType::F8E5M2 => context.float8e5m2_type().as_ref(),
-            DataType::F8E5M2FNUZ => context.float8e5m2fnuz_type().as_ref(),
-            DataType::F8E8M0FNU => context.float8e8m0fnu_type().as_ref(),
-            DataType::C64 => context.complex_type(context.float32_type()).as_ref(),
-            DataType::C128 => context.complex_type(context.float64_type()).as_ref(),
+            DataType::U2 => mlir_context.unsigned_integer_type(2).as_ref(),
+            DataType::U4 => mlir_context.unsigned_integer_type(4).as_ref(),
+            DataType::U8 => mlir_context.unsigned_integer_type(8).as_ref(),
+            DataType::U16 => mlir_context.unsigned_integer_type(16).as_ref(),
+            DataType::U32 => mlir_context.unsigned_integer_type(32).as_ref(),
+            DataType::U64 => mlir_context.unsigned_integer_type(64).as_ref(),
+            DataType::BF16 => mlir_context.bfloat16_type().as_ref(),
+            DataType::F16 => mlir_context.float16_type().as_ref(),
+            DataType::F32 => mlir_context.float32_type().as_ref(),
+            DataType::F64 => mlir_context.float64_type().as_ref(),
+            DataType::F4E2M1FN => mlir_context.float4e2m1fn_type().as_ref(),
+            DataType::F6E2M3FN => mlir_context.float6e2m3fn_type().as_ref(),
+            DataType::F6E3M2FN => mlir_context.float6e3m2fn_type().as_ref(),
+            DataType::F8E3M4 => mlir_context.float8e3m4_type().as_ref(),
+            DataType::F8E4M3 => mlir_context.float8e4m3_type().as_ref(),
+            DataType::F8E4M3FN => mlir_context.float8e4m3fn_type().as_ref(),
+            DataType::F8E4M3FNUZ => mlir_context.float8e4m3fnuz_type().as_ref(),
+            DataType::F8E4M3B11FNUZ => mlir_context.float8e4m3b11fnuz_type().as_ref(),
+            DataType::F8E5M2 => mlir_context.float8e5m2_type().as_ref(),
+            DataType::F8E5M2FNUZ => mlir_context.float8e5m2fnuz_type().as_ref(),
+            DataType::F8E8M0FNU => mlir_context.float8e8m0fnu_type().as_ref(),
+            DataType::C64 => mlir_context.complex_type(mlir_context.float32_type()).as_ref(),
+            DataType::C128 => mlir_context.complex_type(mlir_context.float64_type()).as_ref(),
         })
     }
 
@@ -163,17 +163,17 @@ impl DataTypeLoweringExtension for DataType {
         self,
         tensor_type: TensorTypeRef<'c, 't>,
         value: f64,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
         let attribute = match self {
-            DataType::Zero if value == 0.0 => context.boolean_attribute(false).as_ref(),
-            DataType::Boolean => context.boolean_attribute(value != 0.0).as_ref(),
+            DataType::Zero if value == 0.0 => mlir_context.boolean_attribute(false).as_ref(),
+            DataType::Boolean => mlir_context.boolean_attribute(value != 0.0).as_ref(),
             data_type if data_type.is_integer() => {
-                return self.lower_i64_splat_attribute(tensor_type, value as i64, context);
+                return self.lower_i64_splat_attribute(tensor_type, value as i64, mlir_context);
             }
             data_type if data_type.is_floating_point() => {
-                let element_type = self.lower(context)?.cast::<FloatTypeRef>().unwrap();
-                context.float_attribute(element_type, value).as_ref()
+                let element_type = self.lower(mlir_context)?.cast::<FloatTypeRef>().unwrap();
+                mlir_context.float_attribute(element_type, value).as_ref()
             }
             _ => {
                 return Err(Error::Lowering(LoweringError::UnsupportedDataType {
@@ -182,21 +182,26 @@ impl DataTypeLoweringExtension for DataType {
                 }));
             }
         };
-        context.splatted_dense_attribute_elements_attribute(tensor_type, attribute).map_err(Error::from)
+        mlir_context
+            .splatted_dense_attribute_elements_attribute(tensor_type, attribute)
+            .map_err(Error::from)
     }
 
     fn lower_i64_splat_attribute<'c, 't>(
         self,
         tensor_type: TensorTypeRef<'c, 't>,
         value: i64,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
     ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
         if !self.is_integer() {
-            return self.lower_f64_splat_attribute(tensor_type, value as f64, context);
+            return self.lower_f64_splat_attribute(tensor_type, value as f64, mlir_context);
         }
-        let element_type = self.lower(context)?.cast::<IntegerTypeRef>().unwrap();
-        context
-            .splatted_dense_attribute_elements_attribute(tensor_type, context.integer_attribute(element_type, value))
+        let element_type = self.lower(mlir_context)?.cast::<IntegerTypeRef>().unwrap();
+        mlir_context
+            .splatted_dense_attribute_elements_attribute(
+                tensor_type,
+                mlir_context.integer_attribute(element_type, value),
+            )
             .map_err(Error::from)
     }
 }
@@ -206,7 +211,7 @@ pub trait ArrayTypeLoweringExtension {
     /// Lowers an [`ArrayType`] to a typed MLIR tensor type.
     fn lower<'c, 't, L: Location<'c, 't>>(
         &self,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: L,
     ) -> Result<TensorTypeRef<'c, 't>, Error>;
 
@@ -260,7 +265,7 @@ pub trait ArrayTypeLoweringExtension {
         &self,
         value: ValueRef<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error>;
 
@@ -271,7 +276,7 @@ pub trait ArrayTypeLoweringExtension {
         value: ValueRef<'b, 'c, 't>,
         padding: PhysicalStoragePadding<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error>;
 
@@ -282,7 +287,7 @@ pub trait ArrayTypeLoweringExtension {
         value: ValueRef<'b, 'c, 't>,
         sources: &[(ValueRef<'b, 'c, 't>, usize)],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error>;
 }
@@ -290,10 +295,10 @@ pub trait ArrayTypeLoweringExtension {
 impl ArrayTypeLoweringExtension for ArrayType {
     fn lower<'c, 't, L: Location<'c, 't>>(
         &self,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: L,
     ) -> Result<TensorTypeRef<'c, 't>, Error> {
-        let element_type = self.data_type().lower(context)?;
+        let element_type = self.data_type().lower(mlir_context)?;
         let dimensions = self
             .shape()
             .dimensions()
@@ -307,10 +312,12 @@ impl ArrayTypeLoweringExtension for ArrayType {
         let encoding = bounds
             .iter()
             .any(Option::is_some)
-            .then(|| context.stable_hlo_tensor_type_extensions(bounds.as_slice()))
+            .then(|| mlir_context.stable_hlo_tensor_type_extensions(bounds.as_slice()))
             .transpose()?
             .map(|attribute| attribute.as_ref());
-        context.tensor_type(element_type, dimensions.as_slice(), encoding, location).map_err(Error::from)
+        mlir_context
+            .tensor_type(element_type, dimensions.as_slice(), encoding, location)
+            .map_err(Error::from)
     }
 
     #[inline]
@@ -350,7 +357,7 @@ impl ArrayTypeLoweringExtension for ArrayType {
         &self,
         value: ValueRef<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         let physical_type = self.physical_bound_type()?;
@@ -371,7 +378,7 @@ impl ArrayTypeLoweringExtension for ArrayType {
             let exposed = block.append_operation(stable_hlo::set_dimension_size(
                 value,
                 size,
-                exposed_type.lower(context, location)?,
+                exposed_type.lower(mlir_context, location)?,
                 axis,
                 location,
             )?)?;
@@ -385,7 +392,7 @@ impl ArrayTypeLoweringExtension for ArrayType {
         value: ValueRef<'b, 'c, 't>,
         padding: PhysicalStoragePadding<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         let mut runtime_sizes = Vec::new();
@@ -400,10 +407,10 @@ impl ArrayTypeLoweringExtension for ArrayType {
             return Ok(value);
         }
 
-        let data = self.lower_physical_storage(value, block, context, location)?;
+        let data = self.lower_physical_storage(value, block, mlir_context, location)?;
         let physical_type = self.physical_bound_type()?;
         let index_type = ArrayType::new(DataType::I32, physical_type.shape().clone());
-        let index_tensor_type = index_type.lower(context, location)?;
+        let index_tensor_type = index_type.lower(mlir_context, location)?;
         let mut in_bounds = None;
         for (axis, size) in runtime_sizes {
             let indices = block.append_operation(stable_hlo::iota(index_tensor_type, axis, location)?)?;
@@ -431,7 +438,7 @@ impl ArrayTypeLoweringExtension for ArrayType {
             PhysicalStoragePadding::Scalar(scalar) => block
                 .append_operation(stable_hlo::broadcast(
                     scalar,
-                    physical_type.lower(context, location)?,
+                    physical_type.lower(mlir_context, location)?,
                     &[],
                     location,
                 )?)?
@@ -448,7 +455,7 @@ impl ArrayTypeLoweringExtension for ArrayType {
         mut value: ValueRef<'b, 'c, 't>,
         sources: &[(ValueRef<'b, 'c, 't>, usize)],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         if sources.len() != self.rank() {
@@ -469,7 +476,7 @@ impl ArrayTypeLoweringExtension for ArrayType {
             let refined = block.append_operation(stable_hlo::set_dimension_size(
                 value,
                 size,
-                refined_type.lower(context, location)?,
+                refined_type.lower(mlir_context, location)?,
                 axis,
                 location,
             )?)?;
@@ -486,7 +493,7 @@ pub trait TypeLoweringExtension {
     /// Lowers a [`Type`] to its StableHLO tensor representation.
     fn lower<'c, 't, L: Location<'c, 't>>(
         &self,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: L,
     ) -> Result<TensorTypeRef<'c, 't>, Error>;
 }
@@ -495,12 +502,12 @@ impl TypeLoweringExtension for Type {
     #[inline]
     fn lower<'c, 't, L: Location<'c, 't>>(
         &self,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: L,
     ) -> Result<TensorTypeRef<'c, 't>, Error> {
         match self {
-            Type::Array(array_type) => array_type.lower(context, location),
-            Type::Dimension(_) => ArrayType::scalar(DataType::I64).lower(context, location),
+            Type::Array(array_type) => array_type.lower(mlir_context, location),
+            Type::Dimension(_) => ArrayType::scalar(DataType::I64).lower(mlir_context, location),
             Type::Reference(_) => {
                 Err(Error::Lowering(LoweringError::UnresolvedReference { construct: self.to_string() }))
             }

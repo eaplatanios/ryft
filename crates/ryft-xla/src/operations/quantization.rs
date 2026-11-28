@@ -113,7 +113,7 @@ impl LowerableOperation for ScaledDotOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let lowering_context = lowerer.lowering_context();
         let block = &mut lowerer.block();
-        let (context, location) = (lowerer.context(), lowerer.location());
+        let (context, location) = (lowerer.mlir_context(), lowerer.location());
         let expected_input_count = 2 + usize::from(self.has_lhs_scale()) + usize::from(self.has_rhs_scale());
         check_count!("input", input_values, expected_input_count, ProgramError);
         check_count!("input", input_types, input_values.len(), ProgramError);
@@ -258,7 +258,7 @@ trait ScaledDotOperationLoweringExtension {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -271,7 +271,7 @@ impl ScaledDotOperationLoweringExtension for ScaledDotOperation {
         input_types: &[ArrayType],
         output_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let mut operands = Vec::with_capacity(input_values.len());
@@ -281,7 +281,7 @@ impl ScaledDotOperationLoweringExtension for ScaledDotOperation {
                 *value,
                 PhysicalStoragePadding::Constant(padding_value),
                 block,
-                context,
+                mlir_context,
                 location,
             )?;
             let permutation = &permutations[index % 2];
@@ -292,7 +292,7 @@ impl ScaledDotOperationLoweringExtension for ScaledDotOperation {
             let transposed = block.append_operation(stable_hlo::transpose(value, permutation, location)?)?;
             operands.push(transposed.result(0).unwrap().as_ref());
         }
-        let output_type = output_types[0].physical_bound_type()?.lower(context, location)?;
+        let output_type = output_types[0].physical_bound_type()?.lower(mlir_context, location)?;
         let default_layout = |rank: usize| (0..rank).rev().collect::<Vec<_>>();
         let custom_call = block.append_operation(stable_hlo::custom_call(
             operands.as_slice(),
@@ -315,7 +315,7 @@ impl ScaledDotOperationLoweringExtension for ScaledDotOperation {
             result,
             scaled_dot_output_sources(self, input_values, input_types).as_slice(),
             block,
-            context,
+            mlir_context,
             location,
         )?])
     }

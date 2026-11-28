@@ -51,7 +51,7 @@ impl LowerableOperation for ExpM1Operation<ArrayType> {
                 &output_types[0],
                 self.accuracy().lower(),
                 &mut lowerer.block(),
-                lowerer.context(),
+                lowerer.mlir_context(),
                 lowerer.location(),
             )?]);
         }
@@ -123,7 +123,7 @@ impl LowerableOperation for LogAddExpOperation<ArrayType> {
             input_values,
             output_types,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let form = FloatExtremumForm::for_elementwise(lowerer.lowering_context().target_platform());
@@ -133,7 +133,7 @@ impl LowerableOperation for LogAddExpOperation<ArrayType> {
             &output_types[0],
             form,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         Ok(vec![value])
@@ -155,7 +155,7 @@ impl LowerableOperation for LogisticOperation<ArrayType> {
         let complex = output_type.data_type().is_complex();
         let narrow = !complex && !matches!(output_type.data_type(), DataType::F32 | DataType::F64);
         let working_type = if narrow { output_type.clone().with_data_type(DataType::F32) } else { output_type.clone() };
-        let working_tensor_type = working_type.lower(lowerer.context(), lowerer.location())?;
+        let working_tensor_type = working_type.lower(lowerer.mlir_context(), lowerer.location())?;
         let input = if narrow {
             lowerer
                 .block()
@@ -186,7 +186,7 @@ impl LowerableOperation for LogisticOperation<ArrayType> {
             real,
             &part_type,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let zero = lower_exponential_constant_like(
@@ -194,7 +194,7 @@ impl LowerableOperation for LogisticOperation<ArrayType> {
             real,
             &part_type,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let nonnegative = lowerer
@@ -266,7 +266,7 @@ impl LowerableOperation for LogisticOperation<ArrayType> {
                 .block()
                 .append_operation(stable_hlo::convert(
                     output,
-                    output_type.lower(lowerer.context(), lowerer.location())?,
+                    output_type.lower(lowerer.mlir_context(), lowerer.location())?,
                     lowerer.location(),
                 )?)?
                 .result(0)
@@ -300,15 +300,15 @@ pub(crate) fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     output_type: &ArrayType,
     form: FloatExtremumForm,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let output_tensor_type = output_type.lower(context, location)?;
+    let output_tensor_type = output_type.lower(mlir_context, location)?;
     let data_type = output_type.data_type();
     let narrow = !data_type.is_complex() && !matches!(data_type, DataType::F32 | DataType::F64);
     let (left, right) = if narrow {
         // Evaluate the entire composition in one working type, then round only its final output.
-        let working_type = output_type.clone().with_data_type(DataType::F32).lower(context, location)?;
+        let working_type = output_type.clone().with_data_type(DataType::F32).lower(mlir_context, location)?;
         let left = block
             .append_operation(stable_hlo::convert(left, working_type, location)?)?
             .result(0)
@@ -452,13 +452,13 @@ fn lower_exponential_constant_like<'b, 'c: 'b, 't: 'c>(
     input: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     if output_type.static_shape().is_some() {
         return output_type.lower_f64_splat(factor, block, location);
     }
-    let output_tensor_type = output_type.lower(context, location)?;
+    let output_tensor_type = output_type.lower(mlir_context, location)?;
     let scalar_type = ArrayType::scalar(output_type.data_type());
     let scalar = scalar_type.lower_f64_splat(factor, block, location)?;
     let dimensions = output_type
@@ -490,7 +490,7 @@ fn lower_complex_exp_m1_to_mlir<'b, 'c: 'b, 't: 'c>(
     output_type: &ArrayType,
     accuracy: Accuracy,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let part_type = output_type.clone().with_data_type(if output_type.data_type() == DataType::C64 {
@@ -498,8 +498,8 @@ fn lower_complex_exp_m1_to_mlir<'b, 'c: 'b, 't: 'c>(
     } else {
         DataType::F64
     });
-    let two = lower_exponential_constant_like(2.0, input, &part_type, block, context, location)?;
-    let half = lower_exponential_constant_like(0.5, input, &part_type, block, context, location)?;
+    let two = lower_exponential_constant_like(2.0, input, &part_type, block, mlir_context, location)?;
+    let half = lower_exponential_constant_like(0.5, input, &part_type, block, mlir_context, location)?;
     let real_input = block.append_operation(stable_hlo::real(input, location)?)?.result(0).unwrap().as_ref();
     let imaginary = block.append_operation(stable_hlo::imag(input, location)?)?.result(0).unwrap().as_ref();
     let exponential_minus_one = block

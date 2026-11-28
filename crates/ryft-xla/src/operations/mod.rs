@@ -1112,7 +1112,7 @@ pub(crate) fn normalize_elementwise_input<'b, 'c: 'b, 't: 'c, B, L>(
     input: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
     block: &mut B,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: L,
 ) -> Result<ValueRef<'b, 'c, 't>, Error>
 where
@@ -1126,12 +1126,12 @@ where
             reason: format!("elementwise operand has non-tensor MLIR type `{input_type}`"),
         })
     })?;
-    let output_tensor_type = output_type.lower(context, location)?;
+    let output_tensor_type = output_type.lower(mlir_context, location)?;
     let output_element_type = output_tensor_type.element_type()?;
     let mut input = input;
     if input_tensor_type.element_type()? != output_element_type {
         let dimensions = input_tensor_type.dimensions().collect::<Vec<_>>();
-        let converted_type = context.tensor_type(output_element_type, dimensions.as_slice(), None, location)?;
+        let converted_type = mlir_context.tensor_type(output_element_type, dimensions.as_slice(), None, location)?;
         let converted = block.append_operation(stable_hlo::convert(input, converted_type, location)?)?;
         input = converted.result(0).unwrap().as_ref();
     }
@@ -1181,7 +1181,7 @@ pub(crate) fn normalize_binary_elementwise_inputs<'b, 'c: 'b, 't: 'c, B, L>(
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
     block: &mut B,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: L,
 ) -> Result<[ValueRef<'b, 'c, 't>; 2], Error>
 where
@@ -1191,7 +1191,7 @@ where
     check_count!("input", input_values, 2, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
     let output_type = &output_types[0];
-    let output_tensor_type = output_type.lower(context, location)?;
+    let output_tensor_type = output_type.lower(mlir_context, location)?;
     let multiple_dynamic_axes = output_type
         .shape()
         .dimensions()
@@ -1216,13 +1216,13 @@ where
                 input_values[index],
                 &ArrayType::scalar(output_type.data_type()),
                 block,
-                context,
+                mlir_context,
                 location,
             )?;
             let physical_type = output_type.physical_bound_type()?;
             let broadcast = block.append_operation(stable_hlo::broadcast(
                 scalar,
-                physical_type.lower(context, location)?,
+                physical_type.lower(mlir_context, location)?,
                 &[],
                 location,
             )?)?;
@@ -1236,11 +1236,12 @@ where
                 result,
                 &sources,
                 &mut block.as_ref(),
-                context,
+                mlir_context,
                 location.as_ref(),
             )?;
         } else {
-            inputs[index] = normalize_elementwise_input(input_values[index], output_type, block, context, location)?;
+            inputs[index] =
+                normalize_elementwise_input(input_values[index], output_type, block, mlir_context, location)?;
         }
     }
     Ok(inputs)

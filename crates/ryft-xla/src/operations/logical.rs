@@ -34,7 +34,7 @@ impl LowerableOperation for AndOperation<ArrayType> {
             input_values,
             output_types,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let result = lowerer.block().append_operation(stable_hlo::and(left, right, lowerer.location())?)?;
@@ -55,7 +55,7 @@ impl LowerableOperation for OrOperation<ArrayType> {
             input_values,
             output_types,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let result = lowerer.block().append_operation(stable_hlo::or(left, right, lowerer.location())?)?;
@@ -76,7 +76,7 @@ impl LowerableOperation for XorOperation<ArrayType> {
             input_values,
             output_types,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let result = lowerer.block().append_operation(stable_hlo::xor(left, right, lowerer.location())?)?;

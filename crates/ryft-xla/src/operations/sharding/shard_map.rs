@@ -55,7 +55,7 @@ impl LowerableOperation for ShardMapOperation {
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+        let (mut block, context, location) = (lowerer.block(), lowerer.mlir_context(), lowerer.location());
         let (effect_tokens, _, _, lowering_context) = lowerer.split_effect_tokens();
         lower_manual_computation(
             &mut block,
@@ -84,7 +84,7 @@ fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: 
     program: &Program<Constant, O, ProgramInput, ProgramOutput>,
     local_input_types: &[ArrayType],
     global_output_types: &[ArrayType],
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     lowering_context: &ProgramLoweringContext,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
@@ -172,11 +172,11 @@ where
     let threaded_effects = token_threaded_effects(lowered_effect_classes(program)?).collect::<Vec<_>>();
     let mut local_input_tensor_types = local_input_types
         .iter()
-        .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
+        .map(|array_type| array_type.lower(mlir_context, location).map(|r#type| r#type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let mut global_output_tensor_types = global_output_types
         .iter()
-        .map(|array_type| array_type.lower(context, location).map(|r#type| r#type.as_ref()))
+        .map(|array_type| array_type.lower(mlir_context, location).map(|r#type| r#type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let mut manual_inputs = outer_inputs.to_vec();
     // The shardings of the boundary and of the effect tokens refer to the mesh of the boundary.
@@ -186,14 +186,14 @@ where
         boundary.input_shardings(),
         boundary.manual_axes(),
         enclosing_manual_axes,
-        context,
+        mlir_context,
     )?
     .shardings();
     let mut output_shardings = shardy_tensor_sharding_per_value(
         boundary.output_shardings(),
         boundary.manual_axes(),
         enclosing_manual_axes,
-        context,
+        mlir_context,
     )?
     .shardings();
     // Shardy rejects a manual computation whose result drops an unreduced axis of an input (e.g., a map that completes
@@ -207,11 +207,11 @@ where
         }
     }
     if !threaded_effects.is_empty() {
-        let token_type = context.stable_hlo_token_type()?.as_ref();
+        let token_type = mlir_context.stable_hlo_token_type()?.as_ref();
         // Tokens are rank-0 and have no replicated or unreduced axes. Each device carries its own token, without
         // imposing a total order between devices or attempting to shard a numeric array dimension.
-        let token_sharding = context.shardy_tensor_sharding(
-            context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME),
+        let token_sharding = mlir_context.shardy_tensor_sharding(
+            mlir_context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME),
             &[],
             &[],
             &[],
@@ -225,9 +225,9 @@ where
             output_shardings.push(token_sharding);
         }
     }
-    let mut body_region = context.region();
-    let body_block =
-        context.block(local_input_tensor_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>().as_slice());
+    let mut body_region = mlir_context.region();
+    let body_block = mlir_context
+        .block(local_input_tensor_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>().as_slice());
     {
         let mut body_block_ref = body_block.as_ref();
         // Callees inside the shard-local body always inline. The fresh-root body has no enclosing capture namespace.
@@ -254,9 +254,9 @@ where
     let manual_computation = block.append_operation(shardy::manual_computation(
         manual_inputs.as_slice(),
         global_output_tensor_types.as_slice(),
-        context.shardy_tensor_sharding_per_value(&input_shardings)?,
-        context.shardy_tensor_sharding_per_value(&output_shardings)?,
-        context.shardy_manual_axes(boundary.manual_axes())?,
+        mlir_context.shardy_tensor_sharding_per_value(&input_shardings)?,
+        mlir_context.shardy_tensor_sharding_per_value(&output_shardings)?,
+        mlir_context.shardy_manual_axes(boundary.manual_axes())?,
         body_region,
         location,
     )?)?;
@@ -275,7 +275,7 @@ where
             let result = result?.as_ref();
             match output_type.memory() {
                 Memory::Device => Ok(result),
-                memory => Ok(memory.lower_transfer(&[result], block, context, location)?[0]),
+                memory => Ok(memory.lower_transfer(&[result], block, mlir_context, location)?[0]),
             }
         })
         .collect()
@@ -289,13 +289,13 @@ fn shardy_tensor_sharding_per_value<'c, 't>(
     shardings: &[Sharding],
     manual_axes: &[String],
     enclosing_manual_axes: &[String],
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
 ) -> Result<TensorShardingPerValueAttributeRef<'c, 't>, Error> {
     let shardings = shardings
         .iter()
-        .map(|sharding| manual_computation_tensor_sharding(sharding, manual_axes, enclosing_manual_axes, context))
+        .map(|sharding| manual_computation_tensor_sharding(sharding, manual_axes, enclosing_manual_axes, mlir_context))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(context.shardy_tensor_sharding_per_value(shardings.as_slice())?)
+    Ok(mlir_context.shardy_tensor_sharding_per_value(shardings.as_slice())?)
 }
 
 /// Builds the typed Shardy tensor sharding of one `sdy.manual_computation` boundary value placed by `sharding`. The
@@ -307,23 +307,23 @@ fn manual_computation_tensor_sharding<'c, 't>(
     sharding: &Sharding,
     manual_axes: &[String],
     enclosing_manual_axes: &[String],
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
 ) -> Result<TensorShardingAttributeRef<'c, 't>, Error> {
-    let mesh_symbol_reference = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
+    let mesh_symbol_reference = mlir_context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
     let dimension_shardings =
-        manual_computation_dimension_shardings(sharding, manual_axes, enclosing_manual_axes, context)?;
+        manual_computation_dimension_shardings(sharding, manual_axes, enclosing_manual_axes, mlir_context)?;
     let replicated_axis_names = sharding.replicated_axes();
     let replicated_axes = replicated_axis_names
         .iter()
         .filter(|axis_name| !enclosing_manual_axes.iter().any(|axis| axis.as_str() == **axis_name))
-        .map(|axis_name| context.shardy_axis_ref(*axis_name, None))
+        .map(|axis_name| mlir_context.shardy_axis_ref(*axis_name, None))
         .collect::<Result<Vec<_>, _>>()?;
     let unreduced_axes = sharding
         .unreduced_axes()
         .iter()
-        .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
+        .map(|axis_name| mlir_context.shardy_axis_ref(axis_name.as_str(), None))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(context.shardy_tensor_sharding(
+    Ok(mlir_context.shardy_tensor_sharding(
         mesh_symbol_reference,
         dimension_shardings.as_slice(),
         replicated_axes.as_slice(),
@@ -341,7 +341,7 @@ fn manual_computation_dimension_shardings<'c, 't>(
     sharding: &Sharding,
     manual_axes: &[String],
     enclosing_manual_axes: &[String],
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
 ) -> Result<Vec<DimensionShardingAttributeRef<'c, 't>>, Error> {
     let manual_axis_names = manual_axes.iter().map(String::as_str).collect::<HashSet<_>>();
     let free_axis_names = sharding
@@ -367,17 +367,17 @@ fn manual_computation_dimension_shardings<'c, 't>(
         .dimensions()
         .iter()
         .map(|partition_dimension| match partition_dimension {
-            ShardingDimension::Replicated => context.shardy_dimension_sharding([], !has_unused_free_axes, None),
+            ShardingDimension::Replicated => mlir_context.shardy_dimension_sharding([], !has_unused_free_axes, None),
             ShardingDimension::Sharded(axis_names) => {
                 let axes = axis_names
                     .iter()
-                    .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
+                    .map(|axis_name| mlir_context.shardy_axis_ref(axis_name.as_str(), None))
                     .collect::<Result<Vec<_>, _>>()?;
                 let contains_free_axis =
                     axis_names.iter().any(|axis_name| free_axis_names.contains(axis_name.as_str()));
-                context.shardy_dimension_sharding(axes, !(contains_free_axis || has_unused_free_axes), None)
+                mlir_context.shardy_dimension_sharding(axes, !(contains_free_axis || has_unused_free_axes), None)
             }
-            ShardingDimension::Unconstrained => context.shardy_dimension_sharding([], false, None),
+            ShardingDimension::Unconstrained => mlir_context.shardy_dimension_sharding([], false, None),
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(Error::from)

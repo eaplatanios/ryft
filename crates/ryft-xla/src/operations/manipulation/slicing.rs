@@ -34,7 +34,7 @@ impl LowerableOperation for SliceOperation {
         // sliced with that bound as the limit along each such axis, and the logical extents of the output's dynamic
         // axes are then restored from the same axes of the input. The elements beyond each logical extent are never
         // masked, because restoring the logical extents discards them again.
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
         check_count!("input", input_values, 1, ProgramError);
@@ -142,7 +142,7 @@ impl LowerableOperation for DynamicSliceOperation {
             self.sizes(),
             self.allows_negative_indices(),
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let result = lowerer.block().append_operation(stable_hlo::dynamic_slice(
@@ -177,7 +177,7 @@ impl LowerableOperation for DynamicUpdateSliceOperation {
             &sizes,
             self.allows_negative_indices(),
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         let result = lowerer.block().append_operation(stable_hlo::dynamic_update_slice(
@@ -198,7 +198,7 @@ impl LowerableOperation for DynamicSliceOperation<Type> {
         input_types: &[Type],
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
         let effect_tokens = lowerer.effect_tokens_mut();
@@ -465,7 +465,7 @@ fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
     sizes: &[usize],
     allow_negative_indices: bool,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("input", starts, input_type.rank(), ProgramError);
@@ -521,7 +521,7 @@ fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
             })
             .collect();
     }
-    let signed_type = ArrayType::scalar(DataType::I64).lower(context, location)?;
+    let signed_type = ArrayType::scalar(DataType::I64).lower(mlir_context, location)?;
     starts
         .iter()
         .zip(start_types)
@@ -530,7 +530,7 @@ fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
         .map(|(axis, ((start, start_type), size))| {
             let data_type = if start_type.data_type().is_unsigned() { DataType::U64 } else { DataType::I64 };
             let scalar_type = ArrayType::scalar(data_type);
-            let tensor_type = scalar_type.lower(context, location)?;
+            let tensor_type = scalar_type.lower(mlir_context, location)?;
             let mut start = block
                 .append_operation(stable_hlo::convert(*start, tensor_type, location)?)?
                 .result(0)
@@ -604,21 +604,24 @@ fn lower_dynamic_slice_assertion<'b, 'c: 'b, 't: 'c>(
     size: ValueRef<'b, 'c, 't>,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
     let predicate = lower_deliberately_false_assertion_predicate(start, block, location)?;
     let detail = format!("{axis}:{stride}");
-    let backend_configuration = context.dictionary_attribute(&[
-        context.named_attribute(
-            context.identifier(ASSERT_ACTOR_ATTRIBUTE),
-            context.string_attribute(DYNAMIC_SLICE_OPERATION_NAME),
+    let backend_configuration = mlir_context.dictionary_attribute(&[
+        mlir_context.named_attribute(
+            mlir_context.identifier(ASSERT_ACTOR_ATTRIBUTE),
+            mlir_context.string_attribute(DYNAMIC_SLICE_OPERATION_NAME),
         ),
-        context.named_attribute(
-            context.identifier(ASSERT_KIND_ATTRIBUTE),
-            context.string_attribute(ASSERT_DYNAMIC_SHAPE_SLICE_KIND),
+        mlir_context.named_attribute(
+            mlir_context.identifier(ASSERT_KIND_ATTRIBUTE),
+            mlir_context.string_attribute(ASSERT_DYNAMIC_SHAPE_SLICE_KIND),
         ),
-        context.named_attribute(context.identifier(ASSERT_DETAIL_ATTRIBUTE), context.string_attribute(detail.as_str())),
+        mlir_context.named_attribute(
+            mlir_context.identifier(ASSERT_DETAIL_ATTRIBUTE),
+            mlir_context.string_attribute(detail.as_str()),
+        ),
     ]);
     lower_assertion_custom_call(
         predicate,
@@ -626,7 +629,7 @@ fn lower_dynamic_slice_assertion<'b, 'c: 'b, 't: 'c>(
         backend_configuration,
         effect_tokens,
         block,
-        context,
+        mlir_context,
         location,
     )
 }
@@ -639,10 +642,10 @@ fn lower_array_start<'b, 'c: 'b, 't: 'c>(
     start: ValueRef<'b, 'c, 't>,
     start_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let signed_type = ArrayType::scalar(DataType::I64).lower(context, location)?;
+    let signed_type = ArrayType::scalar(DataType::I64).lower(mlir_context, location)?;
     if !start_type.data_type().is_unsigned() {
         let start = block
             .append_operation(stable_hlo::convert(start, signed_type, location)?)?
@@ -655,7 +658,7 @@ fn lower_array_start<'b, 'c: 'b, 't: 'c>(
         return Ok(start);
     }
     let unsigned_scalar_type = ArrayType::scalar(DataType::U64);
-    let unsigned_type = unsigned_scalar_type.lower(context, location)?;
+    let unsigned_type = unsigned_scalar_type.lower(mlir_context, location)?;
     let start = block
         .append_operation(stable_hlo::convert(start, unsigned_type, location)?)?
         .result(0)

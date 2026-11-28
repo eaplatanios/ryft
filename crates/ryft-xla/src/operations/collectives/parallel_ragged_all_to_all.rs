@@ -51,7 +51,7 @@ impl LowerableOperation for ParallelRaggedAllToAllOperation {
             input_values,
             input_types,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )
     }
@@ -65,7 +65,7 @@ impl MemberLowerableOperation<Type> for ParallelRaggedAllToAllOperation {
         input_types: &[Type],
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let lowering_context = lowerer.lowering_context();
         let block = &mut lowerer.block();
@@ -107,7 +107,7 @@ fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
     replica_groups: &[Vec<usize>],
     inputs: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let group_size = replica_groups.first().map(Vec::len).unwrap_or(0);
@@ -117,8 +117,8 @@ fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
         )
         .into());
     }
-    let replica_group_type = context.tensor_type(
-        context.signless_integer_type(64),
+    let replica_group_type = mlir_context.tensor_type(
+        mlir_context.signless_integer_type(64),
         &[MlirSize::Static(replica_groups.len()), MlirSize::Static(group_size)],
         None,
         location,
@@ -135,7 +135,8 @@ fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let replica_groups = context.dense_i64_elements_attribute(replica_group_type, replica_group_values.as_slice())?;
+    let replica_groups =
+        mlir_context.dense_i64_elements_attribute(replica_group_type, replica_group_values.as_slice())?;
     let channel_id = lowering_context.allocate_channel_id();
     let channel_id = i64::try_from(channel_id).map_err(|_| {
         ProgramError::MalformedProgram(format!(
@@ -143,11 +144,11 @@ fn emit_parallel_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
              attribute",
         ))
     })?;
-    let backend_config = context.dictionary_attribute(&[
-        context.named_attribute(context.identifier("replica_groups"), replica_groups.as_ref()),
-        context.named_attribute(
-            context.identifier("channel_id"),
-            context.integer_attribute(context.signless_integer_type(64), channel_id),
+    let backend_config = mlir_context.dictionary_attribute(&[
+        mlir_context.named_attribute(mlir_context.identifier("replica_groups"), replica_groups.as_ref()),
+        mlir_context.named_attribute(
+            mlir_context.identifier("channel_id"),
+            mlir_context.integer_attribute(mlir_context.signless_integer_type(64), channel_id),
         ),
     ]);
     let output_type = inputs[1].r#type()?;
@@ -194,7 +195,7 @@ trait ParallelRaggedAllToAllOperationLoweringExtension {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 
@@ -212,7 +213,7 @@ trait ParallelRaggedAllToAllOperationLoweringExtension {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 
@@ -224,7 +225,7 @@ trait ParallelRaggedAllToAllOperationLoweringExtension {
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -236,7 +237,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         if self.is_physical() {
@@ -251,9 +252,9 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
         check_count!("input", input_values, 6, ProgramError);
         check_count!("input", input_types, 6, ProgramError);
         if self.batch_dimension_count() > 0 {
-            return self.lower_batched(lowering_context, input_values, input_types, block, context, location);
+            return self.lower_batched(lowering_context, input_values, input_types, block, mlir_context, location);
         }
-        self.lower_unbatched(lowering_context, input_values, input_types, block, context, location)
+        self.lower_unbatched(lowering_context, input_values, input_types, block, mlir_context, location)
     }
 
     fn lower_batched<'b, 'c: 'b, 't: 'c>(
@@ -262,7 +263,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let batch_dimension_count = self.batch_dimension_count();
@@ -294,7 +295,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
                        r#type: &ArrayType,
                        block: &mut BlockRef<'b, 'c, 't>|
          -> Result<ValueRef<'b, 'c, 't>, Error> {
-            let tensor_type = r#type.lower(context, location)?;
+            let tensor_type = r#type.lower(mlir_context, location)?;
             let reshaped =
                 block.append_operation(stable_hlo::reshape_with_output_type(value, tensor_type, location)?)?;
             Ok(reshaped.result(0).unwrap().as_ref())
@@ -322,7 +323,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
         let metadata_length = shapes[2].dimensions()[batch_dimension_count];
         let flat_metadata_length = item_count.checked_mul(metadata_length).ok_or_else(overflow)?;
         let item_metadata_type = ArrayType::new_static(DataType::U64, [item_count, metadata_length]);
-        let item_metadata_tensor_type = item_metadata_type.lower(context, location)?;
+        let item_metadata_tensor_type = item_metadata_type.lower(mlir_context, location)?;
         let flat_metadata_type = ArrayType::new_static(DataType::U64, [flat_metadata_length]);
         for index in 2..6 {
             let mut value = input_values[index];
@@ -370,7 +371,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
             flat_values.as_slice(),
             flat_types.as_slice(),
             block,
-            context,
+            mlir_context,
             location,
         )?;
         check_count!("output", outputs, 1, ProgramError);
@@ -383,7 +384,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let (replica_groups, effective_axis_size) =
@@ -394,7 +395,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
                 replica_groups.as_slice(),
                 input_values,
                 block,
-                context,
+                mlir_context,
                 location,
             )?]);
         }
@@ -436,13 +437,13 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
                 zero,
                 dimension_sources.as_slice(),
                 block,
-                context,
+                mlir_context,
                 location,
             )?
         };
 
         let metadata_type = input_types[2].clone().with_data_type(DataType::U64);
-        let metadata_tensor_type = metadata_type.lower(context, location)?;
+        let metadata_tensor_type = metadata_type.lower(mlir_context, location)?;
         let metadata = input_values[2..]
             .iter()
             .zip(&input_types[2..])
@@ -478,7 +479,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
         let source_axis_index = (AxisIndexOperation::new(self.axis_name().to_string())).lower_to_coordinate(
             lowering_context,
             block,
-            context,
+            mlir_context,
             location,
         )?;
         let source_group_position = if let Some(groups) = self.axis_index_groups() {
@@ -493,8 +494,9 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
                     })?;
                 }
             }
-            let positions_type = (ArrayType::new_static(DataType::I64, [self.axis_size()])).lower(context, location)?;
-            let positions = context.dense_i64_elements_attribute(positions_type, positions.as_slice())?;
+            let positions_type =
+                (ArrayType::new_static(DataType::I64, [self.axis_size()])).lower(mlir_context, location)?;
+            let positions = mlir_context.dense_i64_elements_attribute(positions_type, positions.as_slice())?;
             let positions = block.append_operation(stable_hlo::constant(positions, location)?)?;
             let positions = positions.result(0).unwrap().as_ref();
             let position =
@@ -502,13 +504,13 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
             let position = position.result(0).unwrap().as_ref();
             let position = block.append_operation(stable_hlo::convert(
                 position,
-                ArrayType::new_static(DataType::U64, [1]).lower(context, location)?,
+                ArrayType::new_static(DataType::U64, [1]).lower(mlir_context, location)?,
                 location,
             )?)?;
             let position = position.result(0).unwrap().as_ref();
             let position = block.append_operation(stable_hlo::reshape_with_output_type(
                 position,
-                ArrayType::scalar(DataType::U64).lower(context, location)?,
+                ArrayType::scalar(DataType::U64).lower(mlir_context, location)?,
                 location,
             )?)?;
             position.result(0).unwrap().as_ref()
@@ -533,7 +535,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
                     "`parallel_ragged_all_to_all` output extent {output_extent} cannot be represented by its metadata",
                 ))
             })?,
-            context,
+            mlir_context,
         )?;
         let copy_stride = block.append_operation(stable_hlo::constant(copy_stride, location)?)?;
         let copy_stride = copy_stride.result(0).unwrap().as_ref();
@@ -547,13 +549,14 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
             replica_groups.as_slice(),
             transfer_inputs.as_slice(),
             block,
-            context,
+            mlir_context,
             location,
         )?;
         let mut copy_dimensions = input_types[1].shape().dimensions().to_vec();
         copy_dimensions[0] = Dimension::Static(output_extent);
         copy_dimensions.insert(0, Dimension::Static(metadata_length));
-        let copy_type = (input_types[1].clone().with_shape(Shape::new(copy_dimensions))).lower(context, location)?;
+        let copy_type =
+            (input_types[1].clone().with_shape(Shape::new(copy_dimensions))).lower(mlir_context, location)?;
         let copies = block.append_operation(stable_hlo::reshape_with_output_type(expanded, copy_type, location)?)?;
         let copies = copies.result(0).unwrap().as_ref();
         let contribution = ReductionKind::Sum.lower(
@@ -562,7 +565,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
             &input_types[1],
             FloatExtremumForm::TotalOrder,
             block,
-            context,
+            mlir_context,
             location,
         )?;
         let sum = block.append_operation(stable_hlo::add(input_values[1], contribution, location)?)?;

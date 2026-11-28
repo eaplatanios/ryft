@@ -35,7 +35,7 @@ impl LowerableOperation for PadOperation<ArrayType> {
             output_types,
             None,
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )
     }
@@ -49,7 +49,7 @@ impl LowerableOperation for PadOperation<Type> {
         input_types: &[Type],
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
         let effect_tokens = lowerer.effect_tokens_mut();
@@ -105,7 +105,7 @@ trait PadOperationLoweringExtension {
         output_types: &[ArrayType],
         output_extents: Option<&[ValueRef<'b, 'c, 't>]>,
         block: &mut B,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: L,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -119,7 +119,7 @@ impl<T: CoreType> PadOperationLoweringExtension for PadOperation<T> {
         output_types: &[ArrayType],
         output_extents: Option<&[ValueRef<'b, 'c, 't>]>,
         block: &mut B,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: L,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         check_count!("input", input_values, 2, ProgramError);
@@ -215,7 +215,7 @@ impl<T: CoreType> PadOperationLoweringExtension for PadOperation<T> {
             block
                 .append_operation(stable_hlo::broadcast(
                     input_values[1],
-                    physical_output_type.lower(context, location)?,
+                    physical_output_type.lower(mlir_context, location)?,
                     &[],
                     location,
                 )?)?
@@ -229,7 +229,7 @@ impl<T: CoreType> PadOperationLoweringExtension for PadOperation<T> {
                 input_values[0],
                 PhysicalStoragePadding::Scalar(input_values[1]),
                 &mut block,
-                context,
+                mlir_context,
                 location,
             )?;
             let input = if starts.iter().any(|start| *start != 0)
@@ -273,7 +273,7 @@ impl<T: CoreType> PadOperationLoweringExtension for PadOperation<T> {
             let extent = block
                 .append_operation(stable_hlo::convert(
                     extent,
-                    ArrayType::scalar(DataType::I32).lower(context, location)?,
+                    ArrayType::scalar(DataType::I32).lower(mlir_context, location)?,
                     location,
                 )?)?
                 .result(0)
@@ -286,7 +286,7 @@ impl<T: CoreType> PadOperationLoweringExtension for PadOperation<T> {
                 .append_operation(stable_hlo::set_dimension_size(
                     result,
                     extent,
-                    refined_type.lower(context, location)?,
+                    refined_type.lower(mlir_context, location)?,
                     axis,
                     location,
                 )?)?
@@ -316,7 +316,7 @@ trait PadOperationAssertionLoweringExtension {
         output: ValueRef<'b, 'c, 't>,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<(), Error>;
 }
@@ -330,7 +330,7 @@ impl PadOperationAssertionLoweringExtension for PadOperation<Type> {
         output: ValueRef<'b, 'c, 't>,
         effect_tokens: &mut EffectTokens<'b, 'c, 't>,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<(), Error> {
         let predicate = lower_deliberately_false_assertion_predicate(output, block, location)?;
@@ -340,13 +340,16 @@ impl PadOperationAssertionLoweringExtension for PadOperation<Type> {
             self.edge_padding_high()[axis],
             self.interior_padding()[axis],
         );
-        let backend_configuration = context.dictionary_attribute(&[
-            context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute("pad")),
-            context
-                .named_attribute(context.identifier(ASSERT_KIND_ATTRIBUTE), context.string_attribute(ASSERT_PAD_KIND)),
-            context.named_attribute(
-                context.identifier(ASSERT_DETAIL_ATTRIBUTE),
-                context.string_attribute(detail.as_str()),
+        let backend_configuration = mlir_context.dictionary_attribute(&[
+            mlir_context
+                .named_attribute(mlir_context.identifier(ASSERT_ACTOR_ATTRIBUTE), mlir_context.string_attribute("pad")),
+            mlir_context.named_attribute(
+                mlir_context.identifier(ASSERT_KIND_ATTRIBUTE),
+                mlir_context.string_attribute(ASSERT_PAD_KIND),
+            ),
+            mlir_context.named_attribute(
+                mlir_context.identifier(ASSERT_DETAIL_ATTRIBUTE),
+                mlir_context.string_attribute(detail.as_str()),
             ),
         ]);
         lower_assertion_custom_call(
@@ -355,7 +358,7 @@ impl PadOperationAssertionLoweringExtension for PadOperation<Type> {
             backend_configuration,
             effect_tokens,
             block,
-            context,
+            mlir_context,
             location,
         )
     }

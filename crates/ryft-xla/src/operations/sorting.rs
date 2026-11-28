@@ -18,7 +18,7 @@ impl LowerableOperation for SortOperation {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = input_types;
-        self.lower_to_mlir(input_values, output_types, &mut lowerer.block(), lowerer.context(), lowerer.location())
+        self.lower_to_mlir(input_values, output_types, &mut lowerer.block(), lowerer.mlir_context(), lowerer.location())
     }
 }
 
@@ -43,7 +43,7 @@ trait SortOperationLoweringExtension {
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>;
 }
@@ -54,7 +54,7 @@ impl SortOperationLoweringExtension for SortOperation {
         input_values: &[ValueRef<'b, 'c, 't>],
         output_types: &[ArrayType],
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         if output_types.is_empty() {
@@ -65,12 +65,12 @@ impl SortOperationLoweringExtension for SortOperation {
         }
         let mut comparator_arguments = Vec::with_capacity(2 * output_types.len());
         for output_type in output_types {
-            let scalar_type = (ArrayType::scalar(output_type.data_type())).lower(context, location)?;
+            let scalar_type = (ArrayType::scalar(output_type.data_type())).lower(mlir_context, location)?;
             comparator_arguments.push((scalar_type, location));
             comparator_arguments.push((scalar_type, location));
         }
-        let comparator_block = context.block(comparator_arguments.as_slice());
-        let mut comparator = context.region();
+        let comparator_block = mlir_context.block(comparator_arguments.as_slice());
+        let mut comparator = mlir_context.region();
         let mut comparator_block = comparator.append_block(comparator_block)?;
         let comparison_direction = match self.direction() {
             SortDirection::Ascending => stable_hlo::ComparisonDirection::LessThan,

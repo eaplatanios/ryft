@@ -15,8 +15,12 @@ impl LowerableOperation for TransferToMemoryOperation {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = (input_types, output_types);
-        self.destination()
-            .lower_transfer(input_values, &mut lowerer.block(), lowerer.context(), lowerer.location())
+        self.destination().lower_transfer(
+            input_values,
+            &mut lowerer.block(),
+            lowerer.mlir_context(),
+            lowerer.location(),
+        )
     }
 }
 

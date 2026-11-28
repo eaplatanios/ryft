@@ -28,7 +28,7 @@ impl LowerableOperation for BroadcastOperation {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let lowering_context = lowerer.lowering_context();
         let block = &mut lowerer.block();
-        let (context, location) = (lowerer.context(), lowerer.location());
+        let (context, location) = (lowerer.mlir_context(), lowerer.location());
         check_count!("input", input_values, 1, ProgramError);
         check_count!("input", input_types, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
@@ -144,7 +144,7 @@ impl LowerableOperation for BroadcastLikeOperation {
         check_count!("input", input_values, 2, ProgramError);
         check_count!("input", input_types, 2, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
         let output_type = &output_types[0];
@@ -192,7 +192,7 @@ impl LowerableOperation for DynamicBroadcastOperation {
         input_types: &[Type],
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let lowering_context = lowerer.lowering_context();
         let block = &mut lowerer.block();

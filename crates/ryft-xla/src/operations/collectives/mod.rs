@@ -274,10 +274,10 @@ fn collapse_singleton_axis<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     output_array_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let output_type = output_array_type.lower(context, location)?;
+    let output_type = output_array_type.lower(mlir_context, location)?;
     let reshape = block.append_operation(stable_hlo::reshape_with_output_type(value, output_type, location)?)?;
     Ok(reshape.result(0).unwrap().as_ref())
 }
@@ -288,14 +288,14 @@ fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
     extents: &[ValueRef<'b, 'c, 't>],
     output_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     if output_type.rank() != extents.len() {
         return Err(ProgramError::InvalidInputCount { expected: output_type.rank(), actual: extents.len() }.into());
     }
-    let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
-    let output_tensor_type = output_type.lower(context, location)?;
+    let i32_scalar_type = mlir_context.tensor_type(mlir_context.signless_integer_type(32), &[], None, location)?;
+    let output_tensor_type = output_type.lower(mlir_context, location)?;
     for (axis, &extent) in extents.iter().enumerate() {
         if !matches!(output_type.shape().dimensions()[axis], Dimension::Dynamic(_)) {
             continue;

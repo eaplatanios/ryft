@@ -41,7 +41,7 @@ impl LowerableOperation for ConcatenateOperation<Type> {
         input_types: &[Type],
         output_types: &[Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
         let effect_tokens = lowerer.effect_tokens_mut();
@@ -191,18 +191,24 @@ fn lower_concatenate_extent_assertion<'b, 'c: 'b, 't: 'c>(
     input_extents: &[ValueRef<'b, 'c, 't>],
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
     let predicate = lower_deliberately_false_assertion_predicate(actual, block, location)?;
     let axis = axis.to_string();
-    let backend_configuration = context.dictionary_attribute(&[
-        context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute("concatenate")),
-        context.named_attribute(
-            context.identifier(ASSERT_KIND_ATTRIBUTE),
-            context.string_attribute(ASSERT_CONCATENATE_KIND),
+    let backend_configuration = mlir_context.dictionary_attribute(&[
+        mlir_context.named_attribute(
+            mlir_context.identifier(ASSERT_ACTOR_ATTRIBUTE),
+            mlir_context.string_attribute("concatenate"),
         ),
-        context.named_attribute(context.identifier(ASSERT_DETAIL_ATTRIBUTE), context.string_attribute(axis.as_str())),
+        mlir_context.named_attribute(
+            mlir_context.identifier(ASSERT_KIND_ATTRIBUTE),
+            mlir_context.string_attribute(ASSERT_CONCATENATE_KIND),
+        ),
+        mlir_context.named_attribute(
+            mlir_context.identifier(ASSERT_DETAIL_ATTRIBUTE),
+            mlir_context.string_attribute(axis.as_str()),
+        ),
     ]);
     let observed = std::iter::once(actual).chain(input_extents.iter().copied()).collect::<Vec<_>>();
     lower_assertion_custom_call(
@@ -211,7 +217,7 @@ fn lower_concatenate_extent_assertion<'b, 'c: 'b, 't: 'c>(
         backend_configuration,
         effect_tokens,
         block,
-        context,
+        mlir_context,
         location,
     )
 }

@@ -130,7 +130,7 @@ pub(crate) fn lower_assertion_custom_call<'b, 'c: 'b, 't: 'c>(
     backend_config: DictionaryAttributeRef<'c, 't>,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
     let input_token = current_or_new_token(EffectClass::OrderedAssertion, effect_tokens, block, location)?;
@@ -162,7 +162,7 @@ pub(crate) fn lower_assertion_custom_call<'b, 'c: 'b, 't: 'c>(
         layouts,
         &[],
         None,
-        &[context.stable_hlo_token_type()?],
+        &[mlir_context.stable_hlo_token_type()?],
         location,
     )?)?;
     effect_tokens.set(EffectClass::OrderedAssertion, operation.result(0).unwrap().as_ref());
@@ -208,7 +208,7 @@ pub(crate) fn lower_output_extent_validation<'b, 'c: 'b, 't: 'c>(
     output_types: &[ArrayType],
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Option<ValueRef<'b, 'c, 't>>, Error> {
     let checks = output_extent_checks(declared_types, input_types, output_types)?;
@@ -232,7 +232,7 @@ pub(crate) fn lower_output_extent_validation<'b, 'c: 'b, 't: 'c>(
             &[predicate, value],
             effect_tokens,
             block,
-            context,
+            mlir_context,
             location,
         )?;
         validation = Some(match validation {
@@ -300,7 +300,7 @@ pub(crate) fn lower_guard<'b, 'c: 'b, 't: 'c>(
     actual_types: &[Type],
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
     let guarded = lower_type_relationship_checks(
@@ -311,7 +311,7 @@ pub(crate) fn lower_guard<'b, 'c: 'b, 't: 'c>(
         actual_types,
         effect_tokens,
         block,
-        context,
+        mlir_context,
         location,
     )?;
 
@@ -363,7 +363,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
     actual_types: &[Type],
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<bool, Error> {
     check_count!("input", values, declared_types.len(), ProgramError);
@@ -385,7 +385,7 @@ pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
             &[predicate, expected, actual],
             effect_tokens,
             block,
-            context,
+            mlir_context,
             location,
         )?;
         checked = true;
@@ -628,7 +628,7 @@ impl LowerableOperation for AssertOperation<ArrayType> {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = output_types;
         lowerer.require_runtime(RuntimeRequirement::builtin(ASSERT_CUSTOM_CALL_TARGET))?;
-        let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+        let (mut block, context, location) = (lowerer.block(), lowerer.mlir_context(), lowerer.location());
         lower_assert_to_custom_call(
             self.name(),
             self.message(),
@@ -655,7 +655,7 @@ impl LowerableOperation for AssertOperation<Type> {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let _ = output_types;
         lowerer.require_runtime(RuntimeRequirement::builtin(ASSERT_CUSTOM_CALL_TARGET))?;
-        let context = lowerer.context();
+        let context = lowerer.mlir_context();
         let location = lowerer.location();
         let block = &mut lowerer.block();
         let effect_tokens = lowerer.effect_tokens_mut();
@@ -738,27 +738,33 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
     input_values: &[ValueRef<'b, 'c, 't>],
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), Error> {
     check_count!("input", input_values, labels.len() + 1, ProgramError);
     check_count!("input", input_types, input_values.len(), ProgramError);
     let mut attributes = vec![
-        context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute(actor)),
-        context.named_attribute(
-            context.identifier(ASSERT_KIND_ATTRIBUTE),
-            context.string_attribute(if failure_limit.is_some() { ASSERT_ELEMENTS_KIND } else { ASSERT_GENERIC_KIND }),
+        mlir_context
+            .named_attribute(mlir_context.identifier(ASSERT_ACTOR_ATTRIBUTE), mlir_context.string_attribute(actor)),
+        mlir_context.named_attribute(
+            mlir_context.identifier(ASSERT_KIND_ATTRIBUTE),
+            mlir_context.string_attribute(if failure_limit.is_some() {
+                ASSERT_ELEMENTS_KIND
+            } else {
+                ASSERT_GENERIC_KIND
+            }),
         ),
-        context.named_attribute(context.identifier(ASSERT_MESSAGE_ATTRIBUTE), context.string_attribute(message)),
-        context.named_attribute(
-            context.identifier(ASSERT_LABEL_COUNT_ATTRIBUTE),
-            context.string_attribute(labels.len().to_string().as_str()),
+        mlir_context
+            .named_attribute(mlir_context.identifier(ASSERT_MESSAGE_ATTRIBUTE), mlir_context.string_attribute(message)),
+        mlir_context.named_attribute(
+            mlir_context.identifier(ASSERT_LABEL_COUNT_ATTRIBUTE),
+            mlir_context.string_attribute(labels.len().to_string().as_str()),
         ),
     ];
     for (index, label) in labels.iter().enumerate() {
-        attributes.push(context.named_attribute(
-            context.identifier(format!("label_{index}").as_str()),
-            context.string_attribute(label.as_str()),
+        attributes.push(mlir_context.named_attribute(
+            mlir_context.identifier(format!("label_{index}").as_str()),
+            mlir_context.string_attribute(label.as_str()),
         ));
     }
     let mut arguments = input_values.to_vec();
@@ -771,7 +777,7 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
                 DataType::U1 | DataType::U2 | DataType::U4 => DataType::U8,
                 _ => continue,
             };
-            let tensor_type = input_type.clone().with_data_type(carrier).lower(context, location)?;
+            let tensor_type = input_type.clone().with_data_type(carrier).lower(mlir_context, location)?;
             let converted = block.append_operation(stable_hlo::convert(*value, tensor_type, location)?)?;
             *value = converted.result(0).unwrap().as_ref();
             if data_type == DataType::I1 {
@@ -780,13 +786,13 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
             }
         }
         let rank = input_values[0].r#type()?.cast::<TensorTypeRef>().unwrap().dimensions().count();
-        attributes.push(context.named_attribute(
-            context.identifier(ASSERT_FAILURE_LIMIT_ATTRIBUTE),
-            context.string_attribute(limit.get().to_string().as_str()),
+        attributes.push(mlir_context.named_attribute(
+            mlir_context.identifier(ASSERT_FAILURE_LIMIT_ATTRIBUTE),
+            mlir_context.string_attribute(limit.get().to_string().as_str()),
         ));
-        attributes.push(context.named_attribute(
-            context.identifier(ASSERT_PREDICATE_RANK_ATTRIBUTE),
-            context.string_attribute(rank.to_string().as_str()),
+        attributes.push(mlir_context.named_attribute(
+            mlir_context.identifier(ASSERT_PREDICATE_RANK_ATTRIBUTE),
+            mlir_context.string_attribute(rank.to_string().as_str()),
         ));
         for axis in 0..rank {
             arguments.push(input_values[0].widen_dimension_to_i64(axis, block, location)?);
@@ -803,7 +809,7 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
                 *value,
                 PhysicalStoragePadding::Constant(0.0),
                 block,
-                context,
+                mlir_context,
                 location,
             )?;
         }
@@ -811,10 +817,10 @@ fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
     lower_assertion_custom_call(
         arguments[0],
         &arguments[1..],
-        context.dictionary_attribute(&attributes),
+        mlir_context.dictionary_attribute(&attributes),
         effect_tokens,
         block,
-        context,
+        mlir_context,
         location,
     )
 }
@@ -867,7 +873,7 @@ fn lower_guard_with_outputs<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("output", output_types, input_values.len(), ProgramError);
-    let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+    let (mut block, context, location) = (lowerer.block(), lowerer.mlir_context(), lowerer.location());
     lower_guard(
         boundary,
         declared_types,
@@ -889,7 +895,13 @@ fn lower_guard_with_outputs<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
         .zip(input_types)
         .zip(output_types)
         .map(|((&value, input_type), output_type)| {
-            input_type.lower_cast_shape(value, output_type, &mut lowerer.block(), lowerer.context(), lowerer.location())
+            input_type.lower_cast_shape(
+                value,
+                output_type,
+                &mut lowerer.block(),
+                lowerer.mlir_context(),
+                lowerer.location(),
+            )
         })
         .collect()
 }

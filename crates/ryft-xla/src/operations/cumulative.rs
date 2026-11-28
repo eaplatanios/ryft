@@ -35,7 +35,7 @@ impl LowerableOperation for CumulativeOperation {
             &output_types[0],
             lowerer.lowering_context().target_platform(),
             &mut lowerer.block(),
-            lowerer.context(),
+            lowerer.mlir_context(),
             lowerer.location(),
         )?;
         Ok(vec![value])
@@ -73,7 +73,7 @@ trait CumulativeKindLoweringExtension {
         output_array_type: &ArrayType,
         target_platform: Option<&str>,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error>;
 }
@@ -88,7 +88,7 @@ impl CumulativeKindLoweringExtension for CumulativeKind {
         output_array_type: &ArrayType,
         target_platform: Option<&str>,
         block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
+        mlir_context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
         // The scanned extent is static by construction, because `ryft-core` type inference rejects a dynamic scanned
@@ -123,9 +123,9 @@ impl CumulativeKindLoweringExtension for CumulativeKind {
             let mut carry_dimensions = shape.dimensions().to_vec();
             carry_dimensions.remove(axis);
             let carry_tensor_type =
-                (ArrayType::new_static(element_type, carry_dimensions.clone())).lower(context, location)?;
+                (ArrayType::new_static(element_type, carry_dimensions.clone())).lower(mlir_context, location)?;
             let identity =
-                build_reduction_identity_constant(ReductionKind::Sum, element_type, block, context, location)?;
+                build_reduction_identity_constant(ReductionKind::Sum, element_type, block, mlir_context, location)?;
             let initial_value = match carry_dimensions.is_empty() {
                 true => identity,
                 false => block
@@ -137,9 +137,9 @@ impl CumulativeKindLoweringExtension for CumulativeKind {
 
             // The body receives one slice of the input and the carry, and returns their sum both as the output slice
             // and as the next carry.
-            let mut body_region = context.region();
+            let mut body_region = mlir_context.region();
             let mut body_block = body_region
-                .append_block(context.block(&[(carry_tensor_type, location), (carry_tensor_type, location)]))?;
+                .append_block(mlir_context.block(&[(carry_tensor_type, location), (carry_tensor_type, location)]))?;
             let slice = body_block.argument(0)?.as_ref();
             let carry = body_block.argument(1)?.as_ref();
             let sum = if matches!(element_type, DataType::I1 | DataType::U1) {
@@ -184,10 +184,10 @@ impl CumulativeKindLoweringExtension for CumulativeKind {
             ) => Some(DataType::U8),
             _ => None,
         };
-        let initial_value = build_cumulative_initial_value(self, element_type, block, context, location)?;
+        let initial_value = build_cumulative_initial_value(self, element_type, block, mlir_context, location)?;
         let (input_value, initial_value) = if let Some(carrier_type) = carrier_type {
-            let input_type = output_array_type.clone().with_data_type(carrier_type).lower(context, location)?;
-            let initial_type = ArrayType::scalar(carrier_type).lower(context, location)?;
+            let input_type = output_array_type.clone().with_data_type(carrier_type).lower(mlir_context, location)?;
+            let initial_type = ArrayType::scalar(carrier_type).lower(mlir_context, location)?;
             let input = block.append_operation(stable_hlo::bitcast_convert(input_value, input_type, location)?)?;
             let initial =
                 block.append_operation(stable_hlo::bitcast_convert(initial_value, initial_type, location)?)?;
@@ -195,7 +195,7 @@ impl CumulativeKindLoweringExtension for CumulativeKind {
         } else {
             (input_value, initial_value)
         };
-        let body_region = build_cumulative_body_region(self, element_type, carrier_type, context, location)?;
+        let body_region = build_cumulative_body_region(self, element_type, carrier_type, mlir_context, location)?;
         let rank = output_array_type.rank();
         let mut window_dimensions = vec![1; rank];
         window_dimensions[axis] = extent;
@@ -217,7 +217,7 @@ impl CumulativeKindLoweringExtension for CumulativeKind {
         )?)?;
         let result = result.result(0).unwrap().as_ref();
         if carrier_type.is_some() {
-            let output_type = output_array_type.lower(context, location)?;
+            let output_type = output_array_type.lower(mlir_context, location)?;
             let result = block.append_operation(stable_hlo::bitcast_convert(result, output_type, location)?)?;
             return Ok(result.result(0).unwrap().as_ref());
         }
@@ -235,19 +235,19 @@ fn build_cumulative_initial_value<'b, 'c: 'b, 't: 'c>(
     kind: CumulativeKind,
     element_type: DataType,
     block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     match kind {
         CumulativeKind::Sum => {
-            build_reduction_identity_constant(ReductionKind::Sum, element_type, block, context, location)
+            build_reduction_identity_constant(ReductionKind::Sum, element_type, block, mlir_context, location)
         }
         CumulativeKind::Product => ArrayType::scalar(element_type).lower_i64_splat(1, block, location),
         CumulativeKind::Max => {
-            build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)
+            build_reduction_identity_constant(ReductionKind::Max, element_type, block, mlir_context, location)
         }
         CumulativeKind::Min => {
-            build_reduction_identity_constant(ReductionKind::Min, element_type, block, context, location)
+            build_reduction_identity_constant(ReductionKind::Min, element_type, block, mlir_context, location)
         }
         // Complex types pair negative infinity with a zero imaginary component, whose exponential is exactly zero,
         // rather than using their lowest value, whose imaginary component is infinite too.
@@ -257,7 +257,7 @@ fn build_cumulative_initial_value<'b, 'c: 'b, 't: 'c>(
         // Real formats with infinity use negative infinity, while the supported formats without infinities use their
         // lowest value, which remains an identity after each rounded pairwise combination regardless of prefix length.
         CumulativeKind::LogSumExp => {
-            build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)
+            build_reduction_identity_constant(ReductionKind::Max, element_type, block, mlir_context, location)
         }
     }
 }
@@ -271,7 +271,7 @@ fn build_cumulative_body_region<'c, 't>(
     kind: CumulativeKind,
     element_type: DataType,
     carrier_type: Option<DataType>,
-    context: &'c MlirContext<'t>,
+    mlir_context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<ryft_mlir::DetachedRegion<'c, 't>, Error> {
     let reduction_kind = match kind {
@@ -287,20 +287,20 @@ fn build_cumulative_body_region<'c, 't>(
             reduction_kind,
             element_type,
             FloatExtremumForm::TotalOrder,
-            context,
+            mlir_context,
             location,
         );
     }
 
     // Product, log-sum-exp, and one-bit integer combiners build their body over a pair of scalar block arguments.
-    let scalar_tensor_type = ArrayType::scalar(element_type).lower(context, location)?;
+    let scalar_tensor_type = ArrayType::scalar(element_type).lower(mlir_context, location)?;
     let argument_type = if let Some(carrier_type) = carrier_type {
-        ArrayType::scalar(carrier_type).lower(context, location)?
+        ArrayType::scalar(carrier_type).lower(mlir_context, location)?
     } else {
         scalar_tensor_type
     };
-    let block = context.block(&[(argument_type, location), (argument_type, location)]);
-    let mut region = context.region();
+    let block = mlir_context.block(&[(argument_type, location), (argument_type, location)]);
+    let mut region = mlir_context.region();
     let mut block_ref = region.append_block(block)?;
     let left = block_ref.argument(0)?.as_ref();
     let right = block_ref.argument(1)?.as_ref();
@@ -338,7 +338,7 @@ fn build_cumulative_body_region<'c, 't>(
                 &scalar_type,
                 FloatExtremumForm::TotalOrder,
                 &mut block_ref,
-                context,
+                mlir_context,
                 location,
             )?;
             let part_type =
@@ -376,7 +376,7 @@ fn build_cumulative_body_region<'c, 't>(
             &ArrayType::scalar(element_type),
             FloatExtremumForm::TotalOrder,
             &mut block_ref,
-            context,
+            mlir_context,
             location,
         )?,
         _ => lower_product_combiner_to_mlir(left, right, element_type, &mut block_ref, location)?,
