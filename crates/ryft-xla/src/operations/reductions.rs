@@ -971,8 +971,7 @@ mod tests {
 
     use crate::lowering::tests::{
         ProgramBuilder, UnreducedApplication, UnreducedInput, lower_unreduced_application, lowered_reduce_module,
-        lowered_unary_module, test_matrix_type, test_vector_type, to_rendered_mlir_for_plain_program,
-        unproject_plain_program,
+        lowered_unary_module, test_matrix_type, test_vector_type, unproject_plain_program,
     };
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type, two_device_mesh};
     use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
@@ -2386,7 +2385,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            to_rendered_mlir_for_plain_program(&program, "main"),
+            unproject_plain_program(program).to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "`reduce` with kind `log_sum_exp` requires a format with negative infinity but got `f8e4m3fn`",
         ));
@@ -2461,15 +2460,20 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let stablehlo = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
             module {
-              func.func @main(%arg0: tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<?xf32, #stablehlo.bounds<4>> {
+              func.func @main(%arg0: tensor<4x3xf32>, %arg1: tensor<i32>) -> (tensor<?xf32, #stablehlo.bounds<4>>, tensor<i64>) {
+                %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4x3xf32>, tensor<i32>) -> tensor<?x3xf32, #stablehlo.bounds<4, ?>>
                 %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.add across dimensions = [1] : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<f32>) -> tensor<?xf32, #stablehlo.bounds<4>>
-                return %0 : tensor<?xf32, #stablehlo.bounds<4>>
+                %1 = stablehlo.reduce(%0 init: %cst) applies stablehlo.add across dimensions = [1] : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<f32>) -> tensor<?xf32, #stablehlo.bounds<4>>
+                %2 = stablehlo.get_dimension_size %1, dim = 0 : (tensor<?xf32, #stablehlo.bounds<4>>) -> tensor<i32>
+                %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
+                return %1, %3 : tensor<?xf32, #stablehlo.bounds<4>>, tensor<i64>
               }
             }
             "#},
@@ -2494,7 +2498,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            to_rendered_mlir_for_plain_program(&program, "main"),
+            unproject_plain_program(program).to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "`reduce` mean over dynamically sized axis 0",
         ));

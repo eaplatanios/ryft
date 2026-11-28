@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use ryft_core::{FlatProgram, LogicalMesh, Provenance, ShardMapBoundary, Sharding};
-use ryft_mlir::{AttributeRef, BlockRef, Context as MlirContext, Location, LocationRef, ValueRef};
+use ryft_mlir::{
+    AttributeRef, BlockRef, Context as MlirContext, Location, LocationRef, Module, Operation as MlirOperation,
+    OperationPrintingFlags, ValueRef,
+};
 
 use crate::lowering::sharding::{OpenDimensions, ShardingExtension};
 use crate::lowering::{LoweringError, RaggedDotLoweringStrategy};
@@ -98,12 +101,6 @@ impl ProgramLoweringContext {
             .rev()
             .find(|region| region.manual_axes().iter().any(|axis| axis == axis_name))
             .map(Rc::as_ref)
-    }
-
-    /// Returns `true` if any recursive lowering path constructed a location specific to an instruction from a known
-    /// [`Provenance`].
-    pub(crate) fn has_provenance(&self) -> bool {
-        self.state.has_provenance.get()
     }
 
     /// Returns whether this module requires the runtime assertion handler.
@@ -310,6 +307,30 @@ impl ProgramLoweringContext {
         }
         self.state.has_provenance.set(true);
         lower(context, provenance, base)
+    }
+
+    /// Renders `module` as StableHLO text, including instruction locations when lowering recorded provenance.
+    /// The text is also part of the compilation cache key. Modules without provenance keep the plain rendering.
+    /// Modules with provenance use the parsable debug form and retain all element and resource attributes so that
+    /// a cached artifact carries the locations and constants of the program that produced it. Programs that differ
+    /// only in provenance can therefore have separate cache entries. Sharing those entries would require an explicit
+    /// option to strip provenance from the module before computing its key.
+    pub(super) fn render_module(&self, module: &Module<'_, '_>) -> Result<String, Error> {
+        if !self.state.has_provenance.get() {
+            return Ok(module.to_string());
+        }
+        module
+            .as_operation()?
+            .to_string_with_flags(OperationPrintingFlags {
+                elements_attribute_size_threshold: None,
+                resource_string_size_threshold: None,
+                enable_debug_information: true,
+                pretty_print_debug_information: false,
+                ..OperationPrintingFlags::default()
+            })
+            .map_err(|error| {
+                ryft_mlir::Error::internal(format!("serialized module is not valid UTF-8: {error}")).into()
+            })
     }
 }
 
@@ -555,7 +576,7 @@ mod tests {
         let context = MlirContext::new();
         let provenance = Provenance::scope(ProvenanceScope::new("nested"), Provenance::unknown());
         inner.instruction_location(&context, &provenance, context.unknown_location().as_ref());
-        assert!(sibling.has_provenance());
+        assert!(sibling.state.has_provenance.get());
     }
 
     #[test]

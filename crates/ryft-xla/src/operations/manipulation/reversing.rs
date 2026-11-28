@@ -33,12 +33,11 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{DataType, Placeholder, Shape};
 
-    use crate::ArrayConstant;
     use crate::lowering::tests::{
-        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, to_rendered_mlir_for_plain_program,
-        unproject_plain_program,
+        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, unproject_plain_program,
     };
     use crate::tests::execution_client;
+    use crate::{ArrayConstant, ProgramLoweringExtension, ProgramLoweringOptions};
 
     use super::*;
 
@@ -50,8 +49,9 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
+        let program = unproject_plain_program(program);
         assert_eq!(
-            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap(),
             indoc! {r#"
             module {
               func.func @main(%arg0: tensor<3xf64>) -> tensor<3xf64> {
@@ -64,7 +64,7 @@ mod tests {
         assert_eq!(
             execute_mixed_program(
                 execution_client(),
-                &unproject_plain_program(program),
+                &program,
                 &[MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3])],
                 &[],
             )

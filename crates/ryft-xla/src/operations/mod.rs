@@ -1371,8 +1371,8 @@ mod tests {
     };
 
     use crate::lowering::tests::{
-        PlainProgram, ProgramBuilder as PlainProgramBuilder, UnreducedApplication, UnreducedInput,
-        lower_unreduced_application, lowered_unary_module, to_rendered_mlir_for_plain_program,
+        ProgramBuilder as PlainProgramBuilder, UnreducedApplication, UnreducedInput, lower_unreduced_application,
+        lowered_unary_module, unproject_plain_program,
     };
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_to_bytes, vector_type};
@@ -1382,84 +1382,6 @@ mod tests {
     };
 
     use super::*;
-
-    fn elementwise_normalization_program() -> PlainProgram {
-        let mut builder = PlainProgramBuilder::new();
-        let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
-        let left = builder
-            .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(1)])));
-        let right = builder
-            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(4)])));
-        let condition = builder.add_input(ArrayType::scalar(DataType::Boolean));
-        let boolean_vector =
-            builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)])));
-        let divide = builder.add_instruction(DivOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
-        let atan2 = builder.add_instruction(Atan2Operation::new(), Vec::new(), vec![right, left], None).unwrap()[0];
-        let compare = builder
-            .add_instruction(
-                CompareOperation::new(ComparisonDirection::GreaterThan),
-                Vec::new(),
-                vec![left, right],
-                None,
-            )
-            .unwrap()[0];
-        let select = builder
-            .add_instruction(SelectOperation::new(), Vec::new(), vec![condition, scalar, right], None)
-            .unwrap()[0];
-        let and = builder
-            .add_instruction(AndOperation::new(), Vec::new(), vec![condition, boolean_vector], None)
-            .unwrap()[0];
-        let or = builder
-            .add_instruction(OrOperation::new(), Vec::new(), vec![boolean_vector, condition], None)
-            .unwrap()[0];
-        let xor = builder
-            .add_instruction(XorOperation::new(), Vec::new(), vec![condition, boolean_vector], None)
-            .unwrap()[0];
-        builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
-                vec![divide, atan2, compare, select, and, or, xor],
-                vec![Placeholder; 5],
-                vec![Placeholder; 7],
-            )
-            .unwrap()
-    }
-
-    /// Asserts that `stablehlo` is the module that lowering the [`elementwise_normalization_program`] produces, in
-    /// which every operand is converted and broadcast to the exact result type of its operation.
-    fn assert_elementwise_operands_are_normalized(stablehlo: &str) {
-        assert_eq!(
-            stablehlo,
-            indoc! {"
-                module {
-                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<3x1xf32>, %arg2: tensor<1x4xf64>, %arg3: tensor<i1>, %arg4: tensor<4xi1>) -> (tensor<3x4xf64>, tensor<3x4xf64>, tensor<3x4xi1>, tensor<1x4xf64>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) {
-                    %0 = stablehlo.convert %arg1 : (tensor<3x1xf32>) -> tensor<3x1xf64>
-                    %1 = stablehlo.broadcast_in_dim %0, dims = [0, 1] : (tensor<3x1xf64>) -> tensor<3x4xf64>
-                    %2 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1] : (tensor<1x4xf64>) -> tensor<3x4xf64>
-                    %3 = stablehlo.divide %1, %2 : tensor<3x4xf64>
-                    %4 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1] : (tensor<1x4xf64>) -> tensor<3x4xf64>
-                    %5 = stablehlo.convert %arg1 : (tensor<3x1xf32>) -> tensor<3x1xf64>
-                    %6 = stablehlo.broadcast_in_dim %5, dims = [0, 1] : (tensor<3x1xf64>) -> tensor<3x4xf64>
-                    %7 = stablehlo.atan2 %4, %6 : tensor<3x4xf64>
-                    %8 = stablehlo.convert %arg1 : (tensor<3x1xf32>) -> tensor<3x1xf64>
-                    %9 = stablehlo.broadcast_in_dim %8, dims = [0, 1] : (tensor<3x1xf64>) -> tensor<3x4xf64>
-                    %10 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1] : (tensor<1x4xf64>) -> tensor<3x4xf64>
-                    %11 = stablehlo.compare GT, %9, %10, FLOAT : (tensor<3x4xf64>, tensor<3x4xf64>) -> tensor<3x4xi1>
-                    %12 = stablehlo.broadcast_in_dim %arg3, dims = [] : (tensor<i1>) -> tensor<1x4xi1>
-                    %13 = stablehlo.convert %arg0 : (tensor<f32>) -> tensor<f64>
-                    %14 = stablehlo.broadcast_in_dim %13, dims = [] : (tensor<f64>) -> tensor<1x4xf64>
-                    %15 = stablehlo.select %12, %14, %arg2 : tensor<1x4xi1>, tensor<1x4xf64>
-                    %16 = stablehlo.broadcast_in_dim %arg3, dims = [] : (tensor<i1>) -> tensor<4xi1>
-                    %17 = stablehlo.and %16, %arg4 : tensor<4xi1>
-                    %18 = stablehlo.broadcast_in_dim %arg3, dims = [] : (tensor<i1>) -> tensor<4xi1>
-                    %19 = stablehlo.or %arg4, %18 : tensor<4xi1>
-                    %20 = stablehlo.broadcast_in_dim %arg3, dims = [] : (tensor<i1>) -> tensor<4xi1>
-                    %21 = stablehlo.xor %20, %arg4 : tensor<4xi1>
-                    return %3, %7, %11, %15, %17, %19, %21 : tensor<3x4xf64>, tensor<3x4xf64>, tensor<3x4xi1>, tensor<1x4xf64>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>
-                  }
-                }
-            "},
-        );
-    }
 
     #[test]
     fn test_operation_values_satisfy_the_core_capability_bundles() {
@@ -2235,18 +2157,78 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_elementwise_operand_in_plain_programs() {
-        let program = elementwise_normalization_program();
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
-        assert_elementwise_operands_are_normalized(&stablehlo);
-    }
-
-    #[test]
-    fn test_normalize_elementwise_operand_in_traced_programs() {
-        let plain_program = elementwise_normalization_program();
-        let program = plain_program.into_unprojected::<Constant, Operation>().unwrap();
-        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
-        assert_elementwise_operands_are_normalized(&stablehlo);
+    fn test_normalize_elementwise_operand() {
+        let mut builder = PlainProgramBuilder::new();
+        let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
+        let left = builder
+            .add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(1)])));
+        let right = builder
+            .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1), Dimension::Static(4)])));
+        let condition = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let boolean_vector =
+            builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)])));
+        let divide = builder.add_instruction(DivOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let atan2 = builder.add_instruction(Atan2Operation::new(), Vec::new(), vec![right, left], None).unwrap()[0];
+        let compare = builder
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::GreaterThan),
+                Vec::new(),
+                vec![left, right],
+                None,
+            )
+            .unwrap()[0];
+        let select = builder
+            .add_instruction(SelectOperation::new(), Vec::new(), vec![condition, scalar, right], None)
+            .unwrap()[0];
+        let and = builder
+            .add_instruction(AndOperation::new(), Vec::new(), vec![condition, boolean_vector], None)
+            .unwrap()[0];
+        let or = builder
+            .add_instruction(OrOperation::new(), Vec::new(), vec![boolean_vector, condition], None)
+            .unwrap()[0];
+        let xor = builder
+            .add_instruction(XorOperation::new(), Vec::new(), vec![condition, boolean_vector], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
+                vec![divide, atan2, compare, select, and, or, xor],
+                vec![Placeholder; 5],
+                vec![Placeholder; 7],
+            )
+            .unwrap();
+        let module = unproject_plain_program(program).to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<3x1xf32>, %arg2: tensor<1x4xf64>, %arg3: tensor<i1>, %arg4: tensor<4xi1>) -> (tensor<3x4xf64>, tensor<3x4xf64>, tensor<3x4xi1>, tensor<1x4xf64>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) {
+                    %0 = stablehlo.convert %arg1 : (tensor<3x1xf32>) -> tensor<3x1xf64>
+                    %1 = stablehlo.broadcast_in_dim %0, dims = [0, 1] : (tensor<3x1xf64>) -> tensor<3x4xf64>
+                    %2 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1] : (tensor<1x4xf64>) -> tensor<3x4xf64>
+                    %3 = stablehlo.divide %1, %2 : tensor<3x4xf64>
+                    %4 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1] : (tensor<1x4xf64>) -> tensor<3x4xf64>
+                    %5 = stablehlo.convert %arg1 : (tensor<3x1xf32>) -> tensor<3x1xf64>
+                    %6 = stablehlo.broadcast_in_dim %5, dims = [0, 1] : (tensor<3x1xf64>) -> tensor<3x4xf64>
+                    %7 = stablehlo.atan2 %4, %6 : tensor<3x4xf64>
+                    %8 = stablehlo.convert %arg1 : (tensor<3x1xf32>) -> tensor<3x1xf64>
+                    %9 = stablehlo.broadcast_in_dim %8, dims = [0, 1] : (tensor<3x1xf64>) -> tensor<3x4xf64>
+                    %10 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1] : (tensor<1x4xf64>) -> tensor<3x4xf64>
+                    %11 = stablehlo.compare GT, %9, %10, FLOAT : (tensor<3x4xf64>, tensor<3x4xf64>) -> tensor<3x4xi1>
+                    %12 = stablehlo.broadcast_in_dim %arg3, dims = [] : (tensor<i1>) -> tensor<1x4xi1>
+                    %13 = stablehlo.convert %arg0 : (tensor<f32>) -> tensor<f64>
+                    %14 = stablehlo.broadcast_in_dim %13, dims = [] : (tensor<f64>) -> tensor<1x4xf64>
+                    %15 = stablehlo.select %12, %14, %arg2 : tensor<1x4xi1>, tensor<1x4xf64>
+                    %16 = stablehlo.broadcast_in_dim %arg3, dims = [] : (tensor<i1>) -> tensor<4xi1>
+                    %17 = stablehlo.and %16, %arg4 : tensor<4xi1>
+                    %18 = stablehlo.broadcast_in_dim %arg3, dims = [] : (tensor<i1>) -> tensor<4xi1>
+                    %19 = stablehlo.or %arg4, %18 : tensor<4xi1>
+                    %20 = stablehlo.broadcast_in_dim %arg3, dims = [] : (tensor<i1>) -> tensor<4xi1>
+                    %21 = stablehlo.xor %20, %arg4 : tensor<4xi1>
+                    return %3, %7, %11, %15, %17, %19, %21 : tensor<3x4xf64>, tensor<3x4xf64>, tensor<3x4xi1>, tensor<1x4xf64>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]
@@ -2264,7 +2246,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
+            unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap(),
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<f32>, %arg1: tensor<0xf64>) -> tensor<0xf64> {

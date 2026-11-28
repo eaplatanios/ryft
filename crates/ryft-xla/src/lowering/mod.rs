@@ -167,8 +167,6 @@ pub(crate) mod admission;
 pub(crate) mod contexts;
 /// Decisions about which regions, captures, and session constants of a program lowering emits.
 pub(crate) mod emissions;
-/// Lowering of whole programs to StableHLO modules.
-pub(crate) mod modules;
 /// Options, entry points, and placement analysis for lowering whole programs.
 pub(crate) mod programs;
 /// Lowering and validation of pending reductions.
@@ -842,8 +840,8 @@ pub(crate) fn current_or_new_token<'b, 'c: 'b, 't: 'c>(
 ///
 /// Only an instruction with an input that carries a pending reduction can emit an intermediate value with one, so any
 /// other instruction pays one scan of its input types and of its output types, without allocating or walking the
-/// emitted operations. The constraints are emitted for every target, and lowering removes them, with every other
-/// Shardy operation, for a target without the Shardy dialect (refer to `remove_shardy_operations`).
+/// emitted operations. Lowering emits the constraints for every target and removes them with
+/// [`ryft_mlir::Module::remove_shardy_operations`] when the target lacks the Shardy dialect.
 fn lower_instruction_operation<'b, 'c: 'b, 't: 'c, O: ProgramLoweringOperation>(
     operation: &O,
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
@@ -938,245 +936,40 @@ pub(crate) fn validate_local_output_placement(
 #[cfg(test)]
 pub(crate) mod tests {
     use std::any::{Any, TypeId};
-
     use std::cell::RefCell;
-    use std::collections::HashMap;
-
     use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array, ArrayOperation, ArrayOperations, ArrayType, AtomId, CallOperation, CastOperation, DataType, Device,
-        DeviceMesh, Dimension, DimensionBounds, DimensionVariable, DomainTracingContext, EagerContext, ErasedOperation,
-        Error as CoreError, LinearCallOperation, LogicalMesh, Memory, MeshAxis, MeshAxisType, MulOperation,
-        NegOperation, Operation as CoreOperation, OperationPayloadProjection, Parameterized, ParameterizedFamily,
-        Placeholder, Program, ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedContext, ReduceOperation,
-        ReductionKind, RegionInterface, Reshape, ScanOptions, Shape, ShardMap, ShardMapBoundary, ShardMapOperation,
-        ShardMapOptions, Sharding, ShardingDimension, Sin, TypeError, Typed, TypedProgram, UnreducedKind,
-        ValueProjection, scan,
+        ArrayOperation, ArrayOperations, ArrayType, AtomId, CallOperation, CastOperation, DataType, Device, DeviceMesh,
+        Dimension, DimensionBounds, DimensionVariable, DomainTracingContext, ErasedOperation, Error as CoreError,
+        LinearCallOperation, LogicalMesh, MeshAxis, MeshAxisType, MulOperation, NegOperation,
+        Operation as CoreOperation, OperationPayloadProjection, Parameterized, ParameterizedFamily, Placeholder,
+        Program, ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedContext, ReduceOperation, ReductionKind,
+        RegionInterface, Reshape, ScanOptions, Shape, ShardMap, ShardMapBoundary, ShardMapOperation, ShardMapOptions,
+        Sharding, ShardingDimension, TypeError, Typed, TypedProgram, UnreducedKind, ValueProjection, scan,
     };
 
-    use ryft_mlir::dialects::func;
-    use ryft_mlir::{
-        Attribute, Block, Context as MlirContext, Location, Region, Type as MlirType, TypeAndAttributes, ValueRef,
-    };
+    use ryft_mlir::ValueRef;
     use ryft_pjrt::protos::{OptionOverride, OptionValue, ShapeChecks};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::sharding::LogicalMeshExtension;
+    use crate::operations::assertions::ensure_assertion_handler_registered;
+    use crate::tests::{cpu_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         ArrayConstant, ArrayTracer, CompileTracer, CompiledFunction, Constant, Error, FromPjrt, Operation, Options,
         ProgramLoweringExtension, Session, Type, compile, trace_with_context,
     };
 
-    use crate::devices::MemoryExtension;
-    use crate::lowering::LoweringError;
-    use crate::lowering::modules::{normalize_function_name, serialize_lowered_module};
-
-    use crate::lowering::contexts::ProgramLoweringContext;
-    use crate::lowering::types::ArrayTypeLoweringExtension;
-    use crate::lowering::values::ArrayLiteralLoweringExtension;
-    use crate::operations::assertions::ensure_assertion_handler_registered;
-
-    use crate::tests::{cpu_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes};
-
     use super::*;
 
-    /// Builder of homogeneous array programs that operation tests across the crate use to stage fixtures for the test-only
-    /// plain program lowering (i.e., [`to_rendered_mlir_for_plain_program`]) and for [`unproject_plain_program`].
+    /// Builds homogeneous array fixtures that [`unproject_plain_program`] lifts into the XLA program representation.
     pub(crate) type ProgramBuilder = CoreProgramBuilder<ArrayConstant, ArrayOperation<ArrayConstant>>;
 
-    /// Homogeneous array program that [`ProgramBuilder`] builds, which operation tests across the crate lower through the
-    /// test-only plain program lowering or lift into the array IR through [`unproject_plain_program`].
+    /// Homogeneous array program built by [`ProgramBuilder`].
     pub(crate) type PlainProgram =
         Program<ArrayConstant, ArrayOperation<ArrayConstant>, Vec<ArrayConstant>, Vec<ArrayConstant>>;
-
-    /// Lowers one plain traced program to values inside `block`, whose arguments are the program inputs. This test-only
-    /// path supports no attached regions.
-    fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
-        program: &Program<V, O, Input, Output>,
-        block: &mut BlockRef<'b, 'c, 't>,
-        context: &'c MlirContext<'t>,
-        location: LocationRef<'c, 't>,
-        lowering_context: &ProgramLoweringContext,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
-    where
-        V: ArrayLiteralLoweringExtension,
-        O: LowerableOperation<Type = ArrayType>,
-        Input: Parameterized<V>,
-        Output: Parameterized<V>,
-    {
-        let input_values = (0..program.input_ids().len())
-            .map(|index| block.argument(index).unwrap().as_ref())
-            .collect::<Vec<_>>();
-        // The per-class effect chains of the function body are created lazily and dropped at the end of that body.
-        let mut effect_tokens = EffectTokens::default();
-        let instruction_block = *block;
-        program.interpret_with(
-            input_values,
-            |_, value| value.lower_constant(block, context, location),
-            |instruction, inputs| {
-                let input_types = instruction
-                    .inputs()
-                    .iter()
-                    .map(|input| program.atoms()[input.index()].r#type().into_owned())
-                    .collect::<Vec<_>>();
-                let output_types = instruction
-                    .outputs()
-                    .iter()
-                    .map(|output| program.atoms()[output.index()].r#type().into_owned())
-                    .collect::<Vec<_>>();
-                if !instruction.regions().is_empty() {
-                    return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                        operation: instruction.operation().name().to_string(),
-                        reason: format!(
-                            "plain-program lowering does not support attached regions for `{}`; use the production \
-                             array IR XLA lowerer",
-                            instruction.operation().name(),
-                        ),
-                    }));
-                }
-                let location = lowering_context.instruction_location(context, instruction.provenance(), location);
-                let mut lowerer: Lowerer<'_, '_, '_, Operation> =
-                    Lowerer::new(instruction_block, context, location, lowering_context.clone())
-                        .with_effect_tokens(std::mem::take(&mut effect_tokens));
-                let outputs = instruction.operation().lower(
-                    &mut lowerer,
-                    inputs,
-                    input_types.as_slice(),
-                    output_types.as_slice(),
-                )?;
-                if lowerer.effect_tokens.ordered_assertion.is_some() {
-                    lowering_context.require_assertion_handler();
-                }
-                effect_tokens = lowerer.effect_tokens;
-                Ok(outputs)
-            },
-        )
-    }
-
-    /// Lowers a plain traced [`Program`] to a textual StableHLO MLIR module.
-    pub(crate) fn to_rendered_mlir_for_plain_program<
-        V: ArrayLiteralLoweringExtension,
-        Input: Parameterized<V>,
-        Output: Parameterized<V>,
-        O: LowerableOperation<Type = ArrayType>,
-        S: AsRef<str>,
-    >(
-        program: &Program<V, O, Input, Output>,
-        function_name: S,
-    ) -> Result<String, Error> {
-        to_rendered_mlir_for_plain_program_with_ragged_dot_lowering_strategy(
-            program,
-            function_name,
-            RaggedDotLoweringStrategy::default(),
-        )
-    }
-
-    /// Lowers a plain traced program like [`to_rendered_mlir_for_plain_program`], but with an explicit
-    /// [`RaggedDotLoweringStrategy`].
-    pub(crate) fn to_rendered_mlir_for_plain_program_with_ragged_dot_lowering_strategy<
-        V: ArrayLiteralLoweringExtension,
-        Input: Parameterized<V>,
-        Output: Parameterized<V>,
-        O: LowerableOperation<Type = ArrayType>,
-        S: AsRef<str>,
-    >(
-        program: &Program<V, O, Input, Output>,
-        function_name: S,
-        ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
-    ) -> Result<String, Error> {
-        let function_name = normalize_function_name(function_name.as_ref())?;
-        let context = MlirContext::new();
-        let location = context.unknown_location();
-        let mut module = context.module(location)?;
-        // This entry point lowers one whole module, so the program lowering context is scoped to that module.
-        let lowering_context =
-            ProgramLoweringContext::new().with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy);
-        let input_tensor_types = program
-            .input_ids()
-            .iter()
-            .map(|atom_id| {
-                let input_atom = &program.atoms()[atom_id.index()];
-                input_atom.r#type().as_ref().lower(&context, location)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_tensor_types = program
-            .output_ids()
-            .iter()
-            .map(|atom_id| {
-                let output_atom = &program.atoms()[atom_id.index()];
-                output_atom.r#type().as_ref().lower(&context, location)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        module.body()?.append_operation({
-            let function_block = context.block(
-                input_tensor_types.iter().map(|tensor_type| (*tensor_type, location)).collect::<Vec<_>>().as_slice(),
-            );
-            {
-                let mut function_block_ref = function_block.as_ref();
-                let outputs = lower_plain_program_outputs(
-                    program,
-                    &mut function_block_ref,
-                    &context,
-                    location.as_ref(),
-                    &lowering_context,
-                )?;
-                function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
-            }
-            let mut function_region = context.region();
-            function_region.append_block(function_block)?;
-            func::func(
-                function_name.as_str(),
-                func::FuncAttributes {
-                    arguments: input_tensor_types
-                        .iter()
-                        .zip(program.input_ids())
-                        .map(|(tensor_type, atom_id)| {
-                            let memory = program.atoms()[atom_id.index()].r#type().memory();
-                            let attributes = (memory != Memory::Device).then(|| {
-                                HashMap::from([(
-                                    "mhlo.memory_kind".into(),
-                                    context.string_attribute(memory.placement_kind()).as_ref(),
-                                )])
-                            });
-                            TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
-                        })
-                        .collect(),
-                    results: output_tensor_types
-                        .iter()
-                        .zip(program.output_ids())
-                        .map(|(tensor_type, atom_id)| {
-                            let memory = program.atoms()[atom_id.index()].r#type().memory();
-                            let attributes = (memory != Memory::Device).then(|| {
-                                HashMap::from([(
-                                    "mhlo.memory_kind".into(),
-                                    context.string_attribute(memory.placement_kind()).as_ref(),
-                                )])
-                            });
-                            TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
-                        })
-                        .collect(),
-                    ..Default::default()
-                },
-                function_region,
-                location,
-            )?
-        })?;
-
-        if let Some(mesh) = lowering_context.mesh() {
-            module.body()?.insert_operation(mesh.lower(location)?, 0)?;
-        }
-
-        module.remove_unused_stable_hlo_constants()?;
-        if !module.verify()? {
-            return Err(Error::Lowering(LoweringError::VerificationFailure));
-        }
-
-        serialize_lowered_module(&module, &lowering_context)
-    }
 
     /// Logical mesh with one manual axis named `axis_name` of size `axis_size`.
     pub(crate) fn test_manual_mesh(axis_name: &str, axis_size: usize) -> LogicalMesh {
@@ -1496,7 +1289,7 @@ pub(crate) mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        to_rendered_mlir_for_plain_program(&program, "main")
+        unproject_plain_program(program).to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
     }
 
     /// Builds a one-instruction program reducing an input of the given data type and dimensions, and returns the
@@ -1662,26 +1455,6 @@ pub(crate) mod tests {
         }
         Ok(UnreducedLowering { module, outcomes: outcomes.join("\n"), expected_outcomes: expected_outcomes.join("\n") })
     }
-
-    /// Computes `f(x, y) = x * y + sin(x)` for the pair `inputs` of `(x, y)`.
-    pub(crate) fn scalar_bilinear_sin<T>(inputs: (T, T)) -> T
-    where
-        T: Clone + Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
-    {
-        inputs.0.clone() * inputs.1 + inputs.0.sin().unwrap()
-    }
-
-    /// Computes `f(x) = x^4 + sin(x)`.
-    pub(crate) fn scalar_quartic_plus_sin<T>(x: T) -> T
-    where
-        T: Clone + Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
-    {
-        x.clone() * x.clone() * x.clone() * x.clone() + x.sin().unwrap()
-    }
-
-    /// Eager context over reference backend arrays that stages the scalar programs of the plain program lowering tests.
-    pub(crate) static TEST_ARRAY_DOMAIN: EagerContext<Array, ArrayOperation<Array>> =
-        EagerContext::<Array, ArrayOperation<Array>>::new();
 
     /// Builds a region over two inputs of `scalar_type` (i.e., a residual and a linear input) whose output is the
     /// product of its inputs, and that also runs the instructions that `extend` adds to it when `extended` is set.

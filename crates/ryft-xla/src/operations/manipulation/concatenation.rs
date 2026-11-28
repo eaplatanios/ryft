@@ -234,7 +234,7 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
-        ProgramBuilder, dynamic_dimension, test_matrix_type, test_vector_type, to_rendered_mlir_for_plain_program,
+        ProgramBuilder, dynamic_dimension, test_matrix_type, test_vector_type, unproject_plain_program,
     };
     use crate::lowering::types::physical_bound_type;
     use crate::operations::Operation;
@@ -263,9 +263,11 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<ArrayConstant>, ArrayConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![joined], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let stablehlo = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -412,7 +414,7 @@ mod tests {
             .add_instruction(ConcatenateOperation::<ArrayType>::new(0, 2).unwrap(), Vec::new(), vec![left, right], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<ArrayConstant>, ArrayConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![joined], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(program.transpose().unwrap().output_types(), vec![left_type, right_type]);
     }
@@ -688,9 +690,11 @@ mod tests {
             .add_instruction(ConcatenateOperation::<ArrayType>::new(0, 1).unwrap(), Vec::new(), inputs, None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<ArrayConstant>, ArrayConstant>(vec![joined], vec![Placeholder; 33], Placeholder)
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![joined], vec![Placeholder; 33], vec![Placeholder])
             .unwrap();
-        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let module = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
         // The 33 inputs are joined as two full chunks of 16 followed by one chunk of the two partial results and the
         // last input.
         let parameters = (0..33).map(|index| format!("%arg{index}: tensor<1xf32>")).collect::<Vec<_>>().join(", ");

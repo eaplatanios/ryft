@@ -677,8 +677,7 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
-        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, test_vector_type,
-        to_rendered_mlir_for_plain_program,
+        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, test_vector_type, unproject_plain_program,
     };
     use crate::lowering::types::lower_f64_constant_splat;
     use crate::operations::Operation;
@@ -817,30 +816,36 @@ mod tests {
         ] {
             let value =
                 Array::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0]).unwrap();
-            let mut builder = CoreProgramBuilder::<Array, ArrayOperation<Array>>::new();
-            let output = builder
-                .add_instruction(ArrayOperation::Constant(ConstantOperation::new(value)), Vec::new(), Vec::new(), None)
-                .unwrap()[0];
-            let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+            let output =
+                builder.add_instruction(ConstantOperation::new(value), Vec::new(), Vec::new(), None).unwrap()[0];
+            let program =
+                builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
 
-            let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+            let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap();
             assert_eq!(stablehlo, expected);
         }
     }
 
     #[test]
     fn test_constant_operation_lower_preserves_signed_zero_elements() {
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<ArrayConstant, ArrayOperation<ArrayConstant>>::new();
         let literal = Array::from_elements(test_vector_type(2), &[-0.0f32, 0.0]).unwrap();
         let output = context.bind(ConstantOperation::new(literal), Vec::new(), &[]).unwrap().remove(0);
         let program = context
             .builder()
             .borrow()
             .clone()
-            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
+                vec![output.atom_id().unwrap()],
+                Vec::new(),
+                vec![Placeholder],
+            )
             .unwrap();
 
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let stablehlo = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -856,12 +861,11 @@ mod tests {
         // A rank-positive one-element literal remains an ordinary shaped dense constant rather than being rewritten
         // as a rank-0 constant plus broadcast.
         let literal = Array::from_elements(test_vector_type(1), &[2.5f32]).unwrap();
-        let mut builder = CoreProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let output = builder
-            .add_instruction(ArrayOperation::Constant(ConstantOperation::new(literal)), Vec::new(), Vec::new(), None)
-            .unwrap()[0];
-        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+        let output = builder.add_instruction(ConstantOperation::new(literal), Vec::new(), Vec::new(), None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap();
         assert_eq!(
             stablehlo,
             indoc! {"
@@ -920,24 +924,19 @@ mod tests {
             (Array::vector(Vec::<i32>::new()).unwrap(), Vec::new()),
         ];
 
-        let mut builder = CoreProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let outputs = cases
             .iter()
             .map(|(literal, _)| {
                 builder
-                    .add_instruction(
-                        ArrayOperation::Constant(ConstantOperation::new(literal.clone())),
-                        Vec::new(),
-                        Vec::new(),
-                        None,
-                    )
+                    .add_instruction(ConstantOperation::new(literal.clone()), Vec::new(), Vec::new(), None)
                     .unwrap()[0]
             })
             .collect::<Vec<_>>();
         let program = builder
-            .build::<Vec<Array>, Vec<Array>>(outputs, Vec::new(), vec![Placeholder; cases.len()])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, Vec::new(), vec![Placeholder; cases.len()])
             .unwrap();
-        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap();
         assert_eq!(
             module,
             indoc! {"
@@ -1006,63 +1005,6 @@ mod tests {
         for (output, (literal, expected)) in outputs.into_iter().zip(cases) {
             let actual = output.copy_to_host(None).unwrap().r#await().unwrap();
             assert_eq!(actual, expected, "executed literal type {}", literal.r#type());
-        }
-    }
-
-    #[test]
-    fn test_literal_constant_atom_lowers_with_its_memory_placement() {
-        for (memory, expected) in [
-            (
-                Memory::Device,
-                indoc! {"
-                    module {
-                      func.func @main() -> tensor<4xf32> {
-                        %cst = stablehlo.constant dense<[1.000000e+00, 2.000000e+00, 3.000000e+00, 4.000000e+00]> : \
-                            tensor<4xf32>
-                        return %cst : tensor<4xf32>
-                      }
-                    }
-                "},
-            ),
-            (
-                Memory::Host { pinned: true },
-                indoc! {"
-                    module {
-                      func.func @main() -> (tensor<4xf32> {mhlo.memory_kind = \"pinned_host\"}) {
-                        %cst = stablehlo.constant dense<[1.000000e+00, 2.000000e+00, 3.000000e+00, 4.000000e+00]> : \
-                            tensor<4xf32>
-                        %0 = stablehlo.custom_call @annotate_device_placement(%cst) {backend_config = \"\", \
-                            has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = \
-                            \"pinned_host\"}} : (tensor<4xf32>) -> tensor<4xf32>
-                        return %0 : tensor<4xf32>
-                      }
-                    }
-                "},
-            ),
-            (
-                Memory::Host { pinned: false },
-                indoc! {"
-                    module {
-                      func.func @main() -> (tensor<4xf32> {mhlo.memory_kind = \"unpinned_host\"}) {
-                        %cst = stablehlo.constant dense<[1.000000e+00, 2.000000e+00, 3.000000e+00, 4.000000e+00]> : \
-                            tensor<4xf32>
-                        %0 = stablehlo.custom_call @annotate_device_placement(%cst) {backend_config = \"\", \
-                            has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = \
-                            \"unpinned_host\"}} : (tensor<4xf32>) -> tensor<4xf32>
-                        return %0 : tensor<4xf32>
-                      }
-                    }
-                "},
-            ),
-        ] {
-            let value =
-                Array::from_elements::<f32>(test_vector_type(4).with_memory(memory), &[1.0, 2.0, 3.0, 4.0]).unwrap();
-            let mut builder = CoreProgramBuilder::<Array, ArrayOperation<Array>>::new();
-            let output = builder.add_constant(value);
-            let program = builder.build::<Vec<Array>, Vec<Array>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
-
-            let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
-            assert_eq!(stablehlo, expected);
         }
     }
 
@@ -1148,7 +1090,7 @@ mod tests {
                 ),
             ),
         ] {
-            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+            let context = TracingContext::<ArrayConstant, ArrayOperation<ArrayConstant>>::new();
             let output_type = test_vector_type(4).with_memory(memory);
             let output = context.fill(&output_type, 2.5f64).unwrap();
             assert_eq!(*output.r#type(), output_type);
@@ -1156,13 +1098,19 @@ mod tests {
                 .builder()
                 .borrow()
                 .clone()
-                .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
+                    vec![output.atom_id().unwrap()],
+                    Vec::new(),
+                    vec![Placeholder],
+                )
                 .unwrap();
 
-            let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+            let stablehlo = unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap();
             assert_eq!(stablehlo, expected_vector);
 
-            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+            let context = TracingContext::<ArrayConstant, ArrayOperation<ArrayConstant>>::new();
             let output_type = ArrayType::scalar(DataType::F32).with_memory(memory);
             let output = context.fill(&output_type, 2.5f64).unwrap();
             assert_eq!(*output.r#type(), output_type);
@@ -1170,9 +1118,15 @@ mod tests {
                 .builder()
                 .borrow()
                 .clone()
-                .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
+                    vec![output.atom_id().unwrap()],
+                    Vec::new(),
+                    vec![Placeholder],
+                )
                 .unwrap();
-            let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+            let stablehlo = unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap();
             assert_eq!(stablehlo, expected_scalar);
         }
     }
@@ -1235,16 +1189,19 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
             .unwrap();
+        let module = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
 
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        // Static zero-space arrays are erased at the executable boundary. Inside the program the zero is an i1 tensor.
         assert_eq!(
-            stablehlo,
+            module,
             indoc! {"
                 module {
-                  func.func @main() -> tensor<3xi1> {
+                  func.func @main() {
                     %c = stablehlo.constant dense<false> : tensor<i1>
                     %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i1>) -> tensor<3xi1>
-                    return %0 : tensor<3xi1>
+                    return
                   }
                 }
             "},
@@ -1296,25 +1253,15 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
                 .unwrap();
-            let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
-            assert_eq!(module, expected);
+            let options = ProgramLoweringOptions::new().without_pruning().without_boundary_shardings();
+            assert_eq!(unproject_plain_program(program).to_rendered_mlir("main", &options).unwrap(), expected);
 
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
-            let zero = ArrayIrOperation::<ArrayConstant>::Zero(ZeroOperation::new(output_type.clone()));
+            let zero = ArrayIrOperation::<ArrayConstant>::Zero(ZeroOperation::new(output_type));
             let output = builder.add_instruction(zero, Vec::new(), Vec::new(), None).unwrap()[0];
             let program =
                 builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
-            let input_types: Vec<ArrayType> = Vec::new();
-            let module = program
-                .to_rendered_mlir(
-                    "main",
-                    &ProgramLoweringOptions::new()
-                        .with_input_types(&input_types)
-                        .with_output_types(&vec![output_type])
-                        .without_boundary_shardings(),
-                )
-                .unwrap();
-            assert_eq!(module, expected);
+            assert_eq!(program.to_rendered_mlir("main", &options).unwrap(), expected);
         }
     }
 
@@ -1352,23 +1299,31 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![zero, one], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let module = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"
                 module {
-                  func.func @main(%arg0: tensor<?xf32, #stablehlo.bounds<4>>) -> (tensor<?xf32, #stablehlo.bounds<4>>, tensor<?xf32, #stablehlo.bounds<4>>) {
-                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<4>>) -> tensor<i32>
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<i32>) -> (tensor<?xf32, #stablehlo.bounds<4>>, tensor<?xf32, #stablehlo.bounds<4>>, tensor<i64>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<4>>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<4>>) -> tensor<i32>
                     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                    %2 = stablehlo.convert %0 : tensor<i32>
-                    %3 = stablehlo.set_dimension_size %1, %2, dim = 0 : (tensor<4xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<4>>
-                    %4 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %2 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                    %3 = stablehlo.convert %1 : tensor<i32>
+                    %4 = stablehlo.set_dimension_size %2, %3, dim = 0 : (tensor<4xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<4>>
+                    %5 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<4>>) -> tensor<i32>
                     %cst_0 = stablehlo.constant dense<1.000000e+00> : tensor<f32>
-                    %5 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<4xf32>
-                    %6 = stablehlo.convert %4 : tensor<i32>
-                    %7 = stablehlo.set_dimension_size %5, %6, dim = 0 : (tensor<4xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<4>>
-                    return %3, %7 : tensor<?xf32, #stablehlo.bounds<4>>, tensor<?xf32, #stablehlo.bounds<4>>
+                    %6 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                    %7 = stablehlo.convert %5 : tensor<i32>
+                    %8 = stablehlo.set_dimension_size %6, %7, dim = 0 : (tensor<4xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<4>>
+                    %9:2 = stablehlo.optimization_barrier %4, %8 : tensor<?xf32, #stablehlo.bounds<4>>, tensor<?xf32, #stablehlo.bounds<4>>
+                    %10 = stablehlo.get_dimension_size %4, dim = 0 : (tensor<?xf32, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %11 = stablehlo.convert %10 : (tensor<i32>) -> tensor<i64>
+                    %12 = stablehlo.get_dimension_size %8, dim = 0 : (tensor<?xf32, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %13 = stablehlo.convert %12 : (tensor<i32>) -> tensor<i64>
+                    return %9#0, %9#1, %11, %13 : tensor<?xf32, #stablehlo.bounds<4>>, tensor<?xf32, #stablehlo.bounds<4>>, tensor<i64>, tensor<i64>
                   }
                 }
             "#},
@@ -1391,50 +1346,63 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![zero, one], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         assert_eq!(program.output_types(), vec![input_type.clone(), input_type]);
-        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let module = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning().without_boundary_shardings())
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
                 module {
                   sdy.mesh @mesh = <[\"x\"=2]>
-                  func.func @main(%arg0: tensor<?xcomplex<f64>, #stablehlo.bounds<4>> {mhlo.memory_kind = \
-                      \"pinned_host\"}) -> (tensor<?xcomplex<f64>, #stablehlo.bounds<4>> {mhlo.memory_kind = \
-                      \"pinned_host\"}, tensor<?xcomplex<f64>, #stablehlo.bounds<4>> {mhlo.memory_kind = \
-                      \"pinned_host\"}) {
-                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) \
-                        -> tensor<i32>
+                  func.func @main(%arg0: tensor<4xcomplex<f64>> {mhlo.layout_mode = \"{0}\", mhlo.memory_kind = \
+                      \"pinned_host\"}, %arg1: tensor<i32>) -> (tensor<?xcomplex<f64>, #stablehlo.bounds<4>> \
+                      {mhlo.layout_mode = \"{0}\", mhlo.memory_kind = \"pinned_host\"}, tensor<?xcomplex<f64>, \
+                      #stablehlo.bounds<4>> {mhlo.layout_mode = \"{0}\", mhlo.memory_kind = \"pinned_host\"}, \
+                      tensor<i64>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4xcomplex<f64>>, tensor<i32>) -> \
+                        tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> \
+                        tensor<i32>
                     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
                     %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f64>
-                    %1 = stablehlo.complex %cst, %cst_0 : tensor<complex<f64>>
-                    %2 = stablehlo.broadcast_in_dim %1, dims = [] : (tensor<complex<f64>>) -> tensor<4xcomplex<f64>>
-                    %3 = stablehlo.custom_call @annotate_device_placement(%2) {backend_config = \"\", has_side_effect \
+                    %2 = stablehlo.complex %cst, %cst_0 : tensor<complex<f64>>
+                    %3 = stablehlo.broadcast_in_dim %2, dims = [] : (tensor<complex<f64>>) -> tensor<4xcomplex<f64>>
+                    %4 = stablehlo.custom_call @annotate_device_placement(%3) {backend_config = \"\", has_side_effect \
                         = true, mhlo.frontend_attributes = {_xla_buffer_placement = \"pinned_host\"}} : \
                         (tensor<4xcomplex<f64>>) -> tensor<4xcomplex<f64>>
-                    %4 = stablehlo.custom_call @LayoutConstraint(%3) {operand_layouts = [dense<0> : tensor<1xindex>], \
+                    %5 = stablehlo.custom_call @LayoutConstraint(%4) {operand_layouts = [dense<0> : tensor<1xindex>], \
                         result_layouts = [dense<0> : tensor<1xindex>]} : (tensor<4xcomplex<f64>>) -> \
                         tensor<4xcomplex<f64>>
-                    %5 = stablehlo.convert %0 : tensor<i32>
-                    %6 = stablehlo.set_dimension_size %4, %5, dim = 0 : (tensor<4xcomplex<f64>>, tensor<i32>) -> \
+                    %6 = stablehlo.convert %1 : tensor<i32>
+                    %7 = stablehlo.set_dimension_size %5, %6, dim = 0 : (tensor<4xcomplex<f64>>, tensor<i32>) -> \
                         tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
-                    %7 = sdy.sharding_constraint %6 <@mesh, [{\"x\"}]> : tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
-                    %8 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) \
-                        -> tensor<i32>
+                    %8 = sdy.sharding_constraint %7 <@mesh, [{\"x\"}]> : tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
+                    %9 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> \
+                        tensor<i32>
                     %cst_1 = stablehlo.constant dense<1.000000e+00> : tensor<f64>
                     %cst_2 = stablehlo.constant dense<0.000000e+00> : tensor<f64>
-                    %9 = stablehlo.complex %cst_1, %cst_2 : tensor<complex<f64>>
-                    %10 = stablehlo.broadcast_in_dim %9, dims = [] : (tensor<complex<f64>>) -> tensor<4xcomplex<f64>>
-                    %11 = stablehlo.custom_call @annotate_device_placement(%10) {backend_config = \"\", \
+                    %10 = stablehlo.complex %cst_1, %cst_2 : tensor<complex<f64>>
+                    %11 = stablehlo.broadcast_in_dim %10, dims = [] : (tensor<complex<f64>>) -> tensor<4xcomplex<f64>>
+                    %12 = stablehlo.custom_call @annotate_device_placement(%11) {backend_config = \"\", \
                         has_side_effect = true, mhlo.frontend_attributes = {_xla_buffer_placement = \"pinned_host\"}} \
                         : (tensor<4xcomplex<f64>>) -> tensor<4xcomplex<f64>>
-                    %12 = stablehlo.custom_call @LayoutConstraint(%11) {operand_layouts = [dense<0> : \
+                    %13 = stablehlo.custom_call @LayoutConstraint(%12) {operand_layouts = [dense<0> : \
                         tensor<1xindex>], result_layouts = [dense<0> : tensor<1xindex>]} : (tensor<4xcomplex<f64>>) -> \
                         tensor<4xcomplex<f64>>
-                    %13 = stablehlo.convert %8 : tensor<i32>
-                    %14 = stablehlo.set_dimension_size %12, %13, dim = 0 : (tensor<4xcomplex<f64>>, tensor<i32>) -> \
+                    %14 = stablehlo.convert %9 : tensor<i32>
+                    %15 = stablehlo.set_dimension_size %13, %14, dim = 0 : (tensor<4xcomplex<f64>>, tensor<i32>) -> \
                         tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
-                    %15 = sdy.sharding_constraint %14 <@mesh, [{\"x\"}]> : tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
-                    return %7, %15 : tensor<?xcomplex<f64>, #stablehlo.bounds<4>>, tensor<?xcomplex<f64>, \
-                        #stablehlo.bounds<4>>
+                    %16 = sdy.sharding_constraint %15 <@mesh, [{\"x\"}]> : tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
+                    %17:2 = stablehlo.optimization_barrier %8, %16 : tensor<?xcomplex<f64>, #stablehlo.bounds<4>>, \
+                        tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
+                    %18 = stablehlo.get_dimension_size %8, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> \
+                        tensor<i32>
+                    %19 = stablehlo.convert %18 : (tensor<i32>) -> tensor<i64>
+                    %20 = stablehlo.get_dimension_size %16, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) \
+                        -> tensor<i32>
+                    %21 = stablehlo.convert %20 : (tensor<i32>) -> tensor<i64>
+                    return %17#0, %17#1, %19, %21 : tensor<?xcomplex<f64>, #stablehlo.bounds<4>>, \
+                        tensor<?xcomplex<f64>, #stablehlo.bounds<4>>, tensor<i64>, tensor<i64>
                   }
                 }
             "},
@@ -1454,9 +1422,12 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
+            let error = unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap_err();
             assert!(matches!(
-                to_rendered_mlir_for_plain_program(&program, "main"),
-                Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                error,
+                Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })
                     if reason == format!(
                            "`{name}` output dimension `size` needs a finite upper bound for physical buffer allocation",
                        ),
@@ -1471,7 +1442,9 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let error = to_rendered_mlir_for_plain_program(&program, "main").unwrap_err();
+        let error = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap_err();
         let Error::Core(core_error) = error else { unreachable!() };
         let CoreError::Type(error) = *core_error else { unreachable!() };
         assert_eq!(
@@ -1494,64 +1467,56 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![zero, one], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let module = to_rendered_mlir_for_plain_program(&program, "like_dynamic").unwrap();
+        let module = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
                 module {
-                  func.func @like_dynamic(%arg0: tensor<?xcomplex<f32>, #stablehlo.bounds<4>>) -> \
-                      (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>, tensor<?xcomplex<f32>, #stablehlo.bounds<4>>) {
-                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>) \
-                        -> tensor<i32>
+                  func.func @main(%arg0: tensor<4xcomplex<f32>> {mhlo.layout_mode = \"{0}\"}, %arg1: tensor<i32>) -> \
+                      (tensor<?xcomplex<f32>, #stablehlo.bounds<4>> {mhlo.layout_mode = \"{0}\"}, \
+                      tensor<?xcomplex<f32>, #stablehlo.bounds<4>> {mhlo.layout_mode = \"{0}\"}, tensor<i64>, \
+                      tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4xcomplex<f32>>, tensor<i32>) -> \
+                        tensor<?xcomplex<f32>, #stablehlo.bounds<4>>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>) -> \
+                        tensor<i32>
                     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
                     %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %1 = stablehlo.complex %cst, %cst_0 : tensor<complex<f32>>
-                    %2 = stablehlo.broadcast_in_dim %1, dims = [] : (tensor<complex<f32>>) -> tensor<4xcomplex<f32>>
-                    %3 = stablehlo.custom_call @LayoutConstraint(%2) {operand_layouts = [dense<0> : tensor<1xindex>], \
+                    %2 = stablehlo.complex %cst, %cst_0 : tensor<complex<f32>>
+                    %3 = stablehlo.broadcast_in_dim %2, dims = [] : (tensor<complex<f32>>) -> tensor<4xcomplex<f32>>
+                    %4 = stablehlo.custom_call @LayoutConstraint(%3) {operand_layouts = [dense<0> : tensor<1xindex>], \
                         result_layouts = [dense<0> : tensor<1xindex>]} : (tensor<4xcomplex<f32>>) -> \
                         tensor<4xcomplex<f32>>
-                    %4 = stablehlo.convert %0 : tensor<i32>
-                    %5 = stablehlo.set_dimension_size %3, %4, dim = 0 : (tensor<4xcomplex<f32>>, tensor<i32>) -> \
+                    %5 = stablehlo.convert %1 : tensor<i32>
+                    %6 = stablehlo.set_dimension_size %4, %5, dim = 0 : (tensor<4xcomplex<f32>>, tensor<i32>) -> \
                         tensor<?xcomplex<f32>, #stablehlo.bounds<4>>
-                    %6 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>) \
-                        -> tensor<i32>
+                    %7 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>) -> \
+                        tensor<i32>
                     %cst_1 = stablehlo.constant dense<1.000000e+00> : tensor<f32>
                     %cst_2 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %7 = stablehlo.complex %cst_1, %cst_2 : tensor<complex<f32>>
-                    %8 = stablehlo.broadcast_in_dim %7, dims = [] : (tensor<complex<f32>>) -> tensor<4xcomplex<f32>>
-                    %9 = stablehlo.custom_call @LayoutConstraint(%8) {operand_layouts = [dense<0> : tensor<1xindex>], \
+                    %8 = stablehlo.complex %cst_1, %cst_2 : tensor<complex<f32>>
+                    %9 = stablehlo.broadcast_in_dim %8, dims = [] : (tensor<complex<f32>>) -> tensor<4xcomplex<f32>>
+                    %10 = stablehlo.custom_call @LayoutConstraint(%9) {operand_layouts = [dense<0> : tensor<1xindex>], \
                         result_layouts = [dense<0> : tensor<1xindex>]} : (tensor<4xcomplex<f32>>) -> \
                         tensor<4xcomplex<f32>>
-                    %10 = stablehlo.convert %6 : tensor<i32>
-                    %11 = stablehlo.set_dimension_size %9, %10, dim = 0 : (tensor<4xcomplex<f32>>, tensor<i32>) -> \
+                    %11 = stablehlo.convert %7 : tensor<i32>
+                    %12 = stablehlo.set_dimension_size %10, %11, dim = 0 : (tensor<4xcomplex<f32>>, tensor<i32>) -> \
                         tensor<?xcomplex<f32>, #stablehlo.bounds<4>>
-                    return %5, %11 : tensor<?xcomplex<f32>, #stablehlo.bounds<4>>, tensor<?xcomplex<f32>, \
-                        #stablehlo.bounds<4>>
+                    %13:2 = stablehlo.optimization_barrier %6, %12 : tensor<?xcomplex<f32>, #stablehlo.bounds<4>>, \
+                        tensor<?xcomplex<f32>, #stablehlo.bounds<4>>
+                    %14 = stablehlo.get_dimension_size %6, dim = 0 : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>) -> \
+                        tensor<i32>
+                    %15 = stablehlo.convert %14 : (tensor<i32>) -> tensor<i64>
+                    %16 = stablehlo.get_dimension_size %12, dim = 0 : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>) \
+                        -> tensor<i32>
+                    %17 = stablehlo.convert %16 : (tensor<i32>) -> tensor<i64>
+                    return %13#0, %13#1, %15, %17 : tensor<?xcomplex<f32>, #stablehlo.bounds<4>>, \
+                        tensor<?xcomplex<f32>, #stablehlo.bounds<4>>, tensor<i64>, tensor<i64>
                   }
                 }
             "},
-        );
-        // The wrapper supplies an input extent at execution time. Its static physical boundary avoids CPU PJRT's
-        // unsupported dynamic buffer boundary, and one compiled executable handles both size two and size zero.
-        let module = format!(
-            "{}{}",
-            module
-                .strip_suffix("}\n")
-                .unwrap()
-                .replace("func.func @like_dynamic", "func.func private @like_dynamic"),
-            indoc! {r#"
-              func.func @main(%arg0: tensor<4xcomplex<f32>>, %arg1: tensor<i32>) -> (tensor<4xcomplex<f32>>, tensor<4xcomplex<f32>>, tensor<i32>, tensor<i32>) {
-                %input = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4xcomplex<f32>>, tensor<i32>) -> tensor<?xcomplex<f32>, #stablehlo.bounds<4>>
-                %zero, %one = func.call @like_dynamic(%input) : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>) -> (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>, tensor<?xcomplex<f32>, #stablehlo.bounds<4>>)
-                %zero_size = stablehlo.get_dimension_size %zero, dim = 0 : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>) -> tensor<i32>
-                %one_size = stablehlo.get_dimension_size %one, dim = 0 : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>) -> tensor<i32>
-                %bound = stablehlo.constant dense<4> : tensor<i32>
-                %zero_storage = stablehlo.set_dimension_size %zero, %bound, dim = 0 : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>, tensor<i32>) -> tensor<4xcomplex<f32>>
-                %one_storage = stablehlo.set_dimension_size %one, %bound, dim = 0 : (tensor<?xcomplex<f32>, #stablehlo.bounds<4>>, tensor<i32>) -> tensor<4xcomplex<f32>>
-                return %zero_storage, %one_storage, %zero_size, %one_size : tensor<4xcomplex<f32>>, tensor<4xcomplex<f32>>, tensor<i32>, tensor<i32>
-              }
-            }
-            "#},
         );
         let client = cpu_client(1);
         let executable = client
@@ -1606,6 +1571,8 @@ mod tests {
                 .block_until_ready()
                 .unwrap()
                 .remove(0);
+            assert_eq!(execution.outputs[0].unpadded_dimensions().unwrap(), &[extent as u64]);
+            assert_eq!(execution.outputs[1].unpadded_dimensions().unwrap(), &[extent as u64]);
             let outputs = execution
                 .outputs
                 .iter()
@@ -1619,8 +1586,8 @@ mod tests {
                 &values_from_bytes::<f32>(outputs[1].as_slice())[..2 * extent as usize],
                 [1.0, 0.0].repeat(extent as usize),
             );
-            assert_eq!(values_from_bytes::<i32>(outputs[2].as_slice()), vec![extent]);
-            assert_eq!(values_from_bytes::<i32>(outputs[3].as_slice()), vec![extent]);
+            assert_eq!(values_from_bytes::<i64>(outputs[2].as_slice()), vec![i64::from(extent)]);
+            assert_eq!(values_from_bytes::<i64>(outputs[3].as_slice()), vec![i64::from(extent)]);
         }
     }
 
@@ -1685,7 +1652,9 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![fill, iota], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let module = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning().without_boundary_shardings())
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -1717,20 +1686,28 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![fill, iota], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let module = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"
                 module {
-                  func.func @main(%arg0: tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> (tensor<?x2xf32, #stablehlo.bounds<4, ?>>, tensor<?x2xi32, #stablehlo.bounds<4, ?>>) {
+                  func.func @main(%arg0: tensor<4x2xf32>, %arg1: tensor<i32>) -> (tensor<?x2xf32, #stablehlo.bounds<4, ?>>, tensor<?x2xi32, #stablehlo.bounds<4, ?>>, tensor<i64>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4x2xf32>, tensor<i32>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>>
                     %cst = stablehlo.constant dense<2.500000e+00> : tensor<f32>
-                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4x2xf32>
-                    %1 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
-                    %2 = stablehlo.set_dimension_size %0, %1, dim = 0 : (tensor<4x2xf32>, tensor<i32>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>>
-                    %3 = stablehlo.iota dim = 0 : tensor<4x2xi32>
-                    %4 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
-                    %5 = stablehlo.set_dimension_size %3, %4, dim = 0 : (tensor<4x2xi32>, tensor<i32>) -> tensor<?x2xi32, #stablehlo.bounds<4, ?>>
-                    return %2, %5 : tensor<?x2xf32, #stablehlo.bounds<4, ?>>, tensor<?x2xi32, #stablehlo.bounds<4, ?>>
+                    %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4x2xf32>
+                    %2 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %3 = stablehlo.set_dimension_size %1, %2, dim = 0 : (tensor<4x2xf32>, tensor<i32>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                    %4 = stablehlo.iota dim = 0 : tensor<4x2xi32>
+                    %5 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %6 = stablehlo.set_dimension_size %4, %5, dim = 0 : (tensor<4x2xi32>, tensor<i32>) -> tensor<?x2xi32, #stablehlo.bounds<4, ?>>
+                    %7:2 = stablehlo.optimization_barrier %3, %6 : tensor<?x2xf32, #stablehlo.bounds<4, ?>>, tensor<?x2xi32, #stablehlo.bounds<4, ?>>
+                    %8 = stablehlo.get_dimension_size %3, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %9 = stablehlo.convert %8 : (tensor<i32>) -> tensor<i64>
+                    %10 = stablehlo.get_dimension_size %6, dim = 0 : (tensor<?x2xi32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %11 = stablehlo.convert %10 : (tensor<i32>) -> tensor<i64>
+                    return %7#0, %7#1, %9, %11 : tensor<?x2xf32, #stablehlo.bounds<4, ?>>, tensor<?x2xi32, #stablehlo.bounds<4, ?>>, tensor<i64>, tensor<i64>
                   }
                 }
             "#},
@@ -1757,37 +1734,49 @@ mod tests {
         // Byte strides do not carry across element widths, so the coordinates take the default layout.
         let iota_type = input_type.clone().with_data_type(DataType::I32).with_layout(None);
         assert_eq!(program.output_types(), vec![input_type, iota_type]);
-        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let module = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning().without_boundary_shardings())
+            .unwrap();
         assert_eq!(
             module,
             indoc! {"
                 module {
                   sdy.mesh @mesh = <[\"x\"=2]>
-                  func.func @main(%arg0: tensor<?xf64, #stablehlo.bounds<4>> {mhlo.memory_kind = \"pinned_host\"}) -> \
-                      (tensor<?xf64, #stablehlo.bounds<4>> {mhlo.memory_kind = \"pinned_host\"}, tensor<?xi32, \
-                      #stablehlo.bounds<4>> {mhlo.memory_kind = \"pinned_host\"}) {
+                  func.func @main(%arg0: tensor<4xf64> {mhlo.layout_mode = \"{0}\", mhlo.memory_kind = \
+                      \"pinned_host\"}, %arg1: tensor<i32>) -> (tensor<?xf64, #stablehlo.bounds<4>> {mhlo.layout_mode \
+                      = \"{0}\", mhlo.memory_kind = \"pinned_host\"}, tensor<?xi32, #stablehlo.bounds<4>> \
+                      {mhlo.memory_kind = \"pinned_host\"}, tensor<i64>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4xf64>, tensor<i32>) -> \
+                        tensor<?xf64, #stablehlo.bounds<4>>
                     %cst = stablehlo.constant dense<2.500000e+00> : tensor<f64>
-                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<4xf64>
-                    %1 = stablehlo.custom_call @annotate_device_placement(%0) {backend_config = \"\", has_side_effect \
+                    %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<4xf64>
+                    %2 = stablehlo.custom_call @annotate_device_placement(%1) {backend_config = \"\", has_side_effect \
                         = true, mhlo.frontend_attributes = {_xla_buffer_placement = \"pinned_host\"}} : \
                         (tensor<4xf64>) -> tensor<4xf64>
-                    %2 = stablehlo.custom_call @LayoutConstraint(%1) {operand_layouts = [dense<0> : tensor<1xindex>], \
+                    %3 = stablehlo.custom_call @LayoutConstraint(%2) {operand_layouts = [dense<0> : tensor<1xindex>], \
                         result_layouts = [dense<0> : tensor<1xindex>]} : (tensor<4xf64>) -> tensor<4xf64>
-                    %3 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> \
-                        tensor<i32>
-                    %4 = stablehlo.set_dimension_size %2, %3, dim = 0 : (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, \
+                    %4 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %5 = stablehlo.set_dimension_size %3, %4, dim = 0 : (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, \
                         #stablehlo.bounds<4>>
-                    %5 = sdy.sharding_constraint %4 <@mesh, [{\"x\"}]> : tensor<?xf64, #stablehlo.bounds<4>>
-                    %6 = stablehlo.iota dim = 0 : tensor<4xi32>
-                    %7 = stablehlo.custom_call @annotate_device_placement(%6) {backend_config = \"\", has_side_effect \
+                    %6 = sdy.sharding_constraint %5 <@mesh, [{\"x\"}]> : tensor<?xf64, #stablehlo.bounds<4>>
+                    %7 = stablehlo.iota dim = 0 : tensor<4xi32>
+                    %8 = stablehlo.custom_call @annotate_device_placement(%7) {backend_config = \"\", has_side_effect \
                         = true, mhlo.frontend_attributes = {_xla_buffer_placement = \"pinned_host\"}} : \
                         (tensor<4xi32>) -> tensor<4xi32>
-                    %8 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> \
-                        tensor<i32>
-                    %9 = stablehlo.set_dimension_size %7, %8, dim = 0 : (tensor<4xi32>, tensor<i32>) -> tensor<?xi32, \
+                    %9 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %10 = stablehlo.set_dimension_size %8, %9, dim = 0 : (tensor<4xi32>, tensor<i32>) -> tensor<?xi32, \
                         #stablehlo.bounds<4>>
-                    %10 = sdy.sharding_constraint %9 <@mesh, [{\"x\"}]> : tensor<?xi32, #stablehlo.bounds<4>>
-                    return %5, %10 : tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xi32, #stablehlo.bounds<4>>
+                    %11 = sdy.sharding_constraint %10 <@mesh, [{\"x\"}]> : tensor<?xi32, #stablehlo.bounds<4>>
+                    %12:2 = stablehlo.optimization_barrier %6, %11 : tensor<?xf64, #stablehlo.bounds<4>>, \
+                        tensor<?xi32, #stablehlo.bounds<4>>
+                    %13 = stablehlo.get_dimension_size %6, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> \
+                        tensor<i32>
+                    %14 = stablehlo.convert %13 : (tensor<i32>) -> tensor<i64>
+                    %15 = stablehlo.get_dimension_size %11, dim = 0 : (tensor<?xi32, #stablehlo.bounds<4>>) -> \
+                        tensor<i32>
+                    %16 = stablehlo.convert %15 : (tensor<i32>) -> tensor<i64>
+                    return %12#0, %12#1, %14, %16 : tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xi32, \
+                        #stablehlo.bounds<4>>, tensor<i64>, tensor<i64>
                   }
                 }
             "},
@@ -1806,7 +1795,9 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let error = to_rendered_mlir_for_plain_program(&program, "main").unwrap_err();
+            let error = unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap_err();
             assert!(matches!(
                 error,
                 Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })

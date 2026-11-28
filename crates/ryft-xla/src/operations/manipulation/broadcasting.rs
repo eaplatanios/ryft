@@ -336,18 +336,18 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ADD_OPERATION_NAME, Add, Array as CoreArray, BatchAxis, Broadcast, ConvertElementType, DataType, Device,
-        DeviceMesh, DifferentiableType, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue,
-        DimensionVariable, DynamicBroadcastOperation, Error as CoreError, Layout, LogicalMesh, Max, MeshAxis,
-        MeshAxisType, Min, Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError, Shape, ShardMapOptions,
-        Sharding, ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, Typed, TypedProgram,
-        UnreducedKind, batch, differentiate_at,
+        ADD_OPERATION_NAME, Add, BatchAxis, Broadcast, ConvertElementType, DataType, Device, DeviceMesh,
+        DifferentiableType, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue, DimensionVariable,
+        DynamicBroadcastOperation, Error as CoreError, Layout, LogicalMesh, Max, MeshAxis, MeshAxisType, Min,
+        Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError, Shape, ShardMapOptions, Sharding,
+        ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, Typed, TypedProgram, UnreducedKind, batch,
+        differentiate_at,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
         MixedValue, PlainProgram, ProgramBuilder, dynamic_dimension, execute_mixed_program, shard_map_module,
-        test_manual_mesh, test_vector_type, to_rendered_mlir_for_plain_program,
+        test_manual_mesh, test_vector_type, unproject_plain_program,
     };
     use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, replicated_vector_type};
@@ -369,16 +369,19 @@ mod tests {
         let output_type = test_vector_type(4)
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        let mut builder = CoreProgramBuilder::<CoreArray, BroadcastOperation>::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let program = unproject_plain_program(program);
+        let stablehlo = program
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning().without_boundary_shardings())
+            .unwrap();
 
         assert_eq!(
             stablehlo,
@@ -404,24 +407,28 @@ mod tests {
         let bounded = dynamic_dimension("n", Some(5));
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![bounded.clone()]));
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), bounded]));
-        let mut builder = CoreProgramBuilder::<CoreArray, BroadcastOperation>::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let program = unproject_plain_program(program);
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap();
 
         assert_eq!(
             stablehlo,
             indoc! {r#"
                 module {
-                  func.func @main(%arg0: tensor<?xf32, #stablehlo.bounds<4>>) -> tensor<2x?xf32, #stablehlo.bounds<?, 4>> {
-                    %0 = stablehlo.broadcast_in_dim %arg0, dims = [1] : (tensor<?xf32, #stablehlo.bounds<4>>) -> tensor<2x?xf32, #stablehlo.bounds<?, 4>>
-                    return %0 : tensor<2x?xf32, #stablehlo.bounds<?, 4>>
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<i32>) -> (tensor<2x?xf32, #stablehlo.bounds<?, 4>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<4>>
+                    %1 = stablehlo.broadcast_in_dim %0, dims = [1] : (tensor<?xf32, #stablehlo.bounds<4>>) -> tensor<2x?xf32, #stablehlo.bounds<?, 4>>
+                    %2 = stablehlo.get_dimension_size %1, dim = 1 : (tensor<2x?xf32, #stablehlo.bounds<?, 4>>) -> tensor<i32>
+                    %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
+                    return %1, %3 : tensor<2x?xf32, #stablehlo.bounds<?, 4>>, tensor<i64>
                   }
                 }
             "#},
@@ -431,16 +438,17 @@ mod tests {
         let unbounded = dynamic_dimension("n", None);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![unbounded.clone()]));
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), unbounded]));
-        let mut builder = CoreProgramBuilder::<CoreArray, BroadcastOperation>::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
+        let program = unproject_plain_program(program);
         assert_eq!(
-            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap(),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<?xf32>) -> tensor<2x?xf32> {
@@ -664,24 +672,27 @@ mod tests {
                 dynamic_dimension("size", Some(5)),
                 indoc! {r#"
                     module {
-                      func.func @main(%arg0: tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<2x?xcomplex<f64>, #stablehlo.bounds<?, 4>> {
-                        %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<i32>
+                      func.func @main(%arg0: tensor<4xcomplex<f64>>, %arg1: tensor<i32>) -> (tensor<2x?xcomplex<f64>, #stablehlo.bounds<?, 4>>, tensor<i64>) {
+                        %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4xcomplex<f64>>, tensor<i32>) -> tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
+                        %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<i32>
                         %c = stablehlo.constant dense<4> : tensor<i32>
-                        %1 = stablehlo.set_dimension_size %arg0, %c, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>, tensor<i32>) -> tensor<4xcomplex<f64>>
-                        %2 = stablehlo.iota dim = 0 : tensor<4xi32>
-                        %3 = stablehlo.broadcast_in_dim %0, dims = [] : (tensor<i32>) -> tensor<4xi32>
-                        %4 = stablehlo.compare LT, %2, %3, SIGNED : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi1>
+                        %2 = stablehlo.set_dimension_size %0, %c, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>, tensor<i32>) -> tensor<4xcomplex<f64>>
+                        %3 = stablehlo.iota dim = 0 : tensor<4xi32>
+                        %4 = stablehlo.broadcast_in_dim %1, dims = [] : (tensor<i32>) -> tensor<4xi32>
+                        %5 = stablehlo.compare LT, %3, %4, SIGNED : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi1>
                         %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
-                        %5 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<4xf64>
+                        %6 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<4xf64>
                         %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f64>
-                        %6 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f64>) -> tensor<4xf64>
-                        %7 = stablehlo.complex %5, %6 : tensor<4xcomplex<f64>>
-                        %8 = stablehlo.select %4, %1, %7 : tensor<4xi1>, tensor<4xcomplex<f64>>
-                        %9 = stablehlo.broadcast_in_dim %8, dims = [1] : (tensor<4xcomplex<f64>>) -> tensor<2x4xcomplex<f64>>
-                        %10 = stablehlo.custom_call @LayoutConstraint(%9) {operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<2x4xcomplex<f64>>) -> tensor<2x4xcomplex<f64>>
-                        %11 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<i32>
-                        %12 = stablehlo.set_dimension_size %10, %11, dim = 1 : (tensor<2x4xcomplex<f64>>, tensor<i32>) -> tensor<2x?xcomplex<f64>, #stablehlo.bounds<?, 4>>
-                        return %12 : tensor<2x?xcomplex<f64>, #stablehlo.bounds<?, 4>>
+                        %7 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f64>) -> tensor<4xf64>
+                        %8 = stablehlo.complex %6, %7 : tensor<4xcomplex<f64>>
+                        %9 = stablehlo.select %5, %2, %8 : tensor<4xi1>, tensor<4xcomplex<f64>>
+                        %10 = stablehlo.broadcast_in_dim %9, dims = [1] : (tensor<4xcomplex<f64>>) -> tensor<2x4xcomplex<f64>>
+                        %11 = stablehlo.custom_call @LayoutConstraint(%10) {operand_layouts = [dense<[0, 1]> : tensor<2xindex>], result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<2x4xcomplex<f64>>) -> tensor<2x4xcomplex<f64>>
+                        %12 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<i32>
+                        %13 = stablehlo.set_dimension_size %11, %12, dim = 1 : (tensor<2x4xcomplex<f64>>, tensor<i32>) -> tensor<2x?xcomplex<f64>, #stablehlo.bounds<?, 4>>
+                        %14 = stablehlo.get_dimension_size %13, dim = 1 : (tensor<2x?xcomplex<f64>, #stablehlo.bounds<?, 4>>) -> tensor<i32>
+                        %15 = stablehlo.convert %14 : (tensor<i32>) -> tensor<i64>
+                        return %13, %15 : tensor<2x?xcomplex<f64>, #stablehlo.bounds<?, 4>>, tensor<i64>
                       }
                     }
                 "#},
@@ -690,15 +701,26 @@ mod tests {
             let input_type = ArrayType::new(DataType::C128, Shape::new(vec![dimension.clone()]));
             let output_type = ArrayType::new(DataType::C128, Shape::new(vec![Dimension::Static(2), dimension]))
                 .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
-            let mut builder = CoreProgramBuilder::<CoreArray, BroadcastOperation>::new();
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(input_type);
             let output = builder
-                .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
+                .add_instruction(BroadcastOperation::new(output_type.clone(), vec![1]), Vec::new(), vec![input], None)
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            assert_eq!(to_rendered_mlir_for_plain_program(&program, "main").unwrap(), expected);
+            let program = unproject_plain_program(program);
+            assert_eq!(
+                program
+                    .to_rendered_mlir(
+                        "main",
+                        &ProgramLoweringOptions::new()
+                            .without_pruning()
+                            .with_output_types(&output_type.with_layout(None))
+                    )
+                    .unwrap(),
+                expected
+            );
         }
     }
 
@@ -709,16 +731,22 @@ mod tests {
             (Layout::Tiled(TiledLayout::new(vec![0], vec![Tile::new(vec![TileDimension::Sized(2)])])), "tiled"),
         ] {
             let output_type = ArrayType::new_static(DataType::F32, [4]).with_layout(layout.clone());
-            let mut builder = CoreProgramBuilder::<CoreArray, BroadcastOperation>::new();
+            let mut builder = ProgramBuilder::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F32));
             let output = builder
-                .add_instruction(BroadcastOperation::new(output_type, Vec::new()), Vec::new(), vec![input], None)
+                .add_instruction(
+                    BroadcastOperation::new(output_type.clone(), Vec::new()),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
                 .unwrap()[0];
             let program = builder
-                .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
+            let program = unproject_plain_program(program);
             assert!(matches!(
-                to_rendered_mlir_for_plain_program(&program, "main"),
+                program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning().with_output_types(&output_type.with_layout(None))),
                 Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                     if reason == format!("{kind} output layout `{layout}`"),
             ));
@@ -731,16 +759,17 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone()]));
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), size]))
             .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new())));
-        let mut builder = CoreProgramBuilder::<CoreArray, BroadcastOperation>::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
-            .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
+            .add_instruction(BroadcastOperation::new(output_type.clone(), vec![1]), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
+        let program = unproject_plain_program(program);
         assert!(matches!(
-            to_rendered_mlir_for_plain_program(&program, "main"),
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning().with_output_types(&output_type.with_layout(None))),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "dynamic broadcast with explicit output layout needs finite allocation bounds",
         ));
@@ -753,16 +782,19 @@ mod tests {
         let output_type = test_vector_type(4)
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        let mut builder = CoreProgramBuilder::<CoreArray, BroadcastOperation>::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder
             .add_instruction(BroadcastOperation::new(output_type, vec![0]), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let program = unproject_plain_program(program);
+        let stablehlo = program
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning().without_boundary_shardings())
+            .unwrap();
 
         assert_eq!(
             stablehlo,
@@ -1302,7 +1334,8 @@ mod tests {
                 vec![Placeholder; 2],
             )
             .unwrap();
-        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let program = unproject_plain_program(program);
+        let module = program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap();
         assert_eq!(
             module,
             indoc! {r#"
@@ -1342,7 +1375,8 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let error = to_rendered_mlir_for_plain_program(&program, "main").unwrap_err();
+        let program = unproject_plain_program(program);
+        let error = program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap_err();
         assert!(matches!(
             error,
             Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })
@@ -1415,7 +1449,10 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let program = unproject_plain_program(program);
+        let module = program
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning().without_boundary_shardings())
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"

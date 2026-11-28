@@ -739,9 +739,8 @@ mod tests {
         ArrayOperation, Dimension, ExpM1, Ln1p, Log, LogAddExp, Logistic, Placeholder, Shape, differentiate_at,
     };
 
-    use crate::lowering::tests::{
-        ProgramBuilder, dynamic_dimension, lowered_unary_module, to_rendered_mlir_for_plain_program,
-    };
+    use crate::lowering::programs::{ProgramLoweringExtension, ProgramLoweringOptions};
+    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, lowered_unary_module, unproject_plain_program};
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{ArrayConstant, Session};
@@ -756,7 +755,9 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        to_rendered_mlir_for_plain_program(&program, "main").unwrap()
+        unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap()
     }
 
     #[test]
@@ -821,34 +822,37 @@ mod tests {
             lowered_dynamic_unary_module(ArrayOperation::ExpM1(ExpM1Operation::new()), DataType::C128),
             indoc! {"
                 module {
-                  func.func @main(%arg0: tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<?xcomplex<f64>, #stablehlo.bounds<4>> {
+                  func.func @main(%arg0: tensor<4xcomplex<f64>>, %arg1: tensor<i32>) -> (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4xcomplex<f64>>, tensor<i32>) -> tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
                     %cst = stablehlo.constant dense<2.000000e+00> : tensor<f64>
-                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<i32>
-                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
-                    %2 = stablehlo.reshape %1 : (tensor<i64>) -> tensor<1xi64>
-                    %3 = stablehlo.dynamic_broadcast_in_dim %cst, %2, dims = [] : (tensor<f64>, tensor<1xi64>) -> tensor<?xf64>
-                    %cast = tensor.cast %3 : tensor<?xf64> to tensor<?xf64, #stablehlo.bounds<4>>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    %3 = stablehlo.reshape %2 : (tensor<i64>) -> tensor<1xi64>
+                    %4 = stablehlo.dynamic_broadcast_in_dim %cst, %3, dims = [] : (tensor<f64>, tensor<1xi64>) -> tensor<?xf64>
+                    %cast = tensor.cast %4 : tensor<?xf64> to tensor<?xf64, #stablehlo.bounds<4>>
                     %cst_0 = stablehlo.constant dense<5.000000e-01> : tensor<f64>
-                    %4 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<i32>
-                    %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
-                    %6 = stablehlo.reshape %5 : (tensor<i64>) -> tensor<1xi64>
-                    %7 = stablehlo.dynamic_broadcast_in_dim %cst_0, %6, dims = [] : (tensor<f64>, tensor<1xi64>) -> tensor<?xf64>
-                    %cast_1 = tensor.cast %7 : tensor<?xf64> to tensor<?xf64, #stablehlo.bounds<4>>
-                    %8 = stablehlo.real %arg0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<?xf64, #stablehlo.bounds<4>>
-                    %9 = stablehlo.imag %arg0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<?xf64, #stablehlo.bounds<4>>
-                    %10 = stablehlo.exponential_minus_one %8 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %11 = stablehlo.cosine %9 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %12 = stablehlo.multiply %9, %cast_1 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %13 = stablehlo.sine %12 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %14 = stablehlo.multiply %13, %13 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %15 = stablehlo.multiply %cast, %14 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %16 = stablehlo.multiply %10, %11 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %17 = stablehlo.subtract %16, %15 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %18 = stablehlo.exponential %8 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %19 = stablehlo.sine %9 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %20 = stablehlo.multiply %18, %19 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %21 = stablehlo.complex %17, %20 : tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
-                    return %21 : tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
+                    %5 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %6 = stablehlo.convert %5 : (tensor<i32>) -> tensor<i64>
+                    %7 = stablehlo.reshape %6 : (tensor<i64>) -> tensor<1xi64>
+                    %8 = stablehlo.dynamic_broadcast_in_dim %cst_0, %7, dims = [] : (tensor<f64>, tensor<1xi64>) -> tensor<?xf64>
+                    %cast_1 = tensor.cast %8 : tensor<?xf64> to tensor<?xf64, #stablehlo.bounds<4>>
+                    %9 = stablehlo.real %0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<?xf64, #stablehlo.bounds<4>>
+                    %10 = stablehlo.imag %0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<?xf64, #stablehlo.bounds<4>>
+                    %11 = stablehlo.exponential_minus_one %9 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %12 = stablehlo.cosine %10 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %13 = stablehlo.multiply %10, %cast_1 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %14 = stablehlo.sine %13 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %15 = stablehlo.multiply %14, %14 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %16 = stablehlo.multiply %cast, %15 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %17 = stablehlo.multiply %11, %12 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %18 = stablehlo.subtract %17, %16 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %19 = stablehlo.exponential %9 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %20 = stablehlo.sine %10 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %21 = stablehlo.multiply %19, %20 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %22 = stablehlo.complex %18, %21 : tensor<?xcomplex<f64>, #stablehlo.bounds<4>>
+                    %23 = stablehlo.get_dimension_size %22, dim = 0 : (tensor<?xcomplex<f64>, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %24 = stablehlo.convert %23 : (tensor<i32>) -> tensor<i64>
+                    return %22, %24 : tensor<?xcomplex<f64>, #stablehlo.bounds<4>>, tensor<i64>
                   }
                 }
             "},
@@ -917,7 +921,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
+            unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap(),
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
@@ -968,28 +974,31 @@ mod tests {
             lowered_dynamic_unary_module(ArrayOperation::Logistic(LogisticOperation::new()), DataType::F64),
             indoc! {"
                 module {
-                  func.func @main(%arg0: tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<?xf64, #stablehlo.bounds<4>> {
+                  func.func @main(%arg0: tensor<4xf64>, %arg1: tensor<i32>) -> (tensor<?xf64, #stablehlo.bounds<4>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<4>>
                     %cst = stablehlo.constant dense<1.000000e+00> : tensor<f64>
-                    %0 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
-                    %1 = stablehlo.convert %0 : (tensor<i32>) -> tensor<i64>
-                    %2 = stablehlo.reshape %1 : (tensor<i64>) -> tensor<1xi64>
-                    %3 = stablehlo.dynamic_broadcast_in_dim %cst, %2, dims = [] : (tensor<f64>, tensor<1xi64>) -> tensor<?xf64>
-                    %cast = tensor.cast %3 : tensor<?xf64> to tensor<?xf64, #stablehlo.bounds<4>>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    %3 = stablehlo.reshape %2 : (tensor<i64>) -> tensor<1xi64>
+                    %4 = stablehlo.dynamic_broadcast_in_dim %cst, %3, dims = [] : (tensor<f64>, tensor<1xi64>) -> tensor<?xf64>
+                    %cast = tensor.cast %4 : tensor<?xf64> to tensor<?xf64, #stablehlo.bounds<4>>
                     %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f64>
-                    %4 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
-                    %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
-                    %6 = stablehlo.reshape %5 : (tensor<i64>) -> tensor<1xi64>
-                    %7 = stablehlo.dynamic_broadcast_in_dim %cst_0, %6, dims = [] : (tensor<f64>, tensor<1xi64>) -> tensor<?xf64>
-                    %cast_1 = tensor.cast %7 : tensor<?xf64> to tensor<?xf64, #stablehlo.bounds<4>>
-                    %8 = stablehlo.compare GE, %arg0, %cast_1, FLOAT : (tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<?xi1, #stablehlo.bounds<4>>
-                    %9 = stablehlo.negate %arg0 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %10 = stablehlo.select %8, %9, %arg0 : tensor<?xi1, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>
-                    %11 = stablehlo.exponential %10 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %12 = stablehlo.add %cast, %11 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %13 = stablehlo.divide %cast, %12 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %14 = stablehlo.divide %11, %12 : tensor<?xf64, #stablehlo.bounds<4>>
-                    %15 = stablehlo.select %8, %13, %14 : tensor<?xi1, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>
-                    return %15 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %5 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %6 = stablehlo.convert %5 : (tensor<i32>) -> tensor<i64>
+                    %7 = stablehlo.reshape %6 : (tensor<i64>) -> tensor<1xi64>
+                    %8 = stablehlo.dynamic_broadcast_in_dim %cst_0, %7, dims = [] : (tensor<f64>, tensor<1xi64>) -> tensor<?xf64>
+                    %cast_1 = tensor.cast %8 : tensor<?xf64> to tensor<?xf64, #stablehlo.bounds<4>>
+                    %9 = stablehlo.compare GE, %0, %cast_1, FLOAT : (tensor<?xf64, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<?xi1, #stablehlo.bounds<4>>
+                    %10 = stablehlo.negate %0 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %11 = stablehlo.select %9, %10, %0 : tensor<?xi1, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>
+                    %12 = stablehlo.exponential %11 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %13 = stablehlo.add %cast, %12 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %14 = stablehlo.divide %cast, %13 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %15 = stablehlo.divide %12, %13 : tensor<?xf64, #stablehlo.bounds<4>>
+                    %16 = stablehlo.select %9, %14, %15 : tensor<?xi1, #stablehlo.bounds<4>>, tensor<?xf64, #stablehlo.bounds<4>>
+                    %17 = stablehlo.get_dimension_size %16, dim = 0 : (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %18 = stablehlo.convert %17 : (tensor<i32>) -> tensor<i64>
+                    return %16, %18 : tensor<?xf64, #stablehlo.bounds<4>>, tensor<i64>
                   }
                 }
             "},

@@ -33,9 +33,9 @@ mod tests {
     use ryft_core::{DataType, Dimension, Placeholder, Shape};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::ArrayConstant;
-    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, to_rendered_mlir_for_plain_program};
+    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, unproject_plain_program};
     use crate::tests::{execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
+    use crate::{ArrayConstant, ProgramLoweringExtension, ProgramLoweringOptions};
 
     use super::*;
 
@@ -50,7 +50,9 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
+            unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap(),
             indoc! {r#"
             module {
               func.func @main(%arg0: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
@@ -81,32 +83,9 @@ mod tests {
                 vec![Placeholder; 2],
             )
             .unwrap();
-        let module = to_rendered_mlir_for_plain_program(&program, "transpose_dynamic").unwrap();
-        // Keep CPU PJRT's physical boundary static while transposing bounded dynamic intermediates. The output
-        // extent must follow the permuted axis, and one executable must also handle an empty runtime shape.
-        let module = format!(
-            "{}{}",
-            module
-                .strip_suffix("}\n")
-                .unwrap()
-                .replace("func.func @transpose_dynamic", "func.func private @transpose_dynamic"),
-            indoc! {r#"
-              func.func @main(%arg0: tensor<4x2xi64>, %arg1: tensor<4x2xcomplex<f32>>, %arg2: tensor<i32>) -> (tensor<2x4xi64>, tensor<2x4xcomplex<f32>>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>) {
-                %integers = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : (tensor<4x2xi64>, tensor<i32>) -> tensor<?x2xi64, #stablehlo.bounds<4, ?>>
-                %complex = stablehlo.set_dimension_size %arg1, %arg2, dim = 0 : (tensor<4x2xcomplex<f32>>, tensor<i32>) -> tensor<?x2xcomplex<f32>, #stablehlo.bounds<4, ?>>
-                %integer_result, %complex_result = func.call @transpose_dynamic(%integers, %complex) : (tensor<?x2xi64, #stablehlo.bounds<4, ?>>, tensor<?x2xcomplex<f32>, #stablehlo.bounds<4, ?>>) -> (tensor<2x?xi64, #stablehlo.bounds<?, 4>>, tensor<2x?xcomplex<f32>, #stablehlo.bounds<?, 4>>)
-                %integer_rows = stablehlo.get_dimension_size %integer_result, dim = 0 : (tensor<2x?xi64, #stablehlo.bounds<?, 4>>) -> tensor<i32>
-                %integer_columns = stablehlo.get_dimension_size %integer_result, dim = 1 : (tensor<2x?xi64, #stablehlo.bounds<?, 4>>) -> tensor<i32>
-                %complex_rows = stablehlo.get_dimension_size %complex_result, dim = 0 : (tensor<2x?xcomplex<f32>, #stablehlo.bounds<?, 4>>) -> tensor<i32>
-                %complex_columns = stablehlo.get_dimension_size %complex_result, dim = 1 : (tensor<2x?xcomplex<f32>, #stablehlo.bounds<?, 4>>) -> tensor<i32>
-                %bound = stablehlo.constant dense<4> : tensor<i32>
-                %integer_storage = stablehlo.set_dimension_size %integer_result, %bound, dim = 1 : (tensor<2x?xi64, #stablehlo.bounds<?, 4>>, tensor<i32>) -> tensor<2x4xi64>
-                %complex_storage = stablehlo.set_dimension_size %complex_result, %bound, dim = 1 : (tensor<2x?xcomplex<f32>, #stablehlo.bounds<?, 4>>, tensor<i32>) -> tensor<2x4xcomplex<f32>>
-                return %integer_storage, %complex_storage, %integer_rows, %integer_columns, %complex_rows, %complex_columns : tensor<2x4xi64>, tensor<2x4xcomplex<f32>>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>
-              }
-            }
-            "#},
-        );
+        let module = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
         let client = execution_client();
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
@@ -118,6 +97,11 @@ mod tests {
         let complex_components =
             [1f32, -2.0, -0.0, 0.0, 3.0, -4.0, 5.0, -6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0];
         for extent in [2i32, 0] {
+            let extent_buffer = Arc::new(
+                client
+                    .buffer(values_to_bytes(&[extent]).as_slice(), BufferType::I32, [], None, device.clone(), None)
+                    .unwrap(),
+            );
             let inputs = vec![
                 ExecutionInput {
                     buffer: Arc::new(
@@ -149,21 +133,8 @@ mod tests {
                     ),
                     donatable: false,
                 },
-                ExecutionInput {
-                    buffer: Arc::new(
-                        client
-                            .buffer(
-                                values_to_bytes(&[extent]).as_slice(),
-                                BufferType::I32,
-                                [],
-                                None,
-                                device.clone(),
-                                None,
-                            )
-                            .unwrap(),
-                    ),
-                    donatable: false,
-                },
+                ExecutionInput { buffer: extent_buffer.clone(), donatable: false },
+                ExecutionInput { buffer: extent_buffer, donatable: false },
             ];
             let execution = executable
                 .execute(
@@ -180,23 +151,29 @@ mod tests {
                 .block_until_ready()
                 .unwrap()
                 .remove(0);
+            assert_eq!(execution.outputs.len(), 4);
+            for output in &execution.outputs[..2] {
+                assert_eq!(output.unpadded_dimensions().unwrap(), &[2, extent as u64]);
+            }
             let outputs = execution
                 .outputs
                 .iter()
-                .map(|output| output.copy_to_host(None).unwrap().r#await().unwrap())
+                .map(|output| {
+                    let layout = ryft_pjrt::Layout::dense_major_to_minor(output.dimensions().unwrap().len());
+                    output.copy_to_host(Some(layout)).unwrap().r#await().unwrap()
+                })
                 .collect::<Vec<_>>();
-            assert_eq!(values_from_bytes::<i32>(outputs[2].as_slice()), vec![2]);
-            assert_eq!(values_from_bytes::<i32>(outputs[3].as_slice()), vec![extent]);
-            assert_eq!(values_from_bytes::<i32>(outputs[4].as_slice()), vec![2]);
-            assert_eq!(values_from_bytes::<i32>(outputs[5].as_slice()), vec![extent]);
+            assert_eq!(values_from_bytes::<i64>(&outputs[2]), vec![i64::from(extent)]);
+            assert_eq!(values_from_bytes::<i64>(&outputs[3]), vec![i64::from(extent)]);
             if extent == 2 {
-                // Ignore padding beyond the runtime extent in each physical row.
-                let integer_values = values_from_bytes::<i64>(outputs[0].as_slice());
-                assert_eq!(&integer_values[..2], &[integers[0], integers[2]]);
-                assert_eq!(&integer_values[4..6], &[integers[1], integers[3]]);
-                let complex_bits = values_from_bytes::<u32>(outputs[1].as_slice());
-                assert_eq!(&complex_bits[..4], &[1f32, -2.0, 3.0, -4.0].map(f32::to_bits));
-                assert_eq!(&complex_bits[8..12], &[-0f32, 0.0, 5.0, -6.0].map(f32::to_bits));
+                assert_eq!(
+                    values_from_bytes::<i64>(&outputs[0][..4 * size_of::<i64>()]),
+                    vec![integers[0], integers[2], integers[1], integers[3]],
+                );
+                assert_eq!(
+                    values_from_bytes::<u32>(&outputs[1][..8 * size_of::<u32>()]),
+                    [1f32, -2.0, 3.0, -4.0, -0.0, 0.0, 5.0, -6.0].map(f32::to_bits),
+                );
             }
         }
     }

@@ -420,14 +420,13 @@ mod tests {
     use ryft_core::{
         Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, BatchAxis, BatchableOperation,
         BatchingContext, ConstantOperation, DataType, Dimension, DimensionBounds, DimensionSize, DimensionVariable,
-        DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, FlatProgram, Linearization, Placeholder,
-        ProgramBuilder as CoreProgramBuilder, ProjectedContext, Reduce, Scatter, ScatterDimensionNumbers, ScatterMode,
-        ScatterOperation, ScatterOptions, ScatterReductionKind, Shape, TypeError, TypedProgram, ValueProjection,
-        differentiate_at, i1, u1,
+        DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, FlatProgram, Linearization, Placeholder, ProjectedContext,
+        Reduce, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind,
+        Shape, TypeError, TypedProgram, ValueProjection, differentiate_at, i1, u1,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::tests::{ProgramBuilder, to_rendered_mlir_for_plain_program, unproject_plain_program};
+    use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, read_first_shard};
     use crate::tests::{
@@ -463,7 +462,9 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let stablehlo = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
 
         assert_eq!(
             stablehlo,
@@ -502,7 +503,9 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let stablehlo = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -531,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_scatter_operation_lower_dynamic_window() {
-        let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F32, [3]));
         let indices = builder.add_input(ArrayType::new_static(DataType::I32, [1, 1]));
         let updates = builder.add_input(ArrayType::new(
@@ -553,10 +556,10 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            to_rendered_mlir_for_plain_program(&program, "main"),
+            unproject_plain_program(program).to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "`scatter` dynamic update window axis 1 must match input axis 0; independently sized dynamic \
                    windows are unsupported by XLA",
@@ -735,7 +738,7 @@ mod tests {
             }
         }
         for (input, indices, updates, operation, expected) in literal_cases {
-            let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
+            let mut builder = ProgramBuilder::new();
             let inputs = [input, indices, updates]
                 .into_iter()
                 .map(|value| {
@@ -743,9 +746,12 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let output = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap()[0];
-            let program =
-                builder.build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![], vec![Placeholder]).unwrap();
-            let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+            let program = builder
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![], vec![Placeholder])
+                .unwrap();
+            let module = unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();

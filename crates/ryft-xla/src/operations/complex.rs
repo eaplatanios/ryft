@@ -179,7 +179,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{ArrayOperation, Conjugate, Placeholder, Real, differentiate_at};
 
-    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, to_rendered_mlir_for_plain_program};
+    use crate::lowering::programs::{ProgramLoweringExtension, ProgramLoweringOptions};
+    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, unproject_plain_program};
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{ArrayConstant, Session};
@@ -198,7 +199,9 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
+            unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap(),
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<2xf32>, %arg1: tensor<2xf32>) -> tensor<2xcomplex<f32>> {

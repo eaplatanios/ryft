@@ -422,9 +422,7 @@ mod tests {
     };
 
     use crate::lowering::programs::{ProgramLoweringExtension, ProgramLoweringOptions};
-    use crate::lowering::tests::{
-        ProgramBuilder, lowered_unary_module, to_rendered_mlir_for_plain_program, unproject_plain_program,
-    };
+    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, unproject_plain_program};
     use crate::sessions::tests::{domain_mesh, read_first_shard, replicated_vector_type};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, ArrayConstant, CompiledFunction, Options, Session, Type, Value, compile};
@@ -779,7 +777,7 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            to_rendered_mlir_for_plain_program(&program, "main"),
+            unproject_plain_program(program).to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason == "`cumulative` with kind `log_sum_exp` over dynamically sized axis 0",
         ));
@@ -868,7 +866,12 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let jvp = program.jvp().unwrap();
-            assert!(to_rendered_mlir_for_plain_program(&jvp, "main").is_ok(), "{kind}");
+            assert!(
+                unproject_plain_program(jvp)
+                    .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                    .is_ok(),
+                "{kind}"
+            );
         }
     }
 
@@ -1066,7 +1069,7 @@ mod tests {
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert!(matches!(
-                to_rendered_mlir_for_plain_program(&program, "main"),
+                unproject_plain_program(program).to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()),
                 Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                     if reason == format!(
                            "`cumulative` with kind `log_sum_exp` over `{element_type}`, whose lowest value is not a \

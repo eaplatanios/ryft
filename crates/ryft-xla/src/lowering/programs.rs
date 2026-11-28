@@ -15,7 +15,7 @@ use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
     Attribute, Block, BlockRef, Context as MlirContext, DetachedBlock, Location, LocationRef,
     Operation as MlirOperation, Region, SymbolVisibility, Type as MlirType, TypeAndAttributes, Value as MlirValue,
-    ValueRef,
+    ValueRef, WalkOrder, WalkResult,
 };
 
 use crate::arrays::host::ReductionChange;
@@ -25,7 +25,6 @@ use crate::lowering::emissions::{
     collect_session_constants, emitted_regions, lowers_without_regions, omits_regions, partition_session_constants,
     unread_entry_inputs,
 };
-use crate::lowering::modules::{normalize_function_name, remove_shardy_operations, serialize_lowered_module};
 use crate::lowering::reductions::{
     ShardingReductionExtension, validate_declared_pending_reduction, validate_partial_completion,
     validate_pending_reduction_change,
@@ -877,8 +876,24 @@ where
             module_block.insert_operation(mesh.lower(location)?, 0)?;
         }
 
-        if !supports_shardy {
-            remove_shardy_operations(&mut module)?;
+        // On a single device each sharding holds the whole value, so a target without Shardy can drop its mesh and
+        // sharding constraints. If another Shardy operation prevents removal, name it in the lowering diagnostic.
+        if !supports_shardy && let Err(error) = module.remove_shardy_operations() {
+            let mut unsupported = None;
+            module.as_operation()?.walk(WalkOrder::PreOrder, |operation| match operation.name().as_str() {
+                Ok(name) if name.starts_with("sdy.") && name != "sdy.sharding_constraint" && name != "sdy.mesh" => {
+                    unsupported = Some(name.to_string());
+                    WalkResult::Interrupt
+                }
+                _ => WalkResult::Advance,
+            });
+            return Err(match unsupported {
+                Some(operation) => Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation,
+                    reason: "the target plugin cannot compile with Shardy".to_string(),
+                }),
+                None => error.into(),
+            });
         }
 
         module.remove_unused_stable_hlo_constants()?;
@@ -902,12 +917,7 @@ where
 
         let runtime_requirements = normalize_runtime_requirements(runtime_requirements)?.into();
 
-        Ok(MlirProgram::new(
-            serialize_lowered_module(&module, &lowering_context)?,
-            boundary_mapping,
-            runtime_requirements,
-            mesh,
-        ))
+        Ok(MlirProgram::new(lowering_context.render_module(&module)?, boundary_mapping, runtime_requirements, mesh))
     }
 }
 
@@ -2271,7 +2281,14 @@ where
             return Err(Error::Lowering(LoweringError::UnresolvedState { construct: "program".to_string() }));
         }
 
-        let function_name = normalize_function_name(function_name)?;
+        // Accept surrounding whitespace and one optional MLIR symbol prefix.
+        let function_name = function_name.trim();
+        let function_name = function_name.strip_prefix('@').unwrap_or(function_name);
+        if function_name.is_empty() || function_name.chars().any(char::is_whitespace) {
+            return Err(Error::Lowering(LoweringError::InvalidFunctionName {
+                function_name: function_name.to_string(),
+            }));
+        }
 
         // Session constants are carried by hidden inputs that form the suffix of the capture inputs. The caller
         // declares them through the trailing `capture_types`, in the order of `collect_session_constants`.
@@ -2385,7 +2402,7 @@ where
         let executable_output_types = boundary_mapping.executable_output_types(output_types)?;
 
         Ok(ProgramBoundary {
-            function_name,
+            function_name: function_name.to_string(),
             boundary_mapping,
             session_constants,
             passed_on_constants,
@@ -2798,23 +2815,31 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
+
     use ryft_core::{
-        ArrayOperation, ArrayType, CALL_OPERATION_NAME, CastOperation, CompositeKey, CompositeOperation,
-        ConstrainSharding, CustomRuleDefinition, CustomRuleRegistration, DataType, Device, DeviceMesh, Dimension,
-        DimensionBounds, DimensionValue, DimensionVariable, DomainTracingContext, DotDimensionNumbers, EffectClass,
-        Error as CoreError, FlatProgram, ImportingContext, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite,
-        PLACE_OPERATION_NAME, Place, PlaceOperation, Placeholder, Placement, PlacementRequest, Print, ProgramBuilder,
-        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceWriteOperation, ReshapeOperation, Reshard,
-        ScaledDotOperation, ScanOperation, Shape, ShardMapOptions, Sharding, ShardingDimension, Sin, StopGradient, Tag,
-        TransferToMemory, TypeError, Typed, ValueProjection, shard_map,
+        AddOperation, ArrayOperation, ArrayType, CALL_OPERATION_NAME, CaptureReference, CastOperation, CompositeKey,
+        CompositeOperation, ConditionOperation, ConstrainSharding, Context, Cos, CustomRuleDefinition,
+        CustomRuleRegistration, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionToScalarOperation,
+        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, Dot, DotDimensionNumbers, EffectClass,
+        EffectClasses, Error as CoreError, FlatProgram, ImportingContext, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, NamedComposite, OneLike, PLACE_OPERATION_NAME, Place, PlaceOperation, Placeholder, Placement,
+        PlacementRequest, Print, PrintOperation, ProgramBuilder, Provenance, ProvenanceScope, ReferenceFreezeOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceSource, ReferenceType, ReferenceWriteOperation,
+        ReshapeOperation, Reshard, ScaledDotOperation, ScanOperation, Shape, ShardMapOptions, Sharding,
+        ShardingDimension, Sin, StopGradient, Tag, TiledLayout, TransferToMemory, Transpose, TypeError, Typed,
+        ValueProjection, ZeroLike, differentiate_in_parent_at, shard_map,
     };
+    use ryft_kernels::{KernelBoundaryContract, KernelParameterAccess, validate_kernel_body};
+    use ryft_mlir::Size as MlirSize;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
-        dynamic_dimension, linear_call_program, scalar_linear_region, test_manual_mesh, test_sharding, test_vector_type,
+        dynamic_dimension, linear_call_program, scalar_linear_region, shard_map_module, test_manual_mesh,
+        test_matrix_type, test_sharding, test_vector_type,
     };
-    use crate::sessions::tests::two_device_mesh;
-    use crate::tests::{cpu_client, test_compilation_options, values_from_bytes, values_to_bytes};
+    use crate::lowering::token_threaded_effects;
+    use crate::sessions::tests::{domain_mesh, two_device_mesh};
+    use crate::tests::{cpu_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
         Array, ArrayConstant, ArrayTracer, CompilationError, CompileTracer, CompiledFunction, Constant, Operation,
         Options, Session, StagedFunction, ThroughSession, TracedProgram, Tracer, Type, Value, compile,
@@ -2822,6 +2847,14 @@ mod tests {
     };
 
     use super::*;
+
+    /// Computes `f(x, y) = x * y + sin(x)` for the pair `inputs` of `(x, y)`.
+    fn scalar_bilinear_sin<T>(inputs: (T, T)) -> T
+    where
+        T: Clone + Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
+    {
+        inputs.0.clone() * inputs.1 + inputs.0.sin().unwrap()
+    }
 
     /// Extends a [`scalar_linear_region`] with a reference that is allocated with its `value`, overwritten with its
     /// `residual`, and frozen into its output.
@@ -3125,6 +3158,428 @@ mod tests {
         let options = options.with_exact_input_shardings(shardings.clone()).with_exact_output_shardings(vec![None]);
         assert_eq!(options.exact_input_shardings(), Some(&EntryShardingOverride::Values(shardings)));
         assert_eq!(options.exact_output_shardings(), Some(&EntryShardingOverride::Values(vec![None])));
+    }
+
+    #[test]
+    fn test_program_to_mlir_omits_shardy_for_targets_without_the_dialect() {
+        // A device target that completes a pending reduction over a mesh axis of size one constrains its output, and
+        // the signature shardings annotate the entry function. A target whose plugin lacks the Shardy dialect gets
+        // neither, nor the mesh that both refer to.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let input_type = test_vector_type(4).with_sharding(unreduced.clone()).unwrap();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(input_type.clone().into());
+        let output = builder
+            .add_instruction(PlaceOperation::new(Device::new(0, 0), None), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let output_types = program
+            .output_types()
+            .iter()
+            .map(|r#type| <&ArrayType>::try_from(r#type).cloned().unwrap())
+            .collect::<Vec<_>>();
+        let lower = |supports_shardy| {
+            program
+                .to_mlir(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .without_pruning()
+                        .with_input_types(&vec![input_type.clone()])
+                        .with_output_types(&output_types)
+                        .without_boundary_shardings()
+                        .with_exact_input_shardings(vec![Some(unreduced.clone())])
+                        .with_exact_output_shardings(vec![Some(replicated.clone())])
+                        .with_target_platform(Some("cpu"))
+                        .with_shardy_support(supports_shardy)
+                        .with_reference_bindings(Vec::new(), Vec::new(), Vec::new()),
+                )
+                .unwrap()
+        };
+        let lowered = lower(true);
+        assert_eq!(lowered.mesh(), Some(&mesh));
+        assert_eq!(
+            lowered.into_stable_hlo(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], unreduced={"x"}>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], replicated={"x"}>}) {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}], replicated={"x"}> : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+        let lowered = lower(false);
+        assert_eq!(lowered.mesh(), Some(&mesh));
+        assert_eq!(
+            lowered.into_stable_hlo(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    return %arg0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_program_to_mlir_rejects_manual_computations_for_targets_without_shardy() {
+        // The ordered print keeps the manual computation live even though its output is unused.
+        let (program, sharding) = traced_effectful_dead_shard_map();
+        assert!(matches!(
+            program.to_mlir(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_shardings(vec![sharding.clone()])
+                    .with_output_shardings(vec![sharding])
+                    .with_shardy_support(false),
+            ),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "sdy.manual_computation" && reason == "the target plugin cannot compile with Shardy",
+        ));
+    }
+
+    #[test]
+    fn test_program_to_mlir_rejects_unresolved_reference_state() {
+        assert_eq!(token_threaded_effects(EffectClasses::single(EffectClass::OrderedState)).next(), None);
+
+        // The reference scan over the whole artifact catches the reference atoms and intrinsic semantics before token
+        // threading, so two representative reference operations are enough to pin the diagnostic.
+        let array_type = ArrayType::scalar(DataType::F32);
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(Type::Array(array_type.clone()));
+        let reference = builder
+            .add_instruction(Operation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                Operation::ReferenceWrite(ReferenceWriteOperation::new()),
+                Vec::new(),
+                vec![reference, input],
+                None,
+            )
+            .unwrap();
+        let output = builder
+            .add_instruction(
+                Operation::ReferenceFreeze(ReferenceFreezeOperation::new()),
+                Vec::new(),
+                vec![reference],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // The reference scan runs before the generic state scan at the module entry, so a program whose state comes
+        // from reference operations receives the dedicated reference diagnostic. The state error remains behind it for
+        // future state that does not come from references, and `token_threaded_effects` above pins that `OrderedState`
+        // has no token slot either way.
+        assert!(matches!(
+            program.to_mlir("main", &ProgramLoweringOptions::new()),
+            Err(Error::Lowering(LoweringError::UnresolvedReference { construct })) if construct == "program",
+        ));
+    }
+
+    #[test]
+    fn test_program_to_mlir_rejects_preserved_reference_entries() {
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference = builder.add_input(Type::Reference(ReferenceType::new(scalar_type.clone())));
+        let snapshot =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let contract = KernelBoundaryContract::new(vec![Some(KernelParameterAccess::ReadOnly)]);
+        validate_kernel_body(program.entry_region_ref(), &contract).unwrap();
+        assert!(matches!(
+            program.to_mlir(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .with_input_types(&vec![scalar_type.clone()])
+                    .with_output_types(&vec![scalar_type]),
+            ),
+            Err(Error::Lowering(LoweringError::UnresolvedReference { construct })) if construct == "program",
+        ));
+    }
+
+    #[test]
+    fn test_program_to_mlir_with_reference_states() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
+        let state_type = ArrayType::new_static(DataType::F32, [4]);
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let _zero = builder.add_input(Type::Array(zero_type.clone()));
+        let mutated = builder.add_input(Type::Array(state_type.clone()));
+        let _read_only = builder.add_input(Type::Array(state_type.clone()));
+        let program: FlatProgram<Session> =
+            builder.build(vec![mutated], vec![Placeholder; 3], vec![Placeholder]).unwrap();
+        let input_types = vec![zero_type.clone(), state_type.clone(), state_type.clone()];
+        let output_types = vec![state_type.clone()];
+        let input_shardings = vec![
+            Sharding::replicated(mesh.clone(), 1),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
+        ];
+        let output_shardings = vec![Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()];
+        let states = [
+            ExternalReferenceBinding::new(ReferenceSource::Input { index: 1 }, Some(0)),
+            ExternalReferenceBinding::new(ReferenceSource::Input { index: 2 }, None),
+        ];
+
+        let lowered = program
+            .to_mlir(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings()
+                    .with_exact_input_shardings(input_shardings.iter().cloned().map(Some).collect())
+                    .with_exact_output_shardings(output_shardings.iter().cloned().map(Some).collect())
+                    .with_reference_bindings(states.to_vec(), Vec::new(), Vec::new()),
+            )
+            .unwrap();
+        assert_eq!(lowered.boundary_mapping().input_mapping(), &[None, Some(0), Some(1)]);
+        assert_eq!(lowered.boundary_mapping().output_mapping(), &[Some(0)]);
+        let expected_signature = concat!(
+            "  func.func @main(",
+            "%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>, ",
+            "tf.aliasing_output = 0 : i64}, ",
+            "%arg1: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> ",
+            "(tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {",
+        );
+        assert_eq!(
+            lowered.stable_hlo(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                @SIGNATURE@
+                    %c = stablehlo.constant dense<false> : tensor<i1>
+                    %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i1>) -> tensor<3xi1>
+                    return %arg0 : tensor<4xf32>
+                  }
+                }
+            "#}
+            .replace("@SIGNATURE@", expected_signature),
+        );
+
+        let invalid_state = ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None);
+        assert!(matches!(
+            program.to_mlir(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings()
+                    .with_exact_input_shardings(input_shardings.iter().cloned().map(Some).collect())
+                    .with_exact_output_shardings(output_shardings.iter().cloned().map(Some).collect())
+                    .with_reference_bindings((std::slice::from_ref(&invalid_state)).to_vec(), Vec::new(), Vec::new()),
+            ),
+            Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
+                if message == "logical state input 0 is erased from the executable boundary",
+        ));
+
+        let asymmetric_sharding_message =
+            "reference-state aliases require both input and output sharding metadata or neither";
+        let options = ProgramLoweringOptions::new()
+            .without_pruning()
+            .with_input_types(&input_types)
+            .with_output_types(&output_types)
+            .without_boundary_shardings()
+            .with_reference_bindings(states.to_vec(), Vec::new(), Vec::new());
+        for options in [
+            options.clone().with_exact_input_shardings(input_shardings.iter().cloned().map(Some).collect()),
+            options.with_exact_output_shardings(output_shardings.iter().cloned().map(Some).collect()),
+        ] {
+            assert!(matches!(
+                program.to_mlir("main", &options),
+                Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
+                    if message == asymmetric_sharding_message,
+            ));
+        }
+
+        let mismatched_output_shardings = vec![Sharding::replicated(mesh, 1)];
+        assert!(matches!(
+            program.to_mlir(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings()
+                    .with_exact_input_shardings(input_shardings.iter().cloned().map(Some).collect())
+                    .with_exact_output_shardings(mismatched_output_shardings.iter().cloned().map(Some).collect())
+                    .with_reference_bindings(states.to_vec(), Vec::new(), Vec::new()),
+            ),
+            Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
+                if message == "state input 1 and output 0 must use the same sharding",
+        ));
+    }
+
+    #[test]
+    fn test_program_to_mlir_with_reference_states_rejects_bounded_dynamic_aliases() {
+        let extent = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let state_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 1);
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let state = builder.add_input(Type::Array(state_type.clone()));
+        let program: FlatProgram<Session> = builder.build(vec![state], vec![Placeholder], vec![Placeholder]).unwrap();
+        let reference_state = ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(0));
+
+        assert!(matches!(
+            program.to_mlir(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&vec![state_type.clone()])
+                    .with_output_types(&vec![state_type])
+                    .without_boundary_shardings()
+                    .with_exact_input_shardings(vec![Some(sharding.clone())])
+                    .with_exact_output_shardings(vec![Some(sharding.clone())])
+                    .with_reference_bindings((std::slice::from_ref(&reference_state)).to_vec(), Vec::new(), Vec::new()),
+            ),
+            Err(Error::Lowering(LoweringError::InvalidReferenceStateAbi { message }))
+                if message == "state input 0 and output 0 must be static because bounded-dynamic mutation alias \
+                               compatibility is unsupported",
+        ));
+    }
+
+    #[test]
+    fn test_program_to_mlir_aliases_donated_inputs() {
+        let vector_type = ArrayType::new_static(DataType::F32, [4]);
+        let pair_type = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let first = builder.add_input(Type::Array(vector_type.clone()));
+        let second = builder.add_input(Type::Array(vector_type.clone()));
+        let third = builder.add_input(Type::Array(pair_type.clone()));
+        let program: FlatProgram<Session> =
+            builder.build(vec![second, first, third], vec![Placeholder; 3], vec![Placeholder; 3]).unwrap();
+        let input_types = vec![vector_type.clone(), vector_type.clone(), pair_type.clone()];
+        let output_types = vec![vector_type.clone(), vector_type.clone(), pair_type.clone()];
+        let lower_with =
+            |shardings: Option<(&[Sharding], &[Sharding])>, donated_inputs: &[bool], open_outputs: &[bool]| {
+                let options = ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .with_reference_bindings(Vec::new(), donated_inputs.to_vec(), Vec::new())
+                    .with_open_outputs(open_outputs.to_vec());
+                let options = match shardings {
+                    Some((inputs, outputs)) => options
+                        .with_exact_input_shardings(inputs.iter().cloned().map(Some).collect())
+                        .with_exact_output_shardings(outputs.iter().cloned().map(Some).collect()),
+                    None => options.without_boundary_shardings(),
+                };
+                program.to_mlir("main", &options)
+            };
+        let lower = |shardings: Option<&[Sharding]>, donated_inputs: &[bool], open_outputs: &[bool]| {
+            lower_with(shardings.map(|shardings| (shardings, shardings)), donated_inputs, open_outputs)
+        };
+        let signature = |lowered: MlirProgram| {
+            let line = lowered.stable_hlo().lines().find(|line| line.contains("func.func @main")).unwrap();
+            line.trim().to_string()
+        };
+        // Pairs of the index of each aliased input and the index of its output.
+        let aliases = |lowered: MlirProgram| {
+            signature(lowered)
+                .split("%arg")
+                .skip(1)
+                .enumerate()
+                .filter_map(|(index, argument)| {
+                    let (_, alias) = argument.split_once("tf.aliasing_output = ")?;
+                    Some((index, alias.split(' ').next().unwrap().parse::<usize>().unwrap()))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Each donated input is paired with the first unpaired output of its type, and other inputs with none.
+        assert_eq!(
+            signature(lower(None, &[true, true, false], &[]).unwrap()),
+            concat!(
+                "func.func @main(%arg0: tensor<4xf32> {tf.aliasing_output = 0 : i64}, ",
+                "%arg1: tensor<4xf32> {tf.aliasing_output = 1 : i64}, %arg2: tensor<2xf32>) -> ",
+                "(tensor<4xf32>, tensor<4xf32>, tensor<2xf32>) {",
+            ),
+        );
+        assert_eq!(
+            signature(lower(None, &[false, true, true], &[]).unwrap()),
+            concat!(
+                "func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32> {tf.aliasing_output = 0 : i64}, ",
+                "%arg2: tensor<2xf32> {tf.aliasing_output = 2 : i64}) -> ",
+                "(tensor<4xf32>, tensor<4xf32>, tensor<2xf32>) {",
+            ),
+        );
+        assert!(!signature(lower(None, &[], &[]).unwrap()).contains("tf.aliasing_output"));
+
+        // An open output is only paired on a single device, where the compiler cannot place it differently.
+        let shardings = |device_count: usize| {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", device_count, MeshAxisType::Auto).unwrap()]).unwrap();
+            vec![Sharding::replicated(mesh, 1); 3]
+        };
+        let open_outputs = [true, false, false];
+        let single_device = signature(lower(Some(&shardings(1)), &[true, false, false], &open_outputs).unwrap());
+        assert!(single_device.contains("tf.aliasing_output = 0 : i64"));
+        let two_devices = signature(lower(Some(&shardings(2)), &[true, false, false], &open_outputs).unwrap());
+        assert!(two_devices.contains("tf.aliasing_output = 1 : i64"));
+
+        // An input that finds no output of its own sharding is paired with an output under which every device holds
+        // shards of the same type, such as one that completes its pending sum or splits it along another axis of the
+        // same size, and only after every donated input was paired with an output of its own sharding where one is
+        // free. Before, only an output of the identical sharding was paired, so the first two cases had no alias.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let split = |axes: &[&str]| {
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(axes.iter().copied())]).unwrap()
+        };
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let pending = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let cases = [
+            ("completed sum", [pending, replicated.clone()], [replicated.clone(), replicated.clone()], [true, false]),
+            ("other axis", [split(&["x"]), replicated.clone()], [replicated.clone(), split(&["y"])], [true, false]),
+            (
+                "other extents",
+                [split(&["x"]), replicated.clone()],
+                [replicated.clone(), split(&["x", "y"])],
+                [true, false],
+            ),
+            ("own sharding first", [split(&["x"]), split(&["x"])], [split(&["y"]), split(&["x"])], [true, true]),
+        ];
+        let outcomes = cases
+            .into_iter()
+            .map(|(name, [first_input, second_input], [first_output, second_output], [first, second])| {
+                let input_shardings = [first_input, second_input, replicated.clone()];
+                let output_shardings = [first_output, second_output, replicated.clone()];
+                let donated_inputs = [first, second, false];
+                let lowered = lower_with(Some((&input_shardings, &output_shardings)), &donated_inputs, &[]);
+                (name, aliases(lowered.unwrap()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            [
+                ("completed sum", vec![(0, 0)]),
+                ("other axis", vec![(0, 1)]),
+                ("other extents", vec![]),
+                ("own sharding first", vec![(0, 1), (1, 0)]),
+            ],
+        );
+
+        assert!(matches!(
+            lower(None, &[true], &[]),
+            Err(Error::Execution(ExecutionError::DonationFlagCountMismatch { expected_count: 3, actual_count: 1 })),
+        ));
     }
 
     #[test]
@@ -3503,6 +3958,610 @@ mod tests {
                   }
                 }
             "},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_normalizes_function_names() {
+        let program = trace(|input: ArrayTracer| input, ArrayType::scalar(DataType::F32)).unwrap();
+        let options = ProgramLoweringOptions::new();
+        let expected = program.to_rendered_mlir("main", &options).unwrap();
+        for function_name in [" main ", " @main "] {
+            assert_eq!(program.to_rendered_mlir(function_name, &options).unwrap(), expected);
+        }
+        for (function_name, normalized_name) in [(" @ ", ""), ("main function", "main function")] {
+            assert_eq!(
+                program.to_rendered_mlir(function_name, &options),
+                Err(Error::Lowering(LoweringError::InvalidFunctionName { function_name: normalized_name.to_string() })),
+            );
+        }
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_lowers_manual_computations() {
+        let global_input_type = test_vector_type(8);
+        let mesh = test_manual_mesh("x", 4);
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
+            |_, x| Ok(x.clone() + x),
+            global_input_type,
+            mesh.clone(),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap(),
+            ShardMapOptions::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=4]>
+                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %1 = stablehlo.add %arg1, %arg1 : tensor<2xf32>
+                      sdy.return %1 : tensor<2xf32>
+                    } : (tensor<8xf32>) -> tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_lowers_scalar_function() {
+        let scalar = ArrayType::scalar(DataType::F64);
+        let program: TracedProgram<(ArrayType, ArrayType), ArrayType> =
+            trace(scalar_bilinear_sin, (scalar.clone(), scalar)).unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f64>, %arg1: tensor<f64>) -> tensor<f64> {
+                    %0 = stablehlo.multiply %arg0, %arg1 : tensor<f64>
+                    %1 = stablehlo.sine %arg0 : tensor<f64>
+                    %2 = stablehlo.add %0, %1 : tensor<f64>
+                    return %2 : tensor<f64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_lowers_gradients() {
+        let program: TracedProgram<ArrayType, ArrayType> = trace(
+            |x: ArrayTracer| {
+                differentiate_in_parent_at(x)
+                    .gradient(|x| Ok(x.clone() * x.clone() * x.clone() * x.clone() + x.sin()?))
+                    .unwrap()
+            },
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
+
+        // The gradient computes one cosine for the derivative of `sin(x)`, expands the `x^4` chain rule into
+        // multiplications, accumulates the cotangent contributions with additions, and contains no sine.
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f64>) -> tensor<f64> {
+                    %0 = stablehlo.cosine %arg0 : tensor<f64>
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f64>
+                    %1 = stablehlo.multiply %0, %cst : tensor<f64>
+                    %2 = stablehlo.multiply %arg0, %arg0 : tensor<f64>
+                    %3 = stablehlo.multiply %2, %arg0 : tensor<f64>
+                    %4 = stablehlo.multiply %3, %cst : tensor<f64>
+                    %5 = stablehlo.add %1, %4 : tensor<f64>
+                    %6 = stablehlo.multiply %arg0, %cst : tensor<f64>
+                    %7 = stablehlo.multiply %2, %6 : tensor<f64>
+                    %8 = stablehlo.add %5, %7 : tensor<f64>
+                    %9 = stablehlo.multiply %arg0, %6 : tensor<f64>
+                    %10 = stablehlo.multiply %arg0, %9 : tensor<f64>
+                    %11 = stablehlo.add %8, %10 : tensor<f64>
+                    %12 = stablehlo.multiply %arg0, %9 : tensor<f64>
+                    %13 = stablehlo.add %11, %12 : tensor<f64>
+                    return %13 : tensor<f64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_lowers_standalone_pullbacks() {
+        // Linearize at concrete values and lower the standalone transposed program. Its public inputs are the
+        // output cotangent followed by the residuals saved at that point (i.e., the factors cos(x), x, and y).
+        let client = cpu_client(1);
+        let session = Session::builder().client(client).build().unwrap();
+        let mesh = domain_mesh(client, "x", 1);
+        let scalar = |value: f64| replicated_array(&session, &mesh, DataType::F64, &[], &value.to_ne_bytes());
+        let (_, pullback) = differentiate_in_parent_at((scalar(2.0), scalar(3.0)))
+            .vjp(|inputs| Ok(scalar_bilinear_sin(inputs)))
+            .unwrap();
+        let pullback = pullback.inner().transposed_program(&[]).unwrap().into_program();
+        let stablehlo = pullback
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_boundary_shardings())
+            .unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f64>, %arg1: tensor<f64>, %arg2: tensor<f64>, %arg3: tensor<f64>) -> (tensor<f64>, tensor<f64>) {
+                    %0 = stablehlo.multiply %arg3, %arg0 : tensor<f64>
+                    %1 = stablehlo.multiply %arg2, %arg0 : tensor<f64>
+                    %2 = stablehlo.multiply %arg1, %arg0 : tensor<f64>
+                    %3 = stablehlo.add %0, %2 : tensor<f64>
+                    return %3, %1 : tensor<f64>, tensor<f64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_lowers_staged_gradients() {
+        let scalar = ArrayType::scalar(DataType::F64);
+        let program: TracedProgram<(ArrayType, ArrayType), (ArrayType, ArrayType)> = trace(
+            |inputs: (ArrayTracer, ArrayTracer)| {
+                differentiate_in_parent_at(inputs).gradient(|inputs| Ok(scalar_bilinear_sin(inputs))).unwrap()
+            },
+            (scalar.clone(), scalar),
+        )
+        .unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
+
+        // `cos(x)` is computed symbolically from `%arg0` rather than baked in as a constant, both inputs are
+        // referenced, and the gradient contains no sine, because the derivative of sine is cosine.
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f64>, %arg1: tensor<f64>) -> (tensor<f64>, tensor<f64>) {
+                    %0 = stablehlo.cosine %arg0 : tensor<f64>
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f64>
+                    %1 = stablehlo.multiply %0, %cst : tensor<f64>
+                    %2 = stablehlo.multiply %arg1, %cst : tensor<f64>
+                    %3 = stablehlo.add %1, %2 : tensor<f64>
+                    %4 = stablehlo.multiply %arg0, %cst : tensor<f64>
+                    return %3, %4 : tensor<f64>, tensor<f64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_renders_provenance_locations() {
+        let global_input_type = test_vector_type(8);
+        let mesh = test_manual_mesh("x", 4);
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
+            |_, x| {
+                let context = x.value().context().clone();
+
+                // One instruction staged under nested scopes, one under a fused origin, and one with unknown
+                // provenance, covering every provenance shape in one lowered module.
+                let scoped = context.invoke_with_provenance_scope(ProvenanceScope::new("outer"), || {
+                    context.invoke_with_provenance_scope(ProvenanceScope::new("inner"), || x.clone() + x.clone())
+                });
+                let fused = Provenance::fused([
+                    Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown()),
+                    Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown()),
+                ]);
+                let product = context.invoke_with_provenance_origin(fused, || scoped.clone() * scoped);
+                Ok(product + x)
+            },
+            global_input_type,
+            mesh.clone(),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap(),
+            ShardMapOptions::new(),
+        )
+        .unwrap();
+
+        // The scoped addition carries the nested chain of name locations, the fused multiplication carries a fused
+        // location without metadata, the addition with unknown provenance keeps the unknown base location, and the
+        // module and function scaffolding keeps the base location. Locations render because modules that carry
+        // provenance serialize with debug information enabled, in the parsable form that is not pretty printed.
+        assert_eq!(
+            module,
+            indoc! {r#"
+                #loc = loc(unknown)
+                module {
+                  sdy.mesh @mesh = <["x"=4]> loc(#loc)
+                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>} loc(unknown)) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32> loc(unknown)) {
+                      %1 = stablehlo.add %arg1, %arg1 : tensor<2xf32> loc(#loc4)
+                      %2 = stablehlo.multiply %1, %1 : tensor<2xf32> loc(#loc5)
+                      %3 = stablehlo.add %2, %arg1 : tensor<2xf32> loc(#loc)
+                      sdy.return %3 : tensor<2xf32> loc(#loc)
+                    } : (tensor<8xf32>) -> tensor<8xf32> loc(#loc)
+                    return %0 : tensor<8xf32> loc(#loc)
+                  } loc(#loc)
+                } loc(#loc)
+                #loc1 = loc("inner")
+                #loc2 = loc("a")
+                #loc3 = loc("b")
+                #loc4 = loc("outer"(#loc1))
+                #loc5 = loc(fused[#loc2, #loc3])
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_renders_constants_and_supported_ops() {
+        let global_input_type = test_matrix_type(4, 4);
+        let mesh = test_manual_mesh("x", 2);
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
+            |_, x| {
+                let product = x.transpose(vec![1, 0])?.dot(&x, &DotDimensionNumbers::matmul())?;
+                let waveform = (-product).cos()?.sin()?;
+                Ok((waveform.clone() * waveform.one_like()?) + waveform.zero_like()?)
+            },
+            global_input_type,
+            mesh.clone(),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap(),
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
+            ShardMapOptions::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) -> (tensor<8x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}, {}]>] out_shardings=[<@mesh, [{"x"}, {}]>] manual_axes={"x"} (%arg1: tensor<2x4xf32>) {
+                      %1 = stablehlo.transpose %arg1, dims = [1, 0] : (tensor<2x4xf32>) -> tensor<4x2xf32>
+                      %2 = stablehlo.dot_general %1, %arg1, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<4x2xf32>, tensor<2x4xf32>) -> tensor<4x4xf32>
+                      %3 = stablehlo.negate %2 : tensor<4x4xf32>
+                      %4 = stablehlo.cosine %3 : tensor<4x4xf32>
+                      %5 = stablehlo.sine %4 : tensor<4x4xf32>
+                      %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                      %6 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
+                      %7 = sdy.sharding_constraint %6 <@mesh, [{}, {}]> : tensor<4x4xf32>
+                      %8 = stablehlo.multiply %5, %7 : tensor<4x4xf32>
+                      %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                      %9 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<4x4xf32>
+                      %10 = sdy.sharding_constraint %9 <@mesh, [{}, {}]> : tensor<4x4xf32>
+                      %11 = stablehlo.add %8, %10 : tensor<4x4xf32>
+                      sdy.return %11 : tensor<4x4xf32>
+                    } : (tensor<4x4xf32>) -> tensor<8x4xf32>
+                    return %0 : tensor<8x4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_preserves_boundary_layouts() {
+        let array_type = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
+        let zero_type = ArrayType::new_static(DataType::Zero, [2, 3]);
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(array_type.clone().into());
+        let zero = builder.add_input(zero_type.clone().into());
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![zero, input], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x3xf32> {mhlo.layout_mode = \"{0,1}\"}) \
+                      -> (tensor<2x3xf32> {mhlo.layout_mode = \"{0,1}\"}) {
+                    %c = stablehlo.constant dense<false> : tensor<i1>
+                    %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i1>) -> tensor<2x3xi1>
+                    return %arg0 : tensor<2x3xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_lowers_captures_as_hidden_inputs() {
+        let array_type = test_vector_type(4);
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(array_type.clone().into());
+        let capture = builder.add_constant(Constant::Captured(CaptureReference::new(0, array_type.clone().into())));
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let capture_types = vec![array_type.clone()];
+        let input_types = vec![array_type.clone()];
+        let output_types = vec![array_type];
+        let stablehlo = program
+            .to_rendered_mlir(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_capture_types(capture_types.to_vec())
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.add %arg1, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_lowers_immediate_dimension_constants_in_place() {
+        // An immediate dimension constant carries its own extent from the host, so unlike a capture reference, it
+        // materializes as a scalar `i64` `stablehlo.constant` in the function body instead of consuming a hidden
+        // capture input. That is exactly what makes first-class extents usable where no capture table is reachable,
+        // such as inside a `shard_map` manual region.
+        let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let extent = builder.add_constant(Constant::Dimension(DimensionValue::new(extent_type, 4).unwrap()));
+        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![extent], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main() -> tensor<i64> {
+                    %c = stablehlo.constant dense<4> : tensor<i64>
+                    return %c : tensor<i64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_lowers_capture_output_as_a_hidden_input() {
+        let array_type = test_vector_type(4);
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let output = builder.add_constant(Constant::Captured(CaptureReference::new(0, array_type.clone().into())));
+        let program =
+            builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+        let input_types: [ArrayType; 0] = [];
+        let output_types = vec![array_type.clone()];
+        let stablehlo = program
+            .to_rendered_mlir(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_capture_types((std::slice::from_ref(&array_type)).to_vec())
+                    .with_input_types(&input_types)
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    return %arg0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_forwards_capture_into_nested_regions() {
+        let array_type = test_vector_type(4);
+        let branch = || {
+            let mut builder = ProgramBuilder::<Constant, Operation>::new();
+            let output = builder.add_constant(Constant::Captured(CaptureReference::new(0, array_type.clone().into())));
+            builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap()
+        };
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let true_region = builder.import_program(branch());
+        let false_region = builder.import_program(branch());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let output = builder
+            .add_instruction(
+                Operation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let output_types = vec![array_type.clone()];
+        let stablehlo = program
+            .to_rendered_mlir(
+                "main",
+                &ProgramLoweringOptions::new()
+                    .without_pruning()
+                    .with_capture_types((std::slice::from_ref(&array_type)).to_vec())
+                    .with_input_types(&[ArrayType::scalar(DataType::Boolean)])
+                    .with_output_types(&output_types)
+                    .without_boundary_shardings(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<i1>) -> tensor<4xf32> {
+                    %0 = "stablehlo.if"(%arg1) ({
+                      stablehlo.return %arg0 : tensor<4xf32>
+                    }, {
+                      stablehlo.return %arg0 : tensor<4xf32>
+                    }) : (tensor<i1>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_erases_static_zero_space_boundary() {
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(zero_type.clone().into());
+        let program: FlatProgram<Session> = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main() {
+                    %c = stablehlo.constant dense<false> : tensor<i1>
+                    %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i1>) -> tensor<3xi1>
+                    return
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_preserves_effects_that_produce_an_erased_output() {
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(zero_type.clone().into());
+        let output = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("zero"), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program: FlatProgram<Session> = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
+
+        assert_eq!(
+            stablehlo,
+            indoc! {"
+                module {
+                  func.func @main() {
+                    %c = stablehlo.constant dense<false> : tensor<i1>
+                    %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i1>) -> tensor<3xi1>
+                    %1 = stablehlo.after_all  : !stablehlo.token
+                    %2 = stablehlo.custom_call @ryft.print(%0, %1) {api_version = 4 : i32, \
+                        backend_config = {label = \"zero\", logical_type = \"zero\"}, has_side_effect = true, \
+                        operand_layouts = [dense<0> : tensor<1xindex>, dense<> : tensor<0xindex>], \
+                        result_layouts = [dense<> : tensor<0xindex>]} : (tensor<3xi1>, !stablehlo.token) \
+                        -> !stablehlo.token
+                    return
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_preserves_dynamic_zero_space_shape_carrier() {
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("zero", Some(3))]));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(zero_type.clone().into());
+        let program: FlatProgram<Session> = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
+
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xi1>, %arg1: tensor<i32>) -> (tensor<?xi1, #stablehlo.bounds<2>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<2xi1>, tensor<i32>) -> tensor<?xi1, #stablehlo.bounds<2>>
+                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xi1, #stablehlo.bounds<2>>) -> tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    return %0, %2 : tensor<?xi1, #stablehlo.bounds<2>>, tensor<i64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_isolates_bounded_dynamic_outputs_behind_one_barrier() {
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("count", Some(4))]));
+        let static_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let dynamic = builder.add_input(dynamic_type.clone().into());
+        let r#static = builder.add_input(static_type.clone().into());
+        let program: FlatProgram<Session> =
+            builder.build(vec![dynamic, r#static, dynamic], vec![Placeholder; 2], vec![Placeholder; 3]).unwrap();
+        let stablehlo = program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap();
+
+        // Both dynamic outputs pass through the barrier, while the static output and the hidden extents bypass it.
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<3xf32>, %arg1: tensor<2xf32>, %arg2: tensor<i32>) -> (tensor<?xf32, #stablehlo.bounds<3>>, tensor<2xf32>, tensor<?xf32, #stablehlo.bounds<3>>, tensor<i64>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : (tensor<3xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<3>>
+                    %1:2 = stablehlo.optimization_barrier %0, %0 : tensor<?xf32, #stablehlo.bounds<3>>, tensor<?xf32, #stablehlo.bounds<3>>
+                    %2 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<3>>) -> tensor<i32>
+                    %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
+                    %4 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<3>>) -> tensor<i32>
+                    %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
+                    return %1#0, %arg1, %1#1, %3, %5 : tensor<?xf32, #stablehlo.bounds<3>>, tensor<2xf32>, tensor<?xf32, #stablehlo.bounds<3>>, tensor<i64>, tensor<i64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_program_to_rendered_mlir_declares_the_mesh_of_completed_device_reductions() {
+        // A device target that completes a pending reduction over a mesh axis of size one constrains its output over
+        // the mesh of its type, which neither the signature nor a payload names, so the module declares the mesh
+        // because the lowered constraint refers to it.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let unreduced = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        let input_type = test_vector_type(4).with_sharding(unreduced).unwrap();
+        let mut builder = ProgramBuilder::<Constant, Operation>::new();
+        let input = builder.add_input(input_type.clone().into());
+        let output = builder
+            .add_instruction(PlaceOperation::new(Device::new(0, 0), None), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let output_types = program
+            .output_types()
+            .iter()
+            .map(|r#type| <&ArrayType>::try_from(r#type).cloned().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            program
+                .to_rendered_mlir(
+                    "main",
+                    &ProgramLoweringOptions::new()
+                        .with_input_types(&vec![input_type])
+                        .with_output_types(&output_types)
+                        .without_boundary_shardings()
+                )
+                .unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = sdy.sharding_constraint %arg0 <@mesh, [{}], replicated={"x"}> : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
         );
     }
 
@@ -4012,6 +5071,103 @@ mod tests {
             aliases(&[true]),
             Err(Error::Execution(ExecutionError::DonationFlagCountMismatch { expected_count: 2, actual_count: 1 })),
         );
+    }
+
+    #[test]
+    fn test_entry_alias_attribute_executes_in_place_on_cpu() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let tensor_type = context.tensor_type(context.float32_type(), &[MlirSize::Static(4)], None, location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let function_block = context.block(&[(tensor_type, location)]);
+                {
+                    let input = function_block.argument(0).unwrap();
+                    let mut function_block_ref = function_block.as_ref();
+                    let doubled =
+                        function_block_ref.append_operation(stable_hlo::add(input, input, location).unwrap()).unwrap();
+                    function_block_ref
+                        .append_operation(func::r#return(&[doubled.result(0).unwrap()], location).unwrap())
+                        .unwrap();
+                }
+                let mut function_region = context.region();
+                function_region.append_block(function_block).unwrap();
+                func::func(
+                    "main",
+                    func::FuncAttributes {
+                        arguments: vec![TypeAndAttributes {
+                            r#type: tensor_type.as_ref(),
+                            attributes: Some(HashMap::from([
+                                ("mhlo.sharding".into(), context.string_attribute("{replicated}").as_ref()),
+                                (
+                                    "tf.aliasing_output".into(),
+                                    context.integer_attribute(context.signless_integer_type(64), 0).as_ref(),
+                                ),
+                            ])),
+                        }],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    function_region,
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
+        let module = module.to_string();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32> {mhlo.sharding = "{replicated}", tf.aliasing_output = 0 : i64}) -> tensor<4xf32> {
+                    %0 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+
+        let client = cpu_client(1);
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
+            .unwrap();
+        let device = executable.addressable_devices().unwrap().remove(0);
+        let input = client
+            .buffer(values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(), BufferType::F32, [4], None, device, None)
+            .unwrap();
+        input.ready().unwrap().r#await().unwrap();
+
+        // The input is ready and remains alive in `inputs` until execution completes, so comparing its opaque address
+        // with the synchronized output address does not dereference either device pointer.
+        let input_pointer = unsafe { input.unsafe_pointer().unwrap() };
+        let inputs = [ExecutionInput { buffer: Arc::new(input), donatable: true }];
+        let execution = executable
+            .execute(
+                vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                Vec::new(),
+                0,
+                None,
+                Some(file!()),
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        let mut device_outputs = execution.block_until_ready().unwrap().remove(0);
+        let output = device_outputs.outputs.remove(0);
+        let output_pointer = unsafe { output.unsafe_pointer().unwrap() };
+
+        // `tf.aliasing_output` is a hint rather than a guarantee, because the copy insertion of XLA may materialize a
+        // fresh output. This pointer equality is therefore a deliberate canary pinned to the CPU plugin version that
+        // the repository pins. If a plugin upgrade breaks it while the numeric assertion below still passes,
+        // re-evaluate whether the alias hint is still honored rather than assuming a correctness bug.
+        assert_eq!(output_pointer, input_pointer);
+        let output = output.copy_to_host(None).unwrap().r#await().unwrap();
+        assert_eq!(values_from_bytes::<f32>(output.as_slice()), vec![2.0, 4.0, 6.0, 8.0]);
     }
 
     #[test]

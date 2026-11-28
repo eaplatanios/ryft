@@ -35,7 +35,6 @@ use crate::lowering::admission::validate_data_dependent_compilation;
 use crate::lowering::emissions::{
     collect_session_constants, emitted_capture_reads, emitted_regions, omits_regions, unread_entry_inputs,
 };
-use crate::lowering::modules::value_shardings;
 use crate::lowering::programs::{
     OutputShardingSource, ProgramLoweringAnalysisExtension, ProgramLoweringExtension, ProgramLoweringOptions,
     entry_output_shardings, entry_outputs_with_compiler_chosen_placement,
@@ -801,10 +800,6 @@ impl Session {
             options.feedback_directed_profile(),
         );
         resolve_shardy_debug_options(self.client(), &mut compilation_options);
-        // Shardy currently rejects bounded dynamic tensors. Fully replicated dynamic programs need no partitioning,
-        // so lower them without Shardy metadata and execute one replica per mesh device instead.
-        let lowered_input_shardings = use_shardy_partitioner.then_some(input_annotations.as_slice());
-        let lowered_output_shardings = use_shardy_partitioner.then_some(output_annotations.as_slice());
         // Public outputs without an override leave their placement over auto mesh axes to the compiler, like JAX
         // outputs without `out_shardings`, and compilation reads that placement back from the executable. The StableHLO
         // export of traced programs makes the same decision (refer to `entry_outputs_with_compiler_chosen_placement`).
@@ -820,14 +815,11 @@ impl Session {
             .map(|index| use_shardy_partitioner && index < output_count && public_open_outputs[index])
             .collect::<Vec<_>>();
         // The program is already pruned, and its boundary is the one that this function resolved above.
-        let input_count = effective_capture_types.len() + effective_public_input_types.parameter_count();
         let lowering_options = ProgramLoweringOptions::new()
             .without_pruning()
             .with_capture_types(effective_capture_types.clone())
             .with_input_types(&effective_public_input_types)
             .with_output_types(&output_types)
-            .with_exact_input_shardings(value_shardings(lowered_input_shardings, input_count))
-            .with_exact_output_shardings(value_shardings(lowered_output_shardings, output_types.parameter_count()))
             .with_open_outputs(open_outputs.clone())
             .with_target_platform(target_platform)
             .with_shardy_support(supports_shardy)
@@ -837,6 +829,15 @@ impl Session {
                 options.unread_inputs().unwrap_or(&[]).to_vec(),
             )
             .with_ragged_dot_lowering_strategy(options.ragged_dot_lowering_strategy());
+        let lowering_options = if use_shardy_partitioner {
+            lowering_options
+                .with_exact_input_shardings(input_annotations.into_iter().map(Some).collect())
+                .with_exact_output_shardings(output_annotations.into_iter().map(Some).collect())
+        } else {
+            // Shardy rejects bounded dynamic tensors. Fully replicated dynamic programs can run one replica per
+            // mesh device with an unannotated boundary.
+            lowering_options.without_boundary_shardings()
+        };
         let lowered_module = program.to_mlir("main", &lowering_options)?;
         // The module mesh assigns the devices of the target mesh to mesh coordinates, so a program over another
         // topology cannot be placed on it.

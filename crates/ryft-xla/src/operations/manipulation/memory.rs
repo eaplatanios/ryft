@@ -24,18 +24,15 @@ impl LowerableOperation for TransferToMemoryOperation {
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{
-        Array as CoreArray, ArrayOperation, DataType, DomainTracer, EagerContext, Memory, Placeholder,
-        ReverseModeDifferentiate, Sharding, Trace, TransferToMemory, Typed,
-    };
+    use ryft_core::{DataType, Memory, Placeholder, Sharding, TransferToMemory, Typed};
 
-    use crate::lowering::tests::{ProgramBuilder, test_vector_type, to_rendered_mlir_for_plain_program};
+    use crate::lowering::tests::{ProgramBuilder, test_vector_type};
     use crate::operations::Operation;
     use crate::sessions::tests::domain_mesh;
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, ArrayConstant, CompiledFunction, Constant, Error, LoweringError, ProgramLoweringExtension,
-        ProgramLoweringOptions, Session, compile,
+        Array, ArrayConstant, ArrayTracer, CompiledFunction, Constant, Error, LoweringError, ProgramLoweringExtension,
+        ProgramLoweringOptions, Session, compile, trace_with_context,
     };
 
     use super::*;
@@ -48,8 +45,8 @@ mod tests {
         // needs to see. The program mirrors the JAX example in
         // `python/scripts/dump_transfer_to_memory_mlir_from_jax.py`, and the asserted custom calls are identical, byte
         // for byte, to the ones JAX emits for it.
-        let (_, program) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::trace(
-            |x: DomainTracer<EagerContext<CoreArray, ArrayOperation<CoreArray>>>| {
+        let program = trace_with_context(
+            |_, x: ArrayTracer| {
                 let y = x.clone() * x;
                 let on_host = y.transfer_to_memory(Memory::Host { pinned: true })?;
                 let back = on_host.transfer_to_memory(Memory::Device)?;
@@ -59,7 +56,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
             module {
               func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
@@ -78,13 +75,14 @@ mod tests {
     fn test_transfer_to_memory_operation_lower_pullback() {
         // The pullback of a transfer moves the cotangent back to the input's source memory, which is the default
         // device space here, so it lowers to an `annotate_device_placement` custom call targeting `device`.
-        let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
-            .vjp(|x, ()| x.transfer_to_memory(Memory::Host { pinned: true }), CoreArray::scalar(2.0).unwrap(), ())
-            .unwrap();
-        let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
-        let pullback = pullback.into_program();
+        let program = trace_with_context(
+            |_, x: ArrayTracer| x.transfer_to_memory(Memory::Host { pinned: true }),
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        let pullback = program.transpose().unwrap();
         assert_eq!(
-            to_rendered_mlir_for_plain_program(&pullback, "main").unwrap(),
+            pullback.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(),
             indoc! {r#"
             module {
               func.func @main(%arg0: tensor<f64> {mhlo.memory_kind = "pinned_host"}) -> tensor<f64> {
@@ -213,7 +211,6 @@ mod tests {
     #[test]
     fn test_transfer_to_memory_signature_placement() {
         // A host identity has no transfer instruction, so only its signature can communicate physical placement.
-        // Exercise both the diagnostic homogeneous path and the compiled array IR entry path.
         for (memory, kind) in
             [(Memory::Host { pinned: true }, "pinned_host"), (Memory::Host { pinned: false }, "unpinned_host")]
         {
@@ -230,7 +227,6 @@ mod tests {
                   }
                 }
             "#}.replace("KIND", kind);
-            assert_eq!(to_rendered_mlir_for_plain_program(&program, "main").unwrap(), expected);
             let program = program.into_unprojected::<Constant, Operation>().unwrap();
             assert_eq!(program.to_rendered_mlir("main", &ProgramLoweringOptions::new()).unwrap(), expected,);
 

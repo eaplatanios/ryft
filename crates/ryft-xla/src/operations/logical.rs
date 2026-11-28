@@ -91,7 +91,8 @@ mod tests {
     use ryft_core::{ArrayOperation, DataType, Placeholder};
 
     use crate::ArrayConstant;
-    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, to_rendered_mlir_for_plain_program};
+    use crate::lowering::programs::{ProgramLoweringExtension, ProgramLoweringOptions};
+    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, unproject_plain_program};
 
     use super::*;
 
@@ -122,7 +123,9 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
+            unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap(),
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<4xi1>, %arg1: tensor<4xi1>) -> tensor<4xi1> {
@@ -146,7 +149,9 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
+            unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap(),
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<4xi1>, %arg1: tensor<4xi1>) -> tensor<4xi1> {
@@ -170,7 +175,9 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
+            unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap(),
             indoc! {"
                 module {
                   func.func @main(%arg0: tensor<4xi1>, %arg1: tensor<4xi1>) -> tensor<4xi1> {

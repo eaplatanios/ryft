@@ -277,14 +277,13 @@ mod tests {
         Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, BatchAxis, BatchableOperation,
         BatchingContext, Complex, DataType, Diagonal, Dimension, DimensionBounds, DimensionSize, DimensionVariable,
         DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Gather, GatherDimensionNumbers, GatherMode,
-        GatherOperation, GatherOptions, LogicalMesh, MeshAxis, MeshAxisType, Placeholder,
-        ProgramBuilder as CoreProgramBuilder, ProjectedContext, Reduce, ReductionKind, ScatterDimensionNumbers,
-        ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, Typed, TypedProgram,
-        ValueProjection, differentiate_at, i1,
+        GatherOperation, GatherOptions, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProjectedContext, Reduce,
+        ReductionKind, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, Sharding,
+        ShardingDimension, Typed, TypedProgram, ValueProjection, differentiate_at, i1,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::tests::{ProgramBuilder, to_rendered_mlir_for_plain_program, unproject_plain_program};
+    use crate::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::sessions::tests::{domain_mesh, read_first_shard};
     use crate::tests::{
         execution_client, replicated_array, test_compilation_options, values_from_bytes, values_to_bytes,
@@ -312,7 +311,9 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let stablehlo = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
 
         assert_eq!(
             stablehlo,
@@ -347,7 +348,9 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let stablehlo = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -384,7 +387,9 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let stablehlo = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
 
         assert_eq!(
             stablehlo,
@@ -469,15 +474,17 @@ mod tests {
             ),
         ];
         for (input, indices, operation, expected) in cases {
-            let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
+            let mut builder = ProgramBuilder::new();
             let input_atom = builder.add_input(input.r#type().into_owned());
             let indices_atom = builder.add_input(indices.r#type().into_owned());
             let output =
                 builder.add_instruction(operation, Vec::new(), vec![input_atom, indices_atom], None).unwrap()[0];
             let program = builder
-                .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
-            let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+            let module = unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();
@@ -746,7 +753,7 @@ mod tests {
     fn test_gather_operation_lower_output_sharding() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
+        let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F32, [4]));
         let indices = builder.add_input(ArrayType::new_static(DataType::I32, [2, 1]));
         let updates = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
@@ -772,13 +779,15 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<CoreArray>, Vec<CoreArray>>(
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
                 vec![gathered, scattered],
                 vec![Placeholder; 3],
                 vec![Placeholder; 2],
             )
             .unwrap();
-        let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let module = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning().without_boundary_shardings())
+            .unwrap();
         assert_eq!(
             module,
             indoc! {r#"

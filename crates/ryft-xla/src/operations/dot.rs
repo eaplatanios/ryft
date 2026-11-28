@@ -618,10 +618,7 @@ mod tests {
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::tests::{
-        ProgramBuilder, dynamic_dimension, to_rendered_mlir_for_plain_program_with_ragged_dot_lowering_strategy,
-        unproject_plain_program,
-    };
+    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, unproject_plain_program};
     use crate::operations::Operation;
     use crate::sessions::tests::{domain_mesh, two_device_mesh};
     use crate::tests::{
@@ -687,7 +684,10 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        to_rendered_mlir_for_plain_program_with_ragged_dot_lowering_strategy(&program, "main", strategy)
+        unproject_plain_program(program).to_rendered_mlir(
+            "main",
+            &ProgramLoweringOptions::new().without_pruning().with_ragged_dot_lowering_strategy(strategy),
+        )
     }
 
     // Lowers the basic non-contracting grouped matrix form using `strategy`.
@@ -1686,65 +1686,74 @@ mod tests {
             module,
             indoc! {"
                 module {
-                  func.func @main(%arg0: tensor<?x3x1xf32, #stablehlo.bounds<3, ?, ?>>, %arg1: tensor<2x?x1x1xf32, \
-                      #stablehlo.bounds<?, 3, ?, ?>>, %arg2: tensor<?x2xi32, #stablehlo.bounds<3, ?>>) -> \
-                      tensor<?x3x1xf32, #stablehlo.bounds<3, ?, ?>> {
-                    %0 = stablehlo.subtract %arg2, %arg2 : tensor<?x2xi32, #stablehlo.bounds<3, ?>>
-                    %1 = stablehlo.maximum %arg2, %0 : tensor<?x2xi32, #stablehlo.bounds<3, ?>>
-                    %2 = stablehlo.convert %1 : (tensor<?x2xi32, #stablehlo.bounds<3, ?>>) -> tensor<?x2xui64, \
+                  func.func @main(%arg0: tensor<3x3x1xf32>, %arg1: tensor<2x3x1x1xf32>, %arg2: tensor<3x2xi32>, \
+                      %arg3: tensor<i32>, %arg4: tensor<i32>, %arg5: tensor<i32>) -> (tensor<?x3x1xf32, \
+                      #stablehlo.bounds<3, ?, ?>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg3, dim = 0 : (tensor<3x3x1xf32>, tensor<i32>) -> \
+                        tensor<?x3x1xf32, #stablehlo.bounds<3, ?, ?>>
+                    %1 = stablehlo.set_dimension_size %arg1, %arg4, dim = 1 : (tensor<2x3x1x1xf32>, tensor<i32>) -> \
+                        tensor<2x?x1x1xf32, #stablehlo.bounds<?, 3, ?, ?>>
+                    %2 = stablehlo.set_dimension_size %arg2, %arg5, dim = 0 : (tensor<3x2xi32>, tensor<i32>) -> \
+                        tensor<?x2xi32, #stablehlo.bounds<3, ?>>
+                    %3 = stablehlo.subtract %2, %2 : tensor<?x2xi32, #stablehlo.bounds<3, ?>>
+                    %4 = stablehlo.maximum %2, %3 : tensor<?x2xi32, #stablehlo.bounds<3, ?>>
+                    %5 = stablehlo.convert %4 : (tensor<?x2xi32, #stablehlo.bounds<3, ?>>) -> tensor<?x2xui64, \
                         #stablehlo.bounds<3, ?>>
-                    %3 = stablehlo.get_dimension_size %2, dim = 0 : (tensor<?x2xui64, #stablehlo.bounds<3, ?>>) -> \
+                    %6 = stablehlo.get_dimension_size %5, dim = 0 : (tensor<?x2xui64, #stablehlo.bounds<3, ?>>) -> \
                         tensor<i32>
                     %c = stablehlo.constant dense<3> : tensor<i32>
-                    %4 = stablehlo.set_dimension_size %2, %c, dim = 0 : (tensor<?x2xui64, #stablehlo.bounds<3, ?>>, \
+                    %7 = stablehlo.set_dimension_size %5, %c, dim = 0 : (tensor<?x2xui64, #stablehlo.bounds<3, ?>>, \
                         tensor<i32>) -> tensor<3x2xui64>
-                    %5 = stablehlo.iota dim = 0 : tensor<3x2xi32>
-                    %6 = stablehlo.broadcast_in_dim %3, dims = [] : (tensor<i32>) -> tensor<3x2xi32>
-                    %7 = stablehlo.compare LT, %5, %6, SIGNED : (tensor<3x2xi32>, tensor<3x2xi32>) -> tensor<3x2xi1>
+                    %8 = stablehlo.iota dim = 0 : tensor<3x2xi32>
+                    %9 = stablehlo.broadcast_in_dim %6, dims = [] : (tensor<i32>) -> tensor<3x2xi32>
+                    %10 = stablehlo.compare LT, %8, %9, SIGNED : (tensor<3x2xi32>, tensor<3x2xi32>) -> tensor<3x2xi1>
                     %c_0 = stablehlo.constant dense<0> : tensor<ui64>
-                    %8 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<ui64>) -> tensor<3x2xui64>
-                    %9 = stablehlo.select %7, %4, %8 : tensor<3x2xi1>, tensor<3x2xui64>
+                    %11 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<ui64>) -> tensor<3x2xui64>
+                    %12 = stablehlo.select %10, %7, %11 : tensor<3x2xi1>, tensor<3x2xui64>
                     %c_1 = stablehlo.constant dense<0> : tensor<ui64>
                     %c_2 = stablehlo.constant dense<3> : tensor<ui64>
-                    %10 = stablehlo.clamp %c_1, %9, %c_2 : (tensor<ui64>, tensor<3x2xui64>, tensor<ui64>) -> \
+                    %13 = stablehlo.clamp %c_1, %12, %c_2 : (tensor<ui64>, tensor<3x2xui64>, tensor<ui64>) -> \
                         tensor<3x2xui64>
-                    %11 = \"stablehlo.reduce_window\"(%10, %c_1) <{padding = dense<[[0, 0], [1, 0]]> : \
+                    %14 = \"stablehlo.reduce_window\"(%13, %c_1) <{padding = dense<[[0, 0], [1, 0]]> : \
                         tensor<2x2xi64>, window_dimensions = array<i64: 1, 2>}> ({
-                    ^bb0(%arg3: tensor<ui64>, %arg4: tensor<ui64>):
+                    ^bb0(%arg6: tensor<ui64>, %arg7: tensor<ui64>):
                       %c_3 = stablehlo.constant dense<3> : tensor<ui64>
-                      %27 = stablehlo.subtract %c_3, %arg3 : tensor<ui64>
-                      %28 = stablehlo.minimum %arg4, %27 : tensor<ui64>
-                      %29 = stablehlo.add %arg3, %28 : tensor<ui64>
-                      stablehlo.return %29 : tensor<ui64>
+                      %32 = stablehlo.subtract %c_3, %arg6 : tensor<ui64>
+                      %33 = stablehlo.minimum %arg7, %32 : tensor<ui64>
+                      %34 = stablehlo.add %arg6, %33 : tensor<ui64>
+                      stablehlo.return %34 : tensor<ui64>
                     }) : (tensor<3x2xui64>, tensor<ui64>) -> tensor<3x2xui64>
-                    %12 = stablehlo.pad %11, %c_1, low = [0, 1], high = [0, -1], interior = [0, 0] : \
+                    %15 = stablehlo.pad %14, %c_1, low = [0, 1], high = [0, -1], interior = [0, 0] : \
                         (tensor<3x2xui64>, tensor<ui64>) -> tensor<3x2xui64>
-                    %13 = stablehlo.broadcast_in_dim %arg0, dims = [0, 2, 3] : (tensor<?x3x1xf32, #stablehlo.bounds<3, \
+                    %16 = stablehlo.broadcast_in_dim %0, dims = [0, 2, 3] : (tensor<?x3x1xf32, #stablehlo.bounds<3, \
                         ?, ?>>) -> tensor<?x2x3x1xf32, #stablehlo.bounds<3, ?, ?, ?>>
-                    %14 = stablehlo.broadcast_in_dim %12, dims = [0, 1] : (tensor<3x2xui64>) -> tensor<3x2x3x1xui64>
-                    %15 = stablehlo.broadcast_in_dim %11, dims = [0, 1] : (tensor<3x2xui64>) -> tensor<3x2x3x1xui64>
-                    %16 = stablehlo.iota dim = 2 : tensor<3x2x3x1xui64>
-                    %17 = stablehlo.compare LE, %14, %16, UNSIGNED : (tensor<3x2x3x1xui64>, tensor<3x2x3x1xui64>) -> \
+                    %17 = stablehlo.broadcast_in_dim %15, dims = [0, 1] : (tensor<3x2xui64>) -> tensor<3x2x3x1xui64>
+                    %18 = stablehlo.broadcast_in_dim %14, dims = [0, 1] : (tensor<3x2xui64>) -> tensor<3x2x3x1xui64>
+                    %19 = stablehlo.iota dim = 2 : tensor<3x2x3x1xui64>
+                    %20 = stablehlo.compare LE, %17, %19, UNSIGNED : (tensor<3x2x3x1xui64>, tensor<3x2x3x1xui64>) -> \
                         tensor<3x2x3x1xi1>
-                    %18 = stablehlo.compare LT, %16, %15, UNSIGNED : (tensor<3x2x3x1xui64>, tensor<3x2x3x1xui64>) -> \
+                    %21 = stablehlo.compare LT, %19, %18, UNSIGNED : (tensor<3x2x3x1xui64>, tensor<3x2x3x1xui64>) -> \
                         tensor<3x2x3x1xi1>
-                    %19 = stablehlo.and %17, %18 : tensor<3x2x3x1xi1>
-                    %20 = stablehlo.get_dimension_size %13, dim = 0 : (tensor<?x2x3x1xf32, #stablehlo.bounds<3, ?, ?, \
+                    %22 = stablehlo.and %20, %21 : tensor<3x2x3x1xi1>
+                    %23 = stablehlo.get_dimension_size %16, dim = 0 : (tensor<?x2x3x1xf32, #stablehlo.bounds<3, ?, ?, \
                         ?>>) -> tensor<i32>
-                    %21 = stablehlo.set_dimension_size %19, %20, dim = 0 : (tensor<3x2x3x1xi1>, tensor<i32>) -> \
+                    %24 = stablehlo.set_dimension_size %22, %23, dim = 0 : (tensor<3x2x3x1xi1>, tensor<i32>) -> \
                         tensor<?x2x3x1xi1, #stablehlo.bounds<3, ?, ?, ?>>
-                    %22 = stablehlo.xor %21, %21 : tensor<?x2x3x1xi1, #stablehlo.bounds<3, ?, ?, ?>>
-                    %23 = stablehlo.convert %22 : (tensor<?x2x3x1xi1, #stablehlo.bounds<3, ?, ?, ?>>) -> \
+                    %25 = stablehlo.xor %24, %24 : tensor<?x2x3x1xi1, #stablehlo.bounds<3, ?, ?, ?>>
+                    %26 = stablehlo.convert %25 : (tensor<?x2x3x1xi1, #stablehlo.bounds<3, ?, ?, ?>>) -> \
                         tensor<?x2x3x1xf32, #stablehlo.bounds<3, ?, ?, ?>>
-                    %24 = stablehlo.select %21, %13, %23 : tensor<?x2x3x1xi1, #stablehlo.bounds<3, ?, ?, ?>>, \
+                    %27 = stablehlo.select %24, %16, %26 : tensor<?x2x3x1xi1, #stablehlo.bounds<3, ?, ?, ?>>, \
                         tensor<?x2x3x1xf32, #stablehlo.bounds<3, ?, ?, ?>>
-                    %25 = stablehlo.transpose %24, dims = [1, 0, 2, 3] : (tensor<?x2x3x1xf32, #stablehlo.bounds<3, ?, \
+                    %28 = stablehlo.transpose %27, dims = [1, 0, 2, 3] : (tensor<?x2x3x1xf32, #stablehlo.bounds<3, ?, \
                         ?, ?>>) -> tensor<2x?x3x1xf32, #stablehlo.bounds<?, 3, ?, ?>>
-                    %26 = stablehlo.dot_general %25, %arg1, batching_dims = [1] x [1], contracting_dims = [3, 0] x [2, \
+                    %29 = stablehlo.dot_general %28, %1, batching_dims = [1] x [1], contracting_dims = [3, 0] x [2, \
                         0], precision = [DEFAULT, DEFAULT] : (tensor<2x?x3x1xf32, #stablehlo.bounds<?, 3, ?, ?>>, \
                         tensor<2x?x1x1xf32, #stablehlo.bounds<?, 3, ?, ?>>) -> tensor<?x3x1xf32, #stablehlo.bounds<3, \
                         ?, ?>>
-                    return %26 : tensor<?x3x1xf32, #stablehlo.bounds<3, ?, ?>>
+                    %30 = stablehlo.get_dimension_size %29, dim = 0 : (tensor<?x3x1xf32, #stablehlo.bounds<3, ?, \
+                        ?>>) -> tensor<i32>
+                    %31 = stablehlo.convert %30 : (tensor<i32>) -> tensor<i64>
+                    return %29, %31 : tensor<?x3x1xf32, #stablehlo.bounds<3, ?, ?>>, tensor<i64>
                   }
                 }
             "},
@@ -1789,52 +1798,59 @@ mod tests {
             module,
             indoc! {"
                 module {
-                  func.func @main(%arg0: tensor<?x3x1xf32, #stablehlo.bounds<3, ?, ?>>, %arg1: tensor<2x?x1x1xf32, \
-                      #stablehlo.bounds<?, 3, ?, ?>>, %arg2: tensor<2xi32>) -> tensor<?x3x1xf32, #stablehlo.bounds<3, \
-                      ?, ?>> {
-                    %0 = stablehlo.subtract %arg2, %arg2 : tensor<2xi32>
-                    %1 = stablehlo.maximum %arg2, %0 : tensor<2xi32>
-                    %2 = stablehlo.convert %1 : (tensor<2xi32>) -> tensor<2xui64>
+                  func.func @main(%arg0: tensor<3x3x1xf32>, %arg1: tensor<2x3x1x1xf32>, %arg2: tensor<2xi32>, \
+                      %arg3: tensor<i32>, %arg4: tensor<i32>) -> (tensor<?x3x1xf32, #stablehlo.bounds<3, ?, ?>>, \
+                      tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg3, dim = 0 : (tensor<3x3x1xf32>, tensor<i32>) -> \
+                        tensor<?x3x1xf32, #stablehlo.bounds<3, ?, ?>>
+                    %1 = stablehlo.set_dimension_size %arg1, %arg4, dim = 1 : (tensor<2x3x1x1xf32>, tensor<i32>) -> \
+                        tensor<2x?x1x1xf32, #stablehlo.bounds<?, 3, ?, ?>>
+                    %2 = stablehlo.subtract %arg2, %arg2 : tensor<2xi32>
+                    %3 = stablehlo.maximum %arg2, %2 : tensor<2xi32>
+                    %4 = stablehlo.convert %3 : (tensor<2xi32>) -> tensor<2xui64>
                     %c = stablehlo.constant dense<0> : tensor<ui64>
                     %c_0 = stablehlo.constant dense<3> : tensor<ui64>
-                    %3 = stablehlo.clamp %c, %2, %c_0 : (tensor<ui64>, tensor<2xui64>, tensor<ui64>) -> tensor<2xui64>
-                    %4 = \"stablehlo.reduce_window\"(%3, %c) <{padding = dense<[[1, 0]]> : tensor<1x2xi64>, \
+                    %5 = stablehlo.clamp %c, %4, %c_0 : (tensor<ui64>, tensor<2xui64>, tensor<ui64>) -> tensor<2xui64>
+                    %6 = \"stablehlo.reduce_window\"(%5, %c) <{padding = dense<[[1, 0]]> : tensor<1x2xi64>, \
                         window_dimensions = array<i64: 2>}> ({
-                    ^bb0(%arg3: tensor<ui64>, %arg4: tensor<ui64>):
+                    ^bb0(%arg5: tensor<ui64>, %arg6: tensor<ui64>):
                       %c_1 = stablehlo.constant dense<3> : tensor<ui64>
-                      %20 = stablehlo.subtract %c_1, %arg3 : tensor<ui64>
-                      %21 = stablehlo.minimum %arg4, %20 : tensor<ui64>
-                      %22 = stablehlo.add %arg3, %21 : tensor<ui64>
-                      stablehlo.return %22 : tensor<ui64>
+                      %24 = stablehlo.subtract %c_1, %arg5 : tensor<ui64>
+                      %25 = stablehlo.minimum %arg6, %24 : tensor<ui64>
+                      %26 = stablehlo.add %arg5, %25 : tensor<ui64>
+                      stablehlo.return %26 : tensor<ui64>
                     }) : (tensor<2xui64>, tensor<ui64>) -> tensor<2xui64>
-                    %5 = stablehlo.pad %4, %c, low = [1], high = [-1], interior = [0] : (tensor<2xui64>, tensor<ui64>) \
+                    %7 = stablehlo.pad %6, %c, low = [1], high = [-1], interior = [0] : (tensor<2xui64>, tensor<ui64>) \
                         -> tensor<2xui64>
-                    %6 = stablehlo.broadcast_in_dim %arg0, dims = [0, 2, 3] : (tensor<?x3x1xf32, #stablehlo.bounds<3, \
+                    %8 = stablehlo.broadcast_in_dim %0, dims = [0, 2, 3] : (tensor<?x3x1xf32, #stablehlo.bounds<3, \
                         ?, ?>>) -> tensor<?x2x3x1xf32, #stablehlo.bounds<3, ?, ?, ?>>
-                    %7 = stablehlo.broadcast_in_dim %5, dims = [1] : (tensor<2xui64>) -> tensor<3x2x3x1xui64>
-                    %8 = stablehlo.broadcast_in_dim %4, dims = [1] : (tensor<2xui64>) -> tensor<3x2x3x1xui64>
-                    %9 = stablehlo.iota dim = 2 : tensor<3x2x3x1xui64>
-                    %10 = stablehlo.compare LE, %7, %9, UNSIGNED : (tensor<3x2x3x1xui64>, tensor<3x2x3x1xui64>) -> \
+                    %9 = stablehlo.broadcast_in_dim %7, dims = [1] : (tensor<2xui64>) -> tensor<3x2x3x1xui64>
+                    %10 = stablehlo.broadcast_in_dim %6, dims = [1] : (tensor<2xui64>) -> tensor<3x2x3x1xui64>
+                    %11 = stablehlo.iota dim = 2 : tensor<3x2x3x1xui64>
+                    %12 = stablehlo.compare LE, %9, %11, UNSIGNED : (tensor<3x2x3x1xui64>, tensor<3x2x3x1xui64>) -> \
                         tensor<3x2x3x1xi1>
-                    %11 = stablehlo.compare LT, %9, %8, UNSIGNED : (tensor<3x2x3x1xui64>, tensor<3x2x3x1xui64>) -> \
+                    %13 = stablehlo.compare LT, %11, %10, UNSIGNED : (tensor<3x2x3x1xui64>, tensor<3x2x3x1xui64>) -> \
                         tensor<3x2x3x1xi1>
-                    %12 = stablehlo.and %10, %11 : tensor<3x2x3x1xi1>
-                    %13 = stablehlo.get_dimension_size %6, dim = 0 : (tensor<?x2x3x1xf32, #stablehlo.bounds<3, ?, ?, \
+                    %14 = stablehlo.and %12, %13 : tensor<3x2x3x1xi1>
+                    %15 = stablehlo.get_dimension_size %8, dim = 0 : (tensor<?x2x3x1xf32, #stablehlo.bounds<3, ?, ?, \
                         ?>>) -> tensor<i32>
-                    %14 = stablehlo.set_dimension_size %12, %13, dim = 0 : (tensor<3x2x3x1xi1>, tensor<i32>) -> \
+                    %16 = stablehlo.set_dimension_size %14, %15, dim = 0 : (tensor<3x2x3x1xi1>, tensor<i32>) -> \
                         tensor<?x2x3x1xi1, #stablehlo.bounds<3, ?, ?, ?>>
-                    %15 = stablehlo.xor %14, %14 : tensor<?x2x3x1xi1, #stablehlo.bounds<3, ?, ?, ?>>
-                    %16 = stablehlo.convert %15 : (tensor<?x2x3x1xi1, #stablehlo.bounds<3, ?, ?, ?>>) -> \
+                    %17 = stablehlo.xor %16, %16 : tensor<?x2x3x1xi1, #stablehlo.bounds<3, ?, ?, ?>>
+                    %18 = stablehlo.convert %17 : (tensor<?x2x3x1xi1, #stablehlo.bounds<3, ?, ?, ?>>) -> \
                         tensor<?x2x3x1xf32, #stablehlo.bounds<3, ?, ?, ?>>
-                    %17 = stablehlo.select %14, %6, %16 : tensor<?x2x3x1xi1, #stablehlo.bounds<3, ?, ?, ?>>, \
+                    %19 = stablehlo.select %16, %8, %18 : tensor<?x2x3x1xi1, #stablehlo.bounds<3, ?, ?, ?>>, \
                         tensor<?x2x3x1xf32, #stablehlo.bounds<3, ?, ?, ?>>
-                    %18 = stablehlo.transpose %17, dims = [1, 0, 2, 3] : (tensor<?x2x3x1xf32, #stablehlo.bounds<3, ?, \
+                    %20 = stablehlo.transpose %19, dims = [1, 0, 2, 3] : (tensor<?x2x3x1xf32, #stablehlo.bounds<3, ?, \
                         ?, ?>>) -> tensor<2x?x3x1xf32, #stablehlo.bounds<?, 3, ?, ?>>
-                    %19 = stablehlo.dot_general %18, %arg1, batching_dims = [1] x [1], contracting_dims = [3, 0] x [2, \
+                    %21 = stablehlo.dot_general %20, %1, batching_dims = [1] x [1], contracting_dims = [3, 0] x [2, \
                         0], precision = [DEFAULT, DEFAULT] : (tensor<2x?x3x1xf32, #stablehlo.bounds<?, 3, ?, ?>>, \
                         tensor<2x?x1x1xf32, #stablehlo.bounds<?, 3, ?, ?>>) -> tensor<?x3x1xf32, #stablehlo.bounds<3, \
                         ?, ?>>
-                    return %19 : tensor<?x3x1xf32, #stablehlo.bounds<3, ?, ?>>
+                    %22 = stablehlo.get_dimension_size %21, dim = 0 : (tensor<?x3x1xf32, #stablehlo.bounds<3, ?, \
+                        ?>>) -> tensor<i32>
+                    %23 = stablehlo.convert %22 : (tensor<i32>) -> tensor<i64>
+                    return %21, %23 : tensor<?x3x1xf32, #stablehlo.bounds<3, ?, ?>>, tensor<i64>
                   }
                 }
             "},
@@ -1846,7 +1862,7 @@ mod tests {
         let batch = dynamic_dimension("batch", Some(4));
         let dimensions =
             RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]), 1, Some(0));
-        let dynamic_module = lowered_ragged_dot_module_for(
+        let module = lowered_ragged_dot_module_for(
             dimensions,
             ArrayType::new(DataType::F32, Shape::new(vec![batch.clone(), 3.into(), 1.into()])),
             ArrayType::new(DataType::F32, Shape::new(vec![2.into(), batch.clone(), 1.into(), 1.into()])),
@@ -1854,43 +1870,6 @@ mod tests {
             RaggedDotLoweringStrategy::Decomposition,
         )
         .unwrap();
-        // CPU PJRT cannot expose bounded dynamic parameters at the executable boundary because it lacks XLA's
-        // `PadToStatic` custom call. A static wrapper creates logical size two inside the module, so this executes the
-        // generated decomposition with a runtime prefix below its physical bound of three.
-        let inner_module = dynamic_module.strip_suffix("}\n").unwrap().replacen(
-            "func.func @main",
-            "func.func private @ragged_dot_dynamic",
-            1,
-        );
-        let module = format!(
-            "{inner_module}{}",
-            indoc! {"
-                  func.func @main(
-                      %arg0: tensor<3x3x1xf32>,
-                      %arg1: tensor<2x3x1x1xf32>,
-                      %arg2: tensor<3x2xi32>
-                  ) -> tensor<3x3x1xf32> {
-                    %c2 = stablehlo.constant dense<2> : tensor<i32>
-                    %0 = stablehlo.set_dimension_size %arg0, %c2, dim = 0 :
-                      (tensor<3x3x1xf32>, tensor<i32>) -> tensor<?x3x1xf32, #stablehlo.bounds<3, ?, ?>>
-                    %1 = stablehlo.set_dimension_size %arg1, %c2, dim = 1 :
-                      (tensor<2x3x1x1xf32>, tensor<i32>) -> tensor<2x?x1x1xf32, #stablehlo.bounds<?, 3, ?, ?>>
-                    %2 = stablehlo.set_dimension_size %arg2, %c2, dim = 0 :
-                      (tensor<3x2xi32>, tensor<i32>) -> tensor<?x2xi32, #stablehlo.bounds<3, ?>>
-                    %3 = func.call @ragged_dot_dynamic(%0, %1, %2) :
-                      (tensor<?x3x1xf32, #stablehlo.bounds<3, ?, ?>>,
-                       tensor<2x?x1x1xf32, #stablehlo.bounds<?, 3, ?, ?>>,
-                       tensor<?x2xi32, #stablehlo.bounds<3, ?>>) ->
-                      tensor<?x3x1xf32, #stablehlo.bounds<3, ?, ?>>
-                    %c3 = stablehlo.constant dense<3> : tensor<i32>
-                    %4 = stablehlo.set_dimension_size %3, %c3, dim = 0 :
-                      (tensor<?x3x1xf32, #stablehlo.bounds<3, ?, ?>>, tensor<i32>) -> tensor<3x3x1xf32>
-                    return %4 : tensor<3x3x1xf32>
-                  }
-                }
-            "},
-        );
-
         let client = cpu_client(1);
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
@@ -1922,12 +1901,26 @@ mod tests {
                 )
                 .unwrap(),
             client
-                .buffer(values_to_bytes(&[1i32, 2, 2, 1, 5, 7]).as_slice(), BufferType::I32, [3, 2], None, device, None)
+                .buffer(
+                    values_to_bytes(&[1i32, 2, 2, 1, 5, 7]).as_slice(),
+                    BufferType::I32,
+                    [3, 2],
+                    None,
+                    device.clone(),
+                    None,
+                )
                 .unwrap(),
-        ]
-        .into_iter()
-        .map(|buffer| ExecutionInput { buffer: Arc::new(buffer), donatable: false })
-        .collect::<Vec<_>>();
+        ];
+        // Each array's dynamic batch dimension has a separate scalar input at the production executable boundary.
+        let batch_size = Arc::new(
+            client.buffer(values_to_bytes(&[2i32]).as_slice(), BufferType::I32, [], None, device, None).unwrap(),
+        );
+        let inputs = inputs
+            .into_iter()
+            .map(Arc::new)
+            .chain([batch_size.clone(), batch_size.clone(), batch_size])
+            .map(|buffer| ExecutionInput { buffer, donatable: false })
+            .collect::<Vec<_>>();
         let mut executions = executable
             .execute(
                 vec![ExecutionDeviceInputs { inputs: inputs.as_slice(), ..Default::default() }],
@@ -1942,7 +1935,11 @@ mod tests {
             .unwrap()
             .block_until_ready()
             .unwrap();
-        let output = executions.remove(0).outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
+        let outputs = executions.remove(0).outputs;
+        assert_eq!(outputs.len(), 2);
+        let extent = outputs[1].copy_to_host(None).unwrap().r#await().unwrap();
+        assert_eq!(values_from_bytes::<i64>(extent.as_slice()), vec![2]);
+        let output = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
         let output = values_from_bytes::<f32>(output.as_slice());
         assert_eq!(&output[..6], &[10.0, 40.0, 60.0, 8.0, 10.0, 18.0]);
     }

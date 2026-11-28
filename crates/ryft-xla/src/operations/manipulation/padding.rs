@@ -373,9 +373,7 @@ mod tests {
     use ryft_mlir::{Operation as MlirOperation, Type as MlirType, Value as MlirValue};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::lowering::tests::{
-        ProgramBuilder, dynamic_dimension, test_vector_type, to_rendered_mlir_for_plain_program,
-    };
+    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, test_vector_type, unproject_plain_program};
     use crate::lowering::types::lower_static_index_constants;
     use crate::operations::Operation;
     use crate::tests::{execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
@@ -415,7 +413,9 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let stablehlo = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
 
         assert_eq!(
             stablehlo,
@@ -461,7 +461,9 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let stablehlo = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
 
         assert_eq!(
             stablehlo,
@@ -521,7 +523,9 @@ mod tests {
             let program = builder
                 .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap();
-            let module = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+            let module = unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap();
             let executable = client
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_compilation_options(client, None))
                 .unwrap();

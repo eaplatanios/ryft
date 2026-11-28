@@ -1009,10 +1009,8 @@ mod tests {
         Placeholder, ReferenceType, TiledLayout, ZeroOperation,
     };
 
-    use crate::ArrayConstant;
-    use crate::lowering::tests::{
-        ProgramBuilder, dynamic_dimension, test_vector_type, to_rendered_mlir_for_plain_program,
-    };
+    use crate::lowering::tests::{ProgramBuilder, dynamic_dimension, test_vector_type, unproject_plain_program};
+    use crate::{ArrayConstant, ProgramLoweringExtension, ProgramLoweringOptions};
 
     use super::*;
 
@@ -1051,7 +1049,9 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(
-            to_rendered_mlir_for_plain_program(&zero_program(Memory::Device), "main").unwrap(),
+            unproject_plain_program(zero_program(Memory::Device))
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap(),
             indoc! {r#"
             module {
               func.func @main() -> tensor<4xf32> {
@@ -1076,7 +1076,12 @@ mod tests {
                 }
             "#}
             .replace("KIND", kind);
-            assert_eq!(to_rendered_mlir_for_plain_program(&zero_program(memory), "main").unwrap(), expected);
+            assert_eq!(
+                unproject_plain_program(zero_program(memory))
+                    .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                    .unwrap(),
+                expected
+            );
         }
     }
 
@@ -1134,15 +1139,19 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         // Widening retains the physical bound as well as the runtime dimension before recovering the signed value.
+        let program = unproject_plain_program(program);
         assert_eq!(
-            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
+            program.to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning()).unwrap(),
             indoc! {r#"
         module {
-          func.func @main(%arg0: tensor<?xi1, #stablehlo.bounds<5>>) -> tensor<?xf32, #stablehlo.bounds<5>> {
-            %0 = stablehlo.convert %arg0 : (tensor<?xi1, #stablehlo.bounds<5>>) -> tensor<?xi8, #stablehlo.bounds<5>>
-            %1 = stablehlo.negate %0 : tensor<?xi8, #stablehlo.bounds<5>>
-            %2 = stablehlo.convert %1 : (tensor<?xi8, #stablehlo.bounds<5>>) -> tensor<?xf32, #stablehlo.bounds<5>>
-            return %2 : tensor<?xf32, #stablehlo.bounds<5>>
+          func.func @main(%arg0: tensor<5xi1>, %arg1: tensor<i32>) -> (tensor<?xf32, #stablehlo.bounds<5>>, tensor<i64>) {
+            %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<5xi1>, tensor<i32>) -> tensor<?xi1, #stablehlo.bounds<5>>
+            %1 = stablehlo.convert %0 : (tensor<?xi1, #stablehlo.bounds<5>>) -> tensor<?xi8, #stablehlo.bounds<5>>
+            %2 = stablehlo.negate %1 : tensor<?xi8, #stablehlo.bounds<5>>
+            %3 = stablehlo.convert %2 : (tensor<?xi8, #stablehlo.bounds<5>>) -> tensor<?xf32, #stablehlo.bounds<5>>
+            %4 = stablehlo.get_dimension_size %3, dim = 0 : (tensor<?xf32, #stablehlo.bounds<5>>) -> tensor<i32>
+            %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
+            return %3, %5 : tensor<?xf32, #stablehlo.bounds<5>>, tensor<i64>
           }
         }
         "#},

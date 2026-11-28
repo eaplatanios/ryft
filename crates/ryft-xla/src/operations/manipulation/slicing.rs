@@ -689,17 +689,15 @@ mod tests {
         DataType, Dimension, DimensionBounds, DimensionConstant, DimensionFromScalar, DimensionFromScalarOperation,
         DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Div, DynamicBroadcastOperation,
         DynamicSlice, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
-        DynamicUpdateSliceOperation, EagerContext, Error as CoreError, FlatProgram, Linearization, Pad, Placeholder,
-        ProgramBuilder as ArrayIrProgramBuilder, ReverseModeDifferentiate, Shape, Slice, StagingContext,
-        TracingContext, Typed, TypedProgram, UpdateSlice, UpdateSliceOperation, ValueProjection,
+        DynamicUpdateSliceOperation, Error as CoreError, FlatProgram, Linearization, Pad, Placeholder,
+        ProgramBuilder as ArrayIrProgramBuilder, Shape, Slice, StagingContext, TracingContext, Typed, TypedProgram,
+        UpdateSlice, UpdateSliceOperation, ValueProjection,
     };
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::contexts::ProgramLoweringContext;
-    use crate::lowering::tests::{
-        ProgramBuilder, test_matrix_type, to_rendered_mlir_for_plain_program, unproject_plain_program,
-    };
+    use crate::lowering::tests::{ProgramBuilder, test_matrix_type, unproject_plain_program};
     use crate::operations::Operation;
     use crate::sessions::tests::{
         domain_mesh, f32_vector, program_array, read_first_shard, replicated_scalar_type, replicated_vector_type,
@@ -709,7 +707,8 @@ mod tests {
     };
     use crate::types::DataTypeExtension;
     use crate::{
-        Array, ArrayConstant, Constant, Options, ProgramLoweringExtension, ProgramLoweringOptions, Session, Type, Value,
+        Array, ArrayConstant, ArrayTracer, Constant, Options, ProgramLoweringExtension, ProgramLoweringOptions,
+        Session, Type, Value,
     };
 
     use super::*;
@@ -771,7 +770,9 @@ mod tests {
                 vec![Placeholder, Placeholder, Placeholder, Placeholder],
             )
             .unwrap();
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let stablehlo = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
 
         assert_eq!(
             stablehlo,
@@ -826,40 +827,43 @@ mod tests {
         let program = builder
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_rendered_mlir_for_plain_program(&program, "main").unwrap();
+        let stablehlo = unproject_plain_program(program)
+            .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+            .unwrap();
         assert_eq!(
             stablehlo,
             indoc! {r#"
                 module {
-                  func.func @main(%arg0: tensor<?x3xf32, #stablehlo.bounds<4, ?>>, %arg1: tensor<i32>, %arg2: tensor<i32>) -> tensor<1x2xf32> {
-                    %0 = stablehlo.convert %arg1 : (tensor<i32>) -> tensor<i64>
-                    %1 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
-                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                  func.func @main(%arg0: tensor<4x3xf32>, %arg1: tensor<i32>, %arg2: tensor<i32>, %arg3: tensor<i32>) -> tensor<1x2xf32> {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg3, dim = 0 : (tensor<4x3xf32>, tensor<i32>) -> tensor<?x3xf32, #stablehlo.bounds<4, ?>>
+                    %1 = stablehlo.convert %arg1 : (tensor<i32>) -> tensor<i64>
+                    %2 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
                     %c = stablehlo.constant dense<0> : tensor<i64>
-                    %3 = stablehlo.compare LT, %0, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
-                    %4 = stablehlo.add %0, %2 : tensor<i64>
-                    %5 = stablehlo.select %3, %4, %0 : tensor<i1>, tensor<i64>
+                    %4 = stablehlo.compare LT, %1, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %5 = stablehlo.add %1, %3 : tensor<i64>
+                    %6 = stablehlo.select %4, %5, %1 : tensor<i1>, tensor<i64>
                     %c_0 = stablehlo.constant dense<1> : tensor<i64>
-                    %6 = stablehlo.subtract %2, %c_0 : tensor<i64>
-                    %7 = stablehlo.convert %6 : tensor<i64>
-                    %8 = stablehlo.maximum %5, %c : tensor<i64>
-                    %9 = stablehlo.minimum %8, %7 : tensor<i64>
-                    %10 = stablehlo.convert %9 : tensor<i64>
-                    %11 = stablehlo.convert %arg2 : (tensor<i32>) -> tensor<i64>
-                    %12 = stablehlo.get_dimension_size %arg0, dim = 1 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
-                    %13 = stablehlo.convert %12 : (tensor<i32>) -> tensor<i64>
+                    %7 = stablehlo.subtract %3, %c_0 : tensor<i64>
+                    %8 = stablehlo.convert %7 : tensor<i64>
+                    %9 = stablehlo.maximum %6, %c : tensor<i64>
+                    %10 = stablehlo.minimum %9, %8 : tensor<i64>
+                    %11 = stablehlo.convert %10 : tensor<i64>
+                    %12 = stablehlo.convert %arg2 : (tensor<i32>) -> tensor<i64>
+                    %13 = stablehlo.get_dimension_size %0, dim = 1 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %14 = stablehlo.convert %13 : (tensor<i32>) -> tensor<i64>
                     %c_1 = stablehlo.constant dense<0> : tensor<i64>
-                    %14 = stablehlo.compare LT, %11, %c_1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
-                    %15 = stablehlo.add %11, %13 : tensor<i64>
-                    %16 = stablehlo.select %14, %15, %11 : tensor<i1>, tensor<i64>
+                    %15 = stablehlo.compare LT, %12, %c_1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %16 = stablehlo.add %12, %14 : tensor<i64>
+                    %17 = stablehlo.select %15, %16, %12 : tensor<i1>, tensor<i64>
                     %c_2 = stablehlo.constant dense<2> : tensor<i64>
-                    %17 = stablehlo.subtract %13, %c_2 : tensor<i64>
-                    %18 = stablehlo.convert %17 : tensor<i64>
-                    %19 = stablehlo.maximum %16, %c_1 : tensor<i64>
-                    %20 = stablehlo.minimum %19, %18 : tensor<i64>
-                    %21 = stablehlo.convert %20 : tensor<i64>
-                    %22 = stablehlo.dynamic_slice %arg0, %10, %21, sizes = [1, 2] : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<i64>, tensor<i64>) -> tensor<1x2xf32>
-                    return %22 : tensor<1x2xf32>
+                    %18 = stablehlo.subtract %14, %c_2 : tensor<i64>
+                    %19 = stablehlo.convert %18 : tensor<i64>
+                    %20 = stablehlo.maximum %17, %c_1 : tensor<i64>
+                    %21 = stablehlo.minimum %20, %19 : tensor<i64>
+                    %22 = stablehlo.convert %21 : tensor<i64>
+                    %23 = stablehlo.dynamic_slice %0, %11, %22, sizes = [1, 2] : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<i64>, tensor<i64>) -> tensor<1x2xf32>
+                    return %23 : tensor<1x2xf32>
                   }
                 }
             "#},
@@ -889,16 +893,21 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            to_rendered_mlir_for_plain_program(&program, "main").unwrap(),
+            unproject_plain_program(program)
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap(),
             indoc! {r#"
                 module {
-                  func.func @main(%arg0: tensor<?x4xf32, #stablehlo.bounds<4, ?>>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>> {
+                  func.func @main(%arg0: tensor<4x4xf32>, %arg1: tensor<i32>) -> (tensor<?x2xf32, #stablehlo.bounds<4, ?>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<4x4xf32>, tensor<i32>) -> tensor<?x4xf32, #stablehlo.bounds<4, ?>>
                     %c = stablehlo.constant dense<4> : tensor<i32>
-                    %0 = stablehlo.set_dimension_size %arg0, %c, dim = 0 : (tensor<?x4xf32, #stablehlo.bounds<4, ?>>, tensor<i32>) -> tensor<4x4xf32>
-                    %1 = stablehlo.slice %0 [0:4, 1:4:2] : (tensor<4x4xf32>) -> tensor<4x2xf32>
-                    %2 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x4xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
-                    %3 = stablehlo.set_dimension_size %1, %2, dim = 0 : (tensor<4x2xf32>, tensor<i32>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>>
-                    return %3 : tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                    %1 = stablehlo.set_dimension_size %0, %c, dim = 0 : (tensor<?x4xf32, #stablehlo.bounds<4, ?>>, tensor<i32>) -> tensor<4x4xf32>
+                    %2 = stablehlo.slice %1 [0:4, 1:4:2] : (tensor<4x4xf32>) -> tensor<4x2xf32>
+                    %3 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?x4xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %4 = stablehlo.set_dimension_size %2, %3, dim = 0 : (tensor<4x2xf32>, tensor<i32>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                    %5 = stablehlo.get_dimension_size %4, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %6 = stablehlo.convert %5 : (tensor<i32>) -> tensor<i64>
+                    return %4, %6 : tensor<?x2xf32, #stablehlo.bounds<4, ?>>, tensor<i64>
                   }
                 }
             "#},
@@ -913,16 +922,22 @@ mod tests {
         // through the canonical zero path to a scalar constant broadcast to the array shape. The reverse path
         // stages the pullback over the primal operation family taking `[output_cotangents ++ residuals]`. This slice
         // pullback captures no residuals, so the pullback consumes only the single output cotangent.
-        let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
-            .vjp(
-                |x, ()| Ok(x.slice(&[1], &[3], &[1]).unwrap()),
-                CoreArray::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
-                (),
-            )
-            .unwrap();
-        let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
-        let pullback = pullback.into_program();
-        let stablehlo = to_rendered_mlir_for_plain_program(&pullback, "main").unwrap();
+        let render_pullback = |primal: FlatProgram<Session>| {
+            primal
+                .linearize()
+                .unwrap()
+                .pullback()
+                .unwrap()
+                .into_program()
+                .to_rendered_mlir("main", &ProgramLoweringOptions::new().without_pruning())
+                .unwrap()
+        };
+        let primal = crate::trace(
+            |x: ArrayTracer| x.slice(&[1], &[3], &[1]).unwrap(),
+            ArrayType::new_static(DataType::F64, [4]),
+        )
+        .unwrap();
+        let stablehlo = render_pullback(primal.into_flat_program());
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -940,16 +955,12 @@ mod tests {
 
         // The strided slice pullback pads the cotangent with a zero scalar using the inverse padding
         // (i.e., `low = start` and `interior = stride - 1`), which lowers to `stablehlo.pad`.
-        let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
-            .vjp(
-                |x, ()| Ok(x.slice(&[1], &[6], &[2]).unwrap()),
-                CoreArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap(),
-                (),
-            )
-            .unwrap();
-        let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
-        let pullback = pullback.into_program();
-        let stablehlo = to_rendered_mlir_for_plain_program(&pullback, "main").unwrap();
+        let primal = crate::trace(
+            |x: ArrayTracer| x.slice(&[1], &[6], &[2]).unwrap(),
+            ArrayType::new_static(DataType::F64, [6]),
+        )
+        .unwrap();
+        let stablehlo = render_pullback(primal.into_flat_program());
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -966,16 +977,12 @@ mod tests {
         // The pad pullback first removes the edge padding from the cotangent and then slices it with the non-unit
         // interior stride for the input. It constructs a Boolean padding position mask for the padding value cotangent
         // so non-finite values at input positions cannot contaminate its sum.
-        let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
-            .vjp(
-                |(x, padding_value), ()| Ok(x.pad(&padding_value, &[1], &[2], &[1]).unwrap()),
-                (CoreArray::vector(vec![1.0, 2.0, 3.0]).unwrap(), CoreArray::scalar(9.0).unwrap()),
-                (),
-            )
-            .unwrap();
-        let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
-        let pullback = pullback.into_program();
-        let stablehlo = to_rendered_mlir_for_plain_program(&pullback, "main").unwrap();
+        let primal = crate::trace(
+            |(x, padding_value): (ArrayTracer, ArrayTracer)| x.pad(&padding_value, &[1], &[2], &[1]).unwrap(),
+            (ArrayType::new_static(DataType::F64, [3]), ArrayType::scalar(DataType::F64)),
+        )
+        .unwrap();
+        let stablehlo = render_pullback(primal.into_flat_program());
         assert_eq!(
             stablehlo,
             indoc! {r#"
@@ -999,24 +1006,17 @@ mod tests {
             "#},
         );
 
-        // The dynamic slice pullback scatters the cotangent at the captured index factors, which materialize as
-        // integer constants through `ArrayLiteralLoweringExtension::lower_constant`.
-        let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
-            .vjp(
-                |x, ()| {
-                    let start = x
-                        .context()
-                        .lift(CoreArray::from_elements::<i32>(ArrayType::scalar(DataType::I32), &[1]).unwrap())
-                        .unwrap();
-                    Ok(x.dynamic_slice(&[start], &[2]).unwrap())
-                },
-                CoreArray::vector(vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
-                (),
-            )
-            .unwrap();
-        let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
-        let pullback = pullback.into_program();
-        let stablehlo = to_rendered_mlir_for_plain_program(&pullback, "main").unwrap();
+        // The dynamic slice pullback scatters the cotangent at the index saved by the forward pass.
+        let primal = crate::trace_with_context(
+            |context, x: ArrayTracer| {
+                let start =
+                    context.bind(ConstantOperation::new(CoreArray::scalar(1i32).unwrap()), Vec::new(), &[])?.remove(0);
+                x.dynamic_slice(&[ValueProjection::<ArrayType>::into_projected(start)?], &[2])
+            },
+            ArrayType::new_static(DataType::F64, [4]),
+        )
+        .unwrap();
+        let stablehlo = render_pullback(primal.into_flat_program());
         assert_eq!(
             stablehlo,
             indoc! {r#"
