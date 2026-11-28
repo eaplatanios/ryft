@@ -65,7 +65,7 @@ pub use types::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, MemoryLoweringExtension, PhysicalStoragePadding,
     TypeLoweringExtension, dimension_extent_i32, dimension_extent_i64, lower_constant_output, lower_explicit_shape,
     lower_f64_constant_splat, lower_runtime_dimension_size_i64, lower_signed_one_bit_to_mlir,
-    lower_static_index_constants, lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type,
+    lower_static_index_constants, lower_u64_scalar_constant, lower_unplaced_constant_output,
     stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 

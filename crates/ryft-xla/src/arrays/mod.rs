@@ -55,8 +55,7 @@ use crate::arrays::retained::PlacementIndex;
 use crate::arrays::shards::validate_addressable_buffer;
 use crate::arrays::statistics::ArrayRegistration;
 use crate::compilation::domains::relocated_input_type;
-use crate::types::ArrayTypeExtension;
-use crate::{Error, Session, Type};
+use crate::{ArrayTypeExtension, Error, Session, Type};
 
 pub mod host;
 pub mod metadata;

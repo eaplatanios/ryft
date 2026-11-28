@@ -13,13 +13,14 @@ use ryft_mlir::{
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_constant_output, lower_u64_scalar_constant,
-    physical_bound_type,
 };
 use crate::operations::collectives::CollectiveLoweringExtension;
 use crate::operations::collectives::axis_index::AxisIndexOperationLoweringExtension;
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
-use crate::{Error, LowerableOperation, Lowerer, MemberLowerableOperation, ProgramLoweringOperation, Type};
+use crate::{
+    ArrayTypeExtension, Error, LowerableOperation, Lowerer, MemberLowerableOperation, ProgramLoweringOperation, Type,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -429,7 +430,7 @@ impl ParallelRaggedAllToAllOperationLoweringExtension for ParallelRaggedAllToAll
         let expanded_output = if expanded_output_type.static_shape().is_some() {
             lower_constant_output(std::slice::from_ref(&expanded_output_type), 0, block, context, location)?.remove(0)
         } else {
-            let physical_type = physical_bound_type(&expanded_output_type)?;
+            let physical_type = expanded_output_type.physical_bound_type()?;
             let zero =
                 lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
             let dimension_sources =

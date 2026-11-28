@@ -13,11 +13,11 @@ use ryft_mlir::{
 
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, lower_f64_constant_splat, lower_signed_one_bit_to_mlir,
-    lower_unplaced_constant_output, physical_bound_type,
+    lower_unplaced_constant_output,
 };
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
-use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
+use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
@@ -856,7 +856,7 @@ fn lower_index_reduction_to_mlir<'b, 'c: 'b, 't: 'c>(
     // the input. It is built at the physical bound of every dynamic axis and then receives the runtime extents of the
     // input. Statically shaped inputs need no refinement.
     let index_type = ArrayType::new(index_data_type, input_type.shape().clone());
-    let physical_index_tensor_type = physical_bound_type(&index_type)?.lower(context, location)?;
+    let physical_index_tensor_type = index_type.physical_bound_type()?.lower(context, location)?;
     let indices = block.append_operation(stable_hlo::iota(physical_index_tensor_type, axis, location)?)?;
     let indices = indices.result(0).unwrap().as_ref();
     let extent_sources = (0..index_type.rank()).map(|axis| (input_value, axis)).collect::<Vec<_>>();

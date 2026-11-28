@@ -16,13 +16,11 @@ use ryft_mlir::{
 use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::programs::{CallTraversal, ProgramInlineLoweringExtension, RegionLoweringExtension};
 use crate::lowering::sharding::OpenDimensions;
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, dimension_extent_i64, lower_unplaced_constant_output, physical_bound_type,
-};
+use crate::lowering::types::{ArrayTypeLoweringExtension, dimension_extent_i64, lower_unplaced_constant_output};
 use crate::lowering::{EffectTokens, current_or_new_token, token_threaded_effects};
 use crate::operations::assertions::{lower_guard, validates_output_extents};
 use crate::operations::call::CallFunctionMap;
-use crate::{Constant, Error, Lowerer, LoweringError, ProgramLoweringOperation, Type};
+use crate::{ArrayTypeExtension, Constant, Error, Lowerer, LoweringError, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -266,8 +264,8 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     }
 
     let physical_value = input_type.lower_physical_storage(value, block, context, location)?;
-    let physical_input_type = physical_bound_type(input_type)?;
-    let physical_type = physical_bound_type(declared_type)?;
+    let physical_input_type = input_type.physical_bound_type()?;
+    let physical_type = declared_type.physical_bound_type()?;
     let rank = declared_type.rank();
     // Negative padding slices a physical buffer down to a smaller bound, which keeps every element within the runtime
     // size, because that size lies within both bounds.
@@ -351,7 +349,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
         }
 
         let physical_value = declared_type.lower_physical_storage(value, block, context, location)?;
-        let physical_type = physical_bound_type(declared_type)?;
+        let physical_type = declared_type.physical_bound_type()?;
         let limits = physical_type
             .shape()
             .dimensions()

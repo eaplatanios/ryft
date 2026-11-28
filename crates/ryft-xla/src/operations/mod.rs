@@ -51,13 +51,13 @@ use ryft_mlir::{
 };
 
 use crate::lowering::programs::RegionLoweringExtension;
-use crate::lowering::types::{ArrayTypeLoweringExtension, physical_bound_type};
+use crate::lowering::types::ArrayTypeLoweringExtension;
 use crate::lowering::{unsupported_data_derived_dimensions, validate_local_output_placement};
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::{
-    Constant, Error, KernelOperation, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type,
-    lower_operation_variants,
+    ArrayTypeExtension, Constant, Error, KernelOperation, LowerableOperation, Lowerer, LoweringError,
+    ProgramLoweringOperation, Type, lower_operation_variants,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -1315,7 +1315,7 @@ where
                 context,
                 location,
             )?;
-            let physical_type = physical_bound_type(output_type)?;
+            let physical_type = output_type.physical_bound_type()?;
             let broadcast = block.append_operation(stable_hlo::broadcast(
                 scalar,
                 physical_type.lower(context, location)?,

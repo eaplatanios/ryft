@@ -10,7 +10,7 @@ use ryft_mlir::{
 
 use crate::devices::MemoryExtension;
 use crate::lowering::LoweringError;
-use crate::{ArrayError, Error, Type};
+use crate::{ArrayError, ArrayTypeExtension, Error, Type};
 
 /// Provides lowering support transfers to a [`Memory`] to StableHLO.
 pub trait MemoryLoweringExtension {
@@ -74,7 +74,7 @@ impl MemoryLoweringExtension for Memory {
     }
 }
 
-/// Provides lowering support of [`DataType`]s to StableHLO.
+/// Provides lowering support of [`DataType`]s, and of values of that type, to StableHLO.
 pub trait DataTypeLoweringExtension {
     /// Lowers one [`DataType`] to the corresponding MLIR element type.
     fn lower<'c, 't>(self, context: &'c MlirContext<'t>) -> Result<TypeRef<'c, 't>, Error>;
@@ -200,9 +200,7 @@ impl DataTypeLoweringExtension for DataType {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Lowering of an [`ArrayType`], and of values of that type, to StableHLO.
+/// Provides lowering support of [`ArrayType`]s, and of values of that type, to StableHLO.
 pub trait ArrayTypeLoweringExtension {
     /// Lowers an [`ArrayType`] to a typed MLIR tensor type.
     fn lower<'c, 't, L: Location<'c, 't>>(
@@ -211,9 +209,9 @@ pub trait ArrayTypeLoweringExtension {
         location: L,
     ) -> Result<TensorTypeRef<'c, 't>, Error>;
 
-    /// Exposes a bounded dynamic value as a statically shaped value of its [`physical_bound_type`]. Sets the size of
-    /// each dynamic axis to its physical bound. Elements outside the original runtime shape have unspecified values.
-    /// Callers must discard those elements or accept unspecified padding.
+    /// Exposes a bounded dynamic value as a statically shaped value of its [`ArrayTypeExtension::physical_bound_type`].
+    /// Sets the size of each dynamic axis to its physical bound. Elements outside the original runtime shape have
+    /// unspecified values. Callers must discard those elements or accept unspecified padding.
     fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
         &self,
         value: ValueRef<'b, 'c, 't>,
@@ -233,8 +231,8 @@ pub trait ArrayTypeLoweringExtension {
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error>;
 
-    /// Restores the dynamic dimensions of this type on a value of its [`physical_bound_type`]. Each entry in `sources`
-    /// identifies the value and axis that define the corresponding output dimension.
+    /// Restores the dynamic dimensions of this type on a value of its [`ArrayTypeExtension::physical_bound_type`].
+    /// Each entry in `sources` identifies the value and axis that define the corresponding output dimension.
     fn restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
         &self,
         value: ValueRef<'b, 'c, 't>,
@@ -278,7 +276,7 @@ impl ArrayTypeLoweringExtension for ArrayType {
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-        let physical_type = physical_bound_type(self)?;
+        let physical_type = self.physical_bound_type()?;
         let mut dimensions = self.shape().dimensions().to_vec();
         let mut value = value;
         for (axis, dimension) in self.shape().dimensions().iter().enumerate() {
@@ -323,12 +321,13 @@ impl ArrayTypeLoweringExtension for ArrayType {
                 runtime_sizes.push((axis, size.result(0)?.as_ref()));
             }
         }
+
         if runtime_sizes.is_empty() {
             return Ok(value);
         }
 
         let data = self.lower_physical_storage(value, block, context, location)?;
-        let physical_type = physical_bound_type(self)?;
+        let physical_type = self.physical_bound_type()?;
         let index_type = ArrayType::new(DataType::I32, physical_type.shape().clone());
         let index_tensor_type = index_type.lower(context, location)?;
         let mut in_bounds = None;
@@ -347,13 +346,12 @@ impl ArrayTypeLoweringExtension for ArrayType {
             let axis_in_bounds = axis_in_bounds.result(0).unwrap().as_ref();
             in_bounds = Some(match in_bounds {
                 None => axis_in_bounds,
-                Some(in_bounds) => block
-                    .append_operation(stable_hlo::and(in_bounds, axis_in_bounds, location)?)?
-                    .result(0)
-                    .unwrap()
-                    .as_ref(),
+                Some(in_bounds) => {
+                    block.append_operation(stable_hlo::and(in_bounds, axis_in_bounds, location)?)?.result(0)?.as_ref()
+                }
             });
         }
+
         let physical_tensor_type = physical_type.lower(context, location)?;
         let padding = match padding {
             PhysicalStoragePadding::Constant(value) if physical_type.data_type().is_complex() => {
@@ -375,8 +373,9 @@ impl ArrayTypeLoweringExtension for ArrayType {
                 .result(0)?
                 .as_ref(),
         };
+
         let masked = block.append_operation(stable_hlo::select(in_bounds.unwrap(), data, padding, location)?)?;
-        Ok(masked.result(0).unwrap().as_ref())
+        Ok(masked.result(0)?.as_ref())
     }
 
     fn restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
@@ -390,11 +389,13 @@ impl ArrayTypeLoweringExtension for ArrayType {
         if sources.len() != self.rank() {
             return Err(ProgramError::InvalidInputCount { expected: self.rank(), actual: sources.len() }.into());
         }
-        let mut dimensions = physical_bound_type(self)?.shape().dimensions().to_vec();
+
+        let mut dimensions = self.physical_bound_type()?.shape().dimensions().to_vec();
         for (axis, dimension) in self.shape().dimensions().iter().enumerate() {
             if matches!(dimension, Dimension::Static(_)) {
                 continue;
             }
+
             let size =
                 block.append_operation(stable_hlo::get_dimension_size(sources[axis].0, sources[axis].1, location)?)?;
             let size = size.result(0).unwrap().as_ref();
@@ -407,8 +408,10 @@ impl ArrayTypeLoweringExtension for ArrayType {
                 axis,
                 location,
             )?)?;
-            value = refined.result(0).unwrap().as_ref();
+
+            value = refined.result(0)?.as_ref();
         }
+
         Ok(value)
     }
 }
@@ -422,6 +425,8 @@ pub enum PhysicalStoragePadding<'b, 'c: 'b, 't: 'c> {
     /// A rank-0 MLIR tensor of the array's element type, broadcast with its exact value.
     Scalar(ValueRef<'b, 'c, 't>),
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Widens a logical signed one-bit integer to `i8`, recovering `-1` from StableHLO's predicate carrier.
 pub fn lower_signed_one_bit_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
@@ -456,34 +461,6 @@ pub fn lower_runtime_dimension_size_i64<'b, 'c: 'b, 't: 'c>(
     let i64_scalar = context.tensor_type(context.signless_integer_type(64), &[], None, location)?;
     let size = block.append_operation(stable_hlo::convert(size, i64_scalar, location)?)?;
     Ok(size.result(0)?.as_ref())
-}
-
-/// Returns the statically shaped carrier type of one bounded dynamic array type, in which every dynamic dimension is
-/// replaced by its physical bound (i.e., the largest extent that its exclusive upper bound admits).
-///
-/// # Errors
-///
-/// Returns [`LoweringError::UnsupportedOperation`] when a dynamic dimension has no finite positive upper bound.
-pub fn physical_bound_type(r#type: &ArrayType) -> Result<ArrayType, Error> {
-    let dimensions = r#type
-        .shape()
-        .dimensions()
-        .iter()
-        .map(|dimension| match dimension {
-            Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
-            Dimension::Dynamic(variable) => {
-                variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).map(Dimension::Static).ok_or_else(
-                    || {
-                        Error::Lowering(LoweringError::UnsupportedOperation {
-                            operation: "physical bound".to_string(),
-                            reason: format!("dynamic dimension `{variable}` needs a finite positive physical bound"),
-                        })
-                    },
-                )
-            }
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
-    Ok(r#type.clone().with_shape(Shape::new(dimensions)))
 }
 
 /// Converts one dimension extent to StableHLO's signed 64-bit shape representation.
@@ -889,22 +866,6 @@ mod tests {
     }
 
     #[test]
-    fn test_physical_bound_type() {
-        // Every bounded dynamic dimension is replaced by the largest extent that its exclusive upper bound admits.
-        let bounded =
-            ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(6)), Dimension::Static(3)]));
-        assert_eq!(physical_bound_type(&bounded).unwrap(), ArrayType::new_static(DataType::F32, [5, 3]));
-
-        let unbounded = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", None)]));
-        assert!(matches!(
-            physical_bound_type(&unbounded),
-            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
-                if operation == "physical bound"
-                    && reason == "dynamic dimension `rows` needs a finite positive physical bound",
-        ));
-    }
-
-    #[test]
     fn test_dimension_extent_i64() {
         if usize::MAX <= i64::MAX as usize {
             return;
@@ -1093,7 +1054,7 @@ mod tests {
         let context = MlirContext::new();
         let location = context.unknown_location();
         let block = context.block(&[
-            (physical_bound_type(&bounded_type).unwrap().lower(&context, location).unwrap(), location),
+            (bounded_type.physical_bound_type().unwrap().lower(&context, location).unwrap(), location),
             (bounded_type.lower(&context, location).unwrap(), location),
         ]);
         let input = block.argument(0).unwrap().as_ref();

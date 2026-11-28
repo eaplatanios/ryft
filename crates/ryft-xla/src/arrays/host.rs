@@ -126,8 +126,8 @@ use crate::arrays::metadata::resolve_placement;
 use crate::arrays::shards::{ArrayShard, ShardContribution, ShardDescriptor, ShardLayout};
 use crate::arrays::{Array, ArrayError};
 use crate::devices::PjrtDeviceExtension;
-use crate::types::{ArrayTypeExtension, DataTypeExtension};
-use crate::{Error, FromPjrt, Session, SessionError, ToPjrt};
+use crate::types::DataTypeExtension;
+use crate::{ArrayTypeExtension, Error, FromPjrt, Session, SessionError, ToPjrt};
 
 impl Array {
     /// Creates an [`Array`] by transferring a dense row-major host buffer to the local shards implied by

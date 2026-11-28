@@ -24,7 +24,7 @@ use crate::lowering::EffectTokens;
 use crate::lowering::programs::ProgramInlineLoweringExtension;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, PhysicalStoragePadding, TypeLoweringExtension, lower_explicit_shape,
-    lower_runtime_dimension_size_i64, lower_static_index_constants, physical_bound_type,
+    lower_runtime_dimension_size_i64, lower_static_index_constants,
 };
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::control_flow::{
@@ -34,7 +34,7 @@ use crate::operations::control_flow::{
 };
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
-use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
+use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -322,7 +322,7 @@ impl LowerableOperation for WhileOperation<Type> {
                                     location,
                                 )?)?;
                                 broadcast.result(0).unwrap().as_ref()
-                            } else if let Ok(physical_type) = physical_bound_type(&mask_type) {
+                            } else if let Ok(physical_type) = mask_type.physical_bound_type() {
                                 // Broadcast bounded storage, then restore every logical extent from the carry. A
                                 // predicate cannot supply the dynamic sizes of trailing state axes, and native bounded
                                 // broadcast results admit at most one dynamic axis.

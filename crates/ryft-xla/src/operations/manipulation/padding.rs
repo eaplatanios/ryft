@@ -10,14 +10,12 @@ use ryft_mlir::{
 };
 
 use crate::lowering::EffectTokens;
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_runtime_dimension_size_i64, physical_bound_type,
-};
+use crate::lowering::types::{ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_runtime_dimension_size_i64};
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE, ASSERT_PAD_KIND,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
+use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -178,8 +176,8 @@ impl<T: CoreType> PadOperationLoweringExtension for PadOperation<T> {
             return Ok(vec![result.result(0).unwrap().as_ref()]);
         }
 
-        let physical_input_type = physical_bound_type(&input_types[0])?;
-        let physical_output_type = physical_bound_type(output_type)?;
+        let physical_input_type = input_types[0].physical_bound_type()?;
+        let physical_output_type = output_type.physical_bound_type()?;
         let mut starts = Vec::with_capacity(rank);
         let mut limits = Vec::with_capacity(rank);
         let mut low_padding = Vec::with_capacity(rank);
@@ -631,7 +629,7 @@ mod tests {
                         .unwrap();
                     let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
                     let module = program.to_rendered_mlir("pad_dynamic", &ProgramLoweringOptions::new()).unwrap();
-                    let capacity = physical_bound_type(&output_type).unwrap().dimension(0).value().unwrap();
+                    let capacity = output_type.physical_bound_type().unwrap().dimension(0).value().unwrap();
                     let storage_type = format!("tensor<{capacity}x{element}>");
                     let body = if output_type.static_shape().is_some() {
                         format!(

@@ -13,12 +13,12 @@ use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::values::ArrayLiteralLoweringExtension;
 use crate::lowering::{
-    ArrayTypeLoweringExtension, MemoryLoweringExtension, lower_constant_output, physical_bound_type,
-    stable_hlo_dynamic_dimension_bound,
+    ArrayTypeLoweringExtension, MemoryLoweringExtension, lower_constant_output, stable_hlo_dynamic_dimension_bound,
 };
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{
-    Error, LowerableOperation, Lowerer, LoweringError, MemberLowerableOperation, ProgramLoweringOperation, Type,
+    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, MemberLowerableOperation,
+    ProgramLoweringOperation, Type,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -233,7 +233,7 @@ impl LowerableOperation for FillLikeOperation<ArrayType> {
         check_count!("output", output_types, 1, ProgramError);
         // The exemplar only provides the logical sizes of the dynamic axes, so the scalar is broadcast to the
         // statically shaped physical allocation, like the static `fill`.
-        let physical_type = physical_bound_type(&output_types[0])?;
+        let physical_type = output_types[0].physical_bound_type()?;
         let physical_tensor_type = lowerer.lower_tensor_type(&physical_type)?;
         let value = self.value().lower_constant(&mut lowerer.block(), lowerer.context(), lowerer.location())?;
         let result = lowerer.block().append_operation(stable_hlo::broadcast(
@@ -268,7 +268,7 @@ impl LowerableOperation for IotaLikeOperation<ArrayType> {
         check_count!("output", output_types, 1, ProgramError);
         // Coordinates do not depend on the extent of their axis, so the coordinates of the physical allocation are
         // correct inside every logical size that the exemplar provides.
-        let physical_type = physical_bound_type(&output_types[0])?;
+        let physical_type = output_types[0].physical_bound_type()?;
         let physical_tensor_type = lowerer.lower_tensor_type(&physical_type)?;
         let result = lowerer.block().append_operation(stable_hlo::iota(
             physical_tensor_type,
@@ -538,9 +538,9 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Finishes a constructor whose output takes the type and the runtime shape of an exemplar. `result` must have the
-/// [`physical_bound_type`] of `output_type`, because allocation uses the declared bounds. This function applies the
-/// declared memory placement and layout to that allocation, restores the logical size of every dynamic axis from
-/// `exemplar`, including zero extents, and constrains the result to the sharding that its type declares, if any.
+/// [`ArrayTypeExtension::physical_bound_type`] of `output_type`, because allocation uses the declared bounds. This
+/// function applies the declared memory placement and layout to that allocation, restores the logical size of each
+/// dynamic axis from `exemplar`, including zero extents, and constrains the result to its declared sharding, if any.
 fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
     result: ValueRef<'b, 'c, 't>,
     exemplar: ValueRef<'b, 'c, 't>,
@@ -550,7 +550,7 @@ fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let physical_type = physical_bound_type(output_type)?;
+    let physical_type = output_type.physical_bound_type()?;
     let result = match physical_type.memory() {
         Memory::Device => result,
         memory => memory.lower_transfer(&[result], block, context, location)?[0],

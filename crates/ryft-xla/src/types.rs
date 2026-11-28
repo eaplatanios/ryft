@@ -2,18 +2,19 @@
 //! This module implements [`ToPjrt`] and [`FromPjrt`] for [`DataType`] (i.e., PJRT [`BufferType`]s) and for
 //! [`Layout`], [`TiledLayout`], [`StridedLayout`], [`Tile`], and [`TileDimension`]. Tiled and strided layout
 //! conversions are fallible because PJRT stores minor-to-major dimension indices as unsigned 64-bit integers
-//! and strides as signed 64-bit integers. [`ArrayTypeExtension`] uses the logical size of a single element to
-//! compute the dense byte count of a whole array.
+//! and strides as signed 64-bit integers. [`ArrayTypeExtension`] computes dense byte counts and derives static
+//! storage types for bounded dynamic arrays.
 
 use ryft_core::{
-    ArrayType, DataType, DataTypeError, Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout,
+    ArrayType, DataType, DataTypeError, Dimension, Layout, LayoutError, Shape, StridedLayout, Tile, TileDimension,
+    TiledLayout,
 };
 use ryft_pjrt::{
     BufferType, Layout as PjrtLayout, StridedLayout as PjrtStridedLayout, Tile as PjrtTile,
     TileDimension as PjrtTileDimension, TiledLayout as PjrtTiledLayout,
 };
 
-use crate::{ArrayError, Error, FromPjrt, ToPjrt};
+use crate::{ArrayError, Error, FromPjrt, LoweringError, ToPjrt};
 
 impl ToPjrt for TileDimension {
     type Output = PjrtTileDimension;
@@ -287,7 +288,7 @@ impl DataTypeExtension for DataType {
     }
 }
 
-/// Extends [`ArrayType`] with the dense byte counts used by the XLA backend.
+/// Extends [`ArrayType`] with the dense byte counts and static storage types used by the XLA backend.
 pub trait ArrayTypeExtension {
     /// Returns the number of logical payload bytes required by a dense [`Array`](crate::Array) of this type.
     /// [`DataType::Zero`] requires no payload bytes even when the backend uses a temporary buffer for it.
@@ -297,6 +298,14 @@ pub trait ArrayTypeExtension {
     /// For types other than [`DataType::Zero`], returns an error if the element count cannot be determined from
     /// the shape or if either the element count or byte count overflows [`usize`].
     fn dense_size_in_bytes(&self) -> Result<usize, Error>;
+
+    /// Returns the static storage type for this array type. Each dynamic dimension is replaced by the largest extent
+    /// that its exclusive upper bound admits. The remaining type metadata is preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoweringError::UnsupportedOperation`] when a dynamic dimension has no finite positive upper bound.
+    fn physical_bound_type(&self) -> Result<ArrayType, Error>;
 }
 
 impl ArrayTypeExtension for ArrayType {
@@ -317,13 +326,36 @@ impl ArrayTypeExtension for ArrayType {
             ),
         })
     }
+
+    fn physical_bound_type(&self) -> Result<ArrayType, Error> {
+        let dimensions = self
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| match dimension {
+                Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
+                Dimension::Dynamic(variable) => variable
+                    .bounds()
+                    .upper()
+                    .and_then(|upper| upper.checked_sub(1))
+                    .map(Dimension::Static)
+                    .ok_or_else(|| {
+                        Error::Lowering(LoweringError::UnsupportedOperation {
+                            operation: "physical bound".to_string(),
+                            reason: format!("dynamic dimension `{variable}` needs a finite positive physical bound"),
+                        })
+                    }),
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(self.clone().with_shape(Shape::new(dimensions)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_core::{Dimension, DimensionBounds, DimensionVariable, Shape};
+    use ryft_core::{DimensionBounds, DimensionVariable};
 
     use super::*;
 
@@ -528,5 +560,22 @@ mod tests {
         );
         assert!(matches!(&error, Error::SizeLimitExceeded { message: actual } if actual == &message));
         assert_eq!(error.to_string(), message);
+    }
+
+    #[test]
+    fn test_array_type_physical_bound_type() {
+        // Each bounded dynamic dimension takes the largest extent that its exclusive upper bound admits.
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(6)).unwrap());
+        let bounded = ArrayType::new(DataType::F32, Shape::new(vec![rows.into(), Dimension::Static(3)]));
+        assert_eq!(bounded.physical_bound_type(), Ok(ArrayType::new_static(DataType::F32, [5, 3])));
+
+        let rows = DimensionVariable::new("rows", DimensionBounds::unbounded());
+        let unbounded = ArrayType::new(DataType::F32, Shape::new(vec![rows.into()]));
+        assert!(matches!(
+            unbounded.physical_bound_type(),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "physical bound"
+                    && reason == "dynamic dimension `rows` needs a finite positive physical bound",
+        ));
     }
 }

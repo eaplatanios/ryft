@@ -13,14 +13,14 @@ use crate::lowering::contexts::ProgramLoweringContext;
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, dimension_extent_i32, dimension_extent_i64, lower_explicit_reshape_shape,
-    lower_runtime_dimension_size_i64, lower_static_index_constants, physical_bound_type,
-    stable_hlo_dynamic_dimension_bound, static_dimensions,
+    lower_runtime_dimension_size_i64, lower_static_index_constants, stable_hlo_dynamic_dimension_bound,
+    static_dimensions,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE, ASSERT_RESHAPE_KIND,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
+use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -78,13 +78,13 @@ impl LowerableOperation for DynamicReshapeOperation {
 
         // Native reshape requires equal allocation capacities even when the runtime logical products agree.
         // Reject unsupported bound combinations here rather than letting HLO import fail with a static count error.
-        let physical_input = physical_bound_type(input_type).map_err(|_| {
+        let physical_input = input_type.physical_bound_type().map_err(|_| {
             Error::Lowering(LoweringError::UnsupportedOperation {
                 operation: self.name().to_string(),
                 reason: "`reshape` requires finite physical bounds for every dynamic input dimension".to_string(),
             })
         })?;
-        let physical_output = physical_bound_type(output_type).map_err(|_| {
+        let physical_output = output_type.physical_bound_type().map_err(|_| {
             Error::Lowering(LoweringError::UnsupportedOperation {
                 operation: self.name().to_string(),
                 reason: "`reshape` requires finite physical bounds for every dynamic output dimension".to_string(),

@@ -11,14 +11,13 @@ use ryft_mlir::{
 use crate::lowering::EffectTokens;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_i32, lower_constant_output,
-    lower_runtime_dimension_size_i64, lower_static_index_constants, lower_unplaced_constant_output,
-    physical_bound_type, static_dimensions,
+    lower_runtime_dimension_size_i64, lower_static_index_constants, lower_unplaced_constant_output, static_dimensions,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_DETAIL_ATTRIBUTE, ASSERT_DYNAMIC_SHAPE_SLICE_KIND, ASSERT_KIND_ATTRIBUTE,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
+use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -54,7 +53,7 @@ impl LowerableOperation for SliceOperation {
         }
 
         let input_type = &input_types[0];
-        let physical_type = physical_bound_type(input_type)?;
+        let physical_type = input_type.physical_bound_type()?;
         let size_type = ArrayType::scalar(DataType::I32).lower(context, location)?;
         let mut physical = input_values[0];
         let mut physical_dimensions = input_type.shape().dimensions().to_vec();

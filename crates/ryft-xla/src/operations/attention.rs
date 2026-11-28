@@ -21,13 +21,12 @@ use ryft_mlir::{
 };
 
 use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat, physical_bound_type,
-    static_dimensions,
+    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat, static_dimensions,
 };
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
-use crate::{Error, LoweringError, Type};
+use crate::{ArrayTypeExtension, Error, LoweringError, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -237,7 +236,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             for index in 0..3 {
-                let physical_type = physical_bound_type(&input_types[index])?;
+                let physical_type = input_types[index].physical_bound_type()?;
                 physical_inputs[index] =
                     normalize_fused_attention_operand(physical_inputs[index], &physical_type, block, location)?;
             }
@@ -447,7 +446,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             for index in [0, 1, 2, offset, offset + 2] {
-                let physical_type = physical_bound_type(&input_types[index])?;
+                let physical_type = input_types[index].physical_bound_type()?;
                 physical_inputs[index] =
                     normalize_fused_attention_operand(physical_inputs[index], &physical_type, block, location)?;
             }
@@ -575,7 +574,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 let transposed = transposed.result(0).unwrap().as_ref();
                 let mut transposed = transposed;
                 if input_types[index].rank() == 3 {
-                    let dimensions = static_dimensions(&physical_bound_type(&output_types[index])?)?;
+                    let dimensions = static_dimensions(&output_types[index].physical_bound_type()?)?;
                     let reshaped =
                         block.append_operation(stable_hlo::reshape(transposed, dimensions.as_slice(), location)?)?;
                     transposed = reshaped.result(0).unwrap().as_ref();
@@ -594,7 +593,7 @@ impl AttentionConfigurationLoweringExtension for AttentionConfiguration {
                 && output_types.len() == 4
             {
                 let bias_type = &input_types[bias_index];
-                let physical_bias_type = physical_bound_type(bias_type)?;
+                let physical_bias_type = bias_type.physical_bound_type()?;
                 let mut normalized_bias_dimensions = static_dimensions(&physical_bias_type)?;
                 normalized_bias_dimensions.splice(0..0, std::iter::repeat_n(1, 4 - bias_type.rank()));
                 let score_dimensions = static_dimensions(&score_type)?;
@@ -909,7 +908,7 @@ fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
             // own data type and only then converted to the data type of the scores.
             let bias = broadcast_fused_attention_score_operand(
                 physical_inputs[index],
-                &physical_bound_type(&input_types[index])?,
+                &input_types[index].physical_bound_type()?,
                 &score_type.clone().with_data_type(input_types[index].data_type()),
                 block,
                 context,
@@ -954,7 +953,7 @@ fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
         .map(|index| {
             let mask = broadcast_fused_attention_score_operand(
                 physical_inputs[index],
-                &physical_bound_type(&input_types[index])?,
+                &input_types[index].physical_bound_type()?,
                 &score_type.clone().with_data_type(DataType::Boolean),
                 block,
                 context,

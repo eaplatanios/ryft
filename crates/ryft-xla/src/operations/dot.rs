@@ -13,10 +13,13 @@ use ryft_mlir::{
 
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, PhysicalStoragePadding, lower_u64_scalar_constant,
-    lower_unplaced_constant_output, physical_bound_type,
+    lower_unplaced_constant_output,
 };
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
-use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, RaggedDotLoweringStrategy};
+use crate::{
+    ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation,
+    RaggedDotLoweringStrategy,
+};
 
 // TODO(eaplatanios): Review this module.
 
@@ -175,7 +178,7 @@ impl LowerableOperation for RaggedDotOperation {
         }
         let left_ragged_axis = dimensions.lhs_ragged_dimension();
         let left_prefix = dimensions.group_sizes_prefix_dimensions(left_type.rank()).map_err(ProgramError::from)?;
-        let physical_ragged_extent = physical_bound_type(left_type)?.dimension(left_ragged_axis).value().unwrap();
+        let physical_ragged_extent = left_type.physical_bound_type()?.dimension(left_ragged_axis).value().unwrap();
         let (group_starts, group_ends) = lower_ragged_dot_group_intervals(
             input_values[2],
             group_sizes_type,
@@ -512,7 +515,7 @@ fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
     let metadata_broadcast_dimensions =
         if group_sizes_type.rank() == 1 { vec![prefix_axes.len()] } else { (0..=prefix_axes.len()).collect() };
     let metadata_type = intermediate_type.clone().with_data_type(DataType::U64);
-    let physical_metadata_type = physical_bound_type(&metadata_type)?;
+    let physical_metadata_type = metadata_type.physical_bound_type()?;
     let physical_metadata_tensor_type = physical_metadata_type.lower(context, location)?;
     let dimension_sources = (0..metadata_type.rank()).map(|axis| (input, axis)).collect::<Vec<_>>();
     let group_starts = block.append_operation(stable_hlo::broadcast(

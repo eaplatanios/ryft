@@ -15,11 +15,10 @@ use ryft_mlir::{
 use crate::lowering::NamedCompositionKey;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, DataTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat,
-    physical_bound_type,
 };
 use crate::operations::call::lower_shared_function_call;
 use crate::operations::composites::named_composition_input_types;
-use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Session, Tracer, Type};
+use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Session, Tracer, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -63,8 +62,8 @@ pub(crate) fn scaled_dot_composition_types(
         return Ok(Some((input_types.to_vec(), output_types.to_vec())));
     }
     Ok(Some((
-        input_types.iter().map(physical_bound_type).collect::<Result<Vec<_>, _>>()?,
-        output_types.iter().map(physical_bound_type).collect::<Result<Vec<_>, _>>()?,
+        input_types.iter().map(|r#type| r#type.physical_bound_type()).collect::<Result<Vec<_>, _>>()?,
+        output_types.iter().map(|r#type| r#type.physical_bound_type()).collect::<Result<Vec<_>, _>>()?,
     )))
 }
 
@@ -172,7 +171,7 @@ impl LowerableOperation for ScaledDotOperation {
             }
             let dummy_type =
                 scaled_dot_dummy_scale_type(&composition_input_types[element_index], contracting_dimensions);
-            let physical_type = physical_bound_type(&dummy_type)?;
+            let physical_type = dummy_type.physical_bound_type()?;
             let physical_tensor_type = physical_type.lower(context, location)?;
             let dummy = lower_f64_constant_splat(1.0, &physical_type, physical_tensor_type, block, context, location)?;
             if uses_physical_boundary {
@@ -287,7 +286,7 @@ impl ScaledDotOperationLoweringExtension for ScaledDotOperation {
             let transposed = block.append_operation(stable_hlo::transpose(value, permutation, location)?)?;
             operands.push(transposed.result(0).unwrap().as_ref());
         }
-        let output_type = physical_bound_type(&output_types[0])?.lower(context, location)?;
+        let output_type = output_types[0].physical_bound_type()?.lower(context, location)?;
         let default_layout = |rank: usize| (0..rank).rev().collect::<Vec<_>>();
         let custom_call = block.append_operation(stable_hlo::custom_call(
             operands.as_slice(),

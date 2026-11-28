@@ -12,14 +12,14 @@ use ryft_mlir::{
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_f64_constant_splat, lower_signed_one_bit_to_mlir,
-    lower_unplaced_constant_output, physical_bound_type, static_dimensions,
+    lower_unplaced_constant_output, static_dimensions,
 };
 use crate::operations::assertions::{lower_dependency_barrier, lower_type_relationship_checks};
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::operations::control_flow::{lower_refined_region_input, lower_refined_region_outputs};
 use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::ReductionKindLoweringExtension;
-use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
+use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -385,7 +385,7 @@ impl ArrayTypeLayoutConversionLoweringExtension for ArrayType {
         value: ValueRef<'b, 'c, 't>,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-        let physical_type = physical_bound_type(self)?;
+        let physical_type = self.physical_bound_type()?;
         let physical =
             self.lower_physical_storage(value, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
         let result = physical_type.lower_layout_constraint(physical, &mut lowerer.block(), lowerer.location())?;
@@ -752,7 +752,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         return Ok(result.result(0).unwrap().as_ref());
     }
     // Width-changing bitcasts need physical bounds for XLA's dynamic padding pass.
-    let physical_input_type = physical_bound_type(input_type).map_err(|error| match error {
+    let physical_input_type = input_type.physical_bound_type().map_err(|error| match error {
         Error::Lowering(LoweringError::UnsupportedOperation { .. }) => {
             Error::Lowering(LoweringError::UnsupportedOperation {
                 operation: CONVERT_ELEMENT_TYPE_OPERATION_NAME.to_string(),
@@ -771,7 +771,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         context,
         location,
     )?;
-    let physical_output_type = physical_bound_type(output_type)?;
+    let physical_output_type = output_type.physical_bound_type()?;
     let output_tensor_type = physical_output_type.lower(context, location)?;
     let result = if matches!(input_type.data_type(), DataType::F6E2M3FN | DataType::F6E3M2FN) {
         // XLA stores FP6 in a byte and native rank-changing bitcasts expose eight bits. Recover the six logical

@@ -12,12 +12,12 @@ use ryft_mlir::{
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_explicit_shape, lower_runtime_dimension_size_i64,
-    lower_static_index_constants, lower_unplaced_constant_output, physical_bound_type,
+    lower_static_index_constants, lower_unplaced_constant_output,
 };
 use crate::operations::comparisons::ComparisonDirectionLoweringExtension;
 use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::operations::reductions::build_reduce_body_region;
-use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
+use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
@@ -146,7 +146,7 @@ impl ScatterOperationLoweringExtension for ScatterOperation {
                         .as_ref(),
                 );
                 if self.mode() == ScatterMode::Drop {
-                    let Dimension::Static(capacity) = physical_bound_type(&input_types[0])?.shape().dimensions()[axis]
+                    let Dimension::Static(capacity) = input_types[0].physical_bound_type()?.shape().dimensions()[axis]
                     else {
                         unreachable!()
                     };
@@ -399,7 +399,7 @@ fn lower_index_broadcast<'b, 'c: 'b, 't: 'c>(
             context,
             location,
         )?;
-        let physical_type = physical_bound_type(output_type)?;
+        let physical_type = output_type.physical_bound_type()?;
         let result = block
             .append_operation(stable_hlo::broadcast(value, physical_type.lower(context, location)?, axes, location)?)?
             .result(0)

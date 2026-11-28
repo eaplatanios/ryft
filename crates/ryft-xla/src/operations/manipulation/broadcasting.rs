@@ -9,12 +9,12 @@ use ryft_mlir::{Block, Operation as MlirOperation, Type as MlirType, Value as Ml
 use crate::lowering::sharding::OpenDimensions;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_i64, lower_explicit_shape,
-    lower_runtime_dimension_size_i64, lower_static_index_constants, physical_bound_type,
+    lower_runtime_dimension_size_i64, lower_static_index_constants,
 };
 use crate::operations::constants::{
     ArrayTypeLayoutConstraintLoweringExtension, dynamic_constructor_types, refine_dynamic_constructor_result,
 };
-use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
+use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -42,7 +42,7 @@ impl LowerableOperation for BroadcastOperation {
         } else {
             input
         };
-        let result = if output_type.static_shape().is_none() && physical_bound_type(output_type).is_err() {
+        let result = if output_type.static_shape().is_none() && output_type.physical_bound_type().is_err() {
             if output_type.layout().is_some() {
                 return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                     operation: self.name().to_string(),
@@ -95,7 +95,7 @@ impl LowerableOperation for BroadcastOperation {
             // `stablehlo.broadcast_in_dim` results admit at most one bounded dynamic axis. Broadcast the physical
             // allocation for multiple dynamic axes or an explicit layout, then restore every logical size from its
             // mapped input axis.
-            let physical_type = physical_bound_type(output_type)?;
+            let physical_type = output_type.physical_bound_type()?;
             let physical_input = input_types[0].lower_padded_physical_storage(
                 input,
                 PhysicalStoragePadding::Constant(0.0),
@@ -153,7 +153,7 @@ impl LowerableOperation for BroadcastLikeOperation {
         // The exemplar only provides the logical sizes of the dynamic axes. The value is broadcast at the physical
         // allocation, where a stretched unit axis has a static extent even when its output axis is dynamic, and
         // every logical size is then restored from the exemplar.
-        let physical_type = physical_bound_type(output_type)?;
+        let physical_type = output_type.physical_bound_type()?;
         let value = input_types[0].lower_padded_physical_storage(
             input_values[0],
             PhysicalStoragePadding::Constant(0.0),
@@ -222,7 +222,7 @@ impl LowerableOperation for DynamicBroadcastOperation {
             )?)?;
             let result = broadcast.result(0).unwrap().as_ref();
             output_type.lower_layout_constraint(result, block, location)?
-        } else if physical_bound_type(input_type).is_ok() && physical_bound_type(output_type).is_ok() {
+        } else if input_type.physical_bound_type().is_ok() && output_type.physical_bound_type().is_ok() {
             // Finite bounded inputs can be materialized at their physical shape, broadcast statically, and then
             // refined from the explicit output extents. This avoids `dynamic_broadcast_in_dim`, which the XLA
             // importer cannot legalize when an intermediate shape includes a computed dynamic ratio.
@@ -490,7 +490,8 @@ mod tests {
         /// Executes one homogeneous broadcast or its adjoint through the mixed executable ABI.
         fn execute(program: PlainProgram, values: &[f32], extent: i32) -> (Vec<f32>, Vec<u64>) {
             let input_type = program.input_types().into_owned().remove(0);
-            let dimensions = physical_bound_type(&input_type)
+            let dimensions = input_type
+                .physical_bound_type()
                 .unwrap()
                 .static_shape()
                 .unwrap()

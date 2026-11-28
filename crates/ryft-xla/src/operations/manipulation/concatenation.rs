@@ -11,13 +11,13 @@ use ryft_mlir::{
 use crate::lowering::EffectTokens;
 use crate::lowering::types::{
     ArrayTypeLoweringExtension, PhysicalStoragePadding, dimension_extent_i32, dimension_extent_i64,
-    lower_constant_output, lower_static_index_constants, physical_bound_type,
+    lower_constant_output, lower_static_index_constants,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_CONCATENATE_KIND, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::{Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
+use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, ProgramLoweringOperation, Type};
 
 // TODO(eaplatanios): Review this module.
 
@@ -112,8 +112,8 @@ impl LowerableOperation for ConcatenateOperation<Type> {
             // Native concatenation keeps the axis dynamic even when its bounds prove a singleton extent.
             inferred_dimensions[self.axis()] = Dimension::Dynamic(inferred_extent.to_variable());
             let inferred_type = output_type.clone().with_shape(Shape::new(inferred_dimensions));
-            let physical_input_type = physical_bound_type(&inferred_type)?;
-            let physical_output_type = physical_bound_type(output_type)?;
+            let physical_input_type = inferred_type.physical_bound_type()?;
+            let physical_output_type = output_type.physical_bound_type()?;
             dimension_extent_i32(physical_output_type.dimension(self.axis()).value().unwrap())?;
             let logical_result = result;
             // Concatenate has already packed logical input extents contiguously. Expose its bounded storage,
@@ -241,7 +241,6 @@ mod tests {
     use crate::lowering::tests::{
         ProgramBuilder, dynamic_dimension, test_matrix_type, test_vector_type, unproject_plain_program,
     };
-    use crate::lowering::types::physical_bound_type;
     use crate::operations::Operation;
     use crate::tests::{cpu_client, execution_client, test_compilation_options, values_from_bytes, values_to_bytes};
     use crate::{
@@ -465,7 +464,7 @@ mod tests {
                     .unwrap();
                 let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
                 let module = program.to_rendered_mlir("concatenate_dynamic", &ProgramLoweringOptions::new()).unwrap();
-                let bound = physical_bound_type(&output_type).unwrap().dimension(0).value().unwrap();
+                let bound = output_type.physical_bound_type().unwrap().dimension(0).value().unwrap();
                 // Inputs carry static storage plus hidden i32 extents, and dynamic outputs also return hidden i64
                 // extents.
                 let storage_type = format!("tensor<{bound}x{element}>");

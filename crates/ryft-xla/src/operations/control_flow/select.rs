@@ -15,12 +15,10 @@ use ryft_mlir::{
     Value as MlirValue, ValueRef,
 };
 
-use crate::lowering::types::{
-    ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_signed_one_bit_to_mlir, physical_bound_type,
-};
+use crate::lowering::types::{ArrayTypeLoweringExtension, PhysicalStoragePadding, lower_signed_one_bit_to_mlir};
 use crate::operations::constants::ArrayTypeLayoutConstraintLoweringExtension;
 use crate::operations::normalize_elementwise_input;
-use crate::{Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
+use crate::{ArrayTypeExtension, Error, LowerableOperation, Lowerer, LoweringError, ProgramLoweringOperation};
 
 // TODO(eaplatanios): Review this module.
 
@@ -121,7 +119,7 @@ where
                 context,
                 location.as_ref(),
             )?;
-            let physical_type = physical_bound_type(&target_type)?;
+            let physical_type = target_type.physical_bound_type()?;
             let first_axis = target_type.rank().checked_sub(converted_type.rank()).ok_or_else(|| {
                 Error::Lowering(LoweringError::UnsupportedOperation {
                     operation: SELECT_OPERATION_NAME.to_string(),

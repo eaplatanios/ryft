@@ -76,7 +76,7 @@ pub use lowering::{
     TypeLoweringExtension, UnreducedKindExtension, dimension_extent_i32, dimension_extent_i64, lower_constant_output,
     lower_explicit_shape, lower_f64_constant_splat, lower_projected_operation, lower_runtime_dimension_size_i64,
     lower_signed_one_bit_to_mlir, lower_static_index_constants, lower_u64_scalar_constant,
-    lower_unplaced_constant_output, physical_bound_type, stable_hlo_dynamic_dimension_bound, static_dimensions,
+    lower_unplaced_constant_output, stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 pub use operations::{
     Operation, PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE, ensure_print_handler_registered, with_captured_prints,
@@ -89,6 +89,7 @@ pub use sessions::{
     normalize_runtime_requirements,
 };
 pub use tracing::{ArrayTracer, TracedProgram, trace, trace_with_context};
+pub use types::ArrayTypeExtension;
 pub use values::{ArrayConstant, Constant, Dimension, Reference, Type, Value};
 
 // TODO(eaplatanios): Review this module.
